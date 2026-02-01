@@ -23,6 +23,7 @@ export default defineConfig({
           items: [
             { label: 'Introduction', slug: 'getting-started' },
             { label: 'Neon Database Setup', slug: 'getting-started/neon-setup' },
+            { label: 'Create Script Walkthrough', slug: 'getting-started/create-script' },
             { label: 'LLM Rules', slug: 'getting-started/llm-rules' },
           ],
         },
