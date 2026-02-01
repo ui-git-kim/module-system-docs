@@ -28,6 +28,23 @@ export default defineConfig({
           label: 'Starter Template',
           items: [
             { label: 'Overview', slug: 'starter-template' },
+            { label: 'Base Registry', slug: 'starter-template/base-registry' },
+            { label: 'Registry Reference', slug: 'starter-template/registries' },
+            { label: 'CLI Scripts', slug: 'starter-template/scripts' },
+          ],
+        },
+        {
+          label: 'Module Starter',
+          collapsed: true,
+          items: [
+            { label: 'Overview', slug: 'module-starter' },
+          ],
+        },
+        {
+          label: 'Modules',
+          collapsed: true,
+          items: [
+            { label: 'Catalogue', slug: 'modules' },
           ],
         },
       ],
