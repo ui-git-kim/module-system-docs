@@ -15,6 +15,9 @@ export default defineConfig({
           navLinks: [{ label: "Docs", link: "/getting-started" }],
         }),
       ],
+      logo: {
+        src: ' ',
+      },
       title: "Module System",
       social: [
         {
