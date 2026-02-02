@@ -16,7 +16,7 @@ export default defineConfig({
         }),
       ],
       logo: {
-        src: './public/modularSystem_logo.png',
+        src: "./public/modularSystem_logo.png",
       },
       title: "Module System",
       social: [
@@ -48,15 +48,23 @@ export default defineConfig({
             { label: "Overview", slug: "starter-template" },
             { label: "Architecture", slug: "starter-template/architecture" },
             { label: "Project Structure", slug: "starter-template/structure" },
-            { label: "Built-in Features", slug: "starter-template/features" },
-            { label: "Configuration", slug: "starter-template/configuration" },
-            { label: "Authentication", slug: "starter-template/auth-feature" },
-            { label: "User Feature", slug: "starter-template/user-feature" },
             {
-              label: "Dashboard Feature",
-              slug: "starter-template/dashboard-feature",
+              label: "Built-in Features",
+              items: [
+                { label: "Overview", slug: "starter-template/features" },
+                {
+                  label: "Authentication",
+                  slug: "starter-template/auth-feature",
+                },
+                { label: "User", slug: "starter-template/user-feature" },
+                {
+                  label: "Dashboard",
+                  slug: "starter-template/dashboard-feature",
+                },
+                { label: "Admin", slug: "starter-template/admin-feature" },
+              ],
             },
-            { label: "Admin Feature", slug: "starter-template/admin-feature" },
+            { label: "Configuration", slug: "starter-template/configuration" },
             { label: "Base Registry", slug: "starter-template/base-registry" },
             {
               label: "Registry Reference",
