@@ -48,6 +48,12 @@ export default defineConfig({
             { label: "Overview", slug: "starter-template" },
             { label: "Architecture", slug: "starter-template/architecture" },
             { label: "Project Structure", slug: "starter-template/structure" },
+            { label: "Configuration", slug: "starter-template/configuration" },
+            { label: "Base Registry", slug: "starter-template/base-registry" },
+            {
+              label: "Registry Reference",
+              slug: "starter-template/registries",
+            },
             {
               label: "Built-in Features",
               items: [
@@ -63,12 +69,6 @@ export default defineConfig({
                 },
                 { label: "Admin", slug: "starter-template/admin-feature" },
               ],
-            },
-            { label: "Configuration", slug: "starter-template/configuration" },
-            { label: "Base Registry", slug: "starter-template/base-registry" },
-            {
-              label: "Registry Reference",
-              slug: "starter-template/registries",
             },
             { label: "CLI Scripts", slug: "starter-template/scripts" },
             { label: "Updating", slug: "starter-template/updating" },
