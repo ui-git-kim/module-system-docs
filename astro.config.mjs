@@ -57,6 +57,10 @@ export default defineConfig({
               slug: "starter-template/registries",
             },
             {
+              label: "Shell Layout",
+              slug: "starter-template/shell-layout",
+            },
+            {
               label: "Built-in Features",
               items: [
                 { label: "Overview", slug: "starter-template/features" },
