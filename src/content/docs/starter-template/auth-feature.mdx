@@ -1,0 +1,451 @@
+---
+title: Authentication
+description: How authentication works with Neon Auth
+tableOfContents:
+  maxHeadingLevel: 2
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The starter template uses [Neon Auth](https://neon.tech/docs/guides/neon-auth) for authentication, providing secure JWT-based auth with multiple sign-in methods.
+
+---
+
+## Overview
+
+Authentication flow:
+
+```
+User Sign In (Neon Auth UI)
+    ↓
+JWT Token Issued
+    ↓
+Token stored in session (frontend)
+    ↓
+API requests include: Authorization: Bearer <token>
+    ↓
+Backend verifies token via JWKS
+    ↓
+req.user = { id, email } attached
+    ↓
+User profile auto-created on first request
+```
+
+### Supported Auth Methods
+
+The template enables these methods by default:
+
+| Method | Description |
+|--------|-------------|
+| **Email OTP** | Magic link sent to email |
+| **Credentials** | Email + password with forgot password |
+| **Google OAuth** | Sign in with Google account |
+
+<Aside type="tip">
+  Configure additional OAuth providers (GitHub, Discord, etc.) in your Neon console.
+</Aside>
+
+---
+
+## File Structure
+
+```
+frontend/src/features/auth/
+├── index.ts                    # Public exports
+├── routes.config.tsx           # Auth routes (/auth/*)
+├── lib/
+│   ├── client.ts               # Neon Auth client instance
+│   └── getAuthToken.ts         # Token retrieval for API calls
+├── hooks/
+│   └── useSession.ts           # Session hook wrapper
+├── components/
+│   ├── AuthProtectedRoute.tsx  # Route guard component
+│   └── AccountSettings.tsx     # Account settings UI
+└── pages/
+    └── AuthPage.tsx            # Sign in/up/forgot password page
+
+backend/src/middleware/
+└── auth.middleware.ts          # JWT verification + role checks
+```
+
+---
+
+## Frontend Setup
+
+### Neon Auth Client
+
+The auth client is initialised in `lib/client.ts`:
+
+```tsx
+import { createAuthClient } from '@neondatabase/neon-js';
+import { adapter } from '@neondatabase/neon-js/react';
+
+export const authClient = createAuthClient({
+  authUrl: import.meta.env.VITE_NEON_AUTH_URL,
+  adapter: adapter(),
+});
+
+export const auth = authClient;
+```
+
+### App Provider Setup
+
+In `main.tsx`, the app is wrapped with `NeonAuthUIProvider`:
+
+```tsx
+import { NeonAuthUIProvider } from '@neondatabase/neon-js/react/ui';
+import { authClient } from './features/auth';
+
+createRoot(document.getElementById('root')!).render(
+  <NeonAuthUIProvider
+    authClient={authClient}
+    auth={{
+      emailOTP: true,
+      credentials: { forgotPassword: true },
+      social: ['google'],
+    }}
+  >
+    <RouterProvider router={router} />
+  </NeonAuthUIProvider>
+);
+```
+
+---
+
+## Using Authentication
+
+### Protecting Routes
+
+Wrap protected content with `AuthProtectedRoute`:
+
+```tsx
+// routes.tsx
+import { AuthProtectedRoute } from '@/features/auth';
+
+export const router = createBrowserRouter([
+  // Public routes
+  ...authRoutes,
+
+  // Protected routes
+  {
+    element: (
+      <AuthProtectedRoute>
+        <DashboardPage />
+      </AuthProtectedRoute>
+    ),
+    children: [
+      ...dashboardRoutes,
+      ...userRoutes,
+    ],
+  },
+]);
+```
+
+### Getting Session Data
+
+```tsx
+import { useSession } from '@/features/auth';
+
+function MyComponent() {
+  const { data, isPending, error } = useSession();
+
+  if (isPending) return <Spinner />;
+  if (error) return <Error />;
+
+  const user = data?.user;
+  const token = data?.session?.token;
+
+  return <div>Hello, {user?.email}</div>;
+}
+```
+
+### Session Data Structure
+
+```typescript
+interface SessionUser {
+  id: string;
+  email: string;
+  emailVerified: boolean;
+  name: string | null;
+  image: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface Session {
+  id: string;
+  token: string;
+  userId: string;
+  expiresAt: string;
+}
+
+interface SessionData {
+  user: SessionUser;
+  session: Session;
+}
+```
+
+### Getting Token for API Calls
+
+For non-React code (like API interceptors):
+
+```tsx
+import { getAuthToken } from '@/features/auth';
+
+// In axios interceptor
+api.interceptors.request.use(async (config) => {
+  const token = await getAuthToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+```
+
+---
+
+## Backend Middleware
+
+### JWT Verification
+
+The `requireAuth` middleware verifies tokens using JWKS:
+
+```typescript
+// backend/src/middleware/auth.middleware.ts
+import { createRemoteJWKSet, jwtVerify } from 'jose';
+
+const jwksUrl = new URL('.well-known/jwks.json', env.NEON_AUTH_URL);
+const jwks = createRemoteJWKSet(jwksUrl);
+
+export async function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { payload } = await jwtVerify(token, jwks);
+
+  req.user = {
+    id: payload.sub,
+    email: payload.email,
+  };
+
+  next();
+}
+```
+
+### Role-Based Middleware
+
+```typescript
+// Require admin role
+router.use('/admin', requireAuth, requireAdmin, adminRoutes);
+
+// Require specific role(s)
+router.use('/editor', requireAuth, requireRole('managed'), editorRoutes);
+
+// Attach role without requiring specific role
+router.use('/api', requireAuth, attachRole, apiRoutes);
+// Then check: if (req.user?.role === 'admin') { ... }
+```
+
+### Extended Request Type
+
+```typescript
+declare module 'express' {
+  interface Request {
+    user?: {
+      id: string;
+      email: string;
+      role?: 'user' | 'admin' | 'managed';
+    };
+  }
+}
+```
+
+---
+
+## User Profile Auto-Creation
+
+On first API call after sign-in, the user profile is auto-created:
+
+```typescript
+// backend/src/features/user/user.service.ts
+async getOrCreateProfile(userId: string, email: string) {
+  let user = await prisma.user.findUnique({ where: { id: userId } });
+
+  if (!user) {
+    // Check if this is the first user (make them admin)
+    const userCount = await prisma.user.count();
+
+    user = await prisma.user.create({
+      data: {
+        id: userId,
+        email: email,
+        role: userCount === 0 ? 'admin' : 'user',
+      },
+    });
+  }
+
+  return user;
+}
+```
+
+<Aside type="note">
+  The first user to sign up automatically becomes an admin.
+</Aside>
+
+---
+
+## Auth UI Components
+
+Neon Auth provides pre-built UI components:
+
+### AuthView
+
+Used for sign-in, sign-up, forgot password pages:
+
+```tsx
+import { AuthView } from '@neondatabase/neon-js/react/ui';
+
+function AuthPage() {
+  return <AuthView pathname={pathname} />;
+}
+```
+
+Routes:
+- `/auth/sign-in` - Sign in form
+- `/auth/sign-up` - Registration form
+- `/auth/forgot-password` - Password reset request
+- `/auth/reset-password` - Password reset form
+
+### AccountView
+
+Used for account settings:
+
+```tsx
+import { AccountView } from '@neondatabase/neon-js/react/ui';
+
+function AccountSettings() {
+  return <AccountView pathname={pathname} />;
+}
+```
+
+Routes:
+- `/settings` - Account settings
+- `/sessions` - Active sessions
+- `/password` - Change password
+
+### SignedIn / SignedOut
+
+Conditional rendering based on auth state:
+
+```tsx
+import { SignedIn, SignedOut } from '@/features/auth';
+
+function Header() {
+  return (
+    <>
+      <SignedIn>
+        <UserMenu />
+      </SignedIn>
+      <SignedOut>
+        <Link to="/auth/sign-in">Sign In</Link>
+      </SignedOut>
+    </>
+  );
+}
+```
+
+### UserButton
+
+Quick user menu button:
+
+```tsx
+import { UserButton } from '@/features/auth';
+
+function Header() {
+  return <UserButton />;
+}
+```
+
+---
+
+## Environment Variables
+
+### Frontend
+
+```env
+VITE_NEON_AUTH_URL=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
+```
+
+### Backend
+
+```env
+NEON_AUTH_URL=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
+```
+
+<Aside type="caution">
+  Both URLs must match exactly, including the `/neondb/auth` path.
+</Aside>
+
+---
+
+## Sign Out
+
+```tsx
+import { authClient } from '@/features/auth';
+
+async function handleSignOut() {
+  await authClient.signOut();
+  // Redirect to sign-in page
+  window.location.href = '/auth/sign-in';
+}
+```
+
+---
+
+## Troubleshooting
+
+### 401 Unauthorized Errors
+
+1. Check `NEON_AUTH_URL` matches in both `.env` files
+2. Ensure URL includes full path (`/neondb/auth`)
+3. Verify JWKS endpoint is accessible
+4. Check token is being sent (Network tab → Authorization header)
+
+### Token Not Refreshing
+
+Neon Auth handles token refresh automatically. If issues occur:
+1. Check session expiry in JWKS payload
+2. Verify `authClient` is initialised correctly
+3. Clear browser storage and re-authenticate
+
+### OAuth Not Working
+
+1. Configure OAuth provider in Neon Console
+2. Add correct redirect URLs
+3. Enable the provider in `NeonAuthUIProvider`
+
+### Session Lost on Page Refresh
+
+1. Check that `authClient` is initialised before rendering
+2. Verify session storage isn't being cleared
+3. Check for CORS issues with auth endpoint
+
+---
+
+## Security Considerations
+
+- **HTTPS Required** - Always use HTTPS in production
+- **Token Storage** - Neon Auth uses secure session storage
+- **CORS** - Configure allowed origins in backend
+- **Rate Limiting** - Consider adding rate limits to auth endpoints
+
+---
+
+## Next Steps
+
+- [User Feature](/starter-template/user-feature/) - User profiles and preferences
+- [Admin Feature](/starter-template/admin-feature/) - User management
+- [API Reference](/reference/cli-commands/) - CLI commands

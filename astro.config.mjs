@@ -50,6 +50,13 @@ export default defineConfig({
             { label: "Project Structure", slug: "starter-template/structure" },
             { label: "Built-in Features", slug: "starter-template/features" },
             { label: "Configuration", slug: "starter-template/configuration" },
+            { label: "Authentication", slug: "starter-template/auth-feature" },
+            { label: "User Feature", slug: "starter-template/user-feature" },
+            {
+              label: "Dashboard Feature",
+              slug: "starter-template/dashboard-feature",
+            },
+            { label: "Admin Feature", slug: "starter-template/admin-feature" },
             { label: "Base Registry", slug: "starter-template/base-registry" },
             {
               label: "Registry Reference",
