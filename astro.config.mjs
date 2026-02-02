@@ -32,24 +32,24 @@ export default defineConfig({
           items: [
             { label: "Introduction", slug: "getting-started" },
             {
-              label: "Neon Database Setup",
-              slug: "getting-started/neon-setup",
-            },
-            {
-              label: "Create Script Walkthrough",
-              slug: "getting-started/create-script",
-            },
-            { label: "LLM Rules", slug: "getting-started/llm-rules" },
-            {
               label: "Documentation System",
               slug: "getting-started/documentation",
             },
+            {
+              label: "Neon Database Setup",
+              slug: "getting-started/neon-setup",
+            },
+            { label: "LLM Rules", slug: "getting-started/llm-rules" },
           ],
         },
         {
           label: "Starter Template",
           items: [
             { label: "Overview", slug: "starter-template" },
+            {
+              label: "Create Script Walkthrough",
+              slug: "starter-template/create-script",
+            },
             {
               label: "Project Architecture",
               slug: "starter-template/architecture",
