@@ -16,7 +16,7 @@ export default defineConfig({
         }),
       ],
       logo: {
-        src: ' ',
+        src: './public/modularSystem_logo.png',
       },
       title: "Module System",
       social: [
