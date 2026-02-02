@@ -46,7 +46,10 @@ export default defineConfig({
           label: "Starter Template",
           items: [
             { label: "Overview", slug: "starter-template" },
-            { label: "Project Structure", slug: "starter-template/structure" },
+            {
+              label: "Project Architecture",
+              slug: "starter-template/architecture",
+            },
             { label: "Configuration", slug: "starter-template/configuration" },
             { label: "Base Registry", slug: "starter-template/base-registry" },
             {
