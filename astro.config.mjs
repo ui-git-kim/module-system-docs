@@ -40,6 +40,10 @@ export default defineConfig({
               slug: "getting-started/create-script",
             },
             { label: "LLM Rules", slug: "getting-started/llm-rules" },
+            {
+              label: "Documentation System",
+              slug: "getting-started/documentation",
+            },
           ],
         },
         {
