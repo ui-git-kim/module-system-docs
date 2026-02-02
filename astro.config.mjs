@@ -84,8 +84,11 @@ export default defineConfig({
                 { label: "Admin", slug: "starter-template/admin-feature" },
               ],
             },
+            {
+              label: "Updating Cloned Apps",
+              slug: "starter-template/updating",
+            },
             { label: "CLI Scripts", slug: "starter-template/scripts" },
-            { label: "Updating", slug: "starter-template/updating" },
             { label: "Changelog", slug: "starter-template/changelog" },
             { label: "Roadmap", slug: "starter-template/roadmap" },
           ],
