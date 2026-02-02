@@ -3,17 +3,64 @@ title: Base Registry Pattern
 description: Understanding the BaseRegistry class and how to create custom registries
 ---
 
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
 The `BaseRegistry<T>` class is the foundation for all collection registries in the system. It provides standardised registration, ordering, duplicate handling, and React integration.
+
+---
 
 ## Why BaseRegistry?
 
 Instead of each registry implementing its own storage, sorting, and React subscription logic, they all extend `BaseRegistry<T>`. This ensures:
 
-- Consistent API across all registries
-- Built-in React subscription via `useSyncExternalStore`
-- Automatic sorting by `order` field
-- Duplicate detection with configurable behaviour
-- Reduced code duplication
+- **Consistent API** across all registries
+- **React integration** via `useSyncExternalStore`
+- **Automatic sorting** by `order` field
+- **Duplicate detection** with configurable behaviour
+- **Reduced code duplication**
+
+---
+
+## Core Concepts
+
+### Items and IDs
+
+Every registry item must have a unique `id` and can optionally specify an `order`:
+
+```typescript
+interface RegistryItem {
+  id: string;      // Unique identifier
+  order?: number;  // Sort order (lower = earlier)
+}
+```
+
+### Registration Flow
+
+When you call `register()`:
+
+1. Check if item with same `id` exists
+2. If exists and `allowReplace` is false, skip (warn unless `silent`)
+3. Apply default `order` if not specified
+4. Store item in internal Map
+5. Update sorted snapshot
+6. Notify React subscribers
+
+```
+register(item) → Check Duplicate → Apply Defaults → Store → Sort → Notify
+```
+
+### Sorting
+
+Items are automatically sorted by their `order` field. Lower numbers come first:
+
+```typescript
+// These items will appear in this order: dashboard, projects, billing
+registry.register({ id: 'billing', order: 50 });
+registry.register({ id: 'dashboard', order: 10 });
+registry.register({ id: 'projects', order: 30 });
+```
+
+---
 
 ## BaseRegistry API
 
@@ -25,8 +72,10 @@ abstract class BaseRegistry<T extends RegistryItem> {
 }
 ```
 
-- `registryName`: Used in console warnings for debugging
-- `defaultOrder`: Default order value when items don't specify one
+| Parameter | Description |
+|-----------|-------------|
+| `registryName` | Used in console warnings for debugging |
+| `defaultOrder` | Default order value when items don't specify one |
 
 ### Registration Methods
 
@@ -34,7 +83,7 @@ abstract class BaseRegistry<T extends RegistryItem> {
 // Register a single item
 register(item: T, options?: RegistrationOptions): boolean
 
-// Register multiple items at once
+// Register multiple items at once (single notification)
 registerMany(items: T[], options?: RegistrationOptions): number
 
 // Remove an item by ID
@@ -47,23 +96,23 @@ unregisterMany(ids: string[]): number
 clear(): void
 ```
 
+### Registration Options
+
+```typescript
+interface RegistrationOptions {
+  allowReplace?: boolean;  // Allow replacing existing item (default: false)
+  silent?: boolean;        // Suppress duplicate warning (default: false)
+}
+```
+
 ### Retrieval Methods
 
 ```typescript
-// Get item by ID
-get(id: string): T | undefined
-
-// Get all items (sorted by order)
-getAll(): T[]
-
-// Check if item exists
-has(id: string): boolean
-
-// Get item count
-count(): number
-
-// Get all IDs
-getIds(): string[]
+get(id: string): T | undefined      // Get item by ID
+getAll(): T[]                        // Get all items (sorted)
+has(id: string): boolean             // Check if item exists
+count(): number                      // Get item count
+getIds(): string[]                   // Get all IDs
 ```
 
 ### React Integration
@@ -76,36 +125,34 @@ subscribe(listener: () => void): () => void
 getSnapshot(): T[]
 ```
 
-## RegistryItem Interface
+---
 
-All items must implement this interface:
+## Order Convention
 
-```typescript
-interface RegistryItem {
-  /** Unique identifier for this item */
-  id: string;
-  /** Sort order (lower = earlier). Default: 10 */
-  order?: number;
-}
-```
+All registries follow this ordering convention:
 
-## Registration Options
+| Range | Purpose | Use For |
+|-------|---------|---------|
+| 1-9 | Core/critical | System items that must run first |
+| 10 | Default | Standard feature items |
+| 11-49 | Early features | Items that should appear early |
+| 50-99 | Standard features | Most feature items |
+| 100+ | Late/third-party | Items that should appear last |
 
-```typescript
-interface RegistrationOptions {
-  /** Allow replacing existing item with same ID. Default: false */
-  allowReplace?: boolean;
-  /** Suppress console warning on duplicate. Default: false */
-  silent?: boolean;
-}
-```
+<Aside type="tip">
+Lower numbers appear first in lists and execute first in pipelines.
+</Aside>
+
+---
 
 ## Creating a Custom Registry
 
 ### Step 1: Define Your Item Type
 
 ```typescript
+// my-widget.registry.ts
 import { BaseRegistry, createRegistryHook, type RegistryItem } from './base.registry';
+import type { ComponentType } from 'react';
 
 // Extend RegistryItem with your fields
 interface MyWidget extends RegistryItem {
@@ -158,52 +205,97 @@ export function useMyWidgetsByCategory(category: string) {
 export type { MyWidget };
 ```
 
-## Order Convention
+---
 
-All registries follow this ordering convention:
+## React Hook Utility
 
-| Range | Purpose |
-|-------|---------|
-| 1-9 | Core/critical items (runs first) |
-| 10 | Default order |
-| 11-49 | Early feature items |
-| 50-99 | Standard feature items |
-| 100+ | Late/third-party items |
+The `createRegistryHook` utility creates a hook that automatically subscribes to registry changes:
 
-Lower numbers appear first in lists and execute first in pipelines.
+```typescript
+import { useSyncExternalStore } from 'react';
+
+export function createRegistryHook<T extends RegistryItem>(
+  registry: BaseRegistry<T>
+): () => T[] {
+  return () =>
+    useSyncExternalStore(
+      (listener) => registry.subscribe(listener),
+      () => registry.getSnapshot()
+    );
+}
+```
+
+Usage in components:
+
+```typescript
+const useMyRegistry = createRegistryHook(myRegistry);
+
+function MyComponent() {
+  const items = useMyRegistry(); // Re-renders when registry changes
+  return (
+    <div>
+      {items.map(item => <Item key={item.id} item={item} />)}
+    </div>
+  );
+}
+```
+
+---
 
 ## Frontend vs Backend
 
-### Frontend BaseRegistry
-
+<Tabs>
+  <TabItem label="Frontend">
 Located at `frontend/src/config/base.registry.ts`
 
-Features:
+**Features:**
 - React subscription via `useSyncExternalStore`
-- `createRegistryHook()` utility
+- `createRegistryHook()` utility for easy hook creation
 - Cached snapshot for performance
+- Listener notification on changes
 
-### Backend BaseRegistry
+```typescript
+// Frontend registry with React integration
+class NavigationRegistry extends BaseRegistry<NavItem> {
+  // Can use React hooks
+}
 
+export const useNavigation = createRegistryHook(navigationRegistry);
+```
+  </TabItem>
+  <TabItem label="Backend">
 Located at `backend/src/config/base.registry.ts`
 
-Features:
+**Features:**
 - No React dependencies
 - Lazy-cached sorted array
 - Same registration API
+- Optimised for server-side use
+
+```typescript
+// Backend registry - no React
+class RouteRegistry extends BaseRegistry<RouteConfig> {
+  // Server-side only methods
+  mountAll(app: Express): void { ... }
+}
+```
+  </TabItem>
+</Tabs>
+
+---
 
 ## Best Practices
 
-### 1. Always Provide Unique IDs
+### 1. Use Unique, Descriptive IDs
 
 ```typescript
-// Good - unique, descriptive ID
+// ✅ Good - unique, descriptive ID
 myRegistry.register({
-  id: 'billing-widget',
+  id: 'billing-overview-widget',
   // ...
 });
 
-// Bad - generic ID risks collisions
+// ❌ Bad - generic ID risks collisions
 myRegistry.register({
   id: 'widget-1',
   // ...
@@ -226,7 +318,19 @@ myWidgetRegistry.register({
 });
 ```
 
-### 3. Override Methods When Needed
+### 3. Batch Updates for Performance
+
+```typescript
+// ✅ Good - single notification
+myRegistry.registerMany([item1, item2, item3]);
+
+// ❌ Less efficient - three notifications
+myRegistry.register(item1);
+myRegistry.register(item2);
+myRegistry.register(item3);
+```
+
+### 4. Override Methods When Needed
 
 ```typescript
 class SpecialRegistry extends BaseRegistry<SpecialItem> {
@@ -253,53 +357,122 @@ class SpecialRegistry extends BaseRegistry<SpecialItem> {
 }
 ```
 
-### 4. Batch Updates for Performance
-
-```typescript
-// Good - single notification
-myRegistry.registerMany([item1, item2, item3]);
-
-// Less efficient - three notifications
-myRegistry.register(item1);
-myRegistry.register(item2);
-myRegistry.register(item3);
-```
-
-## Using createRegistryHook
-
-The utility creates a hook that automatically subscribes to registry changes:
-
-```typescript
-import { useSyncExternalStore } from 'react';
-
-export function createRegistryHook<T extends RegistryItem>(
-  registry: BaseRegistry<T>
-): () => T[] {
-  return () =>
-    useSyncExternalStore(
-      (listener) => registry.subscribe(listener),
-      () => registry.getSnapshot()
-    );
-}
-```
-
-Usage:
-```typescript
-const useMyRegistry = createRegistryHook(myRegistry);
-
-function MyComponent() {
-  const items = useMyRegistry(); // Re-renders when registry changes
-  return <div>{items.map(item => <Item key={item.id} item={item} />)}</div>;
-}
-```
+---
 
 ## When Not to Use BaseRegistry
 
-Some registries have specialised requirements:
+Some registries have specialised requirements that don't fit the collection pattern:
 
-- **FilterRegistry**: Pipeline pattern with hook-based transformations
-- **ActionRegistry**: Side effects with sync/async distinction
-- **RouteRegistry**: Express-specific mounting logic
-- **ServiceRegistry**: TypeScript type augmentation for type safety
+| Registry | Pattern | Why Different |
+|----------|---------|---------------|
+| `FilterRegistry` | Pipeline | Transforms data through chain of functions |
+| `ActionRegistry` | Event | Executes side effects, doesn't store items |
+| `RouteRegistry` | Express-specific | Has mounting logic, versioning |
+| `ServiceRegistry` | Type augmentation | Needs TypeScript type safety |
 
 These registries implement their own patterns optimised for their use cases.
+
+---
+
+## Complete Example
+
+Here's a complete example of creating a notifications registry:
+
+```typescript
+// frontend/src/config/notification.registry.ts
+import { BaseRegistry, createRegistryHook, type RegistryItem } from './base.registry';
+import type { ComponentType } from 'react';
+import type { LucideIcon } from 'lucide-react';
+
+// ========================================================================
+// TYPES
+// ========================================================================
+
+interface NotificationConfig extends RegistryItem {
+  id: string;
+  title: string;
+  message: string;
+  icon?: LucideIcon;
+  type: 'info' | 'success' | 'warning' | 'error';
+  dismissable?: boolean;
+  order?: number;
+}
+
+// ========================================================================
+// REGISTRY CLASS
+// ========================================================================
+
+class NotificationRegistry extends BaseRegistry<NotificationConfig> {
+  constructor() {
+    super('NotificationRegistry', 10);
+  }
+
+  getByType(type: NotificationConfig['type']): NotificationConfig[] {
+    return this.getAll().filter(n => n.type === type);
+  }
+
+  dismiss(id: string): boolean {
+    const item = this.get(id);
+    if (item?.dismissable !== false) {
+      return this.unregister(id);
+    }
+    return false;
+  }
+
+  dismissAll(): void {
+    const dismissable = this.getAll().filter(n => n.dismissable !== false);
+    this.unregisterMany(dismissable.map(n => n.id));
+  }
+}
+
+// ========================================================================
+// SINGLETON AND HOOKS
+// ========================================================================
+
+export const notificationRegistry = new NotificationRegistry();
+export const useNotifications = createRegistryHook(notificationRegistry);
+
+export function useErrorNotifications() {
+  useNotifications(); // Subscribe
+  return notificationRegistry.getByType('error');
+}
+
+// ========================================================================
+// TYPE EXPORTS
+// ========================================================================
+
+export type { NotificationConfig };
+```
+
+Usage:
+
+```typescript
+// Show a notification
+notificationRegistry.register({
+  id: 'save-success',
+  title: 'Saved',
+  message: 'Your changes have been saved.',
+  type: 'success',
+  dismissable: true,
+});
+
+// In a component
+function NotificationBanner() {
+  const notifications = useNotifications();
+
+  return (
+    <div>
+      {notifications.map(n => (
+        <Alert key={n.id} type={n.type}>
+          {n.message}
+          {n.dismissable && (
+            <button onClick={() => notificationRegistry.dismiss(n.id)}>
+              Dismiss
+            </button>
+          )}
+        </Alert>
+      ))}
+    </div>
+  );
+}
+```
