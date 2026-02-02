@@ -1,172 +1,216 @@
 ---
 title: Base Registry Pattern
-description: Understanding the BaseRegistry class and how to create custom registries
+description: How registries work and how to create custom ones
 ---
 
 import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
-The `BaseRegistry<T>` class is the foundation for all collection registries in the system. It provides standardised registration, ordering, duplicate handling, and React integration.
+Registries are how features add things (menu items, widgets, settings pages) without editing core files. This page explains how they work.
 
 ---
 
-## Why BaseRegistry?
+## What is a Registry?
 
-Instead of each registry implementing its own storage, sorting, and React subscription logic, they all extend `BaseRegistry<T>`. This ensures:
+A registry is a **list that features can add to**. Instead of editing a file to add a menu item, you register it:
 
-- **Consistent API** across all registries
-- **React integration** via `useSyncExternalStore`
-- **Automatic sorting** by `order` field
-- **Duplicate detection** with configurable behaviour
-- **Reduced code duplication**
+```typescript
+// Without registry: edit the sidebar file directly (BAD)
+const menuItems = [
+  { title: 'Dashboard', url: '/dashboard' },
+  { title: 'Billing', url: '/billing' },  // ← Added here, editing core file
+];
+
+// With registry: register from your feature (GOOD)
+navigationRegistry.registerMain({
+  id: 'billing',
+  title: 'Billing',
+  url: '/billing',
+  icon: CreditCard,
+  order: 40,
+});
+```
+
+The sidebar component reads from the registry and renders whatever has been registered. Your feature doesn't need to know about other features, and no core files get modified.
 
 ---
 
-## Core Concepts
+## How Order Works
 
-### Items and IDs
+**Order controls the position** in the list. Lower numbers come first.
 
-Every registry item must have a unique `id` and can optionally specify an `order`:
-
-```typescript
-interface RegistryItem {
-  id: string;      // Unique identifier
-  order?: number;  // Sort order (lower = earlier)
-}
-```
-
-### Registration Flow
-
-When you call `register()`:
-
-1. Check if item with same `id` exists
-2. If exists and `allowReplace` is false, skip (warn unless `silent`)
-3. Apply default `order` if not specified
-4. Store item in internal Map
-5. Update sorted snapshot
-6. Notify React subscribers
-
-```
-register(item) → Check Duplicate → Apply Defaults → Store → Sort → Notify
-```
-
-### Sorting
-
-Items are automatically sorted by their `order` field. Lower numbers come first:
+### Visual Example: Navigation
 
 ```typescript
-// These items will appear in this order: dashboard, projects, billing
-registry.register({ id: 'billing', order: 50 });
-registry.register({ id: 'dashboard', order: 10 });
-registry.register({ id: 'projects', order: 30 });
+// These registrations can happen in any order, in different files:
+navigationRegistry.registerMain({ id: 'settings', title: 'Settings', order: 70, ... });
+navigationRegistry.registerMain({ id: 'dashboard', title: 'Dashboard', order: 10, ... });
+navigationRegistry.registerMain({ id: 'billing', title: 'Billing', order: 40, ... });
+navigationRegistry.registerMain({ id: 'projects', title: 'Projects', order: 30, ... });
 ```
+
+**Result in sidebar (sorted by order):**
+```
+Dashboard    (order: 10)  ← Lowest, appears first
+Projects     (order: 30)
+Billing      (order: 40)
+Settings     (order: 70)  ← Highest, appears last
+```
+
+### Why This Matters
+
+Different modules register at different times (when they load). Without ordering, items would appear in random load order. With `order`, you control exactly where things appear.
+
+### Default Order
+
+If you don't specify `order`, the registry uses its default (usually 10). Items with the same order appear in registration order.
+
+```typescript
+// No order specified - uses default of 10
+navigationRegistry.registerMain({ id: 'feature-a', title: 'Feature A', ... });
+navigationRegistry.registerMain({ id: 'feature-b', title: 'Feature B', ... });
+
+// Both have order 10, so Feature A appears first (registered first)
+```
+
+### Order Ranges
+
+Use these ranges so features land in predictable positions:
+
+| Range | What Goes Here | Example |
+|-------|---------------|---------|
+| 1-9 | Core system items | — |
+| 10-29 | Primary features | Dashboard (10), Home (15) |
+| 30-49 | Main features | Projects (30), Billing (40) |
+| 50-69 | Secondary features | Reports (50), Analytics (60) |
+| 70-89 | Settings/Admin | Settings (70), Admin (80) |
+| 90-99 | Footer items | Help (90), Logout (95) |
+| 100+ | Third-party plugins | Plugin features (100+) |
+
+<Aside type="tip">
+Pick a number in the middle of the range (e.g., 40 for main features) so there's room to insert items before or after.
+</Aside>
+
+---
+
+## The Registration Pattern
+
+Every registry follows the same pattern:
+
+### 1. Create a Registration File
+
+```typescript
+// features/billing/navigation.registration.ts
+import { navigationRegistry } from '@/config/navigation.registry';
+import { CreditCard } from 'lucide-react';
+
+navigationRegistry.registerMain({
+  id: 'billing',
+  title: 'Billing',
+  url: '/billing',
+  icon: CreditCard,
+  order: 40,
+});
+```
+
+### 2. Import It (Side-Effect Import)
+
+```typescript
+// features/billing/index.ts
+import './navigation.registration';  // ← This line runs the registration
+
+export { BillingPage } from './pages/BillingPage';
+```
+
+When the app imports the billing feature, the registration runs automatically. No manual wiring needed.
+
+---
+
+## Common Registries
+
+| Registry | What It Stores | Order Controls |
+|----------|---------------|----------------|
+| `navigationRegistry` | Menu items | Position in sidebar |
+| `dashboardRegistry` | Dashboard widgets | Position in grid |
+| `settingsPagesRegistry` | Settings page sections | Position in settings nav |
+| `headerToolbarRegistry` | Header buttons/actions | Position in header |
+| `adminPagesRegistry` | Admin panel pages | Position in admin nav |
+
+Each works the same way: register items with an `id` and `order`, they appear in sorted order.
 
 ---
 
 ## BaseRegistry API
 
-### Constructor
+All registries extend `BaseRegistry<T>`, which provides these methods:
+
+### Registration
 
 ```typescript
-abstract class BaseRegistry<T extends RegistryItem> {
-  constructor(registryName: string, defaultOrder: number = 10)
-}
+register(item, options?)      // Add one item
+registerMany(items, options?) // Add multiple items
+unregister(id)                // Remove by ID
+clear()                       // Remove all
 ```
 
-| Parameter | Description |
-|-----------|-------------|
-| `registryName` | Used in console warnings for debugging |
-| `defaultOrder` | Default order value when items don't specify one |
-
-### Registration Methods
+### Retrieval
 
 ```typescript
-// Register a single item
-register(item: T, options?: RegistrationOptions): boolean
-
-// Register multiple items at once (single notification)
-registerMany(items: T[], options?: RegistrationOptions): number
-
-// Remove an item by ID
-unregister(id: string): boolean
-
-// Remove multiple items
-unregisterMany(ids: string[]): number
-
-// Remove all items
-clear(): void
+get(id)      // Get one item by ID
+getAll()     // Get all items (sorted by order)
+has(id)      // Check if ID exists
+count()      // How many items
+getIds()     // List all IDs
 ```
 
-### Registration Options
+### Options
 
 ```typescript
-interface RegistrationOptions {
-  allowReplace?: boolean;  // Allow replacing existing item (default: false)
-  silent?: boolean;        // Suppress duplicate warning (default: false)
-}
-```
-
-### Retrieval Methods
-
-```typescript
-get(id: string): T | undefined      // Get item by ID
-getAll(): T[]                        // Get all items (sorted)
-has(id: string): boolean             // Check if item exists
-count(): number                      // Get item count
-getIds(): string[]                   // Get all IDs
-```
-
-### React Integration
-
-```typescript
-// Subscribe to changes (for useSyncExternalStore)
-subscribe(listener: () => void): () => void
-
-// Get current snapshot
-getSnapshot(): T[]
+registry.register(item, {
+  allowReplace: true,  // Overwrite existing item with same ID
+  silent: true,        // Don't log warning on duplicate
+});
 ```
 
 ---
 
-## Order Convention
+## React Integration
 
-All registries follow this general ordering convention:
+Registries work with React. When items are added/removed, components re-render.
 
-| Range | Purpose |
-|-------|---------|
-| 1-9 | Core/system items |
-| 10-29 | Primary features (Dashboard, Home) |
-| 30-49 | Main features |
-| 50-69 | Secondary features |
-| 70-89 | Settings, admin |
-| 90-99 | Footer items, logout |
-| 100+ | Third-party modules/plugins |
+```typescript
+// In a component
+import { useNavigationRegistry } from '@/config/registry.hooks';
 
-<Aside type="tip">
-Lower numbers appear first in lists and execute first in pipelines.
-</Aside>
+function Sidebar() {
+  const items = useNavigationRegistry();  // Re-renders when registry changes
 
-<Aside type="note">
-Some registries have specific conventions documented in their source files. For example, `headerToolbarRegistry` uses 1-20 for primary actions, 41-60 for notifications, etc. Check the registry file for details.
-</Aside>
+  return (
+    <nav>
+      {items.map(item => (
+        <Link key={item.id} to={item.url}>{item.title}</Link>
+      ))}
+    </nav>
+  );
+}
+```
 
 ---
 
 ## Creating a Custom Registry
 
-### Step 1: Define Your Item Type
+If you need a new registry (e.g., for a widget system in your module):
+
+### Step 1: Define the Item Type
 
 ```typescript
 // my-widget.registry.ts
 import { BaseRegistry, createRegistryHook, type RegistryItem } from './base.registry';
-import type { ComponentType } from 'react';
 
-// Extend RegistryItem with your fields
 interface MyWidget extends RegistryItem {
   id: string;
   title: string;
-  component: ComponentType;
-  category?: string;
-  order?: number;
+  component: React.ComponentType;
+  order?: number;  // Optional - has default
 }
 ```
 
@@ -175,74 +219,44 @@ interface MyWidget extends RegistryItem {
 ```typescript
 class MyWidgetRegistry extends BaseRegistry<MyWidget> {
   constructor() {
-    super('MyWidgetRegistry', 10); // name, defaultOrder
+    super('MyWidgetRegistry', 50);  // Name for logs, default order
   }
 
-  // Add custom methods as needed
-  getByCategory(category: string): MyWidget[] {
-    return this.getAll().filter(w => w.category === category);
-  }
-
-  getCategories(): string[] {
-    return [...new Set(this.getAll().map(w => w.category).filter(Boolean))];
+  // Add custom methods if needed
+  getByTitle(title: string): MyWidget | undefined {
+    return this.getAll().find(w => w.title === title);
   }
 }
 ```
 
-### Step 3: Create Singleton and Hook
+### Step 3: Export Singleton and Hook
 
 ```typescript
-// Singleton instance
+// Single instance used everywhere
 export const myWidgetRegistry = new MyWidgetRegistry();
 
-// React hook using the utility
+// React hook for components
 export const useMyWidgets = createRegistryHook(myWidgetRegistry);
 
-// Optional: convenience hooks
-export function useMyWidgetsByCategory(category: string) {
-  useMyWidgets(); // Subscribe to changes
-  return myWidgetRegistry.getByCategory(category);
-}
-```
-
-### Step 4: Export Types
-
-```typescript
+// Export the type
 export type { MyWidget };
 ```
 
----
-
-## React Hook Utility
-
-The `createRegistryHook` utility creates a hook that automatically subscribes to registry changes:
+### Step 4: Use It
 
 ```typescript
-import { useSyncExternalStore } from 'react';
+// Register a widget
+myWidgetRegistry.register({
+  id: 'sales-chart',
+  title: 'Sales Chart',
+  component: SalesChart,
+  order: 20,
+});
 
-export function createRegistryHook<T extends RegistryItem>(
-  registry: BaseRegistry<T>
-): () => T[] {
-  return () =>
-    useSyncExternalStore(
-      (listener) => registry.subscribe(listener),
-      () => registry.getSnapshot()
-    );
-}
-```
-
-Usage in components:
-
-```typescript
-const useMyRegistry = createRegistryHook(myRegistry);
-
-function MyComponent() {
-  const items = useMyRegistry(); // Re-renders when registry changes
-  return (
-    <div>
-      {items.map(item => <Item key={item.id} item={item} />)}
-    </div>
-  );
+// In a component
+function WidgetGrid() {
+  const widgets = useMyWidgets();
+  return widgets.map(w => <w.component key={w.id} />);
 }
 ```
 
@@ -252,233 +266,69 @@ function MyComponent() {
 
 <Tabs>
   <TabItem label="Frontend">
-Located at `frontend/src/config/base.registry.ts`
-
-**Features:**
-- React subscription via `useSyncExternalStore`
-- `createRegistryHook()` utility for easy hook creation
-- Cached snapshot for performance
-- Listener notification on changes
+Has React integration:
+- `subscribe()` and `getSnapshot()` for React hooks
+- `createRegistryHook()` utility
+- Components re-render when registry changes
 
 ```typescript
-// Frontend registry with React integration
-class NavigationRegistry extends BaseRegistry<NavItem> {
-  // Can use React hooks
-}
+import { BaseRegistry, createRegistryHook } from '@/config/base.registry';
 
-export const useNavigation = createRegistryHook(navigationRegistry);
+class MyRegistry extends BaseRegistry<MyItem> { }
+export const myRegistry = new MyRegistry();
+export const useMyRegistry = createRegistryHook(myRegistry);
 ```
   </TabItem>
   <TabItem label="Backend">
-Located at `backend/src/config/base.registry.ts`
-
-**Features:**
-- No React dependencies
-- Lazy-cached sorted array
-- Same registration API
-- Optimised for server-side use
+No React, same registration API:
+- Same `register()`, `getAll()`, etc.
+- Used for routes, services
 
 ```typescript
-// Backend registry - no React
-class RouteRegistry extends BaseRegistry<RouteConfig> {
-  // Server-side only methods
-  mountAll(app: Express): void { ... }
-}
+import { BaseRegistry } from '../config/base.registry.js';
+
+class MyRegistry extends BaseRegistry<MyItem> { }
+export const myRegistry = new MyRegistry();
+// No hook needed - backend doesn't use React
 ```
   </TabItem>
 </Tabs>
 
 ---
 
-## Best Practices
+## When NOT to Use BaseRegistry
 
-### 1. Use Unique, Descriptive IDs
+Some registries need special behaviour:
 
-```typescript
-// ✅ Good - unique, descriptive ID
-myRegistry.register({
-  id: 'billing-overview-widget',
-  // ...
-});
+| Registry | Why Different |
+|----------|--------------|
+| `routeRegistry` | Needs Express mounting, API versioning |
+| `serviceRegistry` | Needs TypeScript type augmentation |
+| `filterRegistry` | Transforms data through a chain (pipeline pattern) |
+| `actionRegistry` | Runs side effects, not a collection |
 
-// ❌ Bad - generic ID risks collisions
-myRegistry.register({
-  id: 'widget-1',
-  // ...
-});
-```
-
-### 2. Use Side-Effect Imports for Registration
-
-```typescript
-// features/billing/index.ts
-import './widget.registration';  // Triggers registration on import
-
-// features/billing/widget.registration.ts
-import { myWidgetRegistry } from '@/config/my-widget.registry';
-
-myWidgetRegistry.register({
-  id: 'billing-widget',
-  title: 'Billing Overview',
-  // ...
-});
-```
-
-### 3. Batch Updates for Performance
-
-```typescript
-// ✅ Good - single notification
-myRegistry.registerMany([item1, item2, item3]);
-
-// ❌ Less efficient - three notifications
-myRegistry.register(item1);
-myRegistry.register(item2);
-myRegistry.register(item3);
-```
-
-### 4. Override Methods When Needed
-
-```typescript
-class SpecialRegistry extends BaseRegistry<SpecialItem> {
-  // Override register to add defaults
-  override register(item: SpecialItem, options = {}): boolean {
-    const withDefaults = {
-      isActive: true,
-      ...item,
-    };
-    return super.register(withDefaults, options);
-  }
-
-  // Override updateSnapshot for custom sorting
-  protected override updateSnapshot(): void {
-    this.snapshot = Array.from(this.items.values())
-      .sort((a, b) => {
-        // Custom sort: by category first, then by order
-        if (a.category !== b.category) {
-          return a.category.localeCompare(b.category);
-        }
-        return (a.order ?? 10) - (b.order ?? 10);
-      });
-  }
-}
-```
+These implement their own patterns. Use `BaseRegistry` for simple "collection of items" registries.
 
 ---
 
-## When Not to Use BaseRegistry
-
-Some registries have specialised requirements that don't fit the collection pattern:
-
-| Registry | Pattern | Why Different |
-|----------|---------|---------------|
-| `FilterRegistry` | Pipeline | Transforms data through chain of functions |
-| `ActionRegistry` | Event | Executes side effects, doesn't store items |
-| `RouteRegistry` | Express-specific | Has mounting logic, versioning |
-| `ServiceRegistry` | Type augmentation | Needs TypeScript type safety |
-
-These registries implement their own patterns optimised for their use cases.
-
----
-
-## Complete Example
-
-Here's a complete example of creating a notifications registry:
+## Quick Reference
 
 ```typescript
-// frontend/src/config/notification.registry.ts
-import { BaseRegistry, createRegistryHook, type RegistryItem } from './base.registry';
-import type { ComponentType } from 'react';
-import type { LucideIcon } from 'lucide-react';
+// Register
+registry.register({ id: 'my-item', order: 30, ...otherFields });
 
-// ========================================================================
-// TYPES
-// ========================================================================
+// Get all (sorted)
+const items = registry.getAll();
 
-interface NotificationConfig extends RegistryItem {
-  id: string;
-  title: string;
-  message: string;
-  icon?: LucideIcon;
-  type: 'info' | 'success' | 'warning' | 'error';
-  dismissable?: boolean;
-  order?: number;
-}
+// Get one
+const item = registry.get('my-item');
 
-// ========================================================================
-// REGISTRY CLASS
-// ========================================================================
+// Check exists
+if (registry.has('my-item')) { ... }
 
-class NotificationRegistry extends BaseRegistry<NotificationConfig> {
-  constructor() {
-    super('NotificationRegistry', 10);
-  }
+// Remove
+registry.unregister('my-item');
 
-  getByType(type: NotificationConfig['type']): NotificationConfig[] {
-    return this.getAll().filter(n => n.type === type);
-  }
-
-  dismiss(id: string): boolean {
-    const item = this.get(id);
-    if (item?.dismissable !== false) {
-      return this.unregister(id);
-    }
-    return false;
-  }
-
-  dismissAll(): void {
-    const dismissable = this.getAll().filter(n => n.dismissable !== false);
-    this.unregisterMany(dismissable.map(n => n.id));
-  }
-}
-
-// ========================================================================
-// SINGLETON AND HOOKS
-// ========================================================================
-
-export const notificationRegistry = new NotificationRegistry();
-export const useNotifications = createRegistryHook(notificationRegistry);
-
-export function useErrorNotifications() {
-  useNotifications(); // Subscribe
-  return notificationRegistry.getByType('error');
-}
-
-// ========================================================================
-// TYPE EXPORTS
-// ========================================================================
-
-export type { NotificationConfig };
-```
-
-Usage:
-
-```typescript
-// Show a notification
-notificationRegistry.register({
-  id: 'save-success',
-  title: 'Saved',
-  message: 'Your changes have been saved.',
-  type: 'success',
-  dismissable: true,
-});
-
-// In a component
-function NotificationBanner() {
-  const notifications = useNotifications();
-
-  return (
-    <div>
-      {notifications.map(n => (
-        <Alert key={n.id} type={n.type}>
-          {n.message}
-          {n.dismissable && (
-            <button onClick={() => notificationRegistry.dismiss(n.id)}>
-              Dismiss
-            </button>
-          )}
-        </Alert>
-      ))}
-    </div>
-  );
-}
+// In React component
+const items = useMyRegistry();  // Auto re-renders on change
 ```
