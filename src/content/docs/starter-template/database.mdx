@@ -1,0 +1,424 @@
+---
+title: Database & Prisma
+description: Prisma 7 setup, Neon PostgreSQL, and module database guidelines
+---
+
+import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The starter template uses **Prisma 7** with **Neon PostgreSQL**. This page covers the database architecture, Prisma 7 differences, and guidelines for modules adding database tables.
+
+<Aside type="caution">
+  **Prisma 7 is a breaking change from Prisma 6.** The configuration has moved to TypeScript files, the schema no longer contains connection URLs, and adapters are now used for runtime connections.
+</Aside>
+
+---
+
+## Overview
+
+```
+backend/
+├── prisma.config.ts          # Prisma 7 CLI configuration
+├── prisma/
+│   ├── schema.prisma         # Database schema (no URL!)
+│   └── migrations/           # Migration history
+└── src/
+    ├── lib/prisma.ts         # Runtime client with adapters
+    └── generated/prisma/     # Generated Prisma client
+```
+
+**Key points:**
+- Schema defines models only (no connection URL)
+- `prisma.config.ts` configures CLI operations (migrations)
+- `lib/prisma.ts` creates runtime client with adapters
+- Neon uses pooled connections for runtime, direct for migrations
+
+---
+
+## Prisma 7 vs Prisma 6
+
+| Aspect | Prisma 6 | Prisma 7 |
+|--------|----------|----------|
+| Connection URL | In `schema.prisma` | In `prisma.config.ts` |
+| Configuration | `.env` file only | TypeScript config file |
+| Adapters | Optional | Required for Neon |
+| Generated client | `node_modules/.prisma` | Custom output path |
+| CLI commands | `npx prisma` | Same, but reads config |
+
+### Schema Changes
+
+**Prisma 6:**
+```prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+```
+
+**Prisma 7:**
+```prisma
+// No URL in schema - configured in prisma.config.ts
+datasource db {
+  provider = "postgresql"
+}
+```
+
+### Configuration File
+
+Prisma 7 uses `prisma.config.ts` for CLI configuration:
+
+```typescript
+// backend/prisma.config.ts
+import 'dotenv/config';
+import { defineConfig } from 'prisma/config';
+
+export default defineConfig({
+  schema: 'prisma/schema.prisma',
+  migrations: {
+    path: 'prisma/migrations',
+  },
+  datasource: {
+    // Direct URL for migrations (non-pooled)
+    url: process.env.DIRECT_DATABASE_URL || process.env.DATABASE_URL,
+  },
+});
+```
+
+---
+
+## Neon Connection Architecture
+
+Neon requires different connection strategies for different operations:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Neon Database                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   ┌─────────────────┐         ┌─────────────────┐          │
+│   │  Pooled URL     │         │  Direct URL     │          │
+│   │  (DATABASE_URL) │         │ (DIRECT_URL)    │          │
+│   │                 │         │                 │          │
+│   │  -pooler in     │         │  No -pooler     │          │
+│   │  hostname       │         │                 │          │
+│   └────────┬────────┘         └────────┬────────┘          │
+│            │                           │                    │
+│            ▼                           ▼                    │
+│   ┌─────────────────┐         ┌─────────────────┐          │
+│   │  Runtime        │         │  Migrations     │          │
+│   │  (lib/prisma.ts)│         │  (CLI)          │          │
+│   │                 │         │                 │          │
+│   │  WebSocket via  │         │  TCP via        │          │
+│   │  PrismaNeon     │         │  prisma.config  │          │
+│   └─────────────────┘         └─────────────────┘          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Environment Variables
+
+```bash
+# Pooled connection (runtime queries)
+DATABASE_URL="postgresql://user:pass@ep-xxx-pooler.region.aws.neon.tech/db?sslmode=require"
+
+# Direct connection (migrations only)
+DIRECT_DATABASE_URL="postgresql://user:pass@ep-xxx.region.aws.neon.tech/db?sslmode=require"
+
+# Adapter selection
+DATABASE_ADAPTER="neon"  # or "pg" for standard PostgreSQL
+```
+
+<Aside type="tip">
+  The pooled URL has `-pooler` in the hostname. The direct URL doesn't. Both are provided in the Neon dashboard.
+</Aside>
+
+---
+
+## Runtime Client Setup
+
+The `lib/prisma.ts` file creates the Prisma client with the appropriate adapter:
+
+```typescript
+// backend/src/lib/prisma.ts
+import { PrismaClient } from '../generated/prisma/client.js';
+import { PrismaNeon } from '@prisma/adapter-neon';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { neonConfig } from '@neondatabase/serverless';
+import ws from 'ws';
+
+// Configure WebSockets for Node.js
+neonConfig.webSocketConstructor = ws;
+
+// Create adapter based on DATABASE_ADAPTER env var
+const adapter = env.DATABASE_ADAPTER === 'neon'
+  ? new PrismaNeon({ connectionString: env.DATABASE_URL })
+  : new PrismaPg({ connectionString: env.DATABASE_URL });
+
+// Create client with adapter
+export const prisma = new PrismaClient({ adapter });
+```
+
+### Using Prisma in Features
+
+```typescript
+// Import from lib/prisma.ts, not from @prisma/client
+import { prisma } from '../lib/prisma.js';
+
+export async function getUser(id: string) {
+  return prisma.user.findUnique({ where: { id } });
+}
+```
+
+<Aside type="danger">
+  **Do not create separate Prisma clients.** Always import from `lib/prisma.ts` to ensure connection pooling works correctly.
+</Aside>
+
+---
+
+## Database Commands
+
+All commands run from the `backend/` directory:
+
+```bash
+# Generate Prisma client after schema changes
+npx prisma generate
+
+# Create and apply migrations (development)
+npx prisma migrate dev --name your_migration_name
+
+# Apply pending migrations (production)
+npx prisma migrate deploy
+
+# Reset database (drops all data!)
+npx prisma migrate reset
+
+# Open Prisma Studio (GUI)
+npx prisma studio
+```
+
+<Aside type="caution">
+  **Never use `prisma db push` in this template.** Always use `prisma migrate dev` to create proper migration files that can be tracked and deployed.
+</Aside>
+
+---
+
+## Schema Structure
+
+### Core Models
+
+The template includes two core models:
+
+```prisma
+// User - integrates with Neon Auth
+model User {
+  id          String   @id           // From Neon Auth JWT
+  email       String   @unique
+  role        String   @default("user")
+  name        String?
+  avatarUrl   String?
+  bio         String?
+  preferences Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// AppSettings - singleton for global config
+model AppSettings {
+  id                  String  @id @default("default")
+  appName             String  @default("My App")
+  logoUrl             String?
+  navigationOverrides Json    @default("{}")
+  toolbarOverrides    Json    @default("{}")
+  // ...
+}
+```
+
+### Adding New Models
+
+When adding models to your app:
+
+```prisma
+model Project {
+  id        String   @id @default(cuid())
+  name      String
+  userId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relation to User
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+```
+
+Then update the User model:
+
+```prisma
+model User {
+  // ... existing fields
+
+  // Add relation
+  projects Project[]
+}
+```
+
+---
+
+## Module Database Guidelines
+
+<Aside type="danger">
+  **Critical: Modules must use independent tables with NO relations to core models.**
+</Aside>
+
+### Why No Relations?
+
+Modules are installed/uninstalled independently. If a module creates foreign key relations to the User table:
+
+1. **Uninstalling breaks** - Can't remove module tables without dropping the FK
+2. **Migration conflicts** - Module and template migrations interfere
+3. **Circular dependencies** - User model would need to know about all modules
+
+### Correct Pattern for Modules
+
+```prisma
+// ✅ CORRECT - Independent table with userId as plain string
+model BillingSubscription {
+  id        String   @id @default(cuid())
+  userId    String   // Just a string, no @relation
+  plan      String
+  status    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])  // Index for queries
+}
+```
+
+```prisma
+// ❌ WRONG - Foreign key relation to User
+model BillingSubscription {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id])  // NO!
+}
+```
+
+### Querying Without Relations
+
+```typescript
+// Get user's subscription
+const subscription = await prisma.billingSubscription.findFirst({
+  where: { userId: user.id },
+});
+
+// Get user data separately if needed
+const user = await prisma.user.findUnique({
+  where: { id: subscription.userId },
+});
+```
+
+### Module Migration Strategy
+
+Modules should:
+
+1. **Prefix table names** - e.g., `BillingSubscription`, `BillingInvoice`
+2. **Use string IDs** - Reference User.id as plain string
+3. **Add indexes** - `@@index([userId])` for query performance
+4. **Document dependencies** - State which core models they reference
+
+---
+
+## Health Checks
+
+The template includes database health check utilities:
+
+```typescript
+import { checkDatabaseHealth } from '../lib/prisma.js';
+
+app.get('/api/health/db', async (req, res) => {
+  const health = await checkDatabaseHealth();
+  res.status(health.connected ? 200 : 503).json(health);
+});
+
+// Returns:
+// {
+//   connected: true,
+//   latencyMs: 12,
+//   adapter: "neon"
+// }
+```
+
+---
+
+## Transactions
+
+For operations that need atomicity:
+
+```typescript
+import { withTransaction, batchTransaction } from '../lib/prisma.js';
+
+// Interactive transaction
+const result = await withTransaction(async (tx) => {
+  const user = await tx.user.create({ data: { ... } });
+  const settings = await tx.appSettings.update({ ... });
+  return { user, settings };
+});
+
+// Batch transaction (multiple operations)
+const [user, log] = await batchTransaction([
+  prisma.user.create({ data: { ... } }),
+  prisma.auditLog.create({ data: { ... } }),
+]);
+```
+
+---
+
+## Troubleshooting
+
+### "Can't reach database server"
+
+1. Check `DATABASE_URL` is set correctly
+2. Verify Neon project is active (not suspended)
+3. Check IP allowlist if configured
+4. Ensure `-pooler` is in hostname for runtime
+
+### "Migration failed"
+
+1. Ensure `DIRECT_DATABASE_URL` is set (non-pooled)
+2. Check for migration conflicts: `npx prisma migrate status`
+3. Reset if needed (development only): `npx prisma migrate reset`
+
+### "Cannot find module '@prisma/client'"
+
+1. Run `npx prisma generate` after schema changes
+2. Check import path: use `../generated/prisma/client.js`
+3. Ensure `.js` extension in imports (ESM requirement)
+
+### "Prisma client not initialized"
+
+1. Import from `lib/prisma.ts`, not `@prisma/client`
+2. Ensure adapter is created before client
+3. Check `DATABASE_ADAPTER` env var is set
+
+---
+
+## File Reference
+
+<FileTree>
+- backend/
+  - prisma.config.ts (CLI configuration)
+  - prisma/
+    - schema.prisma (Model definitions)
+    - migrations/ (Migration history)
+  - src/
+    - lib/
+      - prisma.ts (Runtime client)
+    - generated/
+      - prisma/ (Generated client)
+</FileTree>
+
+---
+
+## Next Steps
+
+- [Configuration](/starter-template/configuration/) - Environment variables
+- [Base Registry](/starter-template/base-registry/) - Extension system
+- [Module Structure](/modules/structure/) - Building modules

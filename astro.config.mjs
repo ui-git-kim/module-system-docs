@@ -55,6 +55,10 @@ export default defineConfig({
               slug: "starter-template/architecture",
             },
             { label: "Configuration", slug: "starter-template/configuration" },
+            {
+              label: "Database & Prisma",
+              slug: "starter-template/database",
+            },
             { label: "Base Registry", slug: "starter-template/base-registry" },
             {
               label: "Registry Reference",
