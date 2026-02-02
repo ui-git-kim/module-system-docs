@@ -74,6 +74,8 @@ export default defineConfig({
             },
             { label: "CLI Scripts", slug: "starter-template/scripts" },
             { label: "Updating", slug: "starter-template/updating" },
+            { label: "Changelog", slug: "starter-template/changelog" },
+            { label: "Roadmap", slug: "starter-template/roadmap" },
           ],
         },
         {
