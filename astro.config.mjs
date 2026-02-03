@@ -106,6 +106,10 @@ export default defineConfig({
               slug: "module-starter/module-structure",
             },
             {
+              label: "Scaffold Architecture",
+              slug: "module-starter/scaffold",
+            },
+            {
               label: "Versioning & Updates",
               slug: "module-starter/versioning",
             },

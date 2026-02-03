@@ -1,0 +1,389 @@
+---
+title: Scaffold Architecture
+description: How the scaffold infrastructure works — installation pipeline, update mechanism, templates, and auto-registration
+---
+
+import { Steps, Tabs, TabItem, Aside, FileTree } from '@astrojs/starlight/components';
+
+The scaffold is the shared infrastructure that powers every module. It handles installing templates into apps, tracking what was installed, detecting changes, and updating modules. You don't edit these files — but understanding how they work helps you build better modules.
+
+---
+
+## What Is the Scaffold?
+
+The scaffold is the `src/scaffold/` directory in the module starter. When you clone the module starter to create a new module, you get this infrastructure automatically. It provides the CLI commands (`init`, `update`, `uninstall`, etc.) that users run to manage your module in their app.
+
+```
+src/scaffold/
+├── init.ts              # Installation pipeline
+├── update.ts            # Hash-based change detection and updates
+├── uninstall.ts         # Manifest-based cleanup
+├── enable.ts            # Re-enable a disabled module
+├── disable.ts           # Disable without removing
+├── update-schema.ts     # Prisma schema sync
+├── lifecycle-utils.ts   # Lifecycle hook infrastructure
+├── types.ts             # TypeScript interfaces
+├── utils.ts             # Shared utilities
+└── index.ts             # Public exports
+```
+
+<Aside type="caution">
+These files are marked "DO NOT EDIT". Changes to the scaffold propagate to all modules via `scaffold:update`. If you find a bug, report it upstream to the module starter repository.
+</Aside>
+
+---
+
+## Installation Pipeline
+
+When a user runs `npx my-module init`, the scaffold runs a 10-step installation pipeline:
+
+<Steps>
+1. **Check required modules** — If your module declares `requiredModules`, verifies they're installed by checking for their feature directories
+
+2. **Interactive setup** — Runs module-specific prompts (from `module.ts`), detects frontend/backend paths, asks about auto-registration, shadcn components, and dependency installation
+
+3. **Copy database schema** — Detects Prisma structure (multi-file or single-file), processes template placeholders, appends models. For multi-file setups, creates `prisma/my-module.prisma`. For single-file, appends to `schema.prisma`
+
+4. **Generate frontend files** — Creates directory structure, processes all frontend templates (replacing placeholders), adds version headers, writes files. Processes `templates`, `indexFiles`, and `registrations` from your module config
+
+5. **Generate backend files** — Same process for backend templates. Uses your `indexTemplate` if provided, otherwise generates one with side-effect registration imports
+
+6. **Auto-register** — Wires the module into the app:
+   - Adds route import and spread to `routes.tsx`
+   - Detects if navigation uses registry pattern (no config file editing needed)
+   - Adds side-effect import to backend `app.ts`
+
+7. **Environment variables** — Collects values for env variables (supporting `secret` input and `when` conditionals), writes to frontend `.env` (with `VITE_` prefix) and backend `.env` separately
+
+8. **Install UI components** — Runs `npx shadcn@latest add` for each component. Also handles third-party UI libraries (`uiLibraries` config) with their registries
+
+9. **Install dependencies** — Runs `npm install` in frontend and backend directories. Handles provider-specific dependencies based on prompt answers
+
+10. **Save manifest and run lifecycle hooks** — Saves `.module-manifests.json` tracking all installed files and registrations, then runs `onInstall` and `onActivate` lifecycle hooks
+</Steps>
+
+---
+
+## Template Processing
+
+The `processTemplate()` function handles all placeholder replacement. Every template string passes through this before being written to disk.
+
+### Name Placeholders
+
+| Pattern | Replaced With | Example (module id: `ai-chat`) |
+|---------|--------------|-------------------------------|
+| `my-feature` | Module ID (kebab-case) | `ai-chat` |
+| `myFeature` | camelCase | `aiChat` |
+| `MyFeature` | PascalCase | `AiChat` |
+| `my_feature` | snake_case | `ai_chat` |
+
+### Variable Substitution
+
+Variables from prompt answers use double-brace syntax with optional defaults:
+
+```typescript
+// In your template
+const provider = '{{provider}}';
+const timeout = {{timeout|5000}};       // Default: 5000
+const model = '{{model|gpt-4}}';        // Default: 'gpt-4'
+```
+
+### File Path Processing
+
+File paths in `templates` keys are also processed. For example:
+
+```typescript
+templates: {
+  'my-feature.routes.ts': backend.ROUTES_TEMPLATE,
+}
+// Becomes: ai-chat.routes.ts (for module id "ai-chat")
+```
+
+---
+
+## Version Headers
+
+Every generated file gets a version header on the first line:
+
+```typescript
+// @generated-by: ai-chat v1.2.0 | hash: a1b2c3d4
+```
+
+This header contains:
+- **Module ID** — Which module generated this file
+- **Module version** — The version at generation time
+- **Template hash** — MD5 hash (first 8 chars) of the template content
+
+### Why Headers Matter
+
+The `update` command uses headers to make smart decisions:
+
+| Scenario | Header Hash vs File | Template Changed? | Action |
+|----------|-------------------|-------------------|--------|
+| No changes | Match | No | Skip |
+| Template updated | Match | Yes | Update file |
+| User modified file | Mismatch | No | Skip (warn) |
+| Both changed | Mismatch | Yes | Conflict (manual review) |
+
+### Migrate Command
+
+For files that predate the header system, `npx my-module migrate` adds version headers to existing files by matching them against current templates.
+
+---
+
+## Update Mechanism
+
+When a user runs `npx my-module update`, the scaffold compares every installed template against the current version:
+
+<Steps>
+1. **Find installed module** — Reads the manifest to locate all generated files
+
+2. **For each template file:**
+   - Parse the version header (extract old version, old hash)
+   - Load the current template from the module
+   - Process placeholders and calculate new hash
+   - Compare hashes to detect changes
+
+3. **Decision tree:**
+   - Template unchanged (same hash) → **Skip** (nothing to do)
+   - Template changed, file unmodified → **Update** (safe to overwrite)
+   - Template unchanged, file modified → **Skip** (user's changes preserved)
+   - Both changed → **Conflict** (flag for manual review)
+
+4. **Run lifecycle hook** — If the module version changed, runs `onUpdate` with `fromVersion` and `toVersion` context
+</Steps>
+
+### Dry Run
+
+Preview what would change without applying:
+
+```bash
+npx my-module update --dry-run
+```
+
+---
+
+## Manifest System
+
+The scaffold tracks everything it installs in `.module-manifests.json` at the project root. This enables clean uninstallation and update detection.
+
+```json
+{
+  "ai-chat": {
+    "moduleId": "ai-chat",
+    "moduleName": "AI Chat Module",
+    "version": "1.2.0",
+    "installedAt": "2025-01-15T10:30:00Z",
+    "frontendPath": "frontend/src/features/ai-chat",
+    "backendPath": "backend/src/features/ai-chat",
+    "registrations": [
+      { "file": "frontend/src/routes.tsx", "type": "import", "content": "aiChatRoutes" },
+      { "file": "frontend/src/routes.tsx", "type": "spread", "content": "...aiChatRoutes" },
+      { "file": "backend/src/app.ts", "type": "import", "content": "./features/ai-chat/index.js" }
+    ],
+    "schemaModels": ["ai_chat_message", "ai_chat_conversation"],
+    "schemaFile": "backend/prisma/ai-chat.prisma"
+  }
+}
+```
+
+The uninstall command uses this manifest to:
+- Remove all generated files and directories
+- Remove imports and route spreads from `routes.tsx` and `app.ts`
+- Remove Prisma models from the schema
+- Run the `onUninstall` lifecycle hook
+
+---
+
+## Auto-Registration
+
+The scaffold automatically wires modules into three integration points during installation.
+
+### Frontend Routes (`routes.tsx`)
+
+```typescript
+// Before installation:
+...userRoutes,
+...adminRoutes,
+// ...featureRoutes,
+
+// After installation:
+...userRoutes,
+...adminRoutes,
+
+// --- AI Chat Module routes ---
+...aiChatRoutes,
+// ...featureRoutes,
+```
+
+The scaffold finds the last spread route pattern and inserts after it. The `// ...featureRoutes` comment serves as a fallback insertion point.
+
+### Frontend Navigation
+
+If your module has a `navigation.registration.ts` template, the scaffold detects it uses the **registry pattern** and skips any config file editing. The registration runs automatically as a side-effect import in your module's barrel file.
+
+### Backend Routes (`app.ts`)
+
+```typescript
+// Feature registrations
+import './features/user/index.js';
+import './features/admin/index.js';
+import './features/ai-chat/index.js';    // ← Added by scaffold
+```
+
+The scaffold finds the `FEATURE REGISTRATIONS` section or the last feature import and appends yours.
+
+---
+
+## Enable / Disable
+
+Modules can be temporarily disabled without removing files:
+
+```bash
+npx my-module disable    # Runs onDeactivate hook, marks disabled
+npx my-module enable     # Runs onActivate hook, marks enabled
+```
+
+Module state is tracked in `.module-state.json`. Lifecycle hooks can use this to pause background jobs, unregister webhooks, etc.
+
+---
+
+## Module Lifecycle Hooks
+
+Lifecycle hooks let your module run code at key moments. Define them in your `module.ts`:
+
+```typescript
+lifecycle: {
+  onInstall: async (context) => {
+    // Seed initial data, create indexes
+    // context.promptAnswers has user's prompt responses
+    // context.envVariables has collected env values
+  },
+  onUpdate: async (context) => {
+    // Run data migrations
+    // context.fromVersion and context.toVersion available
+  },
+  onActivate: async (context) => {
+    // Start background jobs, register webhooks
+  },
+  onDeactivate: async (context) => {
+    // Pause jobs, unregister webhooks
+  },
+  onUninstall: async (context) => {
+    // Offer data export, clean up external resources
+  },
+},
+```
+
+### Lifecycle Context
+
+All hooks receive a context object with utilities:
+
+```typescript
+{
+  cwd: string,                    // Working directory
+  module: ModuleDefinition,       // Full module config
+  interactive: boolean,           // Is running interactively
+  utils: {
+    fileExists: (path) => boolean,
+    readFile: (path) => string,
+    writeFile: (path, content) => void,
+    ensureDir: (path) => void,
+    runCommand: (cmd) => void,
+    prompt: (question, defaultValue) => Promise<string>,
+    confirmPrompt: (question, defaultValue) => Promise<boolean>,
+    log: { info, success, warning, error },
+  },
+}
+```
+
+**Install-specific context:**
+- `promptAnswers` — User's responses to module prompts
+- `envVariables` — Collected environment variable values
+
+**Update-specific context:**
+- `fromVersion` — Previous installed version
+- `toVersion` — New version being installed
+
+---
+
+## Aligning with the Starter Template
+
+Modules generate code that runs inside the starter template. The generated files must follow the starter template's patterns exactly.
+
+### Registry Pattern
+
+The starter template uses a registry-based architecture. Modules **never modify core files** to add features. Instead, they register with singleton registries:
+
+| Registry | Import From | Method |
+|----------|------------|--------|
+| Navigation | `@/config/navigation.registry` | `registerMain()`, `registerSecondary()`, `registerUserMenu()` |
+| Dashboard | `@/config/dashboard.registry` | `register()` |
+| Settings Pages | `@/config/settings-pages.registry` | `register()` |
+| Admin Pages | `@/config/admin-pages.registry` | `register()` |
+| Preferences | `@/config/preferences.registry` | `register()` |
+| Integrations | `@/config/integrations.registry` | `register()` |
+| Header Toolbar | `@/config/header-toolbar.registry` | `register()` |
+| Personal Info Fields | `@/config/personal-info-fields.registry` | `register()` |
+| Filter (frontend) | `@/config/filter.registry` | `register()` |
+| Action (frontend) | `@/config/action.registry` | `addAction()`, `addActionAsync()` |
+| Routes (backend) | `../../config/route.registry.js` | `register()` |
+| Services (backend) | `../../config/service.registry.js` | `register()` with type augmentation |
+| Filter (backend) | `../../config/filter.registry.js` | `register()`, `registerAsync()` |
+| Action (backend) | `../../config/action.registry.js` | `addAction()`, `addActionAsync()` |
+
+### Side-Effect Import Pattern
+
+Registration files are imported for their side effects (they run code on import, no exports needed). The barrel `index.ts` imports them first:
+
+```typescript
+// Side-effect registrations (MUST come first)
+import './navigation.registration';
+import './registrations/dashboard.registration';
+
+// Then exports
+export { myFeatureRoutes } from './routes.config';
+```
+
+This mirrors how the starter template's own features (dashboard, admin, user) register themselves.
+
+### Keeping Templates in Sync
+
+When the starter template's registries change (new fields, renamed methods, updated types), your module templates need to match. Key places to check:
+
+| If Starter Template Changes... | Update in Module Starter... |
+|-------------------------------|---------------------------|
+| Registry API (method names, parameters) | `src/templates/frontend/registrations.ts` and `src/templates/backend/registrations.ts` |
+| Registry import paths | Same registration template files |
+| Route configuration patterns | `src/templates/frontend/routes.ts` |
+| Feature barrel file pattern | `src/templates/frontend/routes.ts` (INDEX_TEMPLATE) and `src/templates/backend/routes.ts` |
+| `DashboardWidgetProps` interface | `src/templates/frontend/components.ts` (WIDGET_COMPONENT_TEMPLATE) |
+| Backend service patterns | `src/templates/backend/services.ts` |
+| Integration categories | `src/templates/frontend/registrations.ts` and `src/scaffold/types.ts` |
+
+<Aside type="caution">
+After changing any template file, always bump the module version with `npm run version:patch`. Without this, `npx my-module update` won't detect the changes in downstream apps.
+</Aside>
+
+---
+
+## CLI Commands Reference
+
+| Command | Purpose | Key Options |
+|---------|---------|-------------|
+| `init` | Install module into app | `--force` (overwrite), `--no-interactive` |
+| `update` | Update templates to latest | `--dry-run`, `--force` |
+| `update-schema` | Sync Prisma schema only | `--force` |
+| `migrate` | Add version headers to old files | `--dry-run` |
+| `uninstall` | Remove module completely | `--force`, `--keep-data`, `--export <path>` |
+| `disable` | Disable without removing | `--force` |
+| `enable` | Re-enable disabled module | `--force` |
+| `info` | Show module information | — |
+
+---
+
+## Next Steps
+
+- [Creating Modules](/module-starter/creating-modules/) — Step-by-step module creation guide
+- [Code Templates](/module-starter/templates/) — Copy-paste template reference
+- [Versioning & Updates](/module-starter/versioning/) — How versions flow through the system
