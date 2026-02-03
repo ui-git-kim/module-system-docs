@@ -98,30 +98,38 @@ export default defineConfig({
           items: [
             { label: "Overview", slug: "module-starter" },
             {
-              label: "Creating Modules",
-              slug: "module-starter/creating-modules",
-            },
-            {
-              label: "Module Structure",
-              slug: "module-starter/module-structure",
-            },
-            {
-              label: "Registry Integration",
-              slug: "module-starter/registry-integration",
-            },
-            {
               label: "Scaffold Architecture",
               slug: "module-starter/scaffold",
+            },
+            {
+              label: "Starter Integration",
+              slug: "module-starter/starter-integration",
             },
             {
               label: "Versioning & Updates",
               slug: "module-starter/versioning",
             },
-            { label: "Code Templates", slug: "module-starter/templates" },
             {
               label: "Lifecycle Hooks",
               slug: "module-starter/lifecycle-hooks",
             },
+            {
+              label: "Create Script Walkthrough",
+              slug: "module-starter/create-script",
+            },
+            {
+              label: "Building Your Module",
+              slug: "module-starter/building-modules",
+            },
+            {
+              label: "Registry Guide",
+              slug: "module-starter/registry-guide",
+            },
+            {
+              label: "File Reference",
+              slug: "module-starter/file-reference",
+            },
+            { label: "Code Templates", slug: "module-starter/templates" },
             { label: "Changelog", slug: "module-starter/changelog" },
             { label: "Roadmap", slug: "module-starter/roadmap" },
           ],
