@@ -7,6 +7,14 @@ import { Steps, Tabs, TabItem, Aside, FileTree } from '@astrojs/starlight/compon
 
 This guide covers everything you need to build a module **after** cloning the module starter. For the clone process itself, see [Create Script](/module-starter/create-script/).
 
+<Aside type="note">
+**Key implications of the module development workflow:**
+- Templates use `@/` imports that resolve **in the starter template**, not in this repo
+- You do not have access to starter template code during development
+- Settings components like `SettingsComponents` live in the starter at `@/features/user/components/settings/`
+- Test by building, linking, and running `init` in a real starter project
+</Aside>
+
 ---
 
 ## What to Edit
@@ -160,11 +168,12 @@ The default `src/module.ts` in the module starter includes all options with comm
 | `backend.dependencies` | No | npm packages for the backend |
 | `backend.apiPath` | No | API route path (documentation) |
 | `backend.hasInit` | No | Whether the module has an init function |
-| `prompts` | No | Questions asked during `npx my-module init` |
+| `prompts` | No | Questions asked during `npx my-module init` — answers available as `{{variable}}` in templates |
+| `providerDependencies` | No | Conditional npm packages based on prompt answers (e.g., install `stripe` only if provider is `'stripe'`) |
 | `features` | Yes | Feature list shown in post-install summary |
-| `envVariables` | No | Split into `{ frontend: [], backend: [] }` |
-| `requiredModules` | No | Module IDs that must be installed first |
-| `lifecycle` | No | Hooks for install, update, activate, deactivate, uninstall |
+| `envVariables` | No | Split into `{ frontend: [], backend: [] }` — see [Environment Variables](#environment-variables) |
+| `requiredModules` | No | Module IDs that must be installed first — see [Module Dependencies](#module-dependencies) |
+| `lifecycle` | No | Hooks for install, update, activate, deactivate, uninstall — see [Lifecycle Hooks](/module-starter/lifecycle-hooks/) |
 
 Fields marked **Yes*** are required only when their parent block is present.
 
@@ -186,6 +195,20 @@ Every occurrence of these patterns is replaced with the corresponding case varia
 | `my_feature` | snake_case | `ai_chat` |
 
 Use these patterns in file content, file paths, function names, component names, and Prisma model names. The scaffold replaces them everywhere.
+
+**Example transformation:**
+
+```typescript
+// Template (before)
+export const myFeatureRoutes: RouteObject[] = [
+  { path: 'my-feature', element: <MyFeaturePage /> }
+];
+
+// Generated (after, with moduleId = 'ai-chat')
+export const aiChatRoutes: RouteObject[] = [
+  { path: 'ai-chat', element: <AiChatPage /> }
+];
+```
 
 ### Variable Substitution
 
@@ -325,11 +348,118 @@ The module starter ships with templates for the most common patterns. Larger mod
 - **Use the file header pattern.** Every template should start with the `// FILE:` and `// PURPOSE:` comment block. The scaffold adds a version header above this during installation.
 - **Use placeholders.** Templates should use `my-feature`, `MyFeature`, `myFeature`, `my_feature` for name replacement, and `{{variable}}` for prompt-based values.
 - **Add directories.** If your templates create files in new subdirectories, add those to `frontend.directories` (e.g., `'hooks'`, `'dialogs'`, `'utils'`).
-- **Backend uses `.js` imports.** Any relative import in a backend template must use the `.js` extension for ESM compatibility.
+- **Frontend uses `@/` imports.** Frontend templates use the `@/` alias which resolves in the starter template (e.g., `import { Button } from '@/components/ui/button'`).
+- **Backend uses `.js` imports.** Any relative import in a backend template must use the `.js` extension for ESM compatibility (e.g., `import { myFeatureService } from './my-feature.service.js'`).
+- **Update shadcnComponents.** If your new templates use shadcn imports, add those components to the `shadcnComponents` array in `module.ts`.
 
 <Aside type="tip">
 Template files are just TypeScript files that export string constants. There is no limit to how many you can create. The `index.ts` barrel file re-exports everything so `module.ts` can import with `import * as frontend from './templates/frontend/index.js'`.
 </Aside>
+
+---
+
+## Environment Variables
+
+Modules can collect environment variables during installation and write them to `.env` files. Define them in the `envVariables` block of `module.ts`:
+
+```typescript
+envVariables: {
+  frontend: [
+    {
+      name: 'BILLING_PUBLIC_KEY',
+      description: 'Stripe publishable key',
+      default: 'pk_test_...',
+      required: false,
+    },
+  ],
+  backend: [
+    {
+      name: 'STRIPE_SECRET_KEY',
+      description: 'Stripe Secret Key (from Stripe Dashboard > API Keys)',
+      required: true,
+      secret: true,
+    },
+    {
+      name: 'STRIPE_WEBHOOK_SECRET',
+      description: 'Stripe Webhook Secret (starts with whsec_)',
+      required: true,
+      secret: true,
+    },
+    {
+      name: 'AI_PROVIDER_KEY',
+      description: 'AI Provider API Key',
+      required: true,
+      secret: true,
+      when: (answers) => answers.provider === 'anthropic',
+    },
+  ],
+},
+```
+
+### EnvVariable Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `name` | `string` | Variable name — frontend vars are automatically prefixed with `VITE_` |
+| `description` | `string` | Shown to user during collection |
+| `required` | `boolean` | Warn if not provided (default: `false`) |
+| `default` | `string` | Default value pre-filled in prompt |
+| `secret` | `boolean` | Mask input display (default: `false`) |
+| `when` | `(answers) => boolean` | Only collect when condition is true (receives prompt answers) |
+
+<Aside type="tip">
+Frontend environment variables are automatically prefixed with `VITE_` by the scaffold. If you define `name: 'BILLING_PUBLIC_KEY'`, the actual variable written to `frontend/.env` will be `VITE_BILLING_PUBLIC_KEY`.
+</Aside>
+
+---
+
+## Module Dependencies
+
+Modules can declare dependencies on other modules using `requiredModules`:
+
+```typescript
+export const moduleDefinition: ModuleDefinition = {
+  id: 'billing-reports',
+  requiredModules: ['billing'],
+  // ...
+};
+```
+
+**Behaviour:**
+- The init script checks if required feature folders exist in both `frontend/src/features/` and `backend/src/features/` before proceeding
+- Fails gracefully with a clear message listing missing dependencies
+- Modules should be self-contained at the database level — use `requiredModules` for **runtime** service dependencies, not database foreign keys
+
+**Cross-module data access:** If your module needs data from another module, access it via that module's service at runtime. Do **not** create database foreign keys to other modules' tables:
+
+```typescript
+// ✅ Runtime service call — no database FK
+import { billingService } from '@/features/billing';
+const subscription = await billingService.getSubscription(userId);
+```
+
+---
+
+## shadcn Component Management
+
+The `shadcnComponents` array in `module.ts` must list every shadcn component your templates import. There is no automatic detection — you must keep this in sync manually.
+
+**How to identify required components:**
+
+1. Search your templates for `@/components/ui/` imports
+2. Extract the component name (the folder after `ui/`)
+3. Add it to the `shadcnComponents` array
+
+**Common components by template type:**
+
+| Template | Typically Uses |
+|----------|---------------|
+| Page (basic) | `card`, `button` |
+| Preferences | `label`, `switch`, `select` |
+| Dashboard Widget | `card` |
+| Integration | `card`, `button`, `badge` |
+| Forms | `input`, `label`, `button`, `select` |
+| Dialogs | `dialog`, `button` |
 
 ---
 
@@ -394,6 +524,41 @@ Users can then install your module with:
 ```bash
 npx my-billing-module init
 ```
+
+---
+
+## Module Types
+
+Modules generally fall into one of these categories:
+
+| Type | Description | Key Registries |
+|------|-------------|----------------|
+| **Standard Feature** | Has own pages, navigation, possibly dashboard widget and backend API | Navigation, Dashboard, Routes |
+| **Settings Replacement** | Replaces a placeholder page (e.g., Billing). Uses `isReplacement: true` | Settings Pages, Routes |
+| **Integration** | Adds to the Integrations page. Usually connects to an external service | Integrations, Preferences |
+| **Profile Extension** | Adds fields to the Personal Information page. Stores data in `User.preferences` | Personal Info Fields |
+
+Most modules are **Standard Feature** modules. Choose the type that best fits your module's purpose, then add additional registries as needed.
+
+---
+
+## Pre-Publish Checklist
+
+Before publishing your module, verify:
+
+- [ ] Updated `package.json` (name, description, bin command)
+- [ ] Updated `module.ts` (id, name, description, version)
+- [ ] Set `requiredModules` if depending on other modules
+- [ ] Wrote Prisma schema (if needed) — self-contained, no `@relation`, no cross-module FKs
+- [ ] Wrote frontend templates
+- [ ] Wrote backend templates (if needed) — `.js` extensions on all relative imports
+- [ ] **Updated `shadcnComponents` with every shadcn import from templates**
+- [ ] Added registry registrations (navigation, dashboard, preferences, etc.)
+- [ ] Updated `index.ts` barrel files to import registrations as side effects
+- [ ] Tested with `npm run build && npm link`
+- [ ] Tested `init` in a starter project — routes, pages, registrations all working
+- [ ] Tested `uninstall` removes files and registrations cleanly
+- [ ] Version bumped with `npm run release:patch/minor/major`
 
 ---
 
