@@ -106,6 +106,10 @@ export default defineConfig({
               slug: "module-starter/module-structure",
             },
             {
+              label: "Registry Integration",
+              slug: "module-starter/registry-integration",
+            },
+            {
               label: "Scaffold Architecture",
               slug: "module-starter/scaffold",
             },
