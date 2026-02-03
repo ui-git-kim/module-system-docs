@@ -105,6 +105,10 @@ export default defineConfig({
               label: "Module Structure",
               slug: "module-starter/module-structure",
             },
+            {
+              label: "Versioning & Updates",
+              slug: "module-starter/versioning",
+            },
             { label: "Code Templates", slug: "module-starter/templates" },
             {
               label: "Lifecycle Hooks",
