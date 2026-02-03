@@ -110,6 +110,8 @@ export default defineConfig({
               label: "Lifecycle Hooks",
               slug: "module-starter/lifecycle-hooks",
             },
+            { label: "Changelog", slug: "module-starter/changelog" },
+            { label: "Roadmap", slug: "module-starter/roadmap" },
           ],
         },
         {
