@@ -126,6 +126,10 @@ export default defineConfig({
               slug: "module-starter/registry-guide",
             },
             {
+              label: "Module Database",
+              slug: "module-starter/database",
+            },
+            {
               label: "File Reference",
               slug: "module-starter/file-reference",
             },

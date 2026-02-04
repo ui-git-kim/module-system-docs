@@ -1,0 +1,245 @@
+---
+title: Module Database
+description: Schema patterns, transactions, and self-contained database design for modules
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Modules add Prisma models to the starter template's database. This page covers the patterns and constraints that keep modules independent and safely installable/uninstallable.
+
+<Aside type="tip">
+For Prisma 7 configuration, connection architecture, and runtime client setup, see [Database & Prisma](/starter-template/database/).
+</Aside>
+
+---
+
+## Self-Contained Schemas
+
+Module schemas must be **completely self-contained** with **no `@relation` directives**.
+
+### Why No Relations?
+
+Using Prisma's `@relation` directive requires adding a field to the related model. For example:
+
+```prisma
+// ❌ WRONG - This requires modifying the User model
+model my_feature_item {
+  id     String @id
+  userId String
+  user   User   @relation(fields: [userId], references: [id])  // Breaks modularity!
+}
+```
+
+This breaks modularity because:
+- Requires users to manually edit their User model
+- Creates migration conflicts between modules
+- Modules can't be installed or uninstalled in any order
+- Uninstalling a module would break the User model's relation fields
+
+### The Correct Pattern
+
+Use plain foreign key fields with `@@index` for performance:
+
+```prisma
+// ✅ CORRECT - Self-contained, no @relation
+model my_feature_item {
+  id          String   @id @default(cuid())
+  userId      String                          // Plain FK, NOT a @relation
+  name        String
+  description String?
+  status      String   @default("active")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])                           // Index for query performance
+}
+```
+
+### What's Allowed
+
+| Allowed | Not Allowed |
+|---------|-------------|
+| `userId String` (plain FK to User) | `user User @relation(...)` |
+| `@@index([userId])` | Cross-module `@relation` |
+| Separate settings tables | Adding fields to User model |
+| Runtime service calls between modules | Database FKs to other module tables |
+| `Json` fields for flexible data | Assuming other module schemas exist |
+
+---
+
+## User Settings Pattern
+
+Instead of adding fields to the User model, create a separate settings table per module:
+
+```prisma
+// ✅ CORRECT - Separate settings table
+model my_feature_settings {
+  id        String   @id @default(cuid())
+  userId    String   @unique                  // One settings record per user
+  enabled   Boolean  @default(true)
+  theme     String   @default("default")
+  config    Json     @default("{}")           // Flexible JSON for extra settings
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+```
+
+This pattern allows your module to store per-user configuration without touching the core User model. Use the `Json` field for settings that may evolve over time without requiring schema migrations.
+
+---
+
+## Cross-Module Data Access
+
+If your module needs data from another module:
+
+1. **Declare the dependency** using `requiredModules` in `module.ts`
+2. **Access data at runtime** via the other module's service or API
+3. **Never create database FKs** to another module's tables
+
+```typescript
+// ✅ CORRECT - Runtime service call, no database FK
+import { billingService } from '@/features/billing';
+
+async function checkSubscription(userId: string) {
+  const subscription = await billingService.getSubscription(userId);
+  return subscription?.status === 'active';
+}
+```
+
+```typescript
+// ❌ WRONG - Database FK to another module's table
+model my_feature_item {
+  subscriptionId String
+  subscription   billing_subscription @relation(...)  // NO!
+}
+```
+
+<Aside type="caution">
+Modules should be self-contained at the database level. Use `requiredModules` for **runtime** service dependencies, not database foreign keys. This ensures modules can be installed and uninstalled independently.
+</Aside>
+
+---
+
+## Prisma Utilities
+
+The starter template's `lib/prisma.ts` provides utilities for database operations. Import these in your backend templates:
+
+```typescript
+import { prisma, withTransaction, batchTransaction } from '../../lib/prisma.js';
+import type { TransactionClient } from '../../lib/prisma.js';
+```
+
+### Simple Queries
+
+```typescript
+// Standard Prisma queries
+const items = await prisma.my_feature_item.findMany({
+  where: { userId },
+  orderBy: { createdAt: 'desc' },
+});
+
+const item = await prisma.my_feature_item.findUnique({
+  where: { id: itemId },
+});
+```
+
+### Transactions
+
+Use `withTransaction` for atomic operations across multiple tables:
+
+```typescript
+const result = await withTransaction(async (tx: TransactionClient) => {
+  const item = await tx.my_feature_item.create({
+    data: { userId, name: 'New Item' },
+  });
+  const settings = await tx.my_feature_settings.upsert({
+    where: { userId },
+    update: { lastUsed: new Date() },
+    create: { userId, lastUsed: new Date() },
+  });
+  return { item, settings };
+});
+```
+
+Use `batchTransaction` when operations are independent but must all succeed:
+
+```typescript
+const [item, log] = await batchTransaction([
+  prisma.my_feature_item.create({ data: { userId, name: 'Item' } }),
+  prisma.my_feature_log.create({ data: { userId, action: 'created' } }),
+]);
+```
+
+<Aside type="tip">
+For more details on the Prisma client setup, connection architecture, and migration commands, see [Database & Prisma](/starter-template/database/).
+</Aside>
+
+---
+
+## Schema Template Example
+
+Here is a complete example of a module schema template in `src/templates/schema.ts`:
+
+```typescript
+export const SCHEMA = `
+// my-feature models
+model my_feature_item {
+  id          String   @id @default(cuid())
+  userId      String
+  title       String
+  description String?
+  status      String   @default("active")
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+}
+
+model my_feature_settings {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  enabled     Boolean  @default(true)
+  preferences Json     @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId])
+}
+`;
+```
+
+Remember to list all model names in `module.ts`:
+
+```typescript
+schema: {
+  content: SCHEMA,
+  modelNames: ['my_feature_item', 'my_feature_settings'],
+},
+```
+
+The `modelNames` array is used by the scaffold for tracking and clean uninstallation.
+
+---
+
+## Naming Conventions
+
+| Convention | Example | Purpose |
+|------------|---------|---------|
+| Prefix tables with module ID | `billing_subscription` | Avoids name collisions between modules |
+| Use `snake_case` for table names | `my_feature_item` | PostgreSQL convention |
+| Use `camelCase` for field names | `userId`, `createdAt` | Prisma convention |
+| Always include `userId` index | `@@index([userId])` | Query performance |
+| Always include timestamps | `createdAt`, `updatedAt` | Audit trail |
+
+---
+
+## Next Steps
+
+- [Building Modules](/module-starter/building-modules/) -- Module configuration and templates
+- [Database & Prisma](/starter-template/database/) -- Starter template Prisma setup and configuration
+- [Registry Guide](/module-starter/registry-guide/) -- How to register with the starter template's registries
+- [Code Templates](/module-starter/templates/) -- Copy-paste template reference
