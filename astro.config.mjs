@@ -142,8 +142,7 @@ export default defineConfig({
           label: "Modules",
           items: [
             { label: "Catalogue", slug: "modules" },
-            { label: "Module Structure", slug: "modules/structure" },
-            { label: "Structure Module", slug: "modules/structure-module" },
+            { label: "Structure", slug: "modules/structure-module" },
             { label: "Billing", slug: "modules/billing" },
           ],
         },
