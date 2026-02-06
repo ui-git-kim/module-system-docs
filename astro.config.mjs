@@ -142,7 +142,24 @@ export default defineConfig({
           label: "Modules",
           items: [
             { label: "Catalogue", slug: "modules" },
-            { label: "Structure", slug: "modules/structure-module" },
+            {
+              label: "Structure",
+              items: [
+                { label: "Overview", slug: "modules/structure" },
+                { label: "Installation", slug: "modules/structure/installation" },
+                { label: "Node Types", slug: "modules/structure/node-types" },
+                { label: "Admin Page", slug: "modules/structure/admin" },
+                { label: "Pages", slug: "modules/structure/pages" },
+                { label: "Registries", slug: "modules/structure/registries" },
+                {
+                  label: "Components & Hooks",
+                  slug: "modules/structure/components",
+                },
+                { label: "Database & API", slug: "modules/structure/database" },
+                { label: "Changelog", slug: "modules/structure/changelog" },
+                { label: "Roadmap", slug: "modules/structure/roadmap" },
+              ],
+            },
             { label: "Billing", slug: "modules/billing" },
           ],
         },
