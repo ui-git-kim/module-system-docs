@@ -161,6 +161,17 @@ export default defineConfig({
               ],
             },
             { label: "Billing", slug: "modules/billing" },
+            {
+              label: "Pickers",
+              items: [
+                { label: "Overview", slug: "modules/pickers" },
+                { label: "Configuration", slug: "modules/pickers/configuration" },
+                { label: "Usage", slug: "modules/pickers/usage" },
+                { label: "Integration", slug: "modules/pickers/integration" },
+                { label: "Developer Workflow", slug: "modules/pickers/developer-workflow" },
+                { label: "Changelog", slug: "modules/pickers/changelog" },
+              ],
+            },
           ],
         },
         {
