@@ -146,6 +146,7 @@ export default defineConfig({
           label: "Modules",
           items: [
             { label: "Catalogue", slug: "modules" },
+            { label: "Module Roadmap", slug: "modules/roadmap" },
             {
               label: "Structure",
               items: [
