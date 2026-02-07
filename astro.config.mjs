@@ -89,6 +89,10 @@ export default defineConfig({
               slug: "starter-template/updating",
             },
             { label: "CLI Scripts", slug: "starter-template/scripts" },
+            {
+              label: "Developer Workflow",
+              slug: "starter-template/developer-workflow",
+            },
             { label: "Changelog", slug: "starter-template/changelog" },
             { label: "Roadmap", slug: "starter-template/roadmap" },
           ],
