@@ -164,6 +164,13 @@ export default defineConfig({
                 { label: "Roadmap", slug: "modules/structure/roadmap" },
               ],
             },
+            {
+              label: "Builder",
+              items: [
+                { label: "Overview", slug: "modules/builder" },
+                { label: "Roadmap", slug: "modules/builder/roadmap" },
+              ],
+            },
             { label: "Billing", slug: "modules/billing" },
             {
               label: "Pickers",
