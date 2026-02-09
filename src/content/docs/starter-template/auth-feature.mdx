@@ -1,6 +1,8 @@
 ---
 title: Authentication
-description: How authentication works with Neon Auth
+description: How authentication works with Neon Auth — frontend setup, backend verification, and how modules integrate with the auth system
+sidebar:
+  order: 7
 ---
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
@@ -13,24 +15,30 @@ The starter template uses [Neon Auth](https://neon.tech/docs/guides/neon-auth) f
 
 ---
 
-## Overview
+## How It Works
 
-Authentication flow:
+The authentication system has two halves — the **frontend** handles sign-in UI and session management, while the **backend** verifies JWT tokens and enforces access control.
 
 ```
-User Sign In (Neon Auth UI)
-    ↓
-JWT Token Issued
-    ↓
-Token stored in session (frontend)
-    ↓
-API requests include: Authorization: Bearer <token>
-    ↓
-Backend verifies token via JWKS
-    ↓
-req.user = { id, email } attached
-    ↓
-User profile auto-created on first request
+┌─────────────────────────────────────────────────────────────────┐
+│  FRONTEND                                                       │
+│                                                                 │
+│  1. User signs in via Neon Auth UI (email OTP / credentials /   │
+│     Google OAuth)                                               │
+│  2. Neon Auth issues a JWT token and stores it in the session   │
+│  3. api.ts interceptor attaches token to every API request:     │
+│     Authorization: Bearer <token>                               │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  BACKEND                                                        │
+│                                                                 │
+│  4. requireAuth middleware extracts the Bearer token             │
+│  5. Token is verified against Neon Auth's JWKS endpoint         │
+│  6. req.user = { id, email } is attached to the request         │
+│  7. Route handler runs with authenticated user context          │
+│  8. On first API call, user profile is auto-created in DB       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Supported Auth Methods
@@ -53,13 +61,13 @@ The template enables these methods by default:
 
 ```
 frontend/src/features/auth/
-├── index.ts                    # Public exports
+├── index.ts                    # Public exports (barrel file)
 ├── routes.config.tsx           # Auth routes (/auth/*)
 ├── lib/
 │   ├── client.ts               # Neon Auth client instance
 │   └── getAuthToken.ts         # Token retrieval for API calls
 ├── hooks/
-│   └── useSession.ts           # Session hook wrapper
+│   └── useSession.ts           # Session hook + TypeScript types
 ├── components/
 │   ├── AuthProtectedRoute.tsx  # Route guard component
 │   └── AccountSettings.tsx     # Account settings UI
@@ -78,15 +86,19 @@ backend/src/middleware/
 
 The auth client is initialised in `lib/client.ts`:
 
-```tsx
-import { createAuthClient } from '@neondatabase/neon-js';
-import { adapter } from '@neondatabase/neon-js/react';
+```typescript
+// frontend/src/features/auth/lib/client.ts
+import { createAuthClient } from '@neondatabase/neon-js/auth';
+import { BetterAuthReactAdapter } from '@neondatabase/neon-js/auth/react';
 
-export const authClient = createAuthClient({
-  authUrl: import.meta.env.VITE_NEON_AUTH_URL,
-  adapter: adapter(),
-});
+export const authClient = createAuthClient(
+  import.meta.env.VITE_NEON_AUTH_URL,
+  {
+    adapter: BetterAuthReactAdapter(),
+  }
+);
 
+// Alias for cleaner imports
 export const auth = authClient;
 ```
 
@@ -95,20 +107,21 @@ export const auth = authClient;
 In `main.tsx`, the app is wrapped with `NeonAuthUIProvider`:
 
 ```tsx
-import { NeonAuthUIProvider } from '@neondatabase/neon-js/react/ui';
-import { authClient } from './features/auth';
+// frontend/src/main.tsx
+import { NeonAuthUIProvider } from '@neondatabase/neon-js/auth/react';
+import { authClient } from '@/features/auth';
 
 createRoot(document.getElementById('root')!).render(
-  <NeonAuthUIProvider
-    authClient={authClient}
-    auth={{
-      emailOTP: true,
-      credentials: { forgotPassword: true },
-      social: ['google'],
-    }}
-  >
-    <RouterProvider router={router} />
-  </NeonAuthUIProvider>
+  <StrictMode>
+    <NeonAuthUIProvider
+      authClient={authClient}
+      emailOTP
+      credentials={{ forgotPassword: true }}
+      social={{ providers: ['google'] }}
+    >
+      <App />
+    </NeonAuthUIProvider>
+  </StrictMode>
 );
 ```
 
@@ -118,17 +131,18 @@ createRoot(document.getElementById('root')!).render(
 
 ### Protecting Routes
 
-Wrap protected content with `AuthProtectedRoute`:
+All protected routes are wrapped with `AuthProtectedRoute` in `routes.tsx`:
 
 ```tsx
-// routes.tsx
-import { AuthProtectedRoute } from '@/features/auth';
+// frontend/src/routes.tsx
+import { AuthProtectedRoute, authRoutes } from '@/features/auth';
+import { DashboardPage, dashboardRoutes } from '@/features/dashboard';
 
 export const router = createBrowserRouter([
-  // Public routes
+  // Public routes (no auth required)
   ...authRoutes,
 
-  // Protected routes
+  // Protected routes (auth required)
   {
     element: (
       <AuthProtectedRoute>
@@ -138,12 +152,38 @@ export const router = createBrowserRouter([
     children: [
       ...dashboardRoutes,
       ...userRoutes,
+      ...adminRoutes,
+      // ...yourModuleRoutes,  ← add your module routes here
     ],
   },
 ]);
 ```
 
+The `AuthProtectedRoute` component:
+1. Shows a loading spinner while checking the session
+2. Redirects to `/auth/sign-in` if the user is not authenticated
+3. Renders children if authenticated
+
+```tsx
+// frontend/src/features/auth/components/AuthProtectedRoute.tsx
+export function AuthProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { data, isPending } = useSession();
+
+  if (isPending) {
+    return <div className="flex min-h-screen items-center justify-center">Loading...</div>;
+  }
+
+  if (!data?.user) {
+    return <Navigate to="/auth/sign-in" replace />;
+  }
+
+  return <>{children}</>;
+}
+```
+
 ### Getting Session Data
+
+Use the `useSession` hook in any React component:
 
 ```tsx
 import { useSession } from '@/features/auth';
@@ -152,160 +192,624 @@ function MyComponent() {
   const { data, isPending, error } = useSession();
 
   if (isPending) return <Spinner />;
-  if (error) return <Error />;
+  if (error) return <ErrorMessage />;
 
   const user = data?.user;
-  const token = data?.session?.token;
+  const isLoggedIn = !!data?.user;
 
-  return <div>Hello, {user?.email}</div>;
+  return <div>Hello, {user?.name || user?.email}</div>;
 }
 ```
 
 ### Session Data Structure
 
 ```typescript
-interface SessionUser {
-  id: string;
-  email: string;
-  emailVerified: boolean;
-  name: string | null;
-  image: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface Session {
-  id: string;
-  token: string;
-  userId: string;
-  expiresAt: string;
-}
-
-interface SessionData {
+// Returned by useSession().data
+type SessionData = {
   user: SessionUser;
   session: Session;
-}
+} | null;
+
+type SessionUser = {
+  id: string;              // Neon Auth user ID (used as profile ID)
+  name: string;            // Display name
+  email: string;           // Email address
+  emailVerified: boolean;  // Whether email has been verified
+  image?: string | null;   // Profile picture URL (from OAuth)
+  createdAt: Date;         // Account creation date
+  updatedAt: Date;         // Last update date
+};
+
+type Session = {
+  id: string;        // Session ID
+  token: string;     // JWT token for API authentication
+  userId: string;    // User ID this session belongs to
+  expiresAt: Date;   // Session expiration time
+};
 ```
 
 ### Getting Token for API Calls
 
-For non-React code (like API interceptors):
+The `api.ts` client automatically handles token injection for all requests. You don't need to manually pass tokens.
 
-```tsx
+For non-React code (like standalone utilities), use `getAuthToken`:
+
+```typescript
 import { getAuthToken } from '@/features/auth';
 
-// In axios interceptor
-api.interceptors.request.use(async (config) => {
+async function myUtilityFunction() {
   const token = await getAuthToken();
+  if (token) {
+    // Use the token directly
+    headers.Authorization = `Bearer ${token}`;
+  }
+}
+```
+
+---
+
+## The API Client
+
+The `api.ts` client is the bridge between frontend and backend. Understanding it is essential for modules.
+
+```typescript
+// frontend/src/lib/api.ts
+import axios from 'axios';
+import { appConfig } from '@/config/app.config';
+
+// Pre-configured Axios instance
+export const api = axios.create({
+  baseURL: appConfig.apiUrl,
+  headers: { 'Content-Type': 'application/json' },
+});
+
+// Request interceptor: automatically injects JWT token
+api.interceptors.request.use(async (config) => {
+  const { getAuthToken } = await import('@/features/auth');
+  const token = await getAuthToken();
+
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
   }
+
   return config;
 });
+
+// Response interceptor: logs 401 errors
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      console.warn('API request unauthorized:', error.config?.url);
+    }
+    return Promise.reject(error);
+  }
+);
 ```
+
+### How Modules Use the API Client
+
+Every module should import `api` from `@/lib/api` for all API calls. The token injection happens automatically — you never need to handle auth tokens manually.
+
+```typescript
+// frontend/src/features/billing/services/billing.service.ts
+import { api } from '@/lib/api';
+
+export const billingService = {
+  async getSubscription() {
+    // Token is automatically included in the Authorization header
+    const response = await api.get('/api/v1/billing/subscription');
+    return response.data;
+  },
+
+  async updatePlan(planId: string) {
+    const response = await api.patch('/api/v1/billing/plan', { planId });
+    return response.data;
+  },
+};
+```
+
+<Aside type="caution">
+  **Never create your own Axios instance** for API calls. Always use the shared `api` client from `@/lib/api`. This ensures tokens are attached and errors are handled consistently.
+</Aside>
 
 ---
 
 ## Backend Middleware
 
-### JWT Verification
+### JWT Verification (requireAuth)
 
-The `requireAuth` middleware verifies tokens using JWKS:
+The `requireAuth` middleware verifies JWT tokens using JWKS (JSON Web Key Set) from the Neon Auth endpoint:
 
 ```typescript
 // backend/src/middleware/auth.middleware.ts
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { env } from '../config/env.js';
 
-const jwksUrl = new URL('.well-known/jwks.json', env.NEON_AUTH_URL);
-const jwks = createRemoteJWKSet(jwksUrl);
+// JWKS client — automatically caches and refreshes public keys
+const baseUrl = env.NEON_AUTH_URL.endsWith('/')
+  ? env.NEON_AUTH_URL.slice(0, -1)
+  : env.NEON_AUTH_URL;
+const jwksUrl = new URL(`${baseUrl}/.well-known/jwks.json`);
+const JWKS = createRemoteJWKSet(jwksUrl);
 
-export async function requireAuth(req, res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
+export async function requireAuth(req: Request, res: Response, next: NextFunction) {
+  try {
+    const authHeader = req.headers.authorization;
 
-  if (!token) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    if (!authHeader?.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Missing authorization header' });
+      return;
+    }
+
+    const token = authHeader.slice(7);
+    const { payload } = await jwtVerify(token, JWKS);
+
+    // Attach user data to the request object
+    req.user = {
+      id: payload.sub as string,     // 'sub' claim = user ID
+      email: payload.email as string, // 'email' claim = user email
+    };
+
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
   }
-
-  const { payload } = await jwtVerify(token, jwks);
-
-  req.user = {
-    id: payload.sub,
-    email: payload.email,
-  };
-
-  next();
 }
 ```
 
-### Role-Based Middleware
+After `requireAuth` runs, every route handler has access to `req.user`:
 
 ```typescript
-// Require admin role
-router.use('/admin', requireAuth, requireAdmin, adminRoutes);
-
-// Require specific role(s)
-router.use('/editor', requireAuth, requireRole('managed'), editorRoutes);
-
-// Require role but disable admin bypass
-router.use('/user-only', requireAuth, requireRole('user', { adminBypass: false }), userOnlyRoutes);
-
-// Attach role without requiring specific role
-router.use('/api', requireAuth, attachRole, apiRoutes);
-// Then check: if (req.user?.role === 'admin') { ... }
-```
-
-### requireRole Options
-
-```typescript
-requireRole(allowedRoles, options?)
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `adminBypass` | `true` | When true, admin role always has access regardless of `allowedRoles` |
-
-```typescript
-// Admin can access this route (default behaviour)
-requireRole('editor')
-
-// Admin cannot access - strictly 'editor' role only
-requireRole('editor', { adminBypass: false })
-
-// Multiple roles allowed
-requireRole(['editor', 'moderator'])
+router.get('/', async (req, res) => {
+  const userId = req.user!.id;    // Neon Auth user ID
+  const email = req.user!.email;  // User's email
+  // ...
+});
 ```
 
 ### Extended Request Type
 
+The middleware extends the Express `Request` type globally:
+
 ```typescript
-declare module 'express' {
-  interface Request {
-    user?: {
-      id: string;
-      email: string;
-      role?: 'user' | 'admin' | 'managed';
-    };
+// Available in all route handlers after requireAuth
+declare global {
+  namespace Express {
+    interface Request {
+      user?: {
+        id: string;        // Neon Auth user ID (JWT 'sub' claim)
+        email: string;     // User's email (JWT 'email' claim)
+        role?: UserRole;   // Populated by requireAdmin/requireRole/attachRole
+      };
+    }
+  }
+}
+
+type UserRole = 'user' | 'admin' | 'managed';
+```
+
+### Role-Based Middleware
+
+The template provides three role-based middleware functions, all of which must be used **after** `requireAuth`:
+
+#### requireAdmin
+
+Requires the user to have the `admin` role. Queries the database to check:
+
+```typescript
+// Usage in route registration
+routeRegistry.register({
+  path: '/admin',
+  router: adminRoutes,
+  feature: 'admin',
+  requiresAuth: true,  // requireAuth applied automatically
+  middleware: [requireAdmin],  // additional middleware
+});
+```
+
+#### requireRole
+
+Factory function that checks for specific role(s). Admin always has access by default:
+
+```typescript
+import { requireRole } from '../../middleware/auth.middleware.js';
+
+// Require a specific role (admin still has access)
+router.use('/editor', requireRole('editor'));
+
+// Require one of multiple roles
+router.use('/special', requireRole(['editor', 'moderator']));
+
+// Disable admin bypass — strictly 'editor' role only
+router.use('/editor-only', requireRole('editor', { adminBypass: false }));
+```
+
+#### attachRole
+
+Attaches the user's role to `req.user` without enforcing a specific role. Useful when you need to check the role in your handler logic:
+
+```typescript
+router.get('/content', attachRole, async (req, res) => {
+  if (req.user?.role === 'admin') {
+    // Return admin-specific data
+  } else {
+    // Return standard data
+  }
+});
+```
+
+### User Roles
+
+| Role | Description |
+|------|-------------|
+| `user` | Default role. Standard access to all user-facing features. |
+| `admin` | Full administrative access. Bypasses most role restrictions. |
+| `managed` | Permissions controlled by an external module. Without a permissions module, behaves like `user`. |
+
+<Aside type="tip">
+**About the `managed` role:** The template includes infrastructure for a future permissions module. When you need fine-grained control beyond "user" and "admin" (e.g., "can edit posts but not delete"), set the user's role to `managed` and install a permissions module to handle the granular access control.
+</Aside>
+
+---
+
+## How Modules Add Authenticated API Routes
+
+This section walks through the complete pattern for a module to add its own backend API that uses the auth system.
+
+### Step 1: Define Routes
+
+Create an Express router with your endpoints. After `requireAuth` runs (applied automatically by the route registry), `req.user` is available in every handler:
+
+```typescript
+// backend/src/features/billing/billing.routes.ts
+import { Router, Request, Response, NextFunction } from 'express';
+import { billingService } from './billing.service.js';
+
+const router = Router();
+
+// GET /api/v1/billing — get user's subscription
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const subscription = await billingService.getSubscription(req.user!.id);
+    res.json(subscription);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/v1/billing/checkout — create checkout session
+router.post('/checkout', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const session = await billingService.createCheckout(
+      req.user!.id,
+      req.user!.email,
+      req.body.planId
+    );
+    res.json(session);
+  } catch (error) {
+    next(error);
+  }
+});
+
+export const billingRoutes = router;
+```
+
+### Step 2: Register Routes
+
+Register your routes with the route registry. Setting `requiresAuth: true` (the default) automatically applies the `requireAuth` middleware:
+
+```typescript
+// backend/src/features/billing/route.registration.ts
+import { routeRegistry } from '../../config/route.registry.js';
+import { billingRoutes } from './billing.routes.js';
+
+routeRegistry.register({
+  path: '/billing',
+  router: billingRoutes,
+  feature: 'billing',
+  versions: ['v1'],
+  requiresAuth: true,    // default — applies requireAuth automatically
+  description: 'Billing and subscription management',
+});
+```
+
+This mounts the routes at `/api/v1/billing/*` with auth middleware applied.
+
+### Step 3: Add Admin-Only Routes
+
+If your module has admin endpoints, add the `requireAdmin` middleware:
+
+```typescript
+// backend/src/features/billing/route.registration.ts
+import { routeRegistry } from '../../config/route.registry.js';
+import { requireAdmin } from '../../middleware/auth.middleware.js';
+import { billingRoutes } from './billing.routes.js';
+import { billingAdminRoutes } from './billing-admin.routes.js';
+
+// User-facing routes
+routeRegistry.register({
+  path: '/billing',
+  router: billingRoutes,
+  feature: 'billing',
+  requiresAuth: true,
+  description: 'Billing for users',
+});
+
+// Admin-only routes
+routeRegistry.register({
+  path: '/billing/admin',
+  router: billingAdminRoutes,
+  feature: 'billing',
+  requiresAuth: true,
+  middleware: [requireAdmin],
+  description: 'Billing admin operations',
+});
+```
+
+### Step 4: Import in Feature Index
+
+The feature's `index.ts` must import the registration files as side effects:
+
+```typescript
+// backend/src/features/billing/index.ts
+
+// Side-effect imports — trigger route and service registration
+import './route.registration.js';
+import './service.registration.js';
+
+// Public exports
+export { billingRoutes } from './billing.routes.js';
+export { billingService } from './billing.service.js';
+```
+
+### Step 5: Import in app.ts
+
+Add the feature import to `app.ts`:
+
+```typescript
+// backend/src/app.ts
+
+// Feature registrations (side-effect imports)
+import './features/user/index.js';
+import './features/admin/index.js';
+import './features/billing/index.js';  // ← add your module
+```
+
+### Step 6: Create Frontend Service
+
+Create a frontend API service using the shared `api` client:
+
+```typescript
+// frontend/src/features/billing/services/billing.service.ts
+import { api } from '@/lib/api';
+
+export const billingService = {
+  async getSubscription() {
+    const response = await api.get('/api/v1/billing');
+    return response.data;
+  },
+
+  async createCheckout(planId: string) {
+    const response = await api.post('/api/v1/billing/checkout', { planId });
+    return response.data;
+  },
+};
+```
+
+<Aside type="note">
+  The `api` client handles token injection automatically. You never need to pass tokens manually.
+</Aside>
+
+---
+
+## Route Registry Details
+
+The route registry manages how routes are mounted in Express:
+
+### RouteConfig Interface
+
+```typescript
+interface RouteConfig {
+  /** Base path without version prefix (e.g., '/billing') */
+  path: string;
+  /** Express router with route handlers */
+  router: Router;
+  /** API version(s). Default: ['v1'] */
+  versions?: ApiVersion[];
+  /** Additional middleware (applied after auth) */
+  middleware?: RequestHandler[];
+  /** Whether route requires auth. Default: true */
+  requiresAuth?: boolean;
+  /** Feature/module name for documentation */
+  feature: string;
+  /** Description for /api/docs endpoint */
+  description?: string;
+  /** Mark as deprecated (adds Deprecation header) */
+  deprecated?: boolean;
+  /** Deprecation notice message */
+  deprecationMessage?: string;
+}
+```
+
+### How Mounting Works
+
+When `routeRegistry.mountAll(app, requireAuth)` is called in `app.ts`:
+
+1. **Public routes** are mounted first (no auth)
+2. **Feature routes** are mounted with a middleware stack:
+   - Deprecation warning header (if `deprecated: true`)
+   - `requireAuth` middleware (if `requiresAuth: true`, the default)
+   - Route-specific middleware (from `middleware` array)
+   - The route's Express router
+
+### API Versioning
+
+Routes support versioning via the `versions` field:
+
+```typescript
+routeRegistry.register({
+  path: '/billing',
+  router: billingRoutes,
+  feature: 'billing',
+  versions: ['v1'],  // Mounts at /api/v1/billing
+});
+
+// When you need breaking changes, add a v2:
+routeRegistry.register({
+  path: '/billing',
+  router: billingRoutesV2,
+  feature: 'billing',
+  versions: ['v2'],
+});
+```
+
+### Public Routes (No Auth)
+
+For routes that don't require authentication (e.g., webhooks):
+
+```typescript
+routeRegistry.registerPublic({
+  path: '/api/billing/webhook',
+  method: 'post',
+  handler: async (req, res) => {
+    // Handle Stripe webhook — no auth required
+  },
+  description: 'Stripe webhook endpoint',
+});
+```
+
+### Auto-Generated API Docs
+
+All registered routes appear at `/api/docs`:
+
+```bash
+curl http://localhost:3100/api/docs
+```
+
+This returns a JSON document listing all public and feature routes with their paths, auth requirements, and descriptions.
+
+---
+
+## Request Validation
+
+Use the `validate` middleware with Zod schemas to validate request bodies:
+
+```typescript
+// backend/src/features/billing/billing.types.ts
+import { z } from 'zod';
+
+export const CreateCheckoutSchema = z.object({
+  planId: z.string().min(1),
+  billingCycle: z.enum(['monthly', 'annual']).optional(),
+}).strict();
+
+export type CreateCheckoutInput = z.infer<typeof CreateCheckoutSchema>;
+```
+
+```typescript
+// backend/src/features/billing/billing.routes.ts
+import { validate } from '../../middleware/validate.middleware.js';
+import { CreateCheckoutSchema } from './billing.types.js';
+
+router.post('/checkout',
+  validate(CreateCheckoutSchema),
+  async (req, res, next) => {
+    // req.body is validated and typed
+    const { planId, billingCycle } = req.body;
+    // ...
+  }
+);
+```
+
+If validation fails, a structured 400 response is returned:
+
+```json
+{
+  "error": "Validation failed",
+  "details": {
+    "planId": ["Required"],
+    "billingCycle": ["Invalid enum value"]
   }
 }
 ```
 
-### User Roles Explained
+---
 
-| Role | Description |
-|------|-------------|
-| `user` | Standard user with default access to all user-facing features |
-| `admin` | Full administrative access. Can manage settings, users, and all features. Admins bypass most role restrictions. |
-| `managed` | Reserved for granular permissions. When a user has the `managed` role, their permissions are controlled by an external permissions module rather than the simple role-based system. |
+## Error Handling
 
-<Aside type="tip">
-**About the `managed` role:** The template includes infrastructure for a future permissions module. When you need fine-grained control beyond "user" and "admin" (e.g., "can edit posts but not delete", "can view reports but not export"), set the user's role to `managed` and install a permissions module to handle the granular access control. Without a permissions module installed, `managed` users have the same access as regular `user` role.
-</Aside>
+The template provides custom error classes that map to HTTP status codes:
+
+```typescript
+import {
+  BadRequestError,      // 400
+  UnauthorizedError,    // 401
+  ForbiddenError,       // 403
+  NotFoundError,        // 404
+  ConflictError,        // 409
+  TooManyRequestsError, // 429
+  InternalError,        // 500
+} from '../../lib/errors.js';
+
+// Throw in services or route handlers:
+throw new NotFoundError('Subscription not found');
+throw new ForbiddenError('Only plan owners can cancel');
+throw new TooManyRequestsError('Too many requests', 60); // 60s retry-after
+```
+
+The global error handler in `error.middleware.ts` catches these and returns the appropriate HTTP response. Stack traces are only included in development mode.
+
+---
+
+## Service Registry
+
+The service registry enables cross-feature communication on the backend without tight coupling:
+
+### Registering a Service
+
+```typescript
+// backend/src/features/billing/service.registration.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+import { billingService } from './billing.service.js';
+
+// Type augmentation for type-safe access
+declare module '../../config/service.registry.js' {
+  interface ServiceTypes {
+    billing: typeof billingService;
+  }
+}
+
+serviceRegistry.register('billing', billingService, {
+  feature: 'billing',
+  description: 'Billing and subscription management',
+  version: '1.0.0',
+});
+```
+
+### Accessing Services from Other Features
+
+```typescript
+// In another feature's service
+import { serviceRegistry } from '../../config/service.registry.js';
+
+async function notifyUser(userId: string) {
+  // Type-safe access to the user service
+  const userService = serviceRegistry.get('user');
+  const profile = await userService.getOrCreateProfile(userId, '');
+
+  // Optional access (doesn't throw if service not registered)
+  const billing = serviceRegistry.getOptional('billing');
+  if (billing) {
+    const subscription = await billing.getSubscription(userId);
+  }
+}
+```
 
 ---
 
 ## User Profile Auto-Creation
 
-On first API call after sign-in, the user profile is auto-created:
+On the first API call after sign-in, the user profile is automatically created in the database:
 
 ```typescript
 // backend/src/features/user/user.service.ts
@@ -313,14 +817,14 @@ async getOrCreateProfile(userId: string, email: string) {
   let user = await prisma.user.findUnique({ where: { id: userId } });
 
   if (!user) {
-    // Check if this is the first user (make them admin)
     const userCount = await prisma.user.count();
 
     user = await prisma.user.create({
       data: {
-        id: userId,
-        email: email,
-        role: userCount === 0 ? 'admin' : 'user',
+        id: userId,        // Uses Neon Auth user ID as primary key
+        email,
+        role: userCount === 0 ? 'admin' : 'user',  // First user = admin
+        preferences: {},
       },
     });
   }
@@ -330,8 +834,104 @@ async getOrCreateProfile(userId: string, email: string) {
 ```
 
 <Aside type="note">
-  The first user to sign up automatically becomes an admin.
+  The first user to sign up automatically becomes an admin. All subsequent users get the `user` role.
 </Aside>
+
+---
+
+## Complete Module Auth Integration Example
+
+Here's the full picture of how a module integrates with authentication, from frontend to backend:
+
+### Frontend Component
+
+```tsx
+// frontend/src/features/billing/pages/BillingPage.tsx
+import { useEffect, useState } from 'react';
+import { useSession } from '@/features/auth';
+import { billingService } from '../services/billing.service';
+
+export function BillingPage() {
+  const { data: session } = useSession();
+  const [subscription, setSubscription] = useState(null);
+
+  useEffect(() => {
+    // api client handles auth token automatically
+    billingService.getSubscription().then(setSubscription);
+  }, []);
+
+  return (
+    <div>
+      <h1>Billing</h1>
+      <p>Signed in as: {session?.user.email}</p>
+      {/* Subscription UI */}
+    </div>
+  );
+}
+```
+
+### Frontend Service
+
+```typescript
+// frontend/src/features/billing/services/billing.service.ts
+import { api } from '@/lib/api';  // Shared API client with auto-auth
+
+export const billingService = {
+  async getSubscription() {
+    const response = await api.get('/api/v1/billing');
+    return response.data;
+  },
+};
+```
+
+### Backend Route Handler
+
+```typescript
+// backend/src/features/billing/billing.routes.ts
+import { Router, Request, Response, NextFunction } from 'express';
+
+const router = Router();
+
+// req.user is populated by requireAuth (applied by route registry)
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.user!.id;  // Available because requiresAuth: true
+    const subscription = await billingService.getSubscription(userId);
+    res.json(subscription);
+  } catch (error) {
+    next(error);  // Caught by global error handler
+  }
+});
+
+export const billingRoutes = router;
+```
+
+### Backend Route Registration
+
+```typescript
+// backend/src/features/billing/route.registration.ts
+import { routeRegistry } from '../../config/route.registry.js';
+import { billingRoutes } from './billing.routes.js';
+
+routeRegistry.register({
+  path: '/billing',
+  router: billingRoutes,
+  feature: 'billing',
+  versions: ['v1'],       // Mounts at /api/v1/billing
+  requiresAuth: true,     // requireAuth middleware applied automatically
+  description: 'Billing and subscription management',
+});
+```
+
+### Backend Feature Index
+
+```typescript
+// backend/src/features/billing/index.ts
+import './route.registration.js';    // Side-effect: registers routes
+import './service.registration.js';  // Side-effect: registers service
+
+export { billingService } from './billing.service.js';
+```
 
 ---
 
@@ -341,10 +941,10 @@ Neon Auth provides pre-built UI components:
 
 ### AuthView
 
-Used for sign-in, sign-up, forgot password pages:
+Used for sign-in, sign-up, and password reset pages:
 
 ```tsx
-import { AuthView } from '@neondatabase/neon-js/react/ui';
+import { AuthView } from '@neondatabase/neon-js/auth/react/ui';
 
 function AuthPage() {
   return <AuthView pathname={pathname} />;
@@ -352,27 +952,22 @@ function AuthPage() {
 ```
 
 Routes:
-- `/auth/sign-in` - Sign in form
-- `/auth/sign-up` - Registration form
-- `/auth/forgot-password` - Password reset request
-- `/auth/reset-password` - Password reset form
+- `/auth/sign-in` — Sign in form
+- `/auth/sign-up` — Registration form
+- `/auth/forgot-password` — Password reset request
+- `/auth/reset-password` — Password reset form
 
 ### AccountView
 
 Used for account settings:
 
 ```tsx
-import { AccountView } from '@neondatabase/neon-js/react/ui';
+import { AccountView } from '@neondatabase/neon-js/auth/react/ui';
 
 function AccountSettings() {
   return <AccountView pathname={pathname} />;
 }
 ```
-
-Routes:
-- `/settings` - Account settings
-- `/sessions` - Active sessions
-- `/password` - Change password
 
 ### SignedIn / SignedOut
 
@@ -409,6 +1004,19 @@ function Header() {
 
 ---
 
+## Sign Out
+
+```tsx
+import { authClient } from '@/features/auth';
+
+async function handleSignOut() {
+  await authClient.signOut();
+  window.location.href = '/auth/sign-in';
+}
+```
+
+---
+
 ## Environment Variables
 
 ### Frontend
@@ -424,52 +1032,40 @@ NEON_AUTH_URL=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
 ```
 
 <Aside type="caution">
-  Both URLs must match exactly, including the `/neondb/auth` path.
+  Both URLs must match **exactly**, including the `/neondb/auth` path. A mismatch causes token verification failures.
 </Aside>
-
----
-
-## Sign Out
-
-```tsx
-import { authClient } from '@/features/auth';
-
-async function handleSignOut() {
-  await authClient.signOut();
-  // Redirect to sign-in page
-  window.location.href = '/auth/sign-in';
-}
-```
 
 ---
 
 ## Troubleshooting
 
-### 401 Unauthorized Errors
+### 401 Unauthorised Errors
 
-1. Check `NEON_AUTH_URL` matches in both `.env` files
-2. Ensure URL includes full path (`/neondb/auth`)
-3. Verify JWKS endpoint is accessible
-4. Check token is being sent (Network tab → Authorization header)
+1. Check `NEON_AUTH_URL` matches exactly in both `.env` files
+2. Ensure URL includes the full path (`/neondb/auth`)
+3. Verify the JWKS endpoint is accessible: `curl <NEON_AUTH_URL>/.well-known/jwks.json`
+4. Check the token is being sent (Network tab → Request Headers → Authorization)
+5. Check the token hasn't expired
 
 ### Token Not Refreshing
 
 Neon Auth handles token refresh automatically. If issues occur:
-1. Check session expiry in JWKS payload
+1. Check session expiry in the JWT payload
 2. Verify `authClient` is initialised correctly
 3. Clear browser storage and re-authenticate
 
 ### OAuth Not Working
 
-1. Configure OAuth provider in Neon Console
-2. Add correct redirect URLs
+1. Configure the OAuth provider in the Neon Console
+2. Add the correct redirect URLs
 3. Enable the provider in `NeonAuthUIProvider`
+4. Note: Neon Auth shared development keys don't support OAuth account linking — you need custom OAuth credentials for that
 
 ### Session Lost on Page Refresh
 
 1. Check that `authClient` is initialised before rendering
 2. Verify session storage isn't being cleared
-3. Check for CORS issues with auth endpoint
+3. Check for CORS issues with the auth endpoint
 
 ---
 
@@ -486,40 +1082,52 @@ No additional caching configuration is needed.
 
 ### Rate Limiting
 
-Consider adding rate limiting to protect auth-related endpoints:
+Consider adding rate limiting to protect API endpoints:
 
 ```typescript
 import rateLimit from 'express-rate-limit';
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per window
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,  // 15 minutes
+  max: 100,                   // 100 requests per window
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
-app.use('/api/v1/user', authLimiter);
+app.use('/api/', limiter);
 ```
-
-### Token Refresh
-
-Neon Auth handles token refresh automatically in the frontend client. The flow:
-
-1. Token approaches expiry
-2. Client automatically requests new token
-3. New token replaces old one seamlessly
-
-If token refresh fails (network issues, session expired), the user is redirected to sign-in.
 
 ### Security Checklist
 
-- [ ] **HTTPS** - Always use HTTPS in production
-- [ ] **CORS** - Restrict allowed origins in backend
-- [ ] **Rate Limiting** - Add limits to prevent abuse
-- [ ] **Dependency Audit** - Run `npm audit` regularly
+- [ ] **HTTPS** — Always use HTTPS in production
+- [ ] **CORS** — Restrict `FRONTEND_URL` to your production domain
+- [ ] **Rate Limiting** — Add limits to prevent abuse
+- [ ] **Auth URL Match** — Verify `VITE_NEON_AUTH_URL` and `NEON_AUTH_URL` are identical
+- [ ] **Dependency Audit** — Run `npm audit` regularly
+
+---
+
+## Quick Reference for Module Developers
+
+| Task | How |
+|------|-----|
+| Make authenticated API calls from frontend | Use `api` from `@/lib/api` — tokens are injected automatically |
+| Get current user in a React component | `const { data } = useSession()` then `data?.user` |
+| Get user ID in backend route handler | `req.user!.id` (after `requireAuth`) |
+| Get user email in backend route handler | `req.user!.email` (after `requireAuth`) |
+| Register authenticated backend routes | `routeRegistry.register({ ..., requiresAuth: true })` |
+| Add admin-only routes | `routeRegistry.register({ ..., middleware: [requireAdmin] })` |
+| Add role-specific routes | `routeRegistry.register({ ..., middleware: [requireRole('editor')] })` |
+| Register public routes (no auth) | `routeRegistry.registerPublic({ path, method, handler })` |
+| Check role in a handler | Use `attachRole` middleware, then check `req.user?.role` |
+| Access another feature's service | `serviceRegistry.get('user')` |
+| Validate request body | `validate(MyZodSchema)` middleware |
 
 ---
 
 ## Next Steps
 
-- [User Feature](/starter-template/user-feature/) - User profiles and preferences
-- [Admin Feature](/starter-template/admin-feature/) - User management
-- [API Reference](/reference/cli-commands/) - CLI commands
+- [User Feature](/starter-template/user-feature/) — User profiles, settings, and preferences
+- [Admin Feature](/starter-template/admin-feature/) — User management and app settings
+- [Registry Reference](/starter-template/registries/) — All available extension points
+- [Base Registry](/starter-template/base-registry/) — Creating custom registries
