@@ -102,6 +102,35 @@ export default defineConfig({
           items: [
             { label: "Overview", slug: "module-starter" },
             {
+              label: "Create Script Walkthrough",
+              slug: "module-starter/create-script",
+            },
+            {
+              label: "Building Your Module",
+              slug: "module-starter/building-modules",
+            },
+            { label: "Code Templates", slug: "module-starter/templates" },
+            {
+              label: "CLI Reference",
+              slug: "module-starter/cli-reference",
+            },
+            {
+              label: "Lifecycle Hooks",
+              slug: "module-starter/lifecycle-hooks",
+            },
+            {
+              label: "Module Database",
+              slug: "module-starter/database",
+            },
+            {
+              label: "File Reference",
+              slug: "module-starter/file-reference",
+            },
+            {
+              label: "Registry Guide",
+              slug: "module-starter/registry-guide",
+            },
+            {
               label: "Scaffold Architecture",
               slug: "module-starter/scaffold",
             },
@@ -114,30 +143,9 @@ export default defineConfig({
               slug: "module-starter/versioning",
             },
             {
-              label: "Lifecycle Hooks",
-              slug: "module-starter/lifecycle-hooks",
+              label: "Developer Workflow",
+              slug: "module-starter/developer-workflow",
             },
-            {
-              label: "Create Script Walkthrough",
-              slug: "module-starter/create-script",
-            },
-            {
-              label: "Building Your Module",
-              slug: "module-starter/building-modules",
-            },
-            {
-              label: "Registry Guide",
-              slug: "module-starter/registry-guide",
-            },
-            {
-              label: "Module Database",
-              slug: "module-starter/database",
-            },
-            {
-              label: "File Reference",
-              slug: "module-starter/file-reference",
-            },
-            { label: "Code Templates", slug: "module-starter/templates" },
             { label: "Changelog", slug: "module-starter/changelog" },
             { label: "Roadmap", slug: "module-starter/roadmap" },
           ],
