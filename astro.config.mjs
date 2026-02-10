@@ -173,6 +173,10 @@ export default defineConfig({
               items: [
                 { label: "Overview", slug: "modules/structure" },
                 { label: "Installation", slug: "modules/structure/installation" },
+                {
+                  label: "Module Integration",
+                  slug: "modules/structure/integration",
+                },
                 { label: "Node Types", slug: "modules/structure/node-types" },
                 { label: "Admin Page", slug: "modules/structure/admin" },
                 { label: "Pages", slug: "modules/structure/pages" },
