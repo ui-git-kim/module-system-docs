@@ -194,6 +194,11 @@ export default defineConfig({
               label: "Builder",
               items: [
                 { label: "Overview", slug: "modules/builder" },
+                { label: "Configuration", slug: "modules/builder/configuration" },
+                { label: "Usage", slug: "modules/builder/usage" },
+                { label: "Integration", slug: "modules/builder/integration" },
+                { label: "Developer Workflow", slug: "modules/builder/developer-workflow" },
+                { label: "Changelog", slug: "modules/builder/changelog" },
                 { label: "Roadmap", slug: "modules/builder/roadmap" },
               ],
             },
