@@ -1,0 +1,195 @@
+---
+title: Structured Logging
+description: How the backend uses Pino for structured logging with request correlation and module loggers
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The backend uses [Pino](https://github.com/pinojs/pino) for structured logging, providing JSON output in production and pretty-printed output in development. Every log entry includes context (feature name, request ID, user ID) making it easy to trace issues across services.
+
+---
+
+## Log Output
+
+<Tabs>
+  <TabItem label="Development">
+```
+[14:23:01] INFO (user): Profile created for first user
+    userId: "abc-123"
+    role: "admin"
+    audit: true
+```
+Pretty-printed with colours via `pino-pretty`.
+  </TabItem>
+  <TabItem label="Production">
+```json
+{"level":30,"time":1703001781234,"msg":"Profile created for first user","userId":"abc-123","role":"admin","audit":true,"name":"user"}
+```
+JSON for log aggregation services (Datadog, CloudWatch, etc.).
+  </TabItem>
+</Tabs>
+
+---
+
+## Logger Setup
+
+The root logger is created in `backend/src/lib/logger.ts`:
+
+```typescript
+import { createAppLogger, createModuleLogger } from '../lib/logger.js';
+
+// Root logger (used in app.ts and middleware)
+const log = createAppLogger();
+
+// Feature-specific logger (adds feature name to every log entry)
+const log = createModuleLogger('user');
+```
+
+### Log Levels
+
+Set the `LOG_LEVEL` environment variable to control output:
+
+| Level | Value | Includes |
+|-------|-------|----------|
+| `fatal` | 60 | Fatal only |
+| `error` | 50 | Errors + fatal |
+| `warn` | 40 | Warnings and above |
+| `info` | 30 | Standard output (default) |
+| `debug` | 20 | Detailed debugging |
+| `trace` | 10 | Everything |
+
+```env
+# backend/.env
+LOG_LEVEL=info    # Default — shows info, warn, error, fatal
+LOG_LEVEL=debug   # Development — adds debug output
+```
+
+---
+
+## Using Loggers in Features
+
+Each feature creates its own logger with the feature name for context:
+
+```typescript
+// backend/src/features/user/user.service.ts
+import { createModuleLogger } from '../../lib/logger.js';
+
+const log = createModuleLogger('user');
+
+async function getOrCreateProfile(userId: string, email: string) {
+  let user = await prisma.user.findUnique({ where: { id: userId } });
+
+  if (!user) {
+    user = await prisma.user.create({ data: { id: userId, email, role } });
+    log.info({ userId, role, audit: true }, 'Profile created for first user');
+  }
+
+  return user;
+}
+```
+
+The `{ audit: true }` tag marks security-sensitive operations for easy filtering in log aggregation.
+
+### Module Loggers
+
+Modules should use `createModuleLogger` with their module name:
+
+```typescript
+// modules/billing/billing.service.ts
+import { createModuleLogger } from '../../lib/logger.js';
+
+const log = createModuleLogger('billing');
+
+// All log entries include { name: "billing" }
+log.info({ subscriptionId }, 'Subscription created');
+log.warn({ userId }, 'Payment method expiring soon');
+log.error({ err }, 'Payment processing failed');
+```
+
+---
+
+## Request Correlation
+
+The `request-id.middleware.ts` assigns a unique ID to every HTTP request and attaches a child logger to `req.log`:
+
+```typescript
+// In any route handler
+router.get('/', async (req, res, next) => {
+  // req.log includes the request ID automatically
+  req.log.info('Fetching user profile');
+
+  // Or use the feature logger with request context
+  log.info({ requestId: req.id }, 'Processing request');
+});
+```
+
+The middleware:
+1. Reads the `X-Request-ID` header (if present, from a load balancer or API gateway)
+2. Falls back to generating a UUID
+3. Attaches `req.id` and `req.log` (a child logger with the request ID)
+4. Sets the `X-Request-ID` response header for client-side correlation
+
+---
+
+## Audit Logging
+
+Security-sensitive operations are tagged with `{ audit: true }` for easy filtering:
+
+```typescript
+// Tag security-sensitive operations
+log.info({ userId, role, audit: true }, 'User role updated');
+log.info({ userId, audit: true }, 'User account deleted');
+log.warn({ userId, audit: true }, 'Failed login attempt');
+```
+
+In your log aggregation service, filter for `audit: true` to get a security audit trail.
+
+---
+
+## Logging Patterns
+
+### Do
+
+```typescript
+// Structured data as first argument, message as second
+log.info({ userId, email }, 'User created');
+log.error({ err, orderId }, 'Payment failed');
+
+// Use appropriate levels
+log.debug({ query }, 'Database query executed');  // Verbose, dev only
+log.warn({ userId }, 'Rate limit approaching');   // Noteworthy
+log.error({ err }, 'Unhandled exception');         // Errors
+```
+
+### Don't
+
+```typescript
+// Don't use console.*
+console.log('User created');          // ❌ No structure, no level
+console.error('Payment failed');      // ❌ No context
+
+// Don't interpolate into the message
+log.info(`User ${userId} created`);   // ❌ Harder to search/filter
+
+// Don't log sensitive data
+log.info({ password }, 'Login');       // ❌ Never log credentials
+log.info({ token }, 'Auth success');   // ❌ Never log tokens
+```
+
+---
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `info` | Minimum log level to output |
+| `NODE_ENV` | `development` | `production` = JSON, `development` = pretty-print |
+
+No additional configuration is needed. The logger auto-detects the environment and formats output accordingly.
+
+---
+
+## Next Steps
+
+- [Configuration](/starter-template/configuration/) — All environment variables
+- [Project Architecture](/starter-template/architecture/) — Backend file structure

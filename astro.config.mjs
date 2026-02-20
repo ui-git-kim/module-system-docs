@@ -59,10 +59,22 @@ export default defineConfig({
               label: "Database & Prisma",
               slug: "starter-template/database",
             },
-            { label: "Base Registry", slug: "starter-template/base-registry" },
             {
-              label: "Registry Reference",
-              slug: "starter-template/registries",
+              label: "Registries & Hooks",
+              items: [
+                {
+                  label: "Base Registry",
+                  slug: "starter-template/base-registry",
+                },
+                {
+                  label: "Registry Reference",
+                  slug: "starter-template/registries",
+                },
+                {
+                  label: "Filter & Action Hooks",
+                  slug: "starter-template/hooks",
+                },
+              ],
             },
             {
               label: "Shell Layout",
@@ -83,6 +95,27 @@ export default defineConfig({
                 },
                 { label: "Admin", slug: "starter-template/admin-feature" },
               ],
+            },
+            {
+              label: "UI Infrastructure",
+              items: [
+                {
+                  label: "Header Toolbar",
+                  slug: "starter-template/header-toolbar",
+                },
+                {
+                  label: "Dynamic Breadcrumbs",
+                  slug: "starter-template/breadcrumbs",
+                },
+                {
+                  label: "Theme Utilities",
+                  slug: "starter-template/theme",
+                },
+              ],
+            },
+            {
+              label: "Structured Logging",
+              slug: "starter-template/logging",
             },
             {
               label: "Updating Cloned Apps",
