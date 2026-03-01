@@ -86,9 +86,11 @@ declare module '../../config/service.registry.js' {
 
 ## Filter Registry
 
-The builder registers one async filter that enriches structure node responses with block metadata.
+The builder uses filter hooks on both frontend and backend to allow companion modules to modify behaviour without tight coupling.
 
-### `structure.node.response` — Block Count Enrichment
+### Backend Filters
+
+#### `structure.node.response` — Block Count Enrichment
 
 **Hook:** `builder-enrich-node-metadata`
 **Priority:** 15 (runs early)
@@ -112,13 +114,122 @@ Adds `metadata.builder.blockCount` to structure node API responses. This powers 
 Other modules can read this enriched metadata to make decisions. For example, a reporting module could use `metadata.builder.blockCount` to show project statistics.
 </Aside>
 
+### Frontend Filters
+
+#### `builder.canvas.globalCss` — Preview Theme CSS
+
+**Type:** Sync filter (via `filterRegistry.apply()`)
+
+Controls the CSS injected into the iframe preview. The builder constructs a base CSS string from the project's theme variables (or sensible defaults), then passes it through this filter. Companion modules — such as a style module — can replace or extend this CSS with project-specific Tailwind output, custom colour schemes, or any other global styles.
+
+```typescript
+// How the builder applies the filter (inside IframeCanvas):
+const globalCss = useMemo(() => {
+  const baseCss = buildPreviewCss(projectTheme);
+  return filterRegistry.apply('builder.canvas.globalCss', baseCss, {
+    projectId,
+    darkMode: !!darkMode,
+  });
+}, [projectTheme, darkMode, projectId, filterTick]);
+```
+
+**Filter signature:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `value` | `string` | Base CSS string with `:root` variables, `.dark` overrides, and base layer styles |
+| `context.projectId` | `string \| null` | Currently selected project ID |
+| `context.darkMode` | `boolean` | Whether dark mode is active in the preview |
+
+**Registering a filter** (example from a style module):
+
+```typescript
+// In a companion module's registration file:
+import { filterRegistry } from '@/config/filter.registry';
+
+filterRegistry.register(
+  'builder.canvas.globalCss',
+  'style-project-css',
+  (baseCss, ctx) => {
+    const projectCss = getCompiledCssForProject(ctx.projectId);
+    return projectCss || baseCss;  // Replace with compiled CSS, or keep defaults
+  },
+  10
+);
+```
+
+The resulting CSS is sent to the iframe via the `foundry:global-css` postMessage and re-sent whenever the theme, dark mode, or filter output changes. The IframeCanvas subscribes to `filterRegistry.subscribe()` so it reacts immediately when companion modules register or update their filters.
+
+#### `builder.registry.componentsJson` — Registry Config Snippet
+
+**Type:** Sync filter (via `filterRegistry.apply()`)
+
+Enriches the `components.json` snippet shown on the project's Registry tab. By default, the snippet only contains the `registries` key. Companion modules can add `$schema`, `style`, `tailwind`, `aliases`, and other shadcn configuration keys.
+
+```typescript
+// How the builder applies the filter (inside ProjectRegistryTab):
+const componentsJsonSnippet = useMemo(() => {
+  const baseConfig: Record<string, unknown> = {
+    registries: { [`@${handle}`]: registryEntry },
+  };
+
+  const enriched = filterRegistry.apply(
+    'builder.registry.componentsJson',
+    baseConfig,
+    { handle, registryUrl, nodeId: node.id }
+  );
+
+  return JSON.stringify(enriched, null, 2);
+}, [handle, registryUrl, registryToken, node.id]);
+```
+
+**Filter signature:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `value` | `Record<string, unknown>` | Base config object with `registries` key |
+| `context.handle` | `string` | User's registry handle |
+| `context.registryUrl` | `string` | Full registry base URL |
+| `context.nodeId` | `string` | Current project node ID |
+
+**Registering a filter** (example from a style module):
+
+```typescript
+filterRegistry.register(
+  'builder.registry.componentsJson',
+  'style-shadcn-config',
+  (config, ctx) => ({
+    $schema: 'https://ui.shadcn.com/schema.json',
+    style: 'new-york',
+    tailwind: {
+      config: 'tailwind.config.ts',
+      css: 'src/app/globals.css',
+      baseColor: 'zinc',
+    },
+    aliases: {
+      components: '@/components',
+      utils: '@/lib/utils',
+      ui: '@/components/ui',
+    },
+    ...config,  // registries merged last
+  }),
+  10
+);
+```
+
+<Aside type="note">
+The base config is always present — companion modules should spread it into their return value (typically at the end) so the `registries` key is preserved.
+</Aside>
+
 ---
 
 ## Action Registry
 
-The builder registers lifecycle hooks via the `actionRegistry` to respond to structure module events.
+The builder both **listens to** and **fires** action hooks via the `actionRegistry`.
 
-### `structure.node.deleted` — Cleanup
+### Hooks the Builder Listens To
+
+#### `structure.node.deleted` — Cleanup
 
 **Hook:** `builder-cleanup-node-data`
 **Priority:** 20
@@ -137,6 +248,57 @@ interface DeletedContext {
   nodeType: string;
 }
 ```
+
+### Hooks the Builder Fires
+
+The builder fires 8 CRUD action hooks from its backend service via `actionRegistry.doActionAll()`. Companion modules can subscribe to these hooks to react to builder lifecycle events — for example, updating analytics, triggering notifications, or syncing external systems.
+
+#### Block Hooks
+
+| Hook | Fired When | Context |
+|------|-----------|---------|
+| `builder.block.created` | A new block is saved | `{ userId, blockId, block }` |
+| `builder.block.updated` | An existing block is updated | `{ userId, blockId, block }` |
+| `builder.block.deleted` | A block is deleted | `{ userId, blockId }` |
+
+#### Category Hooks
+
+| Hook | Fired When | Context |
+|------|-----------|---------|
+| `builder.category.created` | A new category is created | `{ userId, categoryId, category }` |
+| `builder.category.deleted` | A category is deleted | `{ userId, categoryId }` |
+
+#### Collection Hooks
+
+| Hook | Fired When | Context |
+|------|-----------|---------|
+| `builder.collection.created` | A new collection is created | `{ userId, collectionId, collection }` |
+| `builder.collection.updated` | A collection is updated | `{ userId, collectionId, collection }` |
+| `builder.collection.deleted` | A collection is deleted | `{ userId, collectionId }` |
+
+<Aside type="note">
+The `block` and `collection` objects in context are the full database row after the operation. For delete hooks, only the ID is provided since the record no longer exists.
+</Aside>
+
+#### Subscribing to Builder Hooks
+
+```typescript
+// In another module's backend registration file:
+import { actionRegistry } from '../../config/action.registry.js';
+
+actionRegistry.addActionAsync(
+  'builder.block.created',
+  'my-module-on-block-created',
+  async (context) => {
+    const { userId, blockId, block } = context;
+    // e.g. track analytics, send notification, sync to external system
+    await myService.onBlockCreated(userId, blockId, block);
+  },
+  30  // Priority — higher numbers run later
+);
+```
+
+All 8 hooks follow the same pattern — use `actionRegistry.addActionAsync()` with the hook name and a unique registration ID.
 
 ---
 
