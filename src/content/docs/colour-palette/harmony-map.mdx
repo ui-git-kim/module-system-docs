@@ -1,0 +1,282 @@
+---
+title: Harmony Map
+description: Derivation and design rationale for the harmonyMap function that powers complementary, triadic, tetradic, and split-complementary colour harmonies in OKLCH.
+sidebar:
+  order: 10
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`harmonyMap(colour, degrees)` rotates an OKLCH colour's hue by *N* degrees and reconstructs its lightness and chroma so the result *feels* like the same colour at a new hue rather than a mechanical coordinate translation. Every harmony generator in the Colour Schemes module — complementary, triadic, tetradic, split-complementary, analogous, square, hexagonal — calls `harmonyMap` to place each spoke of the wheel.
+
+This page walks through why a naive hue rotation fails, what perceptual signals we use to correct it, and how each tuning constant was chosen.
+
+## Why a Naive Rotation Fails
+
+OKLCH is perceptually uniform *along any single axis* — two colours with the same L look equally bright, two colours with the same C look equally saturated. But the **gamut shape changes dramatically with hue**. The same (L, C) point that sits comfortably inside sRGB at one hue can land far outside the gamut at another.
+
+Two specific failure modes motivate the entire pipeline:
+
+1. **The yellow dullness problem.** Yellow's sRGB gamut peaks at L≈0.96. If you rotate a saturated red (L≈0.63) to yellow and keep the coordinates, you get a muddy olive — the result is nowhere near yellow's natural brightness. Perceptually, saturated yellow *reads* bright. The Hunt-Kaiser (H-K) effect documents this: the eye expects saturated yellows to look almost white, and saturated blues to look much darker than their measured L.
+
+2. **The cusp shelf (a.k.a. the lime neon trap).** The sRGB gamut's mathematical cusp — the brightest point for each hue — behaves smoothly across most of the wheel, but it has a topological **shelf** between h≈95° and h≈135°, peaking at h=110° with L≈0.965. Any naive "aim for the cusp" strategy in this band produces near-white neon greens like `#fdfe01` or `#d8fd01`. Those coordinates are technically inside sRGB but perceptually unacceptable.
+
+The whole purpose of `harmonyMap` is to reconstruct L and C at the new hue so the result sits at the *same perceptual position* within the new hue's gamut — bright where bright is natural (yellow), dark where dark is natural (blue), and never landing on the cusp shelf.
+
+## The Gamut Triangle
+
+For a given hue, the reachable sRGB colours form a triangle in L-C space with three vertices:
+
+- **B** (black) at (0, 0)
+- **W** (white) at (1, 0)
+- **P** (cusp) at (cuspL, cuspC) — the brightest, most chromatic point
+
+Any in-gamut colour at that hue can be described by three barycentric weights `(wB, wW, wP)` summing to 1:
+
+```
+wP = c / cuspC              // how deep into the chroma axis
+wW = l - wP * cuspL         // how bright, once the chroma tilt is removed
+wB = 1 - wW - wP            // black component (implicit)
+```
+
+The weights are **invariant to hue** — if red and yellow both have `(wP=0.6, wW=0.3, wB=0.1)`, they occupy the same relative position in their respective gamut triangles. That's the foundation for harmony reconstruction: keep the weights, swap the triangle.
+
+But the weights alone aren't enough, because equal weights at different hues produce perceptually *different* brightness (H-K effect) and run into the cusp shelf. The rest of the pipeline exists to correct for those.
+
+## The 5-Stage Pipeline
+
+```
+   Setup   →   Stage 1   →   Stage 2   →   Stage 3   →   Pass 4   →   Pass 5   →   gamutMap3DShaded
+     │            │              │              │            │            │
+  Find cusps   Decompose      Reconstruct   Reconstruct    Measure     Apply reduction
+  (raw and     source in     destination   destination   candidate    (L pull-down +
+   capped)     old triangle      L             C          neon score   C cut)
+```
+
+### Setup: Two Cusp Variants
+
+```ts
+const oldCusp    = findCuspForHue(oldH);
+const rawNewCusp = findCuspForHue(newH);
+
+const CUSP_L_CEILING = 0.9;
+const newCusp =
+  rawNewCusp.l > CUSP_L_CEILING
+    ? { l: CUSP_L_CEILING, c: maxChromaAtLH(CUSP_L_CEILING, newH) }
+    : rawNewCusp;
+```
+
+The `CUSP_L_CEILING = 0.9` cap is the fix for the cusp shelf. In the 95°–135° band, the raw cusp climbs to L≈0.96 — that's the shelf. Reconstructing *toward* that coordinate lands you in neon territory. Capping at L=0.9 aims reconstruction at a perceptually sensible apex instead. Hues outside the shelf (yellow at 0.863, green at 0.875, red at 0.628) are untouched by the cap.
+
+But both variants are used downstream, for different purposes:
+
+| Variant         | Purpose                                    | Why                                                                 |
+|-----------------|--------------------------------------------|---------------------------------------------------------------------|
+| `rawNewCusp.l`  | Shape signals (`warmBase`, `neonBell`)     | They need the hue's **true** gamut geometry — not the ceiling.      |
+| `newCusp.l`     | Reconstruction pivot (`baryL`, `lProximity`) | They need a perceptually sensible **target** — not the shelf.       |
+
+This dual-cusp pattern was discovered during iterative tuning on lime: capping unconditionally made `neonBell` spuriously spike because lime's raw cusp (0.908) sat outside the bell centre but the capped 0.88 sat dead-centre. Split the two roles and both problems disappear.
+
+### Stage 1: Decompose in Source Triangle
+
+```ts
+const wP = oldCusp.c > 0 ? colour.c / oldCusp.c : 0;
+const wW = colour.l - wP * oldCusp.l;
+```
+
+Plain barycentric decomposition. `wB` is implicit (not needed downstream).
+
+### Stage 2: Reconstruct L
+
+```ts
+const baryL = wW + wP * newCusp.l;
+const reconstructedL =
+    baryL
+  + (newCusp.l - baryL) * warmLiftL * 1.35
+  - neonRisk * 0.05;
+```
+
+Three terms:
+
+1. **Barycentric baseline** (`baryL`) — same weights, new triangle.
+2. **Warm-lift pivot** — pull L toward the destination cusp, scaled by how much "warm lift" the hue deserves.
+3. **Neon knockdown** — small downward nudge for cool-side hues whose cusp sits in the mid-bright zone where neon lives.
+
+The `1.35` factor was tuned so saturated yellows reach a perceptually-bright L without dragging reds along for the ride. See [Warm Lift](#warm-lift) below for the derivation.
+
+### Stage 3: Reconstruct C by Source Depth
+
+```ts
+const sourceMaxC   = maxChromaAtLH(colour.l, oldH);
+const sourceDepth  = sourceMaxC > 0 ? colour.c / sourceMaxC : 0;
+const chromaAdjust = 1.3 + warmLiftC * 0.55 - neonRisk * 0.1;
+const depthAdjusted = Math.min(1, sourceDepth * chromaAdjust);
+const destMaxC = maxChromaAtLH(clampedL, newH);
+const reconstructedC = depthAdjusted * destMaxC;
+```
+
+`sourceDepth` is the **anti-neon primitive**: it's the fraction of the source's maximum possible chroma at its own L. A 60%-saturated input produces a 60%-saturated output, regardless of how much chroma the new hue's gamut can hold. Without this, rotating a desaturated red to yellow would blast out at 100% yellow chroma because yellow's gamut is so wide.
+
+The `chromaAdjust` multiplier (1.3 base, +0.55 × warmLiftC, −0.1 × neonRisk) does the fine tuning: a general 1.3× boost lifts the overall palette vibrancy, warm hues get a further push because the H-K deficit tells us they need it to read saturated, and cool-side neon candidates lose a tiny bit pre-emptively. The serious neon work happens in Pass 5.
+
+### Pass 4: Measure Candidate Neon Score
+
+```ts
+const candidateMaxC = maxChromaAtLH(clampedL, newH);
+const lProximity    = Math.max(0, 1 - Math.abs(clampedL - newCusp.l) / 0.25);
+const cFraction     = candidateMaxC > 0 ? reconstructedC / candidateMaxC : 0;
+const neonScore     = lProximity * cFraction * coolnessSharp;
+```
+
+Pass 4 is a second-pass corrective. The a-priori `neonRisk` in Stage 1 guessed from `cusp.l` alone; this measures the **actual candidate** we just constructed. It catches cases where high `sourceDepth` pushed a colour into neon territory that `cusp.l` alone didn't predict.
+
+Three shape signals, multiplied together so all three must align:
+
+- **`lProximity`** — how close the candidate's L sits to the (capped) cusp L. Colours at the cusp "glow"; the multiplier fades linearly over an L=0.25 window.
+- **`cFraction`** — how close to maximum chroma at the candidate's L. 100% = saturated cusp point.
+- **`coolnessSharp`** — directional gate: only cool-side hues can be "neon" in the first place. A warm-side cusp colour like saturated orange is fine.
+
+### Pass 5: Apply Neon Reduction
+
+```ts
+const finalL = clampedL - neonScore * 0.13;
+const finalC = reconstructedC * (1 - neonScore * 0.55);
+
+return gamutMap3DShaded({ l: finalL, c: finalC, h: newH });
+```
+
+Asymmetric reduction: a small L pull-down (0.13) and a larger C cut (0.55). The L cut needs to be meaty enough to actually shift lime off its cusp — a small nudge leaves it reading as a glowing apex colour. The C cut dominates because chroma is what makes neon *neon*.
+
+`gamutMap3DShaded` is the final sRGB containment step, used by every other colour generator in the module.
+
+## Perceptual Signals
+
+### The Fairchild-Pirrotta H-K Model
+
+The Helmholtz-Kohlrausch (H-K) effect is the century-old observation that saturated colours look brighter than their measured luminance predicts — blues especially. Fairchild and Pirrotta's 1991 magnitude model quantifies it:
+
+```
+f1(h) = 0.116 × |sin((h − 90°) / 2)| + 0.085
+```
+
+Two named constants (0.116, 0.085), anchored at h=90° (CIELAB yellow axis). `f1` peaks at h=270° (blue) and minimises at h=90° (yellow). Interpretation:
+
+- **f1 large** (blue) — big H-K boost, saturated blue reads much brighter than its L suggests.
+- **f1 small** (yellow) — small H-K boost, saturated yellow reads near its physical L.
+
+We want the **inverse** — a signal that says "this hue needs extra physical L to look as bright as the eye expects":
+
+```ts
+const f1 = (h) => 0.116 * Math.abs(Math.sin(toRad((h - 90) / 2))) + 0.085;
+const F1_MIN = 0.085;  // f1 at h=90° (yellow)
+const F1_MAX = 0.201;  // f1 at h=270° (blue)
+const hkDeficit = 1 - (f1(newH) - F1_MIN) / (F1_MAX - F1_MIN);
+```
+
+`hkDeficit` is 1.0 at yellow, 0.0 at blue, smooth through the rest of the wheel.
+
+### Coolness Gate
+
+```ts
+const coolness      = Math.max(0, Math.sin(toRad(newH - 90)));  // 0 warm, 1 cool
+const coolnessSharp = Math.pow(coolness, 1.5);
+```
+
+Directional gate: positive on the cool arc (yellow-green → cyan → blue), clamped to zero on the warm arc (red → orange → yellow). Anchored at h=90° — same anchor FP uses, so no new hue constant.
+
+`coolnessSharp = coolness ^ 1.5` is a sharpened variant used only for the neon penalty. Power 1.5 sits between linear (which over-penalises lime because lime has partial coolness) and squared (which under-penalises it). Warm-lift continues to use linear `coolness` so yellow-green tracks smoothly.
+
+### Warm Lift
+
+Warm lift is the mechanism that pulls yellow-family L upward toward the cusp:
+
+```ts
+const warmBase  = hkDeficit * rawNewCusp.l ** 3;
+const warmLiftL = warmBase * (1 - coolness);
+const warmLiftC = warmBase * (1 - coolnessSharp);
+```
+
+`warmBase` combines two signals: the H-K deficit (how much extra L the hue needs) × the cube of the cusp L (how bright the hue *can* be). The cube exponent heavily weights hues whose natural gamut is bright; darker-gamut hues (red, blue) get almost nothing.
+
+`warmBase` uses `rawNewCusp.l` — the **shape signal**, not the capped target. The question is "how bright can this hue naturally be?", which needs true geometry.
+
+Two gated variants:
+
+- **`warmLiftL` — linear gate.** Tight — only pure yellow-family hues get L pulled toward cusp. Lime (h≈130°) stays at its natural L height.
+- **`warmLiftC` — sharp gate.** Wider — lime still gets the **chroma** warmth bump and reads warm/rich rather than green/cool, but not the L lift.
+
+Splitting L and C gates was the key insight for rendering lime correctly. Cyan cleanly zeros both; yellow gets 1.0 on both; lime gets 0 on L but ~0.5 on C.
+
+### Neon Bell
+
+```ts
+const neonBell = Math.exp(-(((rawNewCusp.l - 0.85) / 0.06) ** 2));
+const neonRisk = neonBell * coolnessSharp;
+```
+
+A narrow Gaussian bell centred at cusp L=0.85 with σ=0.06. This catches mid-bright cusps where neon lives — lime-family hues whose gamut cusp sits right in the "glowing" zone. Gated by `coolnessSharp` so warm-side hues with similar cusp brightness (like orange at 0.86) pass through unflagged.
+
+`neonBell` uses `rawNewCusp.l` — the **shape detector**. Lime's raw cusp (~0.908) sits outside the bell's centre; the capped 0.88 would sit dead-centre and spuriously spike the neon risk for every lime-family output. Another reason the dual-cusp pattern matters.
+
+## Tuning Constants Reference
+
+All single-use numeric constants in `harmonyMap`, with rationale:
+
+| Constant             | Value   | Purpose                                                                 |
+|----------------------|---------|-------------------------------------------------------------------------|
+| `CUSP_L_CEILING`     | 0.90    | Perceptual ceiling on reconstruction target to avoid the cusp shelf.    |
+| f1 (0.116, 0.085)    | named   | Fairchild-Pirrotta 1991 H-K magnitude — published constants.            |
+| F1_MIN / F1_MAX      | 0.085 / 0.201 | f1 at yellow (90°) and blue (270°) — used to normalise hkDeficit. |
+| `coolnessSharp` exp  | 1.5     | Between linear (over-penalises lime) and squared (under-penalises).     |
+| `warmBase` cusp exp  | 3       | Heavily weights bright-gamut hues, damps dark-gamut contribution.       |
+| Neon bell centre     | 0.85    | Mid-bright cusp zone where "glow" neons live.                           |
+| Neon bell σ          | 0.06    | Narrow enough that yellow (0.863) gets partial but not full weight.     |
+| L warm-lift factor   | 1.35    | Pulls yellows up without dragging reds; tuned visually.                 |
+| L neon a-priori      | 0.05    | Small — main work happens in Pass 5.                                    |
+| Chroma base          | 1.30    | General vibrancy lift applied to all hues.                              |
+| Chroma warm factor   | 0.55    | Additional chroma for warm-side hues.                                   |
+| Chroma neon a-priori | 0.10    | Small — main work happens in Pass 5.                                    |
+| L neon reduction     | 0.13    | Big enough to shift lime off its cusp.                                  |
+| C neon reduction     | 0.55    | Larger than L — chroma is what makes neon *neon*.                       |
+| lProximity window    | 0.25    | L distance from cusp at which proximity fades to zero.                  |
+
+<Aside type="tip">
+If you need to re-tune, the knobs with the most visual impact are **CUSP_L_CEILING**, the **L neon reduction** (Pass 5), and the **L warm-lift factor** (Stage 2). The other constants are "shape" numbers — changing them tends to introduce new failure modes rather than improve the output.
+</Aside>
+
+## Harmony Generators
+
+Every harmony function in `colour-schemes.ts` calls `harmonyMap` once per spoke:
+
+| Function                | Angles (degrees from source)            |
+|-------------------------|-----------------------------------------|
+| `complementary`         | 0, 180                                  |
+| `analogous(offset)`     | 0, +offset (default 30)                 |
+| `triadic`               | 0, 150, 270                             |
+| `splitComplementary(a)` | 0, 180−a, 180+a (default a=30)          |
+| `analogousN(n, spread)` | n evenly distributed around ±spread     |
+| `tetradic(spread)`      | 0, −spread, +spread, 180                |
+| `equilateralTriadic`    | 0, 120, 240                             |
+| `square`                | 0, 90, 180, 270                         |
+| `rectangular`           | 0, 60, 180, 240                         |
+| `hexagonal`             | 0, 60, 120, 180, 240, 300               |
+
+The generators only decide *which* angles to spoke; `harmonyMap` does all the perceptual heavy lifting.
+
+## Testing Visually
+
+The Colour Schemes showcase page (`/colour-schemes`) renders every harmony against every hue in the base palette, so any regression shows up immediately. Dial in a few test hues if you're iterating on the algorithm:
+
+- **Yellow (h≈90°)** — should come out bright and saturated, not olive.
+- **Orange (h≈60°)** — should keep its warmth when rotated from any source.
+- **Lime (h≈130°)** — the acid test for the cusp shelf. Should read lime-green, never neon.
+- **Blue (h≈260°)** — should come out deep and rich, not washed.
+- **Purple (h≈300°)** — should transition smoothly without stepping through grey.
+
+## References
+
+- Hunt, R. W. G. (1952). *Light and dark adaptation and the perception of color.* JOSA 42(3).
+- Kaiser, P. K. (1986). *Physiological response to color.* Color Research & Application.
+- Fairchild, M. D., & Pirrotta, E. (1991). *Predicting the lightness of chromatic object colors using CIELAB.* Color Research & Application 16(6), 385–393.
+- Ottosson, B. (2020). *A perceptual color space for image processing.* OKLCH specification — https://bottosson.github.io/posts/oklab/
+- Apple Design Resources — *HIG colour guidance* on perceptual lightness vs measured luminance.
