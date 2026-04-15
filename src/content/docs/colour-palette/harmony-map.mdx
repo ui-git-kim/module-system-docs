@@ -90,34 +90,34 @@ Plain barycentric decomposition. `wB` is implicit (not needed downstream).
 
 ```ts
 const baryL = wW + wP * newCusp.l;
-const reconstructedL =
-    baryL
-  + (newCusp.l - baryL) * warmLiftL * 1.35
-  - neonRisk * 0.05;
+const lDelta = newCusp.l - baryL;
+const rawLiftL = lDelta * warmLiftL * 1.35;
+const clampedLift = lDelta > 0 ? Math.min(rawLiftL, lDelta) : 0;
+const reconstructedL = baryL + clampedLift - neonRisk * 0.05;
 ```
 
 Three terms:
 
 1. **Barycentric baseline** (`baryL`) — same weights, new triangle.
-2. **Warm-lift pivot** — pull L toward the destination cusp, scaled by how much "warm lift" the hue deserves.
+2. **Warm-lift pivot (capped)** — pull L toward the destination cusp, but never overshoot it. If the barycentric baseline already sits above the cusp (pastel input, warm destination), the lift is disabled entirely.
 3. **Neon knockdown** — small downward nudge for cool-side hues whose cusp sits in the mid-bright zone where neon lives.
 
-The `1.35` factor was tuned so saturated yellows reach a perceptually-bright L without dragging reds along for the ride. See [Warm Lift](#warm-lift) below for the derivation.
+The `1.35` factor was tuned so saturated yellows reach a perceptually-bright L without dragging reds along for the ride. The cap matters: without it, `1.35` applied to a vivid blue's L-deficit would push the reconstructed yellow *past* its cusp onto the cusp→white edge, where `destMaxC` drops sharply — producing a muddy/pale yellow. We clamp so the lift lands *at* the cusp at most.
 
-### Stage 3: Reconstruct C by Source Depth
+### Stage 3: Reconstruct C by Intrinsic Saturation
 
 ```ts
-const sourceMaxC   = maxChromaAtLH(colour.l, oldH);
-const sourceDepth  = sourceMaxC > 0 ? colour.c / sourceMaxC : 0;
-const chromaAdjust = 1.3 + warmLiftC * 0.6 * Math.sqrt(sourceDepth) - neonRisk * 0.1;
-const depthAdjusted = Math.min(1, sourceDepth * chromaAdjust);
-const destMaxC = maxChromaAtLH(clampedL, newH);
+const chromaAdjust   = 1.3 + warmLiftC * 0.6 * Math.sqrt(wP) - neonRisk * 0.1;
+const depthAdjusted  = Math.min(1, wP * chromaAdjust);
+const destMaxC       = maxChromaAtLH(clampedL, newH);
 const reconstructedC = depthAdjusted * destMaxC;
 ```
 
-`sourceDepth` is the **anti-neon primitive**: it's the fraction of the source's maximum possible chroma at its own L. A 60%-saturated input produces a 60%-saturated output, regardless of how much chroma the new hue's gamut can hold. Without this, rotating a desaturated red to yellow would blast out at 100% yellow chroma because yellow's gamut is so wide.
+We use `wP` (the barycentric chroma weight = `c / cuspC`) directly as the **intrinsic saturation**. It's the anti-neon primitive: a 60% wP input produces a 60% wP output, regardless of how wide the new hue's gamut is. Without this, rotating a desaturated red to yellow would blast out at 100% yellow chroma because yellow's gamut is so wide.
 
-The `chromaAdjust` multiplier (1.3 base, +0.6 × warmLiftC × √sourceDepth, −0.1 × neonRisk) does the fine tuning: a general 1.3× boost lifts the overall palette vibrancy, warm hues get a further push because the H-K deficit tells us they need it to read saturated, and cool-side neon candidates lose a tiny bit pre-emptively. The warm bonus is gated by `sqrt(sourceDepth)` rather than linear `sourceDepth` — a linear gate cut pastel yellow too hard (dull), while no gate at all over-drove saturated yellow/lime. The square-root curve lands ~0.55 at 30% depth, ~0.71 at 50%, ~0.89 at 80% — meaningful lift at the pastel end without blowing out vivid inputs. The serious neon work happens in Pass 5.
+An earlier iteration used `sourceDepth = c / maxChromaAtLH(l, oldH)`, the fraction of the *source's* maximum chroma *at its own L*. This turned out to be the wrong primitive for harmony: because `maxChromaAtLH` drops sharply near the top and bottom of the gamut triangle, a pastel blue at L=0.85, C=0.05 registers `sourceDepth ≈ 1.0` — the algorithm treats it as fully saturated and blasts the destination yellow/lime to full chroma. The same input in barycentric weights is `wP ≈ 0.16`, correctly identifying it as a pastel. Switching to `wP` fixed the "pastels aren't pastel" failure.
+
+The `chromaAdjust` multiplier (1.3 base, +0.6 × warmLiftC × √wP, −0.1 × neonRisk) does the fine tuning: a general 1.3× boost lifts the overall palette vibrancy, warm hues get a further push because the H-K deficit tells us they need it to read saturated, and cool-side neon candidates lose a tiny bit pre-emptively. The warm bonus is gated by `sqrt(wP)` rather than linear `wP` — a linear gate cut pastel yellow too hard (dull), while no gate at all over-drove saturated yellow/lime. The square-root curve lands ~0.55 at 30% depth, ~0.71 at 50%, ~0.89 at 80% — meaningful lift at the pastel end without blowing out vivid inputs. The serious neon work happens in Pass 5.
 
 ### Pass 4: Measure Candidate Neon Score
 
@@ -128,7 +128,7 @@ const cFraction     = candidateMaxC > 0 ? reconstructedC / candidateMaxC : 0;
 const neonScore     = lProximity * cFraction * coolnessSharp;
 ```
 
-Pass 4 is a second-pass corrective. The a-priori `neonRisk` in Stage 1 guessed from `cusp.l` alone; this measures the **actual candidate** we just constructed. It catches cases where high `sourceDepth` pushed a colour into neon territory that `cusp.l` alone didn't predict.
+Pass 4 is a second-pass corrective. The a-priori `neonRisk` in Stage 1 guessed from `cusp.l` alone; this measures the **actual candidate** we just constructed. It catches cases where a high-`wP` input pushed a colour into neon territory that `cusp.l` alone didn't predict.
 
 Three shape signals, multiplied together so all three must align:
 
@@ -139,7 +139,7 @@ Three shape signals, multiplied together so all three must align:
 ### Pass 5: Apply Neon Reduction
 
 ```ts
-const neonCutScale = 1 + Math.max(0, 1 - sourceDepth) * 0.6;
+const neonCutScale = 1 + Math.max(0, 1 - wP) * 0.4;
 const finalL = clampedL - neonScore * 0.13 * neonCutScale;
 const finalC = reconstructedC * (1 - neonScore * 0.55 * neonCutScale);
 
@@ -148,7 +148,7 @@ return gamutMap3DShaded({ l: finalL, c: finalC, h: newH });
 
 Asymmetric reduction: a small L pull-down (0.13) and a larger C cut (0.55). The L cut needs to be meaty enough to actually shift lime off its cusp — a small nudge leaves it reading as a glowing apex colour. The C cut dominates because chroma is what makes neon *neon*.
 
-The `neonCutScale` multiplier makes Pass 5 firmer on pastel inputs. Pastel purple → lime barycentrically lands right on lime's capped cusp (high wW + a bit of wP × 0.88), which puts the candidate at the neon apex — unless we knock it back harder. Vivid inputs decompose with much more wP weight, land below the cusp naturally, and can handle the full neon edge. Scale is 1.6 at fully pastel, 1.0 at fully saturated.
+The `neonCutScale` multiplier makes Pass 5 firmer on pastel inputs. Pastel purple → lime barycentrically lands right on lime's capped cusp (high wW + a bit of wP × 0.88), which puts the candidate at the neon apex — unless we knock it back harder. Vivid inputs decompose with much more wP weight, land below the cusp naturally, and can handle the full neon edge. Scale is 1.4 at fully pastel, 1.0 at fully saturated. (Coefficient 0.4 — half of the earlier 0.6 — because the switch to `wP` means the knockdown already fires harder on pastels; the multiplier just needs a gentler additional push.)
 
 `gamutMap3DShaded` is the final sRGB containment step, used by every other colour generator in the module.
 
@@ -234,14 +234,14 @@ All single-use numeric constants in `harmonyMap`, with rationale:
 | `warmBase` cusp exp  | 3       | Heavily weights bright-gamut hues, damps dark-gamut contribution.       |
 | Neon bell centre     | 0.85    | Mid-bright cusp zone where "glow" neons live.                           |
 | Neon bell σ          | 0.06    | Narrow enough that yellow (0.863) gets partial but not full weight.     |
-| L warm-lift factor   | 1.35    | Pulls yellows up without dragging reds; tuned visually.                 |
+| L warm-lift factor   | 1.35    | Pulls yellows up without dragging reds; capped so it can't overshoot the cusp. |
 | L neon a-priori      | 0.05    | Small — main work happens in Pass 5.                                    |
 | Chroma base          | 1.30    | General vibrancy lift applied to all hues.                              |
-| Chroma warm factor   | 0.60    | Additional chroma for warm-side hues (gated by √sourceDepth).           |
+| Chroma warm factor   | 0.60    | Additional chroma for warm-side hues (gated by √wP).                    |
 | Chroma neon a-priori | 0.10    | Small — main work happens in Pass 5.                                    |
 | L neon reduction     | 0.13    | Big enough to shift lime off its cusp (× neonCutScale).                 |
 | C neon reduction     | 0.55    | Larger than L — chroma is what makes neon *neon* (× neonCutScale).      |
-| neonCutScale         | 1.0–1.6 | Pass 5 multiplier: 1.6 at pastel inputs, 1.0 at vivid.                  |
+| neonCutScale         | 1.0–1.4 | Pass 5 multiplier: 1.4 at pastel inputs (wP≈0), 1.0 at vivid (wP≈1).    |
 | lProximity window    | 0.25    | L distance from cusp at which proximity fades to zero.                  |
 
 <Aside type="tip">
