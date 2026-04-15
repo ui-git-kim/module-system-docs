@@ -227,6 +227,19 @@ export default defineConfig({
             },
             { label: "Billing", slug: "modules/billing" },
             {
+              label: "Colour Palette",
+              items: [
+                { label: "Overview", slug: "colour-palette" },
+                { label: "Configuration", slug: "colour-palette/configuration" },
+                { label: "Usage", slug: "colour-palette/usage" },
+                { label: "Integration", slug: "colour-palette/integration" },
+                { label: "Harmony Map", slug: "colour-palette/harmony-map" },
+                { label: "Developer Workflow", slug: "colour-palette/developer-workflow" },
+                { label: "Changelog", slug: "colour-palette/changelog" },
+                { label: "Roadmap", slug: "colour-palette/roadmap" },
+              ],
+            },
+            {
               label: "Pickers",
               items: [
                 { label: "Overview", slug: "modules/pickers" },
