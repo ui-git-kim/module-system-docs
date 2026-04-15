@@ -234,6 +234,8 @@ export default defineConfig({
                 { label: "Usage", slug: "colour-palette/usage" },
                 { label: "Integration", slug: "colour-palette/integration" },
                 { label: "Harmony Map", slug: "colour-palette/harmony-map" },
+                { label: "Gamut Mapping", slug: "colour-palette/gamut-mapping" },
+                { label: "Tonal Scale", slug: "colour-palette/tonal-scale" },
                 { label: "Developer Workflow", slug: "colour-palette/developer-workflow" },
                 { label: "Changelog", slug: "colour-palette/changelog" },
                 { label: "Roadmap", slug: "colour-palette/roadmap" },

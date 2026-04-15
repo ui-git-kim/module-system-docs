@@ -1,0 +1,251 @@
+---
+title: Tonal Scale
+description: Derivation and design rationale for generateTonalScalePaintMix — the paint-mix algorithm that produces lighter tints and darker shades from a single anchor colour.
+sidebar:
+  order: 12
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`generateTonalScalePaintMix(colour, opts)` takes a single anchor colour and returns a ramp of lighter tints above it and darker shades below, reading as *the same colour at different brightness levels*. The shadcn-style UI pipeline in this module uses it for background variants, hover states, borders, disabled surfaces, and chart accents — anywhere a family of related tones is needed from one brand colour.
+
+The algorithm is built on a specific mental model: a painter with two pots of colourful paint, dabbing into the anchor in increasing amounts. The next few sections walk through why more obvious approaches fail, how the painter's metaphor resolves them, and how each tuning constant was chosen.
+
+## The Three Failure Modes
+
+Produce lighter and darker versions of a colour naively and at least one of three things goes wrong:
+
+1. **Linear L interpolation punches through the gamut.** The reachable sRGB colours at a given hue form a triangle from (0, 0) through the cusp to (1, 0) in L × C space — not a rectangle. Lerping L while holding chroma constant walks across the top or bottom of that triangle and exits through the slanted sides. The result either clips to mud or requires aggressive gamut mapping that kills vividness.
+
+2. **Equal-L spacing looks uneven.** Yellow's cusp sits at L≈0.89. Darkening it from 0.89 to 0.59 (a 0.30 drop) passes through visually dramatic territory because yellow's chroma contracts quickly as L falls. The same 0.30 drop starting from blue's L≈0.45 is perceptually subtle. Uniform L spacing produces a crowded dark end and a thin light end — or vice versa — depending on hue.
+
+3. **Hue drift on the dark side.** As L falls, warm hues desaturate and drift cool: orange becomes brown, yellow becomes olive. Without a warm-side correction, the dark shades feel like a different colour family from the anchor.
+
+The paint-mix algorithm fixes all three in the same move: interpolate not between L values, but between the anchor and two carefully-chosen colourful endpoints.
+
+## The Painter's Metaphor
+
+Imagine a painter with three jars:
+
+- A jar of **the anchor** — pure, saturated paint at the input hue.
+- A jar of the **lightest colourful version** of that hue — not white, but the brightest still-saturated form on this hue's gamut.
+- A jar of the **darkest colourful version** — not black, but the darkest still-saturated form.
+
+Each step in the tonal scale is produced by dipping the brush into the anchor, then mixing in a dab of one of the other two jars. For tints, grow the dab of the light jar. For shades, grow the dab of the dark jar. The further from the anchor, the bigger the dab.
+
+The unlock: **the endpoints are colourful, not neutral.** Mix a colour with white and you desaturate it (and at the extreme, erase its identity). Mix it with a lighter version of itself and you brighten it while preserving hue. Same on the dark side — mixing toward a dark colourful endpoint keeps the hue family intact all the way through the scale.
+
+## The 7-Step Algorithm
+
+```
+  1. Anchor         5. Light steps
+     │                 │   (linear dabs, 65/35 chroma blend)
+  2. Anchor chroma   ↓
+     fraction       6. Dark steps
+     │                 │   (t^1.7 power-curve dabs)
+  3. L range         ↓
+     (gamut-driven) 7. Assemble
+     │
+  4. Build two
+     endpoint pots
+```
+
+### Step 1 — Anchor via `gamutMap3D`
+
+```ts
+const anchor = gamutMap3D(colour);
+const cusp   = findCuspForHue(anchor.h);
+const cuspC  = cusp.c;
+```
+
+Every subsequent step works in terms of the gamut-mapped anchor — the same vivid-aware result the [Gamut Mapping](/colour-palette/gamut-mapping/) page describes, and exactly what the Colour Gamut tool's "3D Nearest" card shows. Whatever the user typed in, the algorithm starts from the most vivid in-gamut version of it.
+
+### Step 2 — Anchor's Chroma Fraction
+
+```ts
+const anchorMaxC    = maxChromaAtLH(anchor.l, anchor.h);
+const anchorFraction = anchorMaxC > 0
+  ? Math.min(anchor.c / anchorMaxC, 1)
+  : 0.85;
+```
+
+This is the anchor's chroma as a fraction of what the gamut allows at its own L. The endpoints inherit this fraction — if the anchor sits at 70% of its max chroma, the light and dark endpoints will also sit at 70% of *their* max chromas. That's what keeps the scale's "richness" consistent across steps.
+
+<Aside type="note">
+The harmony-map page explains why `anchor.c / maxChromaAtLH` is a problematic **saturation** measure when you're *rotating* hue — `maxChromaAtLH` collapses near white, inflating the ratio artificially. For the tonal scale it's the right measure, because we're staying at the same hue. The gamut triangle is identical at every step, so the fraction is comparable across the scale.
+</Aside>
+
+### Step 3 — Find the L Range from Gamut Shape
+
+```ts
+const threshold = cuspC * 0.08;
+let lMaxFull = cusp.l;
+for (let testL = cusp.l; testL <= 0.98; testL += 0.01) {
+  if (maxChromaAtLH(testL, anchor.h) < threshold) break;
+  lMaxFull = testL;
+}
+lMaxFull = Math.min(lMaxFull + 0.02, 0.985);
+// ...same walk downward for lMinFull
+```
+
+Walk outward from the cusp in both directions, stopping when the available chroma at that L drops below 8% of the cusp's chroma. This defines a per-hue L range in the region where "useful colour" exists.
+
+Yellow ends up tall (cusp at L≈0.89, useful range down to L≈0.55). Blue ends up narrower (cusp at L≈0.45, useful range down to L≈0.15). Each hue gets a natural range without per-hue constants — the gamut boundary itself supplies the shape.
+
+The 8% threshold was picked empirically. 5% extends too deep into near-black olive for yellow; 15% crops off shades that still read as "the same colour". The `opts.range` parameter lets callers slice a sub-range from this full L range — `[0.2, 0.8]` extracts the middle 60%, useful when a UI context wants only the interior of the scale.
+
+### Step 4 — Build the Two Endpoint Pots
+
+```ts
+const lightMC = maxChromaAtLH(lMax, anchor.h);
+const lightEnd = gamutMap3D(
+  { l: lMax, c: lightMC * anchorFraction, h: anchor.h }, 0.05, 3,
+);
+
+const darkMC = maxChromaAtLH(lMin, anchor.h);
+const darkEnd = gamutMap3D(
+  { l: lMin, c: darkMC * anchorFraction, h: anchor.h }, 0.05, 3,
+);
+```
+
+These are the two paint pots — the **lightest colourful** and **darkest colourful** version of the hue. Each sits at the anchor's chroma fraction of its own L's gamut max. Both pass through `gamutMap3D` with reduced search bounds (±0.05 L, ±3°) — small enough that neither endpoint wanders off the hue, large enough to nudge each into its local widest-gamut patch.
+
+This is the critical design choice: **the endpoints are not white and black.** A tonal scale that mixed anchor with white would desaturate every tint. A scale that mixed anchor with black would mud every shade. Mixing with colourful endpoints preserves hue family across the full scale.
+
+### Step 5 — Light Side (Linear Dabs, Blended Chroma)
+
+```ts
+for (let i = lighterCount; i >= 1; i--) {
+  const t       = i / lighterCount;
+  const stepL   = lerp(anchor.l, lightEnd.l, t);
+  const linearC = lerp(anchor.c, lightEnd.c, t);
+  const gamutC  = maxChromaAtLH(stepL, anchor.h) * anchorFraction;
+
+  lightSteps.push(gamutMap3D({
+    l: stepL,
+    c: linearC * 0.65 + gamutC * 0.35,
+    h: lerpHue(anchor.h, lightEnd.h, t),
+  }, 0.05, 3));
+}
+```
+
+Equal linear dabs — step `i` out of `lighterCount` gets a dab of size `i / lighterCount`. L and H interpolate linearly between anchor and `lightEnd`.
+
+Chroma is the interesting bit: a **65/35 blend of two candidates**:
+
+- **`linearC`** — straight linear interpolation of chroma from anchor to `lightEnd`.
+- **`gamutC`** — what the gamut boundary would allow at this L, scaled by the anchor's chroma fraction.
+
+Pure linear undershoots the gamut boundary's curve and produces dull mids. Pure gamut-following hits the wall too hard and produces neon-ish mids. 65/35 — favouring linear for stability, with enough gamut-awareness to keep the midtones rich — is the working compromise. It was tuned empirically against saturated yellow, orange, and purple anchors, which are the three hues most sensitive to the mid-range dullness failure.
+
+Each result passes through `gamutMap3D` with reduced search bounds for a final polish.
+
+### Step 6 — Dark Side (Power-Curve Dabs)
+
+```ts
+for (let i = 1; i <= darkerCount; i++) {
+  const linearT = i / darkerCount;
+  const t       = Math.pow(linearT, 1.7);
+  darkSteps.push(gamutMap3D({
+    l: lerp(anchor.l, darkEnd.l, t),
+    c: lerp(anchor.c, darkEnd.c, t),
+    h: lerpHue(anchor.h, darkEnd.h, t),
+  }, 0.05, 3));
+}
+```
+
+Dabs grow on a `t^1.7` curve. The first dark step gets `(1/5)^1.7 ≈ 0.066` — a gentle nudge toward the dark endpoint. The last step gets the full `1.0` dab. The effect: early shades sit close to the anchor (small perceptual jumps), later shades accelerate toward the dark extreme.
+
+The `1.7` exponent was chosen empirically. `1.0` (linear) put the first dark too far from the anchor — a visible jump. `2.0` squeezed steps 1–2 so close they became indistinguishable. `1.7` is the sweet spot where every step is distinguishable and the curve feels natural.
+
+L, C, **and H** are all interpolated. That last bit matters: if `lightEnd.h` and `darkEnd.h` drifted during their `gamutMap3D` call (which they typically do for warm hues, where chroma constraints pull the endpoints slightly warmer), the dark steps inherit that drift automatically. The warm-hue "don't become brown" correction is implicit in the endpoint construction — no separate warm-shift constant is required.
+
+### Step 7 — Assemble
+
+```ts
+return {
+  steps: [...lightSteps, anchor, ...darkSteps],
+  anchorIndex: lighterCount,
+};
+```
+
+Lightest first, anchor in the middle, darkest last. `anchorIndex` lets consumers locate the original brand colour in the scale.
+
+## Why Asymmetric (Linear Lights, Power-Curve Darks)
+
+The asymmetry reflects the gamut geometry itself.
+
+The **light side** usually has less perceptual range to cover — for most hues the cusp sits relatively close to white, so `lMax` is only modestly brighter than the anchor. Equal dabs produce evenly-spaced steps that feel right.
+
+The **dark side** covers much more L distance — often 0.4 or more units for bright-cusp hues like yellow and orange. Equal dabs there produce a visible first-step jump: the dab is small in absolute terms, but the dark endpoint is so far away that even a small fraction of the way toward it moves significantly. The `t^1.7` curve starts the dabs tiny and grows them — matching the perceptual feel of each step being "a bit darker than the last" rather than "a big plunge toward black".
+
+Symmetric curves were tested. Linear everywhere was too flat on the light side and too big-stepping on the dark. Power curves on both sides compressed the light side uncomfortably. Asymmetric — linear up, power-curve down — is the shape that matches how the gamut actually widens and narrows around the cusp.
+
+## Design History — Approaches Tried and Rejected
+
+The current algorithm is the fifth iteration. The previous versions live in `colour-reference.ts` and each one illustrates a mode of failure:
+
+1. **Hybrid (chroma-weighted darks).** Even-L spacing with chroma ease-off on the light side and chroma-weighting on the dark side. Visible jump from anchor to the first dark step.
+2. **Power-curve hybrid.** Same as above, but dark side used `t^1.6` L spacing. Fixed the anchor-to-first-dark jump but the darks felt "computed" — correct in shape, wrong in character.
+3. **Paint-mix v1.** Compute two tinted endpoints (tinted white at `lMax`, tinted black at `lMin`), then lerp between them. Rich mids, but the light steps came out too close to white. This was the version that prompted the user's reframe: *"it's using the lightEnd mixed with the anchor, and darkEnd mixed with anchor — and the amount in the dab is perceptually equal."*
+4. **Paint-mix with ΔE equalisation.** Sample each anchor-to-endpoint path at 200 points, measure ΔE from the anchor at each, match every dark step's ΔE to its mirror light step. Theoretically perceptually equal. Failed for blue: the dark path was shorter than the light path, so proportional scaling clumped the dark steps together.
+5. **Paint-mix with power-curve darks (current).** Linear dabs on the light side, `t^1.7` dabs on the dark side, chroma blended 65/35 on the light side.
+
+The painter's metaphor was the pivot between v2 and v3. Once the mental model stopped being "a scale computation" and became "dabs of two colourful paints", everything else fell out naturally.
+
+## Master Scale and Sampling
+
+UI contexts request different numbers of steps from the same base colour — a border wants 3 light steps, a chart series wants 7 mid-range steps, a full shadcn scale wants 11. Re-running the full algorithm for every request would be wasteful and would produce slightly different results at different resolutions.
+
+The fix is a master scale: 51 steps (25 lighter + anchor + 25 darker) at high resolution, generated once per colour, sampled cheaply afterwards.
+
+```ts
+export function generateTonalMaster(colour: OklchColor): TonalMaster {
+  const result = generateTonalScalePaintMix(colour, { lighter: 25, darker: 25 });
+  return {
+    steps: result.steps,
+    anchorIndex: result.anchorIndex,
+    anchor: result.steps[result.anchorIndex],
+  };
+}
+
+export function sampleTonalScale(
+  master: TonalMaster,
+  steps: number,
+  rangeStart = 0,
+  rangeEnd = 1,
+): { steps: OklchColor[]; anchorIndex: number };
+```
+
+`sampleTonalScale` picks evenly-spaced indices from the master and snaps the nearest index to the anchor if it falls within the requested range — so any sampled scale that covers the anchor L contains the exact anchor, not an interpolated neighbour.
+
+## Tuning Constants
+
+| Constant                            | Value        | Purpose                                                                     |
+|-------------------------------------|--------------|-----------------------------------------------------------------------------|
+| Anchor via `gamutMap3D`             | default      | Same vivid-aware result the Gamut page's "3D Nearest" card produces.        |
+| Chroma threshold for L range        | 8% of cusp C | Where useful colour gives way to near-neutral. 5% overshoots, 15% crops.    |
+| Light-side chroma blend             | 65% linear / 35% gamut-following | Rich mids without neon.                                  |
+| Dark-side curve exponent            | 1.7          | First dark close to anchor; steps 1–2 distinguishable; last dark at endpoint. |
+| Per-step `gamutMap3D` shifts        | 0.05 L, 3° H | Polish without wandering off the hue.                                       |
+| Default `lighter` / `darker` counts | 5 / 5        | 11 steps total including anchor — the shadcn / Material Design standard.    |
+| Master scale size                   | 25 / 25      | 51 steps total. Enough resolution that any downsample is visually smooth.   |
+
+<Aside type="tip">
+If you need to re-tune, the knobs with the most visual impact are the **dark-side curve exponent** (controls first-step jump vs late-scale compression) and the **light-side chroma blend** (controls mid-scale vibrancy). The L range threshold and the per-step polish shifts are "shape" numbers — changes there tend to introduce new failure modes rather than improve output.
+</Aside>
+
+## Testing Visually
+
+The Colour Palette tool renders every generated scheme's tonal scale for every brand colour, so any regression is immediately visible. Useful probes if you're iterating on the algorithm:
+
+- **Yellow (h≈90°)** — the tall-range hard case. Darks should read as mustard/olive progression, not jumping to dead brown.
+- **Orange (h≈60°)** — the hue-drift hard case. Darks should stay warm; if they read as terracotta → chocolate that's correct, if they read as grey-brown the endpoint construction has drifted.
+- **Blue (h≈260°)** — the short-dark-path hard case. Every dark step should be visibly distinct; clumping is the failure mode.
+- **Lime (h≈130°)** — the neon-adjacent hard case. Lights should lift to pale mint, never to neon yellow-green.
+- **Purple (h≈300°)** — the mid-chroma smooth case. Both sides should progress smoothly without a visible "break".
+
+## See Also
+
+- [Gamut Mapping](/colour-palette/gamut-mapping/) — the `gamutMap3D` function that produces the anchor and every endpoint.
+- [Harmony Map](/colour-palette/harmony-map/) — the hue-rotation counterpart. Tonal scale stays at one hue; harmony map crosses hues. The two algorithms share the `maxChromaAtLH` / `findCuspForHue` primitives.

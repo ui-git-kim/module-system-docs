@@ -1,0 +1,206 @@
+---
+title: Gamut Mapping
+description: Derivation and design rationale for gamutMap3D and gamutMap3DShaded — the 3D neighbourhood-search gamut mapper used throughout the Colour Palette module.
+sidebar:
+  order: 11
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`gamutMap3D(colour, maxLShift, maxHueShift)` takes an OKLCH coordinate that may lie outside the sRGB gamut and returns the nearest in-gamut colour — but "nearest" is measured in three dimensions, not one. Instead of collapsing chroma at a fixed lightness and hue (what CSS Color 4 does), it searches a small neighbourhood in L × H for the widest-gamut target, then blends the input toward it by exactly as much as the gamut geometry allows.
+
+Every vivid output in the Colour Palette module eventually passes through this function. `gamutMap3DShaded` wraps it for the common case where the input is already in-gamut but would benefit from the same vivid-aware reconstruction.
+
+## Why a Naive Clip Fails
+
+Standard CSS Color 4 gamut mapping — `culori.clampChroma` and every implementation that follows the spec — holds L and H constant and binary-searches chroma downward until the colour lands inside sRGB. Mathematically correct, but perceptually over-aggressive: it only moves along the chroma axis at a fixed (L, H), so it kills more chroma than necessary.
+
+For vivid OKLCH inputs the result is dull. Saturated yellow at `L=0.74, C=0.19, H=90` emerges as muddy olive — nowhere near the bright yellow the coordinates describe. The W3C CSS Working Group has documented this extensively in [issue #10579](https://github.com/w3c/csswg-drafts/issues/10579) and is actively evaluating replacement algorithms (Edge Seeker, Chromium, Raytrace, Ottosson).
+
+The reframe that unlocked `gamutMap3D`:
+
+> Don't ask "how do I clip this colour back in?" Ask "where is the nearest **vivid** in-gamut point?"
+
+OKLCH is a 3D cylinder — L × C × H — and the sRGB gamut boundary is a complex surface inside it. The widest patch of that surface isn't necessarily at the input (L, H). For yellow, the gamut widens dramatically as L approaches the cusp at L≈0.89; shifting L toward the cusp recovers far more chroma than clipping in place. Small hue shifts (±5°) land on similarly wider belts — green and cyan have noticeably fatter gamut regions than red or magenta.
+
+## The 5-Step Pipeline
+
+```
+  Step 1   →   Step 2   →   Step 3   →   Step 4   →   Step 5
+    │            │            │            │            │
+ Analyse      Find the     Blend by     Correct      Fill chroma
+ input        vividest     triangle     temperature  to 97% of
+ neighbour-   (L, H) in    ratio                     available
+ hood         the range
+```
+
+### Step 1 — Analyse
+
+```ts
+if (_inSrgb({ mode: 'oklch', l, c, h })) return color;
+
+const maxCHere   = maxChromaAtLH(l, h);
+const cuspL      = peakLightnessForHue(h);
+const lDirection = cuspL > l ? 1 : -1;
+const lBound     = l + lDirection * maxLShift;
+```
+
+An in-gamut input short-circuits here — no work to do. Otherwise we establish two facts: how much chroma is available at the input's own (L, H), and which direction the hue's cusp sits. Searching *toward* the cusp is the only direction that can improve chroma; moving away can only reduce it.
+
+### Step 2 — Find the Vivid Spot
+
+```ts
+const lSteps = 16;
+const hSteps = 10;
+
+let vividL = l, vividH = h, vividMaxC = maxCHere;
+
+for (let li = 0; li <= lSteps; li++) {
+  const candidateL = lerp(l, lBound, li / lSteps);
+  if (candidateL < 0.01 || candidateL > 0.99) continue;
+
+  for (let hi = 0; hi <= hSteps; hi++) {
+    const hueOffset  = lerp(-maxHueShift, maxHueShift, hi / hSteps);
+    const candidateH = ((h + hueOffset) % 360 + 360) % 360;
+
+    const mc = maxChromaAtLH(candidateL, candidateH);
+    if (mc > vividMaxC) {
+      vividMaxC = mc;
+      vividL    = candidateL;
+      vividH    = candidateH;
+    }
+  }
+}
+```
+
+A 17 × 11 = 187-candidate grid search (16 and 10 *steps*, so one more sample at each end). Every candidate is scored by a single primitive — `maxChromaAtLH`, which binary-searches the sRGB boundary for the maximum in-gamut chroma at a given (L, H). No distance metric, no weighting, no hue preference: the gamut boundary itself decides.
+
+This is the anti-dullness move. If the input is a yellow just beyond sRGB, the grid will almost always find a better (L, H) point toward the cusp. If the input is already a reasonable blue, the grid returns values close to the input and the next step will produce a small correction.
+
+### Step 3 — Blend by Triangle Ratio
+
+Rather than jumping all the way to the vivid spot (which would overcorrect — a blue input would come out as cyan), blend from the input toward it by exactly enough to reach the target chroma.
+
+```ts
+const targetC       = c * 0.80;
+const chromaRange   = vividMaxC - maxCHere;
+const chromaNeeded  = targetC - maxCHere;
+
+const blendT = chromaRange > 0
+  ? Math.min(Math.max(1 - chromaNeeded / chromaRange, 0), 1)
+  : 0;
+
+const blendedL = lerp(l, vividL, blendT);
+const blendedH = lerpHue(h, vividH, blendT);
+```
+
+The blend fraction is **not a tuning knob** — it's derived directly from the gamut geometry. `(chromaNeeded / chromaRange)` is "how much of the available chroma headroom do we need", expressed as a 0→1 fraction. Subtracting from 1 inverts it so `blendT = 1` means "no shift needed, stay here" and `blendT = 0` means "take the full trip to the vivid spot".
+
+Target chroma backs off to 80% of the originally-requested C. Any higher and the output jumps visibly every time the pipeline runs; any lower and the result reads as dull. 80% is the smallest back-off that consistently produces calm, in-gamut results.
+
+### Step 4 — Temperature Correction
+
+The grid search in Step 2 is biased cool, because green and cyan have the widest gamut belts in mid-bright L. Without correction, saturated oranges drift noticeably toward yellow-green — orange becomes amber, amber becomes mustard. Step 4 pulls the hue back toward the original, proportional to how much of the search range actually got used:
+
+```ts
+const hueShift = Math.abs(((blendedH - h + 540) % 360) - 180);
+const t                = maxHueShift > 0 ? Math.min(hueShift / maxHueShift, 1) : 0;
+const correctionAmount = Math.pow(t, 1.5);
+const bestH            = lerpHue(blendedH, h, correctionAmount);
+const bestL            = blendedL;
+const bestC            = maxChromaAtLH(bestL, bestH);
+```
+
+The curve is `t^1.5` — an ease-in:
+
+- **Full search range** (`t=1`): correction 1.0, pull all the way back to original hue.
+- **Half range** (`t=0.5`): correction ≈ 0.35, moderate pull-back.
+- **Quarter range** (`t=0.25`): correction ≈ 0.125, barely touch it.
+
+The reasoning: small hue shifts are usually a genuine gamut preference (blue legitimately has more room at 265° than at 260°) and shouldn't be undone. Large shifts are usually temperature drift and must be. `t^1.0` over-corrects at mid-shifts and washes out the benefit of searching in the first place; `t^2.0` under-corrects and lets oranges drift to mustard. `t^1.5` is the working compromise.
+
+### Step 5 — Fill Chroma
+
+At the corrected (L, H), pack in as much chroma as fits, with a small margin:
+
+```ts
+const finalC = Math.min(c, bestC * 0.97);
+const result = gamutMap({ l: bestL, c: finalC, h: bestH });
+```
+
+The `0.97` keeps the output 3% off the gamut wall — far enough that floating-point noise in the boundary search doesn't push the result out, close enough to preserve saturation. The trailing `gamutMap` call is a safety net: the 3D pipeline should land us inside the gamut, but if numerical noise leaves a few thousandths of a point outside, the CSS Color 4 clip mops up.
+
+## Key Properties
+
+**In-gamut inputs pass through unchanged.** Step 1's short-circuit means no colour that already fits sRGB is modified. The function is a no-op on valid inputs.
+
+**No per-hue tuning.** Yellow, blue, and red all get different treatment — but that treatment comes from `maxChromaAtLH` and `peakLightnessForHue` returning different numbers, not from hue-specific constants. The algorithm stays correct if the gamut-boundary lookup is updated or replaced.
+
+**The blend is derived from the triangle.** `(chromaNeeded / chromaRange)` is the gamut boundary's chroma gradient translated into a blend fraction. Pure geometry — there is no tuned blend constant.
+
+**Temperature correction is proportional.** `(ΔH / maxHueShift)^1.5` scales with the search parameters. If `maxHueShift` changes from 5° to 10°, the correction curve adapts automatically.
+
+**Cost.** Dominated by 187 `maxChromaAtLH` calls in Step 2, each ~13 iterations of a boundary binary search. Roughly 2,400 gamut checks per colour — comfortably fast for palette generation (dozens of colours), far too slow for per-pixel rendering.
+
+## `gamutMap3DShaded`
+
+The 3D pipeline only does useful work when the input is *out of gamut*. In-gamut inputs short-circuit at Step 1 and return unchanged. But most inputs the palette module receives are in-gamut hex values from a colour picker — which means the vivid-aware logic never runs for the colours that would most benefit.
+
+The shaded wrapper forces the pipeline to run by darkening the input just enough to push it past the boundary:
+
+```ts
+export function gamutMap3DShaded(color: OklchColor): OklchColor {
+  const shadedL       = Math.max(0.01, color.l - 0.15);
+  const shadedInGamut = _inSrgb({ mode: 'oklch', l: shadedL, c: color.c, h: color.h });
+
+  if (!shadedInGamut) {
+    // Shaded version is out — let gamutMap3D find the vivid neighbour
+    return gamutMap3D({ ...color, l: shadedL });
+  }
+  // Even shaded, input is genuinely low-chroma — return it as-is
+  return gamutMap3D(color);
+}
+```
+
+Why −0.15? It's large enough to push most mid-chroma inputs past the boundary (so the 3D search finds the widest-gamut patch and pulls L back up through the blend step), but not so large it distorts already-dark inputs. For low-chroma inputs whose shaded version still fits in gamut, the wrapper falls through to the unshaded call — the input is genuinely a muted colour and doesn't need 3D optimisation.
+
+This is the function used throughout the module: by `harmonyMap` for its final containment step, by the working-colour store when ingesting user input, and by the palette generator during chart-colour placement. Plain `gamutMap3D` is only exposed directly for the Colour Gamut tool, where users want to see what each pipeline stage produces on a chosen input.
+
+## Iteration History
+
+For context on why the current shape is what it is, the functions that `gamutMap3D` replaced:
+
+- **`gamutMap`** — plain CSS Color 4 clip via `clampChroma`. The starting point. Too dull for vivid inputs.
+- **`gamutMapVivid`** — clip first, then slide L toward the cusp to recover chroma. Partially worked, but the "slide amount" was a hand-tuned bias parameter with no principled value.
+- **`ottosonGamutMap`** — Björn Ottosson's analytical direct-projection algorithm. Fast (O(1), no iteration), best hue preservation (ΔH ≈ 2.28), but holds hue fixed like CSS Color 4 and therefore inherits the same dullness for hues whose widest-gamut point isn't at the input H.
+- **`projectTowardGrey`, `projectTowardCusp`, `projectAdaptive`** — various targeted-projection experiments. All live on the Colour Gamut comparison page as reference implementations; none matched `gamutMap3D` in side-by-side output.
+- **`mindeMap`, `cssColor4Map`** — direct implementations of the spec approaches, kept as baselines.
+
+What the 3D search does that none of them did: combine *all three* degrees of freedom OKLCH offers — L shift, H shift, C scaling — into a single step that first locates the widest-gamut neighbourhood and *then* blends toward it by a geometrically-derived amount.
+
+## Tuning Constants
+
+| Constant             | Default | Purpose                                                                 |
+|----------------------|---------|-------------------------------------------------------------------------|
+| `maxLShift`          | 0.15    | Max L search distance toward the cusp. Reaches most cusp regions while preserving input L character. |
+| `maxHueShift`        | 5°      | Max hue search distance either side. Finds better gamut patches without letting temperature correction wash out the result. |
+| L grid steps         | 16      | 17 samples along the L axis (i=0…16). |
+| H grid steps         | 10      | 11 samples across the H range. Combined with L: 187 candidates. |
+| Target C factor      | 0.80    | 20% back-off from requested C. Higher produces jumpy output; lower reads as dull. |
+| Temperature curve    | `t^1.5` | Ease-in. `t^1.0` over-corrects at mid-shifts; `t^2.0` under-corrects. |
+| Chroma fill          | 0.97    | 3% gamut margin. Prevents banding and absorbs boundary-search noise. |
+| Shaded L offset      | −0.15   | Pushes most mid-chroma inputs out of gamut; small enough to leave dark inputs alone. |
+
+<Aside type="tip">
+If you need to re-tune, the knobs with the most visual impact are **Target C factor** (vibrancy vs stability) and **maxHueShift** (search width for the vivid spot). The grid-resolution numbers are cost/quality trade-offs rather than perceptual ones.
+</Aside>
+
+## References
+
+1. Ottosson, B. (2021). *Gamut clipping for OKLCH.* [bottosson.github.io](https://bottosson.github.io/posts/gamutclipping/) — the analytical direct-projection method; ported as `ottosonGamutMap`.
+2. Ottosson, B. (2020). *A perceptual color space for image processing.* [bottosson.github.io](https://bottosson.github.io/posts/oklab/) — OKLab background; the perceptual uniformity that makes L-shifting tractable.
+3. dokozero. *OKLCH gamut clipping tests.* [dokozero.github.io](https://dokozero.github.io/oklch-tests/) — visual comparisons across every major algorithm. Showed that the choice of target coordinate matters more than the clipping technique.
+4. dokozero. *OKLCH relative chroma.* [dokozero.github.io](https://dokozero.github.io/oklch-relative-chroma/) — the "generate colours already in gamut" reframing. Led to searching the 3D neighbourhood for the widest-gamut point.
+5. Smashing Magazine. *OKLCH Color Spaces, Gamuts, and CSS.* [smashingmagazine.com](https://www.smashingmagazine.com/2023/08/oklch-color-spaces-gamuts-css/) — practical OKLCH overview.
+6. W3C CSS Working Group. *Replace CSS Color 4 gamut mapping algorithm (issue #10579).* [github.com/w3c/csswg-drafts](https://github.com/w3c/csswg-drafts/issues/10579) — current research on replacement algorithms.
+7. colorjs.io / Simon Cozens. *Gamut mapping in ColorJS.* Practical comparisons showing every algorithm that delegates to `clampChroma` inherits the over-reduction problem.
