@@ -17,6 +17,61 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v1.21.0
+
+**Style Registry + `components.json` sync pipeline**
+
+A single `styleRegistry` for modules to contribute both **runtime CSS overrides** (tokens + raw CSS) and **build-time shadcn `components.json`** values (style, base colour, cssVariables, registries, aliases). Complements the existing `theme.cssVariables` filter and `theme.changed` action hooks from v1.20.1.
+
+Full reference on the [Registry Reference page](/starter-template/registries/#style-registry); terminal script usage on [CLI Scripts](/starter-template/scripts/#sync-shadcn-components); toggle reinstall UI is [on the roadmap](/starter-template/roadmap/#in-app-component-reinstall-for-style-registry).
+
+### What's new
+
+**Frontend — `frontend/src/config/style.registry.ts`** + **`frontend/src/lib/style-pipeline.ts`**
+
+- Imperative API: `register`, `update`, `unregister`, `setOverride`, `clearOverride`, `applyOverrides`.
+- Exclusivity enforced at registration for `componentsJson.style`, `componentsJson.tailwind.baseColor`, `componentsJson.tailwind.cssVariables` — a second entry claiming the same field throws `StyleRegistryError` with code `EXCLUSIVE_FIELD_CLAIMED`. Additive fields (`aliases`, `registries`) merge with last-write-wins and a `console.warn` on overlap.
+- Pipeline merges tokens by `order`, pipes through the existing `theme.cssVariables` filter, applies via `applyThemeVariables()`, and writes concatenated raw CSS into a single `<style id="module-styles">` tag appended to `<head>` (so module CSS wins over `globals.css` on specificity ties).
+- **Bug fixed in the process:** `applyThemeVariables` only ever *set* CSS variables on `:root` — stale values were never cleared. The new pipeline tracks previously-applied tokens and clears any that aren't in the next merge, so disabling a module reliably reverts its tokens.
+
+**Backend — `AppSettings.styleOverrides`**
+
+New `Json` field on the `AppSettings` model persisting per-entry admin toggles (`Record<entryId, boolean>`). Modules ship `enabled: true` by default; admin overrides win. `AppSettingsContext` calls `styleRegistry.applyOverrides(map)` on load, so the pipeline honours the admin's state before modules finish registering.
+
+New endpoints:
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET` | `/api/v1/admin/style-overrides` | Authenticated | Read full overrides map (frontend bootstrap) |
+| `PUT` | `/api/v1/admin/style-overrides` | Admin only | Replace full overrides map |
+
+Action hook `admin.styleOverridesUpdated` fires after a successful update so modules can react (e.g. invalidate caches).
+
+**Sync script — `npm run components:sync`**
+
+PowerShell + Bash scripts at `scripts/sync-components.{ps1,sh}`. Reads `componentsJsonContribution` from each enabled module in `.module-manifests.json`, enforces exclusivity, merges into `frontend/components.json` atomically, then runs `npx shadcn@latest add --overwrite` for the union of `installedShadcnComponents` from `.module-state.json`. A `--dry-run` / `-DryRun` mode previews without writing. Bash version requires `jq`.
+
+```bash
+npm run components:sync        # merge manifests → components.json → reinstall
+npm run components:sync:dry    # preview only
+```
+
+### Migration for downstream apps
+
+1. `npm run template:update` — merges the new `AppSettings.styleOverrides` field into your Prisma schema (also updates the multi-file `app-settings.prisma` heredoc for apps that were on multi-file mode but hadn't added AppSettings yet).
+2. `cd backend && npx prisma migrate dev --name add_style_overrides` — creates the DB migration.
+3. `npm run components:sync` — no-op if you have no modules contributing to `componentsJson`; otherwise applies their contributions.
+
+### Module contract
+
+Modules that want to contribute `componentsJson` fields declare a `componentsJsonContribution` entry in their `.module-manifests.json` **in addition to** calling `styleRegistry.register({ componentsJson: {...} })` at module load time. The registry copy is for runtime validation (exclusivity) and admin UI display; the manifest copy is what the sync script reads. These should match — a divergence means the runtime app sees different config than shadcn actually wrote out.
+
+### Known limitation
+
+There's a brief flash on first paint if an admin disabled a module-registered entry — the module's tokens apply at registration time, then the `applyOverrides` call removes them once the AppSettings fetch completes. Fixable with a localStorage cache of `styleOverrides` at bootstrap (same pattern as the theme class init in `main.tsx`). Not critical; can land in a follow-up patch.
+
+---
+
 ## v1.20.7
 
 **Performance — correctness cleanup (Group D of the v1.20.4 audit)**

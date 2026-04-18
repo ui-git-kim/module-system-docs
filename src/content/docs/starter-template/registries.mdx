@@ -611,6 +611,94 @@ function MyCustomField({ field, value, onChange }: PersonalInfoFieldProps) {
 
 ---
 
+### Style Registry
+
+Register module-contributed CSS overrides **and** shadcn `components.json` contributions. One registry handles both runtime styling (tokens, raw CSS applied immediately) and build-time shadcn config (the `components:sync` script reads module manifests and reinstalls components with the merged config).
+
+Added in v1.21.0. Complements the lower-level `theme.cssVariables` filter and `theme.changed` action hooks from v1.20.1 — the registry is the declarative front door; the filter remains an escape hatch for cross-cutting dynamic transforms.
+
+#### Entry shape
+
+```typescript
+import { styleRegistry } from '@/config/style.registry';
+
+styleRegistry.register({
+  id: 'style.shadcn-config',
+  order: 50,        // default 50 — later entries win on token overlap
+  enabled: true,    // module's default; admin can override via AppSettings
+
+  // Runtime (hot) — applied immediately on register/update/toggle
+  tokens: {
+    '--sidebar': 'oklch(...)',
+    '--primary': 'oklch(...)',
+  },
+  css: `@layer components { .my-module-class { ... } }`,
+
+  // Build-time (cold) — mirror of what the module contributes to components.json.
+  // The components:sync script reads this from .module-manifests.json (modules
+  // should declare the same contribution there) and applies it to the app's
+  // components.json, then reinstalls the union of installed shadcn components.
+  componentsJson: {
+    style: 'new-york',
+    tailwind: { baseColor: 'neutral', cssVariables: true },
+    aliases: { blocks: '@/blocks' },           // additive (with overlap warn)
+    registries: { '@my-module': 'https://.../{name}.json' },  // additive
+  },
+});
+
+// Update an existing entry (partial merge; componentsJson is full-replace):
+styleRegistry.update('style.shadcn-config', {
+  tokens: { '--primary': 'oklch(0.65 0.2 250)' },
+});
+
+// Remove:
+styleRegistry.unregister('style.shadcn-config');
+```
+
+#### Field contribution rules
+
+| Field | Rule |
+|-------|------|
+| `tokens`, `css` | **Many contributors** — merged by `order`, later wins on overlap. Tokens pipe through `theme.cssVariables` filter → `applyThemeVariables`. `css` concatenates into a single `<style id="module-styles">` appended to `<head>` (wins over globals.css on specificity ties). |
+| `componentsJson.aliases`, `componentsJson.registries` | **Many contributors** — last-write-wins with a `console.warn` on overlap. |
+| `componentsJson.style`, `componentsJson.tailwind.baseColor`, `componentsJson.tailwind.cssVariables` | **Exclusive** — at most one entry per app may carry each. A second entry attempting to claim the same field throws `StyleRegistryError` with code `EXCLUSIVE_FIELD_CLAIMED`. |
+| `componentsJson.tailwind.prefix` | App-owned, not module-overridable. |
+
+#### Admin enable/disable
+
+Admin toggles are persisted in `AppSettings.styleOverrides: Record<string, boolean>`. Modules ship with `enabled: true` by default; admin overrides win. The `AppSettingsContext` loads overrides at bootstrap and calls `styleRegistry.applyOverrides(map)` automatically.
+
+Manual control from your own admin UI:
+
+```typescript
+styleRegistry.setOverride('colour-palette.active', false);  // disable an entry
+styleRegistry.clearOverride('colour-palette.active');       // revert to module default
+styleRegistry.getOverrides();                               // full override map for persistence
+```
+
+After any override change, persist the full map:
+
+```typescript
+await api.put('/api/v1/admin/style-overrides', {
+  overrides: styleRegistry.getOverrides(),
+});
+```
+
+#### Cold-side reinstall
+
+Changes to `componentsJson` don't auto-reinstall — shadcn components need to be re-added with the new config to pick up style or base-colour changes. The terminal flow:
+
+```bash
+npm run components:sync       # merge manifests + run shadcn add --overwrite
+npm run components:sync:dry   # preview changes without writing files
+```
+
+The script reads `componentsJsonContribution` from every enabled module's entry in `.module-manifests.json`, enforces the same exclusivity rules, writes the merged `frontend/components.json`, then reinstalls the union of `installedShadcnComponents` from `.module-state.json`. An in-app version is tracked on the [roadmap](/starter-template/roadmap/#in-app-component-reinstall-for-style-registry).
+
+**Hooks:** the registry exposes `getActiveEntries()` and `getEffectiveComponentsJson()` for admin UIs that want to display the current merged state.
+
+---
+
 ## Backend Registries
 
 ### Route Registry
@@ -970,6 +1058,7 @@ When the app imports the feature (in `main.tsx` or `app.ts`), registrations happ
 | `notificationPreferencesRegistry` | Notification options | BaseRegistry |
 | `languageOptionsRegistry` | Language options | BaseRegistry |
 | `personalInfoFieldsRegistry` | Personal info fields | BaseRegistry |
+| `styleRegistry` | Runtime CSS + components.json contributions | BaseRegistry |
 | `filterRegistry` | Data transformation | Custom |
 | `actionRegistry` | Side effects | Custom |
   </TabItem>
