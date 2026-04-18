@@ -1,0 +1,335 @@
+---
+title: Data Fetching
+description: TanStack Query conventions for server state across the starter and modules
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The starter template uses **TanStack Query** (React Query) as its single data fetching layer. Every feature and every module shares one `QueryClient` mounted at the app root, so caches, deduplication, and devtools work uniformly across the system.
+
+This page is the authoritative reference. The [LLM rules](/getting-started/llm-rules/#data-fetching) page summarises the same conventions for AI assistants.
+
+---
+
+## Why TanStack Query
+
+Before this layer existed, feature providers fetched with raw `fetch` or `axios` calls wrapped in `useState` + `useEffect`. That pattern has four recurring problems:
+
+1. **No deduplication.** Two providers mounting the same endpoint hit the network twice.
+2. **No shared cache.** Re-navigating a route triggers a full refetch even when the data hasn't changed.
+3. **Inconsistent loading and error handling.** Every module author reinvents the same shape.
+4. **No devtools.** Debugging a stale cache means grepping for `console.log` across providers.
+
+TanStack Query solves all four. Once installed at the root, every `useQuery` call participates in the same cache, respects the same defaults, and appears in the devtools.
+
+<Aside type="tip">
+The starter template already configures the `QueryClient` and wraps the app. You do not need to install TanStack Query in your module — just import from `@tanstack/react-query`.
+</Aside>
+
+---
+
+## Server state vs client state
+
+The most common mistake is reaching for TanStack Query for UI-only state, or reaching for Zustand/`useState` for data the server owns. Split it this way:
+
+| State type | Tool | Examples |
+|------------|------|----------|
+| **Server state** (from the API) | TanStack Query | User profile, billing status, entity records, settings from DB |
+| **Client state** (UI only) | Zustand or `useState` | Sidebar open/closed, selected tab, form draft before save, theme toggle |
+
+- **Never** store server data in Zustand. You'll end up reinventing caching and deduplication.
+- **Never** use TanStack Query for pure UI state. You'll pay the cost of a cache layer for zero benefit.
+
+When in doubt: if the data lives in the database and the API could return a different value next second, it's server state.
+
+---
+
+## Query key convention
+
+TanStack Query identifies cache entries by their **query key** — an array literal you pass to `useQuery`. The convention below is mandatory because it keeps modules from stepping on each other.
+
+### Rule: module keys MUST be namespaced with the module ID
+
+```typescript
+// ✅ Correct — module-scoped
+useQuery({ queryKey: ['billing', 'subscription'], queryFn: fetchSubscription });
+useQuery({ queryKey: ['structure', 'entity', entityId], queryFn: fetchEntity });
+
+// ❌ Wrong — leaks into the global cache namespace
+useQuery({ queryKey: ['subscription'], queryFn: fetchSubscription });
+useQuery({ queryKey: ['entity', entityId], queryFn: fetchEntity });
+```
+
+Without the module prefix, two modules that both own a `subscription` concept would collide. A consumer calling `invalidateQueries({ queryKey: ['subscription'] })` would clobber both caches.
+
+### Rule: app-level keys use a single top-level string
+
+Keys owned by the starter template itself — not by any module — use a single top-level string:
+
+```typescript
+useQuery({ queryKey: ['app-settings'], queryFn: fetchAppSettings });
+useQuery({ queryKey: ['session'], queryFn: fetchSession });
+```
+
+These are documented in `frontend/src/lib/query-keys.ts` as `appQueryKeys`. Import the constant if you need to read one from app code:
+
+```typescript
+import { appQueryKeys } from '@/lib/query-keys';
+
+queryClient.invalidateQueries({ queryKey: appQueryKeys.appSettings });
+```
+
+### Scoped invalidation
+
+Namespacing enables surgical cache invalidation. TanStack Query treats a partial key as a prefix match:
+
+```typescript
+// Invalidate every billing query — and nothing else
+queryClient.invalidateQueries({ queryKey: ['billing'] });
+
+// Invalidate just the subscription — leave ['billing', 'invoices'] alone
+queryClient.invalidateQueries({ queryKey: ['billing', 'subscription'] });
+```
+
+This is the main reason to namespace: after a successful mutation in the billing module, you can invalidate the entire billing subtree without worrying about collateral damage in `structure` or `app-settings`.
+
+### Optional helper
+
+`frontend/src/lib/query-keys.ts` exports a thin convenience factory. Using it is optional — passing the namespaced array literal directly is equally valid.
+
+```typescript
+import { createModuleQueryKeys } from '@/lib/query-keys';
+
+const billingKeys = createModuleQueryKeys('billing');
+
+billingKeys.root;                         // ['billing']
+billingKeys.key('subscription');          // ['billing', 'subscription']
+billingKeys.key('invoice', invoiceId);    // ['billing', 'invoice', <id>]
+```
+
+<Aside type="caution">
+Do **not** build a registry, class, or framework around this helper. It is a convenience, not mandatory. Modules that prefer inline array literals should use them.
+</Aside>
+
+---
+
+## Do not wrap TanStack Query
+
+Modules import `useQuery`, `useMutation`, and `useQueryClient` directly from `@tanstack/react-query`. Do **not** build:
+
+- A custom hook factory that wraps `useQuery` with module defaults
+- A service layer that hides the query key behind a method name
+- A registry of "module queries" that fires `useQuery` by ID
+
+Every layer of indirection obscures the cache, breaks devtools attribution, and makes code harder to debug. The convention is: keep the call site explicit, namespace the key, and trust the defaults.
+
+The one exception is a `useQuery` wrapped in a **React Context** — used by the starter template for app-wide shared state like `AppSettingsContext`. That pattern exists to preserve a stable consumer API across many components; it is not a generic wrapper.
+
+---
+
+## Opinionated defaults
+
+The `QueryClient` configured in `frontend/src/lib/query-client.ts` applies these defaults to every query and mutation:
+
+| Option | Value | Notes |
+|--------|-------|-------|
+| `staleTime` | `60_000` (1 min) | Reads within this window return cached data without a network request. |
+| `gcTime` | `5 * 60_000` (5 min) | Unused entries linger this long before garbage collection. |
+| `retry` (queries) | `1` | One retry absorbs transient blips; three adds perceptible delay on real failures. |
+| `retry` (mutations) | `0` | Never silently retry — a retried `POST`/`PUT`/`DELETE` can duplicate side effects. |
+| `refetchOnWindowFocus` | `false` | Multi-tab SaaS usage would produce refetch storms and waste Neon compute. |
+| `refetchOnReconnect` | `true` | A one-shot resync after reconnect is cheap and usually needed. |
+
+See [Configuration → TanStack Query Client Defaults](/starter-template/configuration/#tanstack-query-client-defaults) for the full rationale.
+
+If a query needs different behaviour, **override per-hook**. Do not change the global defaults — they're load-bearing for other modules.
+
+---
+
+## Mutation patterns
+
+TanStack Query handles writes through `useMutation`. Two patterns cover almost every case in this system.
+
+### Invalidation after a successful mutation
+
+The simplest pattern: when a mutation succeeds, invalidate the queries whose server state just changed. TanStack Query will refetch them in the background and any component reading them will update.
+
+```typescript
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+
+function useUpdateSubscription() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (plan: string) => {
+      const { data } = await api.patch('/api/v1/billing/subscription', { plan });
+      return data;
+    },
+    onSuccess: () => {
+      // Refetch every billing query — the subscription change may have
+      // affected invoices, usage, entitlements, etc.
+      queryClient.invalidateQueries({ queryKey: ['billing'] });
+    },
+  });
+}
+```
+
+### Optimistic update via `setQueryData`
+
+When the UI needs to reflect the change immediately — and you don't want to wait for a refetch round-trip — write straight into the cache. `AppSettingsContext` uses this pattern for its `updateSettings()` method.
+
+```typescript
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+
+function useRenameEntity(entityId: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (newName: string) => {
+      const { data } = await api.patch(`/api/v1/structure/entity/${entityId}`, { name: newName });
+      return data;
+    },
+    onMutate: async (newName) => {
+      // Snapshot the previous value so we can roll back on error
+      await queryClient.cancelQueries({ queryKey: ['structure', 'entity', entityId] });
+      const previous = queryClient.getQueryData(['structure', 'entity', entityId]);
+
+      queryClient.setQueryData(['structure', 'entity', entityId], (old: any) =>
+        old ? { ...old, name: newName } : old,
+      );
+
+      return { previous };
+    },
+    onError: (_err, _newName, ctx) => {
+      if (ctx?.previous) {
+        queryClient.setQueryData(['structure', 'entity', entityId], ctx.previous);
+      }
+    },
+    onSettled: () => {
+      // Refetch to reconcile with whatever the server actually stored
+      queryClient.invalidateQueries({ queryKey: ['structure', 'entity', entityId] });
+    },
+  });
+}
+```
+
+<Aside type="tip">
+Start with the invalidation pattern. Reach for optimistic updates only when the latency genuinely hurts — the rollback logic is easy to get wrong and the simpler pattern is usually fast enough.
+</Aside>
+
+---
+
+## Reference implementation
+
+The canonical example in the starter template is `frontend/src/features/admin/context/AppSettingsContext.tsx`. It shows:
+
+- A `useQuery` wrapped in a React Context so the consumer API (`useGlobalAppSettings()`) stays stable
+- App-level key (`['app-settings']`) imported from `@/lib/query-keys`
+- A `queryFn` that normalises the API response, merges with defaults, and fires a side-effect into `styleRegistry`
+- A 401 path that returns defaults instead of throwing — so logged-out renders still work
+- `updateSettings()` implemented as an optimistic `queryClient.setQueryData` write
+- `refetch()` wrapping the `useQuery` `refetch` to return a plain `Promise<void>`
+
+Read that file when building your own module-level provider.
+
+---
+
+## Worked module example
+
+A billing module exposing a subscription query and an update mutation. Shows the full convention end-to-end.
+
+<Tabs>
+  <TabItem label="queries.ts">
+```typescript
+// ========================================================================
+// FILE: src/templates/billing/frontend/services/billing.queries.ts
+// PURPOSE: TanStack Query hooks for the billing module
+// ========================================================================
+
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+import { createModuleQueryKeys } from '@/lib/query-keys';
+
+// Namespace every key under the 'billing' module ID.
+const billingKeys = createModuleQueryKeys('billing');
+
+export interface Subscription {
+  id: string;
+  plan: 'free' | 'pro' | 'enterprise';
+  renewsAt: string;
+}
+
+export function useSubscription() {
+  return useQuery({
+    queryKey: billingKeys.key('subscription'),
+    queryFn: async (): Promise<Subscription> => {
+      const { data } = await api.get<Subscription>('/api/v1/billing/subscription');
+      return data;
+    },
+  });
+}
+
+export function useUpdateSubscriptionPlan() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (plan: Subscription['plan']) => {
+      const { data } = await api.patch<Subscription>(
+        '/api/v1/billing/subscription',
+        { plan },
+      );
+      return data;
+    },
+    onSuccess: () => {
+      // Changing plans can affect invoices, usage, entitlements.
+      // Invalidate the whole billing subtree, not just the subscription.
+      queryClient.invalidateQueries({ queryKey: billingKeys.root });
+    },
+  });
+}
+```
+  </TabItem>
+  <TabItem label="SubscriptionPage.tsx">
+```tsx
+import { useSubscription, useUpdateSubscriptionPlan } from '../services/billing.queries';
+
+export function SubscriptionPage() {
+  const { data, isLoading, error } = useSubscription();
+  const updatePlan = useUpdateSubscriptionPlan();
+
+  if (isLoading) return <LoadingState />;
+  if (error) return <ErrorAlert error={error.message} />;
+  if (!data) return null;
+
+  return (
+    <div>
+      <PageHeader title="Subscription" />
+      <p>Current plan: {data.plan}</p>
+      <button
+        disabled={updatePlan.isPending}
+        onClick={() => updatePlan.mutate('pro')}
+      >
+        Upgrade to Pro
+      </button>
+    </div>
+  );
+}
+```
+  </TabItem>
+</Tabs>
+
+Things to notice:
+
+- The query key is `['billing', 'subscription']` — namespaced under the module ID.
+- The mutation invalidates `['billing']` (the module root), not `['billing', 'subscription']`. Changing a plan can invalidate more than just the subscription record.
+- No custom hook factory, no service wrapper around TanStack Query — just direct `useQuery` / `useMutation` calls.
+- The call site uses the hooks directly; no `BillingContext` required for a simple module.
+
+---
+
+## Further reading
+
+- [LLM rules — Data Fetching](/getting-started/llm-rules/#data-fetching) — short version for AI assistants
+- [Configuration — TanStack Query defaults](/starter-template/configuration/#tanstack-query-client-defaults) — rationale for each default
+- [TanStack Query official docs](https://tanstack.com/query/latest/docs/framework/react/overview) — deeper reference for advanced patterns (infinite queries, suspense, streaming, etc.)

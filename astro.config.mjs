@@ -118,6 +118,10 @@ export default defineConfig({
               slug: "starter-template/style-system",
             },
             {
+              label: "Data Fetching",
+              slug: "starter-template/data-fetching",
+            },
+            {
               label: "Structured Logging",
               slug: "starter-template/logging",
             },
