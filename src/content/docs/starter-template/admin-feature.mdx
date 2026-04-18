@@ -219,7 +219,36 @@ The backend enforces these rules:
 
 ## Adding Admin Pages
 
-Features can register custom admin pages using the admin pages registry:
+Features can register custom admin pages using the admin pages registry. Two patterns are supported — choose based on how often the page is visited.
+
+### Lazy-loaded (recommended for most admin pages)
+
+The built-in admin pages are code-split out of the main bundle via `React.lazy` so users who never visit `/admin` don't pay for the code. The admin route at `features/admin/routes.config.tsx` already wraps children in `<Suspense>`, so no extra wiring is needed.
+
+```tsx
+// features/my-feature/admin-pages.registration.ts
+import { lazy } from 'react';
+import { adminPagesRegistry } from '@/config/admin-pages.registry';
+import { Settings } from 'lucide-react';
+
+// Named-export → default-export shim required by React.lazy
+const MyAdminPage = lazy(() =>
+  import('./pages/MyAdminPage').then((m) => ({ default: m.MyAdminPage })),
+);
+
+adminPagesRegistry.register({
+  id: 'my-feature-settings',
+  title: 'My Feature',
+  description: 'Configure my feature',
+  icon: Settings,
+  component: MyAdminPage,
+  order: 30,
+});
+```
+
+### Static import (for frequently-accessed pages or small pages)
+
+If the admin page is small and/or central to the experience, a plain static import is also fine. The registry accepts any `ComponentType`.
 
 ```tsx
 // features/my-feature/admin-pages.registration.ts
@@ -237,7 +266,7 @@ adminPagesRegistry.register({
 });
 ```
 
-The page will automatically appear in the admin sidebar at `/admin/my-feature-settings`.
+Either way, the page will automatically appear in the admin sidebar at `/admin/my-feature-settings`.
 
 ### Building Admin Pages with Shared Components
 
@@ -325,14 +354,17 @@ function MyAdminPage() {
 
 ## API Endpoints
 
-### Public Endpoint (All Authenticated Users)
+### Public Endpoints (All Authenticated Users)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/v1/admin/settings` | GET | Get all app settings (branding + all overrides) |
+| `/api/v1/admin/style-overrides` | GET | Get style registry enable/disable map |
 
 <Aside type="note">
-This single endpoint returns **everything** users need: app name, logo, navigation overrides (including section overrides), and toolbar overrides. This is what the `AppSettingsProvider` fetches for all users to render the sidebar correctly.
+The `/settings` endpoint returns **everything** the frontend needs to render the shell: app name, logo, navigation overrides (including section overrides), toolbar overrides, and style registry overrides. This is what the `AppSettingsProvider` fetches for all users on mount.
+
+`/style-overrides` exists as a dedicated read because the frontend `styleRegistry` bootstrap may want to fetch and apply overrides before the full settings payload arrives — useful for preventing a brief unstyled flash on first paint.
 </Aside>
 
 ### Admin-Only Endpoints (Require Admin Role)
@@ -342,12 +374,21 @@ This single endpoint returns **everything** users need: app name, logo, navigati
 | `/api/v1/admin/settings` | PATCH | Update app branding settings |
 | `/api/v1/admin/navigation` | PATCH | Update navigation + section overrides |
 | `/api/v1/admin/toolbar` | PATCH | Update toolbar overrides |
+| `/api/v1/admin/style-overrides` | **PUT** | Replace the full style registry overrides map |
 | `/api/v1/admin/users` | GET | List all users |
 | `/api/v1/admin/users/:id/role` | PATCH | Update user role |
 | `/api/v1/admin/users/:id` | DELETE | Delete user |
 
+`/style-overrides` uses **PUT** (full replace), not PATCH — sending the entire map each time keeps persistence in sync with the in-memory `styleRegistry` state and automatically drops stale keys for entries that have been unregistered.
+
 <Aside type="tip">
 The admin panel also uses a GET endpoint for `/navigation` and `/toolbar` to fetch data for editing. These are admin-only because regular users get everything from the single `/settings` endpoint.
+</Aside>
+
+<Aside type="tip" title="Pattern: public reads, admin writes">
+Several endpoints here use a **public-read, admin-write** structure: GET is accessible to all authenticated users (so the frontend can render the shell correctly), but PATCH/PUT/DELETE require the admin role. `/settings` and `/style-overrides` both follow this pattern.
+
+If you build a module that needs admins to configure app-wide state that every user reads, replicate this pattern: one route registration for the public reader, one admin-only writer.
 </Aside>
 
 ---
@@ -364,6 +405,7 @@ model AppSettings {
   enableMarketingPages Boolean  @default(false)
   navigationOverrides  Json     @default("{}")  // Items + sections
   toolbarOverrides     Json     @default("{}")  // Toolbar hidden
+  styleOverrides       Json     @default("{}")  // Style registry enable/disable
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 }
@@ -380,7 +422,59 @@ interface NavigationOverrides {
 }
 ```
 
-The table uses a singleton pattern - there's only ever one row with `id = "default"`. The service auto-creates this row on first access.
+The `styleOverrides` JSON field is a flat map from `styleRegistry` entry id to boolean enabled flag. Modules ship with `enabled: true` by default; an override here wins. Absence of a key means "use the module's default". See the [Style System page](/starter-template/style-system/) for the full flow.
+
+```typescript
+type StyleOverrides = Record<string, boolean>;
+```
+
+The table uses a singleton pattern — there's only ever one row with `id = "default"`. The service auto-creates this row on first access.
+
+---
+
+## Style Registry Overrides
+
+The admin panel is the natural control surface for module-contributed style entries. Modules register entries in the `styleRegistry` with their own `enabled` default; admins can override that per-entry. Overrides persist in `AppSettings.styleOverrides` and are applied by `AppSettingsProvider` during bootstrap.
+
+### Reading the current state
+
+```typescript
+import { useStyleRegistry, styleRegistry } from '@/config/registry.hooks';
+
+function StyleOverridesList() {
+  // Reactive — re-renders when entries are registered/updated/unregistered.
+  const entries = useStyleRegistry();
+
+  return entries.map((entry) => (
+    <StyleEntryRow
+      key={entry.id}
+      entry={entry}
+      enabled={styleRegistry.isEnabled(entry.id)}
+    />
+  ));
+}
+```
+
+`styleRegistry.isEnabled(id)` composes the module default with any admin override in one place, so admin UI doesn't need to duplicate that logic.
+
+### Writing an override
+
+```typescript
+// 1. Flip locally so the pipeline re-applies immediately (hot side responds)
+styleRegistry.setOverride(entry.id, false);
+
+// 2. Persist the full map — server replaces atomically
+await api.put('/api/v1/admin/style-overrides', {
+  overrides: styleRegistry.getOverrides(),
+});
+```
+
+`clearOverride(id)` reverts to the module's registered default. Calling `getOverrides()` returns only *explicit* overrides (not the computed enabled state for every entry), which keeps the persisted map tight and means a module changing its default later is picked up by any entry that wasn't explicitly overridden.
+
+See also:
+
+- [Style System](/starter-template/style-system/) — full flow from module registration through admin override to reinstall
+- [Registry Reference → Style Registry](/starter-template/registries/#style-registry) — full entry shape and API
 
 ---
 

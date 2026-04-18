@@ -114,6 +114,10 @@ export default defineConfig({
               ],
             },
             {
+              label: "Style System",
+              slug: "starter-template/style-system",
+            },
+            {
               label: "Structured Logging",
               slug: "starter-template/logging",
             },

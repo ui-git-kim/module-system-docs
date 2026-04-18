@@ -1,0 +1,185 @@
+---
+title: Style System
+description: How runtime CSS overrides, shadcn components.json, and admin toggles compose into one coherent styling pipeline
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The starter template has one styling pipeline that modules contribute to and admins configure. This page is the map — it tells you what each layer is for, which one to reach for, and how they compose. Individual layers are documented in depth on their own pages; links are at the bottom of each section.
+
+Added in v1.21.0.
+
+---
+
+## The layers at a glance
+
+```
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  Module code                                                        │
+ │    styleRegistry.register({ tokens, css, componentsJson, ... })     │
+ └─────────────────────────────┬───────────────────────────────────────┘
+                               │
+     ┌─────────────────────────┴──────────────────────────┐
+     │                                                    │
+     ▼  RUNTIME (hot)                                     ▼  BUILD-TIME (cold)
+ ┌─────────────────────────────┐           ┌────────────────────────────────┐
+ │ style-pipeline.ts           │           │ scripts/sync-components.{ps1,  │
+ │  ─ merge tokens by order    │           │   sh}  (`npm run components:   │
+ │  ─ run theme.cssVariables   │           │   sync`)                        │
+ │    filter                   │           │  ─ read .module-manifests.json │
+ │  ─ applyThemeVariables()    │           │  ─ merge componentsJson        │
+ │    → :root inline styles    │           │  ─ enforce exclusivity         │
+ │  ─ write <style id=          │           │  ─ write frontend/             │
+ │    "module-styles">          │           │    components.json             │
+ │  ─ clear stale tokens        │           │  ─ npx shadcn@latest add       │
+ │  ─ fire theme.changed       │           │    --overwrite                 │
+ └─────────────────────────────┘           └────────────────────────────────┘
+              │                                           │
+              ▼                                           ▼
+   Admin toggles affect                       Admin changes to style /
+   which entries are active                   baseColor / cssVariables
+   (AppSettings.styleOverrides                require a manual
+   → styleRegistry.applyOverrides)            `components:sync` run
+```
+
+---
+
+## Two kinds of contribution
+
+Every `styleRegistry` entry may carry both, either, or neither:
+
+### Runtime (hot)
+
+`tokens` (CSS custom property overrides) and `css` (raw CSS) apply **immediately** to the running app whenever an entry is registered, updated, unregistered, or toggled. No build step. No reinstall. No refresh.
+
+Tokens are merged in `order` across all active entries, passed through the existing `theme.cssVariables` filter hook (so cross-cutting modules can still transform them), and applied to `document.documentElement.style`. `css` strings are concatenated into a single `<style id="module-styles">` tag appended to `<head>` — it comes after `globals.css` in source order, so module CSS wins specificity ties.
+
+**Use runtime for:** palette/theme tokens (`--primary`, `--sidebar`), module-specific CSS rules, live-preview UIs.
+
+### Build-time (cold)
+
+`componentsJson` declares what the module contributes to the app's `components.json`. It mirrors whatever the module also writes into its `.module-manifests.json` entry (modules declare contributions in both places — the registry copy is for exclusivity validation + admin UI display; the manifest copy is what `npm run components:sync` reads).
+
+The cold side does **not** apply automatically. `componentsJson` changes require a manual reinstall: `npm run components:sync` rewrites `components.json` and runs `npx shadcn@latest add --overwrite` for every component in the union of `installedShadcnComponents` across enabled modules. Until that's run, shadcn components on disk still reflect the previous config.
+
+**Use build-time for:** changing shadcn `style` / `baseColor` / `cssVariables` (e.g. in a Style module's admin config page), adding new shadcn registries (`@your-module`), contributing import aliases.
+
+---
+
+## Which layer do I use?
+
+| Your use case | Reach for… |
+|---------------|------------|
+| Module-contributed tokens that compose with others | **`styleRegistry`** — runtime side (`tokens`, `css`) |
+| Module-contributed shadcn config (style, base colour, registries) | **`styleRegistry`** — build-time side (`componentsJson`) + declare in manifest |
+| App-level one-off CSS variable override (not a module) | `applyThemeVariables()` direct — see [Theme Utilities](/starter-template/theme/) |
+| Cross-cutting transform over any module's tokens | `theme.cssVariables` filter — see [Theme Utilities](/starter-template/theme/) |
+| React to any theme change for analytics/canvas/etc. | `theme.changed` action — see [Theme Utilities](/starter-template/theme/) |
+
+If you're writing a **module**, the answer is almost always `styleRegistry`. It handles exclusivity enforcement, admin overrides, stale-token clearing, and composition with other modules' contributions — none of which you get from the primitives.
+
+---
+
+## Field contribution rules
+
+Documented in full on the [Style Registry reference](/starter-template/registries/#style-registry). Summary:
+
+| Field | Rule |
+|-------|------|
+| `tokens`, `css` | Many contributors, merged by `order`, later wins on overlap |
+| `componentsJson.aliases`, `componentsJson.registries` | Many contributors, last-write-wins with `console.warn` on overlap |
+| `componentsJson.style`, `componentsJson.tailwind.baseColor`, `componentsJson.tailwind.cssVariables` | **Exclusive** — one entry per app. A second registration claiming the same field throws `StyleRegistryError(EXCLUSIVE_FIELD_CLAIMED)`. |
+| `componentsJson.tailwind.prefix` | App-owned, not module-overridable |
+
+Exclusivity matches the reality that these aren't really per-module — the whole app runs on one `style`, one `baseColor`, one `cssVariables` setting. Having two modules both try to own them is always a bug; the registry refuses to let it happen silently.
+
+---
+
+## Admin overrides
+
+Modules ship with `enabled: true` at registration. Admins can flip that per-entry; the override persists in `AppSettings.styleOverrides` (`Record<string, boolean>`). The override map is loaded by `AppSettingsContext` on bootstrap and applied to the registry via `styleRegistry.applyOverrides(map)` — entries marked `false` stop contributing; entries marked `true` contribute even if the module defaulted to off.
+
+Admins typically toggle entries through a dedicated UI. See the [Admin Feature](/starter-template/admin-feature/#style-registry-overrides) page for the React-side API (`useStyleRegistry`, `styleRegistry.setOverride`, persisting via `PUT /api/v1/admin/style-overrides`).
+
+---
+
+## Reinstall flow (terminal-only for now)
+
+When a module changes any cold-side field — typically via its config page calling `styleRegistry.update(id, { componentsJson: {...} })` — the on-disk `components.json` goes out of sync with what the registry says. The **runtime** CSS on the page stays correct (the pipeline re-applies immediately), but the shadcn components shipped to disk still reflect the previous base colour / style / cssVariables choice.
+
+To bring them back in sync:
+
+```bash
+npm run components:sync       # merge + reinstall
+npm run components:sync:dry   # preview only, no writes
+```
+
+The script:
+
+1. Walks `.module-manifests.json`, honours `.module-state.json` `enabled`.
+2. Re-enforces exclusivity across enabled modules (second guard-rail — the frontend registry catches it at dev time; the sync catches it at scaffold time).
+3. Merges additive fields (`aliases`, `registries`) with last-write-wins + warnings.
+4. Writes `frontend/components.json` atomically (temp file + rename).
+5. Runs `npx shadcn@latest add --overwrite --yes <union>` for every component any enabled module has marked `installedShadcnComponents` in the state file.
+
+An **in-app** version of this flow is [planned on the roadmap](/starter-template/roadmap/#in-app-component-reinstall-for-style-registry) once Admin Module Management lands the node-spawn-and-stream pattern it shares with this feature.
+
+---
+
+## The module contract
+
+A module that contributes styles does three things:
+
+1. **At module-load time**, register an entry:
+    ```typescript
+    // features/my-module/style.registration.ts
+    import { styleRegistry } from '@/config/style.registry';
+    
+    styleRegistry.register({
+      id: 'my-module.theme',
+      order: 50,
+      tokens: { '--primary': 'oklch(0.7 0.15 240)' },
+      css: `@layer components { .my-module-card { ... } }`,
+      componentsJson: {
+        registries: {
+          '@my-module': 'https://registry.example.com/{name}.json',
+        },
+      },
+    });
+    ```
+
+2. **Mirror the same `componentsJsonContribution` in the module's manifest** (declared by the module-starter scaffold, persisted in the app's `.module-manifests.json`):
+    ```json
+    {
+      "my-module": {
+        "moduleId": "my-module",
+        "version": "1.0.0",
+        "componentsJsonContribution": {
+          "registries": {
+            "@my-module": "https://registry.example.com/{name}.json"
+          }
+        }
+      }
+    }
+    ```
+
+3. **If the module has dynamic config (like the Style module's admin page)**, expose a UI that calls `styleRegistry.update(id, { componentsJson: {...} })` on save, and also writes the new contribution to the module's manifest entry via a backend endpoint the module owns.
+
+The registry copy and the manifest copy should match. Runtime behaviour is driven by the registry; reinstall behaviour is driven by the manifest. A divergence means the running app is styled differently from what shadcn actually wrote to disk.
+
+---
+
+## Known limitation — first-paint flash
+
+Modules register synchronously at feature-import time, which runs before React mounts. Their tokens apply immediately. `AppSettingsContext` then fetches `styleOverrides` asynchronously; on arrival, it calls `applyOverrides` which may disable entries that had already applied. If an admin disabled an entry whose tokens visibly change the shell, the user sees a brief flash from the "on" state to the "off" state.
+
+Fixable by caching `styleOverrides` in `localStorage` at bootstrap (mirroring the theme class init in `main.tsx`) and applying them synchronously before any module registers. Tracked on the [roadmap](/starter-template/roadmap/#styleoverrides-bootstrap-cache-fix).
+
+---
+
+## Next steps
+
+- [Registry Reference → Style Registry](/starter-template/registries/#style-registry) — full entry shape and API
+- [Admin Feature → Style registry overrides](/starter-template/admin-feature/#style-registry-overrides) — admin-side read/write patterns
+- [CLI Scripts → Sync shadcn components](/starter-template/scripts/#sync-shadcn-components) — script reference
+- [Theme Utilities](/starter-template/theme/) — low-level `applyThemeVariables` primitive and the `theme.cssVariables` / `theme.changed` hooks
