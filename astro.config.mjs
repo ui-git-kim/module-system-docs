@@ -233,6 +233,13 @@ export default defineConfig({
                 { label: "Roadmap", slug: "modules/builder/roadmap" },
               ],
             },
+            {
+              label: "Style",
+              items: [
+                { label: "Overview", slug: "modules/style" },
+                { label: "Roadmap", slug: "modules/style/roadmap" },
+              ],
+            },
             { label: "Billing", slug: "modules/billing" },
             {
               label: "Colour Palette",
