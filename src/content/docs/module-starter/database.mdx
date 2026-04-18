@@ -38,10 +38,10 @@ This breaks modularity because:
 
 ### The Correct Pattern
 
-Use plain foreign key fields with `@@index` for performance:
+Use plain foreign key fields with compound `@@index` that cover the columns you filter AND sort by:
 
 ```prisma
-// ✅ CORRECT - Self-contained, no @relation
+// ✅ CORRECT - Self-contained, no @relation, compound index
 model my_feature_item {
   id          String   @id @default(cuid())
   userId      String                          // Plain FK, NOT a @relation
@@ -51,7 +51,10 @@ model my_feature_item {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  @@index([userId])                           // Index for query performance
+  // Compound index covers WHERE userId AND ORDER BY createdAt — the
+  // default list query pattern. Without the createdAt column in the
+  // index, Postgres would sort in memory on every list fetch.
+  @@index([userId, createdAt])
 }
 ```
 
@@ -180,7 +183,7 @@ For more details on the Prisma client setup, connection architecture, and migrat
 
 ## Schema Template Example
 
-Here is a complete example of a module schema template in `src/templates/schema.ts`:
+Here is the default schema template that ships in `src/templates/schema.ts`:
 
 ```typescript
 export const SCHEMA = `
@@ -188,24 +191,25 @@ export const SCHEMA = `
 model my_feature_item {
   id          String   @id @default(cuid())
   userId      String
-  title       String
+  name        String
   description String?
   status      String   @default("active")
-  metadata    Json     @default("{}")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  @@index([userId])
-  @@index([status])
+  // Compound index supports the default "items per user, newest first"
+  // list query without an in-memory sort. Add additional compound indexes
+  // for other common filter combinations (e.g. [userId, status]).
+  @@index([userId, createdAt])
 }
 
 model my_feature_settings {
-  id          String   @id @default(cuid())
-  userId      String   @unique
-  enabled     Boolean  @default(true)
-  preferences Json     @default("{}")
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  enabled   Boolean  @default(true)
+  config    Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([userId])
 }
@@ -223,6 +227,22 @@ schema: {
 
 The `modelNames` array is used by the scaffold for tracking and clean uninstallation.
 
+### Paginated List Query
+
+The compound `[userId, createdAt]` index pairs with cursor-based pagination in the generated backend service. The service's `getAll()` method (see `src/templates/backend/services.ts`) uses:
+
+```typescript
+await prisma.my_feature_item.findMany({
+  where: { userId },
+  orderBy: { createdAt: 'desc' },
+  take: limit + 1,                         // Fetch one extra to detect next page
+  ...(cursor && { cursor: { id: cursor }, skip: 1 }),
+  select: { id: true, name: true, status: true, createdAt: true, updatedAt: true },
+});
+```
+
+The `select` clause keeps list payloads small — full objects (including `description` and any `Json` columns) only come back from `getById()`. See the Frontend Service template for the matching client-side pagination signature.
+
 ---
 
 ## Naming Conventions
@@ -232,7 +252,7 @@ The `modelNames` array is used by the scaffold for tracking and clean uninstalla
 | Prefix tables with module ID | `billing_subscription` | Avoids name collisions between modules |
 | Use `snake_case` for table names | `my_feature_item` | PostgreSQL convention |
 | Use `camelCase` for field names | `userId`, `createdAt` | Prisma convention |
-| Always include `userId` index | `@@index([userId])` | Query performance |
+| Use **compound** indexes for list queries | `@@index([userId, createdAt])` | Covers filter AND sort — avoids in-memory sort |
 | Always include timestamps | `createdAt`, `updatedAt` | Audit trail |
 
 ---
