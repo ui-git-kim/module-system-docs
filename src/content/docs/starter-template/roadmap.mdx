@@ -125,6 +125,45 @@ v1.23.0 shipped `ForgotPasswordPage.tsx` and `ResetPasswordPage.tsx` as custom s
 
 If any step fails, fall back to Neon's standalone `<ForgotPasswordForm>` / `<ResetPasswordForm>` components under a scoped CSS loader (to keep the Tabs fix intact on every other route) until Neon's 1.6 upgrade lands and the SDK path works cleanly.
 
+### Template update mechanism review
+
+**Priority:** High — every point fix to date has been a patch on top of the wrong abstraction.
+
+`npm run template:update` uses a git three-way merge as its update mechanism. That choice has cost real time across the v1.22.0 → v1.23.1 arc: v1.22.2 leaked a withdrawn experimental change into a downstream app, v1.23.0's merge left stale imports behind, the docs submodule at various points copied its contents into apps that had no business tracking docs, and every template release has required a post-ship patch to unwind one or another merge surprise. The v1.23.1 post-merge force-sync is a patch on the symptom, not the cause.
+
+The cause is that **git merge is the wrong tool for this job.** Merge assumes bidirectional collaboration between peers — two branches that have legitimately diverged and want to reconcile. Template updates are unidirectional: the template is authoritative, the app is a consumer, and the app's job is to receive updates, not negotiate with them. Every scenario where git's three-way resolution "helpfully" keeps a local line is a scenario where the template lost.
+
+This entry is a **review, not an implementation plan** — the point is to step back and question every assumption before writing more code. Concrete deliverable: a design doc (not a PR) that answers the questions below with data from real update scenarios, then proposes an architecture.
+
+**Questions the review should answer:**
+
+- **What are the actual scenarios `template:update` has to handle?** Enumerate every real case — fresh app off `create-app`, app that's merged every release, app that skipped several releases, app that pulled a withdrawn experimental release, app that forked a core file legitimately (e.g. custom admin dashboard), app with user-owned files that the template also ships (`components.json`, `schema.prisma`), app that has `.claude/` / `docs/` leaked in from a prior bad merge, app on a disconnected network with a local template path, app tracking multiple modules with their own update cadences. What does each need?
+- **Which scenarios does today's git-merge-based flow actually handle correctly?** The evidence so far says the happy path works and almost everything else takes manual intervention. Let's write this down with examples rather than guess.
+- **Is there a reason we're using git merge beyond "git is available"?** The update flow doesn't need most of what merge provides (conflict markers, interactive resolution, rebase compatibility). It needs: "replace template-owned files with the new versions, leave user-owned files alone, stop pretending these two categories are negotiable."
+- **Could a simpler mechanism replace it?** Candidates to evaluate:
+  - **Copy-then-sync** — `template:update` fetches the template at the target version, walks a manifest of template-owned paths, copies each into the app's working tree. No merge. User-owned paths are never touched. File deletions in the template become deletions in the app. This is how GitHub's "Template repository" feature works in spirit. Simpler, harder to mess up, easy to preview accurately. Cost: loses git's conflict detection for apps that have forked a template file — need an opt-in mechanism (the `.template-ignore` from the sibling roadmap entry).
+  - **Versioned patches** — the template publishes a patch file per release (`patches/v1.22.3-to-v1.23.0.patch`). `template:update` applies the patch sequentially. Reproducible, reviewable, auditable. Cost: patch files drift if the user's files diverge; needs a reject-file review step when a patch doesn't apply.
+  - **Manifest-driven per-file sync** — the template ships `.template-manifest.json` listing every file it owns and its current content hash. `template:update` compares app file hashes against the manifest and syncs the diff. User-owned files are absent from the manifest, so they're never touched. Clean separation of concerns. Cost: manifest has to be kept in sync with the template tree — solvable with a pre-commit hook on the template side.
+  - **Hybrid** — force-sync for template-authoritative files (the majority), git merge for shared-ownership files like `schema.prisma`, skip for user-owned files. Essentially today's v1.23.1 behaviour formalised with explicit categorisation in a manifest rather than a hardcoded allow-list.
+- **What testing harness does this need?** The update script currently has zero automated coverage. Every new scenario is discovered by a downstream user in production. At minimum we should have a test that spins up a simulated app at version N, runs `template:update` to N+1, and asserts specific files are in specific states. Running the full matrix (every supported starting version × every current version) on every release is how we catch the v1.22.2 class of bug before it ships.
+- **How does preview mode accurately represent what will happen?** Today's `--preview` shows a git diff between branches — but the actual merge behaviour diverges from a naive diff. Preview should run the full update in a throwaway worktree and show the true before/after for the app's tree, including post-merge force-syncs and path removals.
+- **What's the rollback story?** If `template:update` goes wrong, there's no clean undo beyond `git reset --hard`, which the script can't offer because it'd also discard uncommitted user work. `template:revert-to v<N>` should be a first-class command — snapshot the app's tree before the update, restore on request.
+- **How does the app signal "I've genuinely customised this template file and I know what I'm doing"?** The `.template-ignore` roadmap entry is one answer. There might be others — per-file YAML frontmatter markers, a fork registry, whatever.
+- **What's the relationship to the Module Starter's update flow?** Modules already have an update path (`npx my-module update`). Does the template update mechanism share code / principles / primitives with it? If not, should it? A unified "update-something-from-upstream" primitive used by both would be worth the refactor cost.
+
+**Scope for the review:**
+
+- Write the design doc answering the above. Publish to `docs/src/content/docs/starter-template/update-mechanism-review.mdx` with a draft banner.
+- Implement a test harness for `template:update` covering at least the five known-problematic scenarios from this session (v1.22.2 → v1.23.0 stale import, docs submodule leak, .claude leak, user-customised `schema.prisma`, fresh unrelated-histories merge).
+- Propose an architecture change based on the design doc's conclusions. Plan the migration from today's git-merge flow to the chosen architecture.
+
+**Out of scope for the review** (explicitly — keep it bounded):
+
+- Shipping the new architecture in the same release as the design doc. This is a review, not a rewrite. Ship the doc first, discuss, then plan the implementation.
+- Refactoring `create-app` in the same pass — different concerns, can come later.
+
+**Expected outcome:** at minimum, an honest catalogue of what works and what doesn't. At best, a clear architectural direction that closes this class of bug permanently so we stop patching the symptom.
+
 ### `.template-ignore` for per-app merge customisation
 
 **Priority:** Medium — follow-up to v1.23.1's force-sync behaviour.
