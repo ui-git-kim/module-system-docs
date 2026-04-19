@@ -74,7 +74,8 @@ The main entity your users work with.
    ```typescript
    import { structureRoutes } from '@/features/structure';
 
-   // In protected routes:
+   // In protected routes — spread at the END so more specific app
+   // routes take precedence over Structure's catch-all patterns.
    ...structureRoutes,
    ```
 
@@ -85,6 +86,12 @@ The main entity your users work with.
    await initStructure();
    ```
 </Steps>
+
+<Aside type="note" title="Gotchas">
+- **`initStructure()` only exists when `hasInit: true`** is set in `src/module.ts`. Structure ships with it enabled by default.
+- **Route ordering matters.** Structure's protected routes use catch-all patterns (`/:nodeType`, `/:nodeType/:nodeId`). Spread them at the end of your route table — anything after them with a specific path will never match.
+- **Default node types are seeded with `userId: null`.** This makes them system-level and visible to all users. Modules that register their own node types at init should pass their own userId or set `moduleId` for ownership tracking.
+</Aside>
 
 ---
 
@@ -209,8 +216,19 @@ User-specific preferences and UI state.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | String | CUID primary key |
-| `userId` | String | Unique owner reference |
+| `userId` | String | Unique owner reference (`@unique`) |
 | `settings` | JSON | Flexible settings object |
+| `createdAt` | DateTime | Creation timestamp |
+| `updatedAt` | DateTime | Last update timestamp |
+
+### Raw SQL access notes
+
+If your code queries these tables directly (outside of Prisma), note two things:
+
+- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_templates`). Use the plural names in raw SQL.
+- **Unique constraints on `structure_node`.** Beyond the primary key, there are two compound uniques that the API surfaces as `400` errors:
+  - `@@unique([userId, slug])` — a user can't have two nodes with the same slug
+  - `@@unique([userId, parentId, name])` — a user can't have two siblings with the same name under the same parent
 
 ---
 
@@ -226,15 +244,21 @@ interface NodeTypeConfig {
   name: string;
   namePlural: string;
   description?: string;
-  icon: string;
+  icon?: string;
   color?: string;
-  moduleId?: string;
-  isSystem: boolean;
-  sortOrder: number;
+  moduleId?: string | null;
+  isSystem?: boolean;
+  sortOrder?: number;
   rules: NodeTypeRules;
   features: NodeTypeFeatures;
-  fields: NodeTypeField[];
+  fields?: NodeTypeField[];
   navigation: NodeTypeNavigation;
+  // Template assignment — reference reusable templates per view
+  cardTemplateId?: string | null;
+  listItemTemplateId?: string | null;
+  detailHeaderTemplateId?: string | null;
+  overviewTemplateId?: string | null;
+  templateOverrides?: NodeTypeTemplateOverrides;
   labels?: NodeTypeLabels;
   integrations?: NodeTypeIntegrations;
 }
@@ -244,26 +268,36 @@ interface NodeTypeConfig {
 
 ```typescript
 interface NodeTypeRules {
-  allowedParents?: string[];
-  allowedChildren?: string[];
-  canBeRoot?: boolean;
-  canNestSameType?: boolean;
-  canContainSameType?: boolean;
-  maxDepth?: number;
+  isRoot?: boolean;                 // Can exist at root level (no parent)
+  allowedParents?: string[];        // Slugs of types this can nest inside
+  allowedChildren?: string[];       // Slugs of types this can contain
+  maxDepth?: number;                // Max nesting depth
+  maxChildren?: number;             // Max number of direct children
+  isHierarchical?: boolean;         // Can form hierarchies
+  allowMultipleParents?: boolean;   // Tag-like behaviour
+  isConnection?: boolean;           // Is this a connection-type node?
+  connectionConfig?: {
+    fromTypes?: string[];
+    toTypes?: string[];
+    bidirectional?: boolean;
+  };
 }
 ```
 
 ### Features
 
+Each flag turns on an optional capability for entries of this type. Used by the admin UI (Properties tab) and checked at runtime by the API.
+
 ```typescript
 interface NodeTypeFeatures {
-  canFavorite?: boolean;
-  canArchive?: boolean;
-  canPublish?: boolean;
-  canManualSort?: boolean;
-  customSlug?: boolean;
-  customColor?: boolean;
-  customIcon?: boolean;
+  slug?: boolean;         // Allow custom URL slug
+  description?: boolean;  // Show rich description field
+  color?: boolean;        // Allow custom colour override
+  icon?: boolean;         // Allow custom icon override
+  favorites?: boolean;    // Allow marking as favourite
+  archiving?: boolean;    // Allow archive (soft delete)
+  publishing?: boolean;   // Enable draft/published workflow
+  manualSort?: boolean;   // Allow drag-and-drop reordering
 }
 ```
 
@@ -272,27 +306,33 @@ interface NodeTypeFeatures {
 ```typescript
 interface NodeTypeNavigation {
   mainNav?: {
-    enabled?: boolean;
-    order?: number;
+    enabled: boolean;
+    label?: string;
     icon?: string;
+    order?: number;
+    showCount?: boolean;
   };
   sidebarNav?: {
-    style?: 'list' | 'tree';
+    style: 'none' | 'list' | 'tree';
+    parentType?: string;
+    maxDepth?: number;
     showEmpty?: boolean;
-    maxItems?: number;
-    sortBy?: string;
-    filter?: string;
-    label?: string;
+    collapsible?: boolean;
+    defaultExpanded?: boolean;
   };
   pageNav?: {
-    style?: 'tabs' | 'sidebar' | 'none';
+    style: 'tabs' | 'sidebar' | 'none';
+    // Each built-in tab can be a simple boolean (show/hide) or an object
+    // with per-tab overrides like a custom label or widget layout.
     builtInTabs?: {
-      overview?: boolean;
-      info?: boolean;
-      children?: boolean;
-      connections?: boolean;
-      settings?: boolean;
+      overview?: boolean | { label?: string; widgetLayout?: 'single' | 'two-column' };
+      info?: boolean | { label?: string };
+      children?: boolean | { label?: string };
+      connections?: boolean | { label?: string };
+      settings?: boolean | { label?: string };
     };
+    tabOrder?: string[];       // Explicit tab ordering by ID
+    hideTabs?: string[];       // IDs of module-provided tabs to hide
     defaultTab?: string;
   };
   listPage?: {
@@ -300,6 +340,7 @@ interface NodeTypeNavigation {
     defaultSort?: string;
     showFilters?: boolean;
     showSearch?: boolean;
+    groupBy?: string;
     card?: {
       showDescription?: boolean;
       showIcon?: boolean;
@@ -463,21 +504,37 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 
 ---
 
-## Updating
+## CLI Reference
+
+Complete list of subcommands exposed by `npx structure <command>`.
+
+| Command | Flags | Purpose |
+|---------|-------|---------|
+| `init` | `--force`, `--no-interactive` | Install the module. `--force` overwrites existing files; `--no-interactive` skips prompts and uses defaults |
+| `update` | `--dry-run`, `--force`, `--skip-schema` | Update templates and schema. `--dry-run` previews, `--force` proceeds through conflicts, `--skip-schema` updates templates only |
+| `migrate` | `--dry-run` | Add version headers to existing files (for installations that pre-date version tracking) |
+| `uninstall` | `--force`, `--keep-data`, `--export <path>` | Remove the module. `--keep-data` preserves tables, `--export <path>` writes data to JSON before removal |
+| `disable` | `--force` | Temporarily disable without removing files |
+| `enable` | `--force` | Re-enable a disabled module |
+| `info` | — | Print module name, version, features, and available commands |
+
+### Updating
 
 ```bash
 npx structure update            # Update templates and schema
 npx structure update --skip-schema  # Update templates only
+npx structure update --dry-run  # Preview changes without applying
+npx structure update --force    # Force update through conflicts
 ```
 
 The update command pulls the latest template versions. If the schema has changed, it updates your Prisma schema block. Run `npx prisma generate` and `npx prisma migrate dev` after updating.
 
----
-
-## Uninstalling
+### Uninstalling
 
 ```bash
 npx structure uninstall
+npx structure uninstall --keep-data             # Keep database tables
+npx structure uninstall --export ./backup.json  # Dump data first
 ```
 
 This removes generated files and the schema block. You will need to manually clean up any references in your `routes.tsx` and `server.ts`.
