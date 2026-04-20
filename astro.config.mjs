@@ -129,6 +129,10 @@ export default defineConfig({
               label: "Updating Cloned Apps",
               slug: "starter-template/updating",
             },
+            {
+              label: "Versioning & Deprecation",
+              slug: "starter-template/versioning",
+            },
             { label: "CLI Scripts", slug: "starter-template/scripts" },
             {
               label: "Developer Workflow",
