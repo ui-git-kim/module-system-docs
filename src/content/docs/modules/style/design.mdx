@@ -1,28 +1,63 @@
 ---
 title: Design philosophy
-description: How the Style module owns app-wide styling via the styleRegistry catalogue pattern
+description: How the Style module owns app-wide styling by matching shadcn create exactly and extending it through the catalogue pattern
 sidebar:
   order: 1
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-The Style module is the **sole stylist** for apps built on the module system. No other module contributes styling. Everything — tokens, CSS, shadcn config — flows through the starter's [`styleRegistry`](/starter-template/style-system/), and the Style module is the registry's single writer.
+The Style module is the **sole stylist** for apps built on the module system. No other module contributes styling. Everything flows through the starter's [`styleRegistry`](/starter-template/style-system/), and the Style module is the registry's single writer.
 
 <Aside type="caution" title="One module, one voice">
-Other modules must not call `styleRegistry.register()` or edit `components/ui/*` files. If a module needs a visual tweak, it requests a catalogue entry here and the Style module ships it. This keeps the cascade understandable and prevents specificity wars across independent contributors.
+Other modules must not call `styleRegistry.register()` or edit `components/ui/*` files. If a module needs a visual tweak, it requests a catalogue entry here and the Style module ships it.
 </Aside>
+
+<Aside type="tip" title="Match shadcn, then extend">
+The core `baseColor + theme + radius + menuAccent + menuColor + font + iconLibrary + style + chartColor + fontHeading` pipeline produces CSS **byte-identical to `shadcn init`** for the same preset code. Our own features (typography presets, sidebar accent, the other catalogue entries) are layered on top as additive registry entries — never baked into the shadcn baseline.
+</Aside>
+
+---
+
+## Menu ≠ Sidebar — the most important distinction
+
+Shadcn's "Menu" controls in `shadcn.com/create` govern **dropdowns, popovers, and select menus** — not the sidebar.
+
+| You set | What changes |
+|---------|--------------|
+| Menu Colour: **Inverted** | Dropdowns, popovers, select menus render with dark-mode tokens on a light page (and vice versa). The sidebar is **not affected**. |
+| Menu Colour: **Translucent** | Those same menus get a translucent backdrop. Sidebar not affected. |
+| Menu Accent: **Bold** | The global `--accent` token is redirected to `--primary`. Hover/active states on buttons, menu items, and selection highlights across the whole app pick up the primary colour. |
+
+Menu colour is applied **at runtime**, not in the generated CSS. The module installs a binding that toggles `.dark` on every element with the `.cn-menu-target` class and sets `data-menu-translucent` on `[data-menu-translucent]` elements. Starter template dropdowns must carry `.cn-menu-target` for this to take effect.
+
+Menu accent IS in the generated CSS — `buildRegistryTheme` (our `resolveTheme`) mutates `--accent` and `--accent-foreground` to match `--primary` when bold.
+
+---
+
+## Sidebar Accent — our extension
+
+Shadcn ships `--sidebar-*` tokens but no UI to make the active nav item bold. That's a reasonable design knob that sits cleanly alongside shadcn without breaking preset compatibility.
+
+Our `sidebarAccent` field (values `'subtle' | 'bold'`):
+
+- Stored in `StyleConfig`, not encoded in the shadcn preset code — codes still round-trip cleanly with `shadcn.com/create`
+- Implemented as the `my-feature.sidebar-accent-bold` catalogue entry:
+
+```css
+:root, .dark {
+  --sidebar-accent: var(--primary);
+  --sidebar-accent-foreground: var(--primary-foreground);
+}
+```
+
+- Toggled on/off via `styleRegistry.setOverride()` by the admin settings page when the user picks Bold. Pure additive layer — the baseline `:root` / `.dark` blocks stay byte-identical to shadcn's output.
 
 ---
 
 ## The catalogue pattern
 
-The module ships two flavours of contribution through `styleRegistry`:
-
-1. **The app theme entry** (`my-feature.app-theme`) — one per app. Carries the admin-chosen `:root` / `.dark` CSS variable blocks derived from the `StyleConfig`. Updated live when an admin saves in the theme settings page.
-2. **The catalogue** — many opt-in entries, each targeting a specific primitive + variant + state combination (`my-feature.tabs-line-primary`, `my-feature.button-bold`, etc.). Ships disabled by default. Admins enable entries per-app from the starter's `AppSettings.styleOverrides` UI.
-
-All catalogue entries target shadcn's **stable public API**: the `data-slot`, `data-variant`, and `data-state` attributes that every primitive renders. Class names are internal implementation detail; data attributes are the contract.
+Beyond the shadcn baseline, the module ships opt-in `styleRegistry` entries targeting shadcn's **stable public API**: the `data-slot`, `data-variant`, and `data-state` attributes every primitive renders.
 
 ```html
 <div data-slot="tabs" data-orientation="horizontal">
@@ -52,20 +87,39 @@ Zero changes to `components/ui/tabs.tsx`. Zero template edits. Purely additive.
 
 ---
 
+## Preset codec — byte-compatible with shadcn
+
+The module's `preset-codec.ts` is a line-for-line port of `shadcn/preset/preset.ts`. A preset code generated in `shadcn.com/create` decodes identically here, and vice versa.
+
+**Format:** version character prefix (`"b"` = current v2) + base62-encoded bit-packed integer.
+
+**V2 field layout (51 bits):**
+
+```
+menuColor (3) | menuAccent (3) | radius (4) | font (6) | iconLibrary (6)
+  | theme (6) | baseColor (6) | style (6) | chartColor (6) | fontHeading (5)
+```
+
+Value arrays (`PRESET_STYLES`, `PRESET_FONTS`, etc.) follow shadcn's ordering exactly. Rule: **never reorder existing arrays — only append**. Reordering breaks all existing codes.
+
+Our `sidebarAccent` and `typographyPreset` are NOT encoded in the preset code. They live in `StyleConfig` and persist separately through the normal theme save path.
+
+---
+
 ## Why the cascade wins
 
-Two properties work together so module CSS lands on top reliably:
+Catalogue entries land on top of shadcn's CSS reliably because:
 
-1. **Source order** — the style pipeline appends a single `<style id="module-styles">` tag to `<head>` **after** `globals.css` and after any Tailwind utilities. On ties, later wins.
-2. **Specificity on attribute selectors** — shadcn's `data-[state=active]:text-foreground` compiles to class + attribute, specificity `(0,2,0)`. A catalogue selector like `[data-slot="tabs-trigger"][data-variant="line"][data-state="active"]` is `(0,3,0)` — strictly higher, wins even without source order.
+1. **Source order** — the style pipeline appends `<style id="module-styles">` to `<head>` **after** `globals.css` and any Tailwind utilities. On ties, later wins.
+2. **Specificity on attribute selectors** — shadcn's `data-[state=active]:text-foreground` compiles to class + attribute, specificity `(0,2,0)`. A catalogue selector like `[data-slot="tabs-trigger"][data-variant="line"][data-state="active"]` is `(0,3,0)` — strictly higher.
 
-You don't need `!important`. See the caveats section for the one exception.
+You don't need `!important` outside of rare edge cases (see caveats).
 
 ---
 
 ## Tokens vs CSS — decision matrix
 
-When you add a catalogue entry, decide whether the change is a **token override** or a **selector-scoped CSS rule**.
+When writing a new catalogue entry, decide:
 
 | Property type | Use | Why |
 |---------------|-----|-----|
@@ -73,76 +127,65 @@ When you add a catalogue entry, decide whether the change is a **token override*
 | Radius | `tokens` → `--radius-*` | Same |
 | Font family | `tokens` → `--font-sans`, `--font-mono` | Same |
 | Typography sizing, weight, spacing | `css` | shadcn hardcodes these as Tailwind utilities, no CSS var to override |
-| Layout (gaps, padding on a specific variant) | `css` | Same |
-| State-driven styles (hover, active, disabled) | `css` | Radix exposes state via data attributes, not CSS vars |
+| Layout (gaps, padding on a variant) | `css` | Same |
+| State-driven styles (hover, active, disabled) | `css` | Radix exposes state via data attributes |
 | Animations / transitions | `css` | Same |
 
 **Rule of thumb:** if shadcn's `@theme inline` block lists a CSS variable for it, use `tokens`. Otherwise use `css` targeting data attributes.
 
 ---
 
-## Hybrid pattern — CSS reads module-owned tokens
+## Hybrid pattern — CSS that reads module-owned tokens
 
-Sometimes you want user-facing toggles to drive typography (sizing, weight, tracking), which is `css` territory per the matrix. The hybrid is:
-
-1. Define a catalogue `css` entry that targets data-slots and **reads module-owned custom properties** with sensible fallbacks
-2. Keep the property values in a preset map keyed by a user choice
-3. Write the active preset's tokens into the catalogue entry via `styleRegistry.update(id, { tokens })`
-
-The Style module's typography pass uses exactly this. The `my-feature.admin-typography` entry ships:
+For the **typography pass** we use a hybrid: a single catalogue CSS entry targets data-slots and reads module-owned custom properties with fallbacks, and the admin preset dropdown writes the active preset's tokens into the entry via `styleRegistry.update()`.
 
 ```css
+/* catalogue entry */
 [data-slot="badge"] {
   font-size: var(--typography-badge-size, 0.75rem);
   font-weight: var(--typography-badge-weight, 500);
 }
-[data-slot="card-title"] {
-  font-size: var(--typography-card-title-size, 1rem);
-  font-weight: var(--typography-card-title-weight, 600);
-}
-/* …page-title, status-pill, admin-role-badge */
 ```
 
-And the admin theme settings page's typography dropdown writes the selected preset's tokens:
-
 ```typescript
+// admin page
 styleRegistry.update('my-feature.admin-typography', {
   tokens: TYPOGRAPHY_PRESETS[preset],
 });
 ```
 
-This keeps the CSS static and auditable (one selector block per target), while admin changes travel entirely through the tokens channel.
+Static, auditable CSS. Admin changes travel entirely through tokens.
 
 ---
 
 ## Status colour tokens
 
-The module ships six semantic status tokens alongside the shadcn standards:
+The module ships four semantic status tokens alongside shadcn's standards:
 
-| Token | Purpose | Light-mode default |
-|-------|---------|--------------------|
-| `destructive` / `destructive-foreground` | Errors, delete actions | `oklch(0.577 0.245 27.325)` |
-| `success` / `success-foreground` | Confirmations, success states | `oklch(0.517 0.174 142.5)` |
-| `warning` / `warning-foreground` | Cautions, attention needed | `oklch(0.769 0.188 70.08)` |
-| `info` / `info-foreground` | Informational states, neutral emphasis | `oklch(0.55 0.18 250)` |
+| Token | Purpose | Light default |
+|-------|---------|---------------|
+| `destructive` | Errors, delete actions | `oklch(0.577 0.245 27.325)` |
+| `success` | Confirmations | `oklch(0.517 0.174 142.5)` |
+| `warning` | Cautions | `oklch(0.769 0.188 70.08)` |
+| `info` | Informational states | `oklch(0.55 0.18 250)` |
 
-Downstream components should consume these semantic tokens instead of ad-hoc Tailwind palette utilities:
+Downstream components should consume semantic tokens:
 
 ```tsx
-// ❌ before — hardcoded palette
+// ❌ before
 <Badge className="bg-red-100 text-red-800">Expired</Badge>
 
-// ✅ after — semantic token
+// ✅ after
 <Badge className="bg-destructive/10 text-destructive">Expired</Badge>
 ```
 
-The Style module only ships the tokens. Migrating badge components to use them is a separate starter-template PR.
+The Style module only ships the tokens. Migrating starter-template badges to use them is a separate starter PR.
 
 ---
 
 ## Shadow pass
 
-Default shadcn primitives don't ship shadow utilities — apps that want card elevation opt into the `my-feature.card-elevated` catalogue entry instead. This keeps elevation a deliberate choice rather than baked into the starter, and lets an app tune the elevation scale globally from one place.
+Default shadcn primitives ship no shadow utilities — apps opt into `my-feature.card-elevated` for card elevation. Keeps elevation a deliberate choice and lets an app tune the elevation scale globally.
 
 ---
 
@@ -159,24 +202,25 @@ Default shadcn primitives don't ship shadow utilities — apps that want card el
    styleRegistry.register({
      id: 'my-feature.my-thing',
      order: 60,
-     enabled: false, // admins opt in
+     enabled: false,
      tokens: {},
      css: CATALOGUE_MY_THING,
    });
    ```
-3. Bump the module version (`npm run version:patch`) and ship.
-
-For apps to pick up the new entry, run `npx style update` in the target app.
+3. Bump the module version and ship. Apps pick up the new entry with `npx style update`.
 
 ---
 
 ## Caveats
 
 ### `!important` as escape hatch
-If a shadcn class has higher specificity than your selector (rare — happens with some `[&>...]` Tailwind compound selectors), you can use `!important` for that rule. Always document why in a comment on the entry so it doesn't spread.
+If a shadcn class has higher specificity than your selector (rare — happens with some `[&>...]` Tailwind compound selectors), use `!important` for that rule. Document why in a comment.
 
 ### `@source` in module CSS
-Tailwind v4 refuses `@source` directives inside module CSS that goes through `@layer`. If an entry needs Tailwind utilities, generate them up-front during the module's build and ship the compiled CSS string. Raw CSS (what the catalogue ships today) is always safe.
+Tailwind v4 refuses `@source` directives inside module CSS that goes through `@layer`. If an entry needs Tailwind utilities, generate them up-front at the module's build time and ship the compiled CSS string. Raw CSS (what the catalogue ships today) is always safe.
+
+### Value arrays are append-only
+The preset codec's value arrays (`PRESET_STYLES`, `PRESET_FONTS`, etc.) mirror shadcn's. Reordering or removing entries breaks every existing preset code. Only append new values to the end.
 
 ---
 
@@ -186,3 +230,5 @@ Tailwind v4 refuses `@source` directives inside module CSS that goes through `@l
 - [Roadmap](/modules/style/roadmap/) — known issues and planned improvements
 - [Style System](/starter-template/style-system/) — the starter-side pipeline this module feeds
 - [Registry Reference](/starter-template/registries/#style-registry) — the `styleRegistry` API
+- [shadcn preset.ts](https://github.com/shadcn-ui/ui/blob/main/packages/shadcn/src/preset/preset.ts) — upstream codec we mirror
+- [shadcn buildRegistryTheme](https://github.com/shadcn-ui/ui/blob/main/apps/v4/registry/config.ts) — upstream CSS generation we mirror
