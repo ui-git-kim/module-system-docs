@@ -132,7 +132,7 @@ function MyComponent() {
 |------|---------|----------|
 | `useBranding()` | Public subset: `appName`, `logoUrl`, `logoDisplayMode`, `styleOverrides`. Forgiving — returns `DEFAULT_BRANDING` if provider absent. | `BrandingProvider` (root) |
 | `useBrandingState()` | Full Branding context with loading/error state. | `BrandingProvider` (root) |
-| `useGlobalAppSettings()` | Full authenticated context (settings, loading, error, refetch). Throws if used outside the provider. | `AppSettingsProvider` (shell) |
+| `useGlobalAppSettings()` | Full authenticated context — `settings`, `isLoading`, `error`, `refetch`, `updateSettings`, `setAppTheme`. Throws if used outside the provider. | `AppSettingsProvider` (shell) |
 | `useAppSettingsValue()` | Just settings with defaults (most common authenticated read). | `AppSettingsProvider` (shell) |
 | `useGlobalNavigationOverrides()` | Navigation + section overrides. | `AppSettingsProvider` (shell) |
 | `useGlobalToolbarOverrides()` | Toolbar hidden items. | `AppSettingsProvider` (shell) |
@@ -380,7 +380,7 @@ The `variant="line"` prop on `TabsList` ships with shadcn's `radix-nova` style (
 | `/api/v1/branding` | GET | **Public** (no auth) — public branding subset for auth pages |
 
 <Aside type="note">
-The `/settings` endpoint returns **everything** the frontend needs to render the shell: app name, logo, navigation overrides (including section overrides), toolbar overrides, and style registry overrides. This is what the `AppSettingsProvider` fetches for all users on mount.
+The `/settings` endpoint returns **everything** the frontend needs to render the shell: app name, logo, navigation overrides (including section overrides), toolbar overrides, style registry overrides, and (since v1.25.0) the module-owned `appTheme` blob. This is what the `AppSettingsProvider` fetches for all users on mount.
 
 `/style-overrides` exists as a dedicated read because the frontend `styleRegistry` bootstrap may want to fetch and apply overrides before the full settings payload arrives — useful for preventing a brief unstyled flash on first paint.
 </Aside>
@@ -493,6 +493,84 @@ See also:
 
 - [Style System](/starter-template/style-system/) — full flow from module registration through admin override to reinstall
 - [Registry Reference → Style Registry](/starter-template/registries/#style-registry) — full entry shape and API
+
+---
+
+## App Theme (`appTheme`)
+
+Added in **v1.25.0**. A dedicated field on `AppSettings` for **module-owned theme configuration**. The starter treats it as opaque JSON storage — the shape is defined and validated by the consuming style module (e.g. useFoundry), not the template.
+
+### Why it's separate from `styleOverrides`
+
+`styleOverrides` is a `Record<string, boolean>` — purpose-built for "is catalogue entry X enabled." `appTheme` is a free-shape blob holding the **base app theme** that the module derives from (shadcn preset codes like `baseColor`, `radius`, `font`, plus whatever extensions the module needs).
+
+The split keeps each storage field cleanly purposed:
+
+| Field | Purpose | Shape |
+|-------|---------|-------|
+| `appTheme` | Base theme config owned by the style module | `unknown` (opaque, module-defined) |
+| `styleOverrides` | On/off switches for individual catalogue entries (`tabs-line-primary`, `button-bold`, etc.) | `Record<string, boolean>` |
+
+A module's typical flow: on mount, read `appTheme` from context, derive CSS (or use it directly if the module writes pre-rendered CSS), register into `styleRegistry` as a single entry (e.g. `{ id: 'app-theme', css: ... }`). The existing styleRegistry pipeline then injects everything via its `<style id="module-styles">` tag — no new injection primitives in the starter.
+
+### Reading it
+
+```tsx
+import { useGlobalAppSettings } from '@/features/admin';
+
+function MyThemeConsumer() {
+  const { settings } = useGlobalAppSettings();
+  const appTheme = settings?.appTheme ?? null;
+
+  // Cast to the module's expected shape (module owns the schema)
+  const themeConfig = appTheme as MyModuleThemeConfig | null;
+  // ...
+}
+```
+
+The type comes through as `unknown` from the starter — modules cast on read. If you want compile-time protection, define the expected shape in the module and use a type guard.
+
+### Writing it
+
+```tsx
+import { useGlobalAppSettings } from '@/features/admin';
+
+function ThemeSaveButton({ newTheme }: { newTheme: MyModuleThemeConfig }) {
+  const { setAppTheme } = useGlobalAppSettings();
+
+  const handleSave = async () => {
+    // Optimistic update + PATCH + refetch, packaged into one call.
+    await setAppTheme(newTheme);
+  };
+
+  return <Button onClick={handleSave}>Save theme</Button>;
+}
+```
+
+`setAppTheme(theme)`:
+1. Updates the query cache optimistically so consumers re-render immediately.
+2. PATCHes `/api/v1/admin/settings` with `{ appTheme: theme }`.
+3. Refetches on completion to reconcile with whatever the server normalised.
+
+Pass `null` to clear the stored theme.
+
+### Shape contract
+
+**The starter does not enforce a shape.** The Zod schema on `UpdateAppSettingsSchema.appTheme` accepts `z.unknown().optional()`. The database column is `Json?` — anything JSON-serialisable is valid storage.
+
+This is deliberate. The consuming style module evolves its schema independently of starter releases; keeping `appTheme` loose on the starter side means a module can ship v1.0, v1.1, v2.0 without the starter ever needing to re-version. Validation is the module's responsibility on both the write path (before calling `setAppTheme`) and the read path (shape-guard after `useGlobalAppSettings().settings?.appTheme`).
+
+<Aside type="tip" title="Typical shapes a style module might write">
+- A **pre-rendered CSS string** — module generates CSS from its internal config on save, writes the string to `appTheme`. Starter-side read → `styleRegistry.update('app-theme', { css: theme as string })` → pipeline injects.
+- A **structured JSON config** (shadcn preset codes + module extensions) — module re-compiles to CSS on every read. More flexible if the module wants to re-render on palette changes without a round-trip.
+- **Anything JSON-serialisable** — strings, objects, arrays. Storage is neutral.
+</Aside>
+
+### Why not let modules register their own `AppSettings` fields?
+
+Extensible settings would mean modules could each add their own columns, and the template's `AppSettings` type would become a union that depends on which modules are installed. Nightmare for typing and API evolution.
+
+Instead: one well-known `appTheme` slot, reserved for whichever style module the app is using. An app with no style module simply has `appTheme: null` and ignores the field. An app with *multiple* style modules picks one as the owner of `appTheme` — the others either share the same shape convention or use their own `styleOverrides` entries.
 
 ---
 

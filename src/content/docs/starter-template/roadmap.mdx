@@ -164,6 +164,32 @@ This entry is a **review, not an implementation plan** — the point is to step 
 
 **Expected outcome:** at minimum, an honest catalogue of what works and what doesn't. At best, a clear architectural direction that closes this class of bug permanently so we stop patching the symptom.
 
+### Auto-merge schema field additions in `template:update`
+
+**Priority:** High — fills the last piece of the "no manual changes per release" promise.
+
+v1.25.0 added the `appTheme` field to the `AppSettings` model. The update script already detects and auto-adds **new models** (via `Extract-ModelSection` in `update-template.{ps1,sh}`), but doesn't handle **new fields on existing models**. Downstream apps that pull v1.25.0 have to manually add `appTheme Json?` to their local `AppSettings` and run `prisma migrate dev` — small, but the kind of friction this template's versioning philosophy keeps saying shouldn't exist.
+
+**What this would do:**
+
+- **Parse both schemas after merge.** For each model the template ships (User, AppSettings, plus anything future releases add), diff the field lists. Field present in template but not in local → "missing field."
+- **Insert missing fields into the local schema** with their full Prisma definition (type, modifiers, default, attributes). Preserves any local fields the user has added to the same model.
+- **Set `$needsMigration = true`** so the existing auto-migrate step (`prisma migrate dev --name template_update_vX_X_X`) fires and generates the migration for the downstream app's DB.
+- **Handle the "field removed in template but user added it locally" case** — leave the user's field alone, warn about the mismatch at the end of the update so the user can decide.
+
+**Edge cases:**
+
+- **Field renames** — template changes `oldName String` to `newName String`. Diff algorithm sees "remove old, add new" — not a rename. Ship a data-migration SQL snippet alongside the schema change for renames; document as a breaking change.
+- **Type changes** — template changes `field Int` to `field BigInt`. Diff sees same field name, different definition. Warn the user, don't auto-overwrite. Type changes force a major bump anyway per the [deprecation policy](/starter-template/versioning/).
+- **Multi-file schema mode** — the `Extract-ModelSection` approach works per-file; extend to iterate `backend/prisma/schema/*.prisma` in multi-file mode.
+- **User has removed the model entirely** — if downstream deleted `AppSettings` (unusual but possible), respect that; the existing new-model auto-add kicks in. Don't force a re-add.
+
+**Why this belongs in the update script, not a codemod:**
+
+Codemods (per the separate [Deprecation codemods](#deprecation-codemods-shipped-with-templateupdate) roadmap item) are for consumer-code changes — rewriting imports and JSX shapes. Schema additions are infrastructure changes the downstream app needs regardless of what its own code looks like. Handling them in the update script keeps the flow atomic: one `template:update` run pulls the release and makes the downstream whole.
+
+**Target: v1.25.1 or v1.26.0.** The `appTheme` field already requires a manual schema step for apps pulling v1.25.0 — documented in the changelog. Shipping this fix in v1.25.1 means apps that update in the intervening window do the manual step once; apps that jump v1.24.X → v1.25.1 get it for free.
+
 ### Structure-only styling migration
 
 **Priority:** High — retires the ~170 legacy style-in-template violations the v1.24.7 audit catalogued.
@@ -474,6 +500,7 @@ Features that have been implemented and released.
 
 | Feature | Version | Description |
 |---------|---------|-------------|
+| `AppSettings.appTheme` field + `setAppTheme` mutator | v1.25.0 | Added a dedicated `Json?` field on the `AppSettings` singleton for module-owned theme configuration. Shape is opaque (starter enforces no type) — the consuming style module (e.g. useFoundry) defines and validates its own schema. Exposed on the frontend as `AppTheme` type + `setAppTheme(config)` on the `AppSettingsContext` (optimistic update + PATCH + refetch). Backend: Zod accepts `z.unknown()`, service handles `null` → `Prisma.DbNull` for clearing. Downstream apps pulling v1.25.0 need a one-time manual schema step (add `appTheme Json?` to their `AppSettings` model + `prisma migrate dev`); auto-merge roadmapped as a follow-up. TabBar shim removal deferred past v1.25.0 per the deprecation policy. |
 | Structure-only styling policy (rule 7) | v1.24.7 | Codified the rule that template components under `frontend/src/` (outside `components/ui/`) use layout utilities + shadcn semantic tokens only — no typography scale, font weights, colour literals, or decorative shadows. Visual design lives in globals.css, shadcn variants, or Style Registry entries. LLM rules page rule 7 added with the full allow/deny list. CLAUDE.md critical rules + dedicated "Structure-Only Styling Policy" section. Audit caught ~158 font-size/weight occurrences and ~12 colour-literal occurrences — migration planned as a dedicated roadmap entry (see "Structure-only styling migration"). No code changes in this release — policy only, enforced on new code going forward. |
 | Deprecation policy + `TabBar` shim + versioning docs | v1.24.6 | Codifies the template's "deprecate, then remove" contract for public exports. New `@/lib/deprecation` utility emits dev-only, once-per-id warnings (tree-shaken in production). `TabBar` removed cold in v1.24.4 is now restored as a deprecation shim wrapping shadcn `<Tabs variant="line">` under the old API — downstream `import { TabBar } from '@/components/settings-blocks'` keeps working with zero changes. Removal target: v1.25.0 (next minor). New `/starter-template/versioning/` docs page with the full policy, release cadence, shim pattern, and currently-deprecated table. LLM rules page rewritten — old "no backwards compatibility" rule retired in favour of deprecate-then-remove. CLAUDE.md summary + Common Mistakes entry updated. |
 | Frontend TS cleanup + conflict-branch user-owned paths + unified `AppSettings` | v1.24.5 | Three bundled cleanups. 1) Extended `update-template.{ps1,sh}` conflict branch to auto-resolve user-owned paths with `git checkout --ours` (mirrors the success-branch allow-list; no more hand-resolving `globals.css`/`package.json`/etc. every release). 2) Unified the two parallel `AppSettings` interfaces (service had createdAt/updatedAt, context had styleOverrides — neither was a superset, causing TS2345 in AppSettingsPage). Service is now the canonical source; context imports and re-exports. 3) Frontend TS/lint cleanup: unused imports in AdminDashboardPage and NavigationManagementPage; LucideIcon→ReactNode cast in AdminComponents; canonical class names in AdminDataTable + 4 auth pages; `UserRole \| null` accepted in NavMain+NavSecondary `hasRoleAccess`; React 19 `useRef` initial value in PersonalInformationPage. |

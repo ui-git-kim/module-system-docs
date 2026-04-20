@@ -17,6 +17,99 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v1.25.0
+
+**`AppSettings.appTheme` — module-owned theme storage on the singleton**
+
+A new dedicated slot on `AppSettings` for **style modules** (useFoundry, or any future alternative) to persist their theme configuration. The starter treats it as opaque JSON storage — the shape is entirely owned and validated by the consuming module. This closes the loop for the style-registry conversation: modules now have a single well-known location for their app-level theme, cleanly separated from the `styleOverrides` boolean map used for catalogue entry toggles.
+
+### The two-bucket model
+
+| Field | What lives here | Shape | Who owns shape |
+|-------|-----------------|-------|----------------|
+| `appTheme` **(new)** | Base app-level theme config — shadcn preset codes, module extensions, whatever the style module needs | `unknown` (opaque) | The consuming style module |
+| `styleOverrides` | On/off flags for individual catalogue entries (`tabs-line-primary`, `button-bold`, etc.) | `Record<string, boolean>` | Starter (boolean-map convention) |
+
+`appTheme` is the **base**; `styleOverrides` is **adhoc opt-ins layered on top**. Matches the "shadcn core + module extensions in appTheme, catalogue entries separate" split that surfaced during the style-module architecture conversation.
+
+### What shipped
+
+**Backend:**
+
+- **Schema**: `appTheme Json?` added to the `AppSettings` model in `backend/prisma/schema.prisma`. Nullable so a freshly-created app starts with no theme ("use module defaults").
+- **Types** (`admin.types.ts`): new `AppTheme = unknown` type alias; `appTheme: AppTheme | null` added to `AppSettings` interface; `appTheme: z.unknown().optional()` added to `UpdateAppSettingsSchema`.
+- **Service** (`admin.service.ts`): `getAppSettings()` returns `appTheme` via Prisma spread; `updateAppSettings()` handles `data.appTheme === null` → `Prisma.DbNull` (clears the column), non-null → `Prisma.InputJsonValue`, `undefined` → field omitted from update (standard Prisma semantics).
+
+**Frontend:**
+
+- **Service types** (`features/admin/services/admin.service.ts`): `AppTheme` type + `appTheme: AppTheme | null` on `AppSettings` + `appTheme?: AppTheme | null` on `UpdateAppSettingsInput`. Re-exported from `features/admin/index.ts` and (for consistency) from `features/admin/context/AppSettingsContext.tsx`.
+- **Context** (`AppSettingsContext.tsx`): new `setAppTheme(config: AppTheme | null): Promise<void>` on the context value. Optimistic cache write → PATCH `/api/v1/admin/settings` with `{ appTheme }` → refetch to reconcile. `DEFAULT_SETTINGS.appTheme = null`.
+
+**Usage from a style module:**
+
+```tsx
+import { useGlobalAppSettings, type AppTheme } from '@/features/admin';
+
+function MyStyleModuleBootstrap() {
+  const { settings, setAppTheme } = useGlobalAppSettings();
+  const theme = settings?.appTheme as MyThemeConfig | null;
+
+  // Read + register into styleRegistry
+  useEffect(() => {
+    if (theme) {
+      styleRegistry.update('app-theme', { css: generateCss(theme) });
+    }
+  }, [theme]);
+
+  // Save from your UI
+  const handleSave = async (newTheme: MyThemeConfig) => {
+    await setAppTheme(newTheme);
+  };
+
+  return /* … */;
+}
+```
+
+The starter contributes **storage + transport**. The module contributes **shape + interpretation + CSS injection** (via the existing `styleRegistry.update(...)` pipeline — no new injection primitive in the starter).
+
+### Migration for downstream apps
+
+**Manual schema step required in v1.25.0.** The update script auto-detects and auto-adds new *models* to the downstream schema but does not yet handle new *fields on existing models*. Roadmapped for v1.25.1 / v1.26.0 (see [Auto-merge schema field additions](/starter-template/roadmap/#auto-merge-schema-field-additions-in-templateupdate) in the roadmap).
+
+After `npm run template:update` pulls v1.25.0, open your `backend/prisma/schema.prisma` and add this field to the `AppSettings` model (anywhere after the existing `styleOverrides Json` line):
+
+```prisma
+model AppSettings {
+  // ... existing fields ...
+  styleOverrides Json @default("{}")
+
+  // Add this line:
+  appTheme Json?
+}
+```
+
+Then run:
+
+```bash
+cd backend
+npx prisma migrate dev --name add_app_theme_to_app_settings
+```
+
+Prisma generates the migration (`ALTER TABLE "AppSettings" ADD COLUMN "appTheme" JSONB`) and regenerates the Prisma client with the new field. TypeScript will then accept the backend references to `appTheme` that this release added to `admin.service.ts`.
+
+If you skip this step, `prisma generate` won't know about `appTheme` and the backend will fail to compile. The manual step is one-off per app; once it's in your local schema, future `template:update` runs leave it alone (schema.prisma is user-owned via the allow-list).
+
+### Deprecation status
+
+- TabBar shim: **removal deferred past v1.25.0** — [versioning page](/starter-template/versioning/#currently-deprecated-exports) now targets v1.26.0 at the earliest, and only when no tracked downstream apps still import it. v1.25.0 is additive; no need to bundle a breaking removal with it.
+- Nothing else currently deprecated.
+
+### Why minor, not patch
+
+New public type (`AppTheme`), new field on a public data model (`AppSettings.appTheme`), new method on `AppSettingsContext` (`setAppTheme`), new backend schema surface. All additive, no breaking changes to existing exports — minor bump per the [versioning policy](/starter-template/versioning/).
+
+---
+
 ## v1.24.7
 
 **Structure-only styling rule — template components express layout + state, not visual design**
