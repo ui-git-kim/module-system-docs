@@ -1,0 +1,182 @@
+---
+title: Versioning & Deprecation Policy
+description: How the starter template manages breaking changes, deprecations, and public API stability
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The starter template follows a **deprecate-then-remove** policy for every public export. Downstream apps never wake up to a broken build because the template removed something — removals always go through a warning cycle first.
+
+This page covers the rules, the release cadence, the shim pattern, and the current list of deprecated exports.
+
+---
+
+## The rule
+
+<Aside type="tip" title="Single-sentence version">
+If a public export is going away, ship a shim that keeps the old API working for one release cycle, emit a deprecation warning, and remove the shim in the next minor (or major, if the replacement is itself breaking).
+</Aside>
+
+### What counts as public
+
+**Public (versioned by this policy):**
+
+- Named exports from `@/components/*/index.ts` (page-blocks, settings-blocks)
+- Named exports from `@/features/*/index.ts` (auth, user, admin, dashboard)
+- Named exports from `@/config/*.ts` (registries, hooks, app-config)
+- Named exports from `@/lib/*.ts` (api, query-keys, theme, deprecation)
+- Registry APIs (`navigationRegistry`, `dashboardRegistry`, `styleRegistry`, etc.)
+- Backend API routes under `/api/v1/*` mounted by the template
+- Database schema models shipped by the template
+
+**Not public (can change without warning):**
+
+- Anything inside a feature's internal folders (`components/`, `hooks/`, `services/`, `context/`, `pages/`) that isn't re-exported from the feature's `index.ts`
+- Exports tagged `@internal` in their JSDoc
+- Exports tagged `@experimental` — these are explicitly opt-in and may change in any release
+- Shadcn-generated files under `frontend/src/components/ui/` (those are owned by your `shadcn init` / `components:sync`)
+- Test helpers, migration scripts, generator scaffolding
+
+---
+
+## The release cadence
+
+| Change type | What ships |
+|-------------|-----------|
+| **New export** | Minor bump (1.X.0). Additive, no deprecation needed. |
+| **Non-breaking fix** | Patch bump (1.X.Y). Includes internal refactors that don't touch public signatures. |
+| **Deprecation** | Minor bump. Old export stays as a shim, warning added, docs updated, changelog lists the replacement. |
+| **Removal of a deprecated export** | Minor bump (one cycle after deprecation) **or** major bump if the removal is forced by a breaking change elsewhere. |
+| **Breaking change to a public export** | Major bump (2.0.0). Replacement shipped alongside a shim under the old name where feasible. |
+
+**Rule of thumb**: one minor version between deprecation and removal. If v1.24.X deprecates something, v1.25.0 is the earliest version allowed to remove the shim.
+
+---
+
+## The shim pattern
+
+Every deprecation follows the same three-part structure:
+
+### 1. Deprecation shim
+
+Re-export the old name from a file that implements the same API on top of the new API. The shim should:
+
+- Accept the **same props/arguments** as the original so downstream code needs zero changes.
+- Render or delegate to the new API internally.
+- Emit a one-time dev-mode console warning via `deprecationWarning()` from `@/lib/deprecation`.
+- Carry a `@deprecated` JSDoc block with a concrete migration snippet.
+
+Reference implementation — the `TabBar` shim that landed in v1.24.6:
+
+```tsx
+// frontend/src/components/settings-blocks/components/TabBar.tsx
+import { deprecationWarning } from '@/lib/deprecation';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+
+/**
+ * @deprecated Since v1.24.4. Scheduled for removal in v1.25.0.
+ *
+ * Replace with `<Tabs>` + `<TabsList variant="line">` from
+ * `@/components/ui/tabs`. See the v1.24.4 changelog entry for the
+ * migration snippet.
+ */
+export function TabBar({ tabs, activeTab, onTabChange, className }: TabBarProps) {
+  deprecationWarning(
+    'settings-blocks.TabBar',
+    'TabBar is deprecated since v1.24.4 and scheduled for removal in v1.25.0. Use <Tabs><TabsList variant="line">…</TabsList></Tabs> from @/components/ui/tabs instead.',
+  );
+
+  return (
+    <Tabs value={activeTab} onValueChange={onTabChange} className={className}>
+      <TabsList variant="line">
+        {tabs.map(tab => (
+          <TabsTrigger key={tab.id} value={tab.id}>{tab.label}</TabsTrigger>
+        ))}
+      </TabsList>
+    </Tabs>
+  );
+}
+```
+
+### 2. The warning emitter
+
+Use the centralised `deprecationWarning()` utility — don't call `console.warn` directly. The util dedups per `id` per page session (so a component inside a list that renders 50 times warns once, not 50 times) and is tree-shaken out of production bundles via `import.meta.env.DEV`.
+
+**Warning id convention**: `"<module-path>.<export-name>"`. Examples:
+
+- `settings-blocks.TabBar`
+- `features.admin.useAppSettings`
+- `config.navigationRegistry.registerMain`
+
+Stable ids make it easy to suppress individual warnings if a downstream app is knowingly running on a deprecated path (add a filter in the app's console, or wrap the shim locally).
+
+### 3. Docs trail
+
+Every deprecation ships with:
+
+- **Changelog entry** in the release that introduced the deprecation, listing the migration snippet.
+- **Entry in the "Currently deprecated" table below** (this page) with removal version.
+- **`@deprecated` JSDoc** on the export so editor tooltips show a strikethrough + hover note.
+- **Updated examples** in any feature doc page that referenced the old export.
+
+---
+
+## Currently deprecated exports
+
+| Export | Deprecated since | Removal target | Replacement |
+|--------|-----------------|----------------|-------------|
+| `TabBar` (and `TabBarProps`, `TabItem`) from `@/components/settings-blocks` | v1.24.4 (removal) / v1.24.6 (shim reinstated) | v1.25.0 | `<Tabs>` + `<TabsList variant="line">` + `<TabsTrigger>` from `@/components/ui/tabs`. See [v1.24.4 changelog](/starter-template/changelog/#v1244). |
+
+Nothing else is currently deprecated. If an upcoming release adds entries to this table, they'll land here before the release ships.
+
+---
+
+## For LLM-assisted changes
+
+LLMs working on the starter template (Claude Code, Cursor, Copilot, etc.) should follow the same policy. Before removing any named export:
+
+<Steps>
+1. **Check whether any downstream can consume it.** If it's in an `index.ts` for a feature / page-blocks / settings-blocks / config / lib, it's public.
+
+2. **If public, ship a shim** (not a removal). Use the shim pattern above.
+
+3. **Never delete a public file outright** — convert it to the shim shape and keep it.
+
+4. **Update the "Currently deprecated" table** on this page and add a changelog entry. Don't skip either.
+
+5. **Wait at least one minor version** before removing the shim. If the deprecation lands in v1.24.X, the earliest valid removal is v1.25.0.
+</Steps>
+
+The [LLM rules page](/getting-started/llm-rules/) includes the short version of this policy for quick reference during automated edits.
+
+---
+
+## FAQ
+
+### Why not just use major version bumps?
+
+Major bumps force every downstream app to coordinate. For a starter template that apps consume via `git merge`, a major bump per breaking change means downstream apps stuck on versions behind head because the migration feels too risky. Minor versions with shims let apps upgrade at their own pace while still signalling the direction.
+
+### What if I genuinely can't ship a shim?
+
+Rare but possible — if the old API is fundamentally incompatible with the new design (e.g. the old export returns `Promise<T>` and the new one is synchronous). In that case:
+
+- Document the break loudly in the changelog under a **"Breaking"** section.
+- Bump **major** version, not minor.
+- Still mark the old export with `@deprecated` + warning for one release cycle before renaming the file.
+
+### Do internal refactors need deprecations?
+
+No. Changes to files under a feature's internal folders (`components/`, `hooks/`, etc.) that aren't re-exported from the feature's `index.ts` can change without warning. If you're not sure whether something is public, grep the feature's `index.ts` — if it's re-exported, it's public.
+
+### What about backend route changes?
+
+Same policy. Renaming a route counts as "removing the old and adding the new" — deprecate the old route (keep it mounted, return a `Deprecation` header, log a warning server-side) for one minor before retiring. Breaking payload shape changes force a new `/api/v2/*` version; the `/api/v1/*` version stays mounted until v2 has been available for at least one release cycle.
+
+---
+
+## Next
+
+- [Changelog](/starter-template/changelog/) — release-by-release list of what changed
+- [Roadmap](/starter-template/roadmap/) — planned template work
+- [LLM Rules](/getting-started/llm-rules/) — guidance for automated template edits
