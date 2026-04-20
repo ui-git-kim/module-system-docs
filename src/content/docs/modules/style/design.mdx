@@ -1,0 +1,188 @@
+---
+title: Design philosophy
+description: How the Style module owns app-wide styling via the styleRegistry catalogue pattern
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The Style module is the **sole stylist** for apps built on the module system. No other module contributes styling. Everything — tokens, CSS, shadcn config — flows through the starter's [`styleRegistry`](/starter-template/style-system/), and the Style module is the registry's single writer.
+
+<Aside type="caution" title="One module, one voice">
+Other modules must not call `styleRegistry.register()` or edit `components/ui/*` files. If a module needs a visual tweak, it requests a catalogue entry here and the Style module ships it. This keeps the cascade understandable and prevents specificity wars across independent contributors.
+</Aside>
+
+---
+
+## The catalogue pattern
+
+The module ships two flavours of contribution through `styleRegistry`:
+
+1. **The app theme entry** (`my-feature.app-theme`) — one per app. Carries the admin-chosen `:root` / `.dark` CSS variable blocks derived from the `StyleConfig`. Updated live when an admin saves in the theme settings page.
+2. **The catalogue** — many opt-in entries, each targeting a specific primitive + variant + state combination (`my-feature.tabs-line-primary`, `my-feature.button-bold`, etc.). Ships disabled by default. Admins enable entries per-app from the starter's `AppSettings.styleOverrides` UI.
+
+All catalogue entries target shadcn's **stable public API**: the `data-slot`, `data-variant`, and `data-state` attributes that every primitive renders. Class names are internal implementation detail; data attributes are the contract.
+
+```html
+<div data-slot="tabs" data-orientation="horizontal">
+  <div data-slot="tabs-list" data-variant="line">
+    <button data-slot="tabs-trigger" data-variant="line" data-state="active">…</button>
+  </div>
+</div>
+```
+
+A catalogue entry hooks those attributes:
+
+```typescript
+styleRegistry.register({
+  id: 'my-feature.tabs-line-primary',
+  order: 60,
+  enabled: false,
+  css: `
+    [data-slot="tabs-trigger"][data-variant="line"][data-state="active"] {
+      color: var(--primary);
+      border-color: var(--primary);
+    }
+  `,
+});
+```
+
+Zero changes to `components/ui/tabs.tsx`. Zero template edits. Purely additive.
+
+---
+
+## Why the cascade wins
+
+Two properties work together so module CSS lands on top reliably:
+
+1. **Source order** — the style pipeline appends a single `<style id="module-styles">` tag to `<head>` **after** `globals.css` and after any Tailwind utilities. On ties, later wins.
+2. **Specificity on attribute selectors** — shadcn's `data-[state=active]:text-foreground` compiles to class + attribute, specificity `(0,2,0)`. A catalogue selector like `[data-slot="tabs-trigger"][data-variant="line"][data-state="active"]` is `(0,3,0)` — strictly higher, wins even without source order.
+
+You don't need `!important`. See the caveats section for the one exception.
+
+---
+
+## Tokens vs CSS — decision matrix
+
+When you add a catalogue entry, decide whether the change is a **token override** or a **selector-scoped CSS rule**.
+
+| Property type | Use | Why |
+|---------------|-----|-----|
+| Colours (primary, background, sidebar) | `tokens` → `--primary`, `--sidebar-*` | shadcn reads these via `@theme inline`; modules just redefine them |
+| Radius | `tokens` → `--radius-*` | Same |
+| Font family | `tokens` → `--font-sans`, `--font-mono` | Same |
+| Typography sizing, weight, spacing | `css` | shadcn hardcodes these as Tailwind utilities, no CSS var to override |
+| Layout (gaps, padding on a specific variant) | `css` | Same |
+| State-driven styles (hover, active, disabled) | `css` | Radix exposes state via data attributes, not CSS vars |
+| Animations / transitions | `css` | Same |
+
+**Rule of thumb:** if shadcn's `@theme inline` block lists a CSS variable for it, use `tokens`. Otherwise use `css` targeting data attributes.
+
+---
+
+## Hybrid pattern — CSS reads module-owned tokens
+
+Sometimes you want user-facing toggles to drive typography (sizing, weight, tracking), which is `css` territory per the matrix. The hybrid is:
+
+1. Define a catalogue `css` entry that targets data-slots and **reads module-owned custom properties** with sensible fallbacks
+2. Keep the property values in a preset map keyed by a user choice
+3. Write the active preset's tokens into the catalogue entry via `styleRegistry.update(id, { tokens })`
+
+The Style module's typography pass uses exactly this. The `my-feature.admin-typography` entry ships:
+
+```css
+[data-slot="badge"] {
+  font-size: var(--typography-badge-size, 0.75rem);
+  font-weight: var(--typography-badge-weight, 500);
+}
+[data-slot="card-title"] {
+  font-size: var(--typography-card-title-size, 1rem);
+  font-weight: var(--typography-card-title-weight, 600);
+}
+/* …page-title, status-pill, admin-role-badge */
+```
+
+And the admin theme settings page's typography dropdown writes the selected preset's tokens:
+
+```typescript
+styleRegistry.update('my-feature.admin-typography', {
+  tokens: TYPOGRAPHY_PRESETS[preset],
+});
+```
+
+This keeps the CSS static and auditable (one selector block per target), while admin changes travel entirely through the tokens channel.
+
+---
+
+## Status colour tokens
+
+The module ships six semantic status tokens alongside the shadcn standards:
+
+| Token | Purpose | Light-mode default |
+|-------|---------|--------------------|
+| `destructive` / `destructive-foreground` | Errors, delete actions | `oklch(0.577 0.245 27.325)` |
+| `success` / `success-foreground` | Confirmations, success states | `oklch(0.517 0.174 142.5)` |
+| `warning` / `warning-foreground` | Cautions, attention needed | `oklch(0.769 0.188 70.08)` |
+| `info` / `info-foreground` | Informational states, neutral emphasis | `oklch(0.55 0.18 250)` |
+
+Downstream components should consume these semantic tokens instead of ad-hoc Tailwind palette utilities:
+
+```tsx
+// ❌ before — hardcoded palette
+<Badge className="bg-red-100 text-red-800">Expired</Badge>
+
+// ✅ after — semantic token
+<Badge className="bg-destructive/10 text-destructive">Expired</Badge>
+```
+
+The Style module only ships the tokens. Migrating badge components to use them is a separate starter-template PR.
+
+---
+
+## Shadow pass
+
+Default shadcn primitives don't ship shadow utilities — apps that want card elevation opt into the `my-feature.card-elevated` catalogue entry instead. This keeps elevation a deliberate choice rather than baked into the starter, and lets an app tune the elevation scale globally from one place.
+
+---
+
+## Adding a new catalogue entry
+
+1. Export the CSS from `utils/catalogue.ts`:
+   ```typescript
+   export const CATALOGUE_MY_THING = `
+     [data-slot="..."][data-variant="..."] { … }
+   `;
+   ```
+2. Register it in `registrations/catalogue.registration.ts`:
+   ```typescript
+   styleRegistry.register({
+     id: 'my-feature.my-thing',
+     order: 60,
+     enabled: false, // admins opt in
+     tokens: {},
+     css: CATALOGUE_MY_THING,
+   });
+   ```
+3. Bump the module version (`npm run version:patch`) and ship.
+
+For apps to pick up the new entry, run `npx style update` in the target app.
+
+---
+
+## Caveats
+
+### `!important` as escape hatch
+If a shadcn class has higher specificity than your selector (rare — happens with some `[&>...]` Tailwind compound selectors), you can use `!important` for that rule. Always document why in a comment on the entry so it doesn't spread.
+
+### `@source` in module CSS
+Tailwind v4 refuses `@source` directives inside module CSS that goes through `@layer`. If an entry needs Tailwind utilities, generate them up-front during the module's build and ship the compiled CSS string. Raw CSS (what the catalogue ships today) is always safe.
+
+---
+
+## Related
+
+- [Overview](/modules/style/) — install, architecture, dependencies
+- [Roadmap](/modules/style/roadmap/) — known issues and planned improvements
+- [Style System](/starter-template/style-system/) — the starter-side pipeline this module feeds
+- [Registry Reference](/starter-template/registries/#style-registry) — the `styleRegistry` API

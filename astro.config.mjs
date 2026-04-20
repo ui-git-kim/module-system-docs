@@ -241,6 +241,7 @@ export default defineConfig({
               label: "Style",
               items: [
                 { label: "Overview", slug: "modules/style" },
+                { label: "Design philosophy", slug: "modules/style/design" },
                 { label: "Roadmap", slug: "modules/style/roadmap" },
               ],
             },
