@@ -17,6 +17,51 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v1.24.0
+
+**Split branding from AppSettings — auth pages now follow admin-configured branding via a public endpoint**
+
+Fixes a v1.23.0 regression. The custom shadcn auth pages that shipped in v1.23.0 (`SignInPage`, `SignUpPage`, `ForgotPasswordPage`, `ResetPasswordPage`) started calling `useAppSettingsValue()` to display the app's name and logo on sign-in — but `AppSettingsProvider` is mounted inside `DashboardPage`, which only renders for authenticated users. Hitting `/auth/sign-in` signed-out threw `useGlobalAppSettings must be used within AppSettingsProvider` and crashed the page with the React Router "Unexpected Application Error" screen.
+
+v1.24.0 splits the public-facing subset of settings into its own provider at the app root, backed by a new public backend endpoint. Auth pages now render with the admin's configured branding without ever needing a session.
+
+### What changed
+
+**Backend:**
+- New **public** `GET /api/v1/branding` endpoint (no auth required). Returns `{ appName, logoUrl, logoDisplayMode, styleOverrides }` — the subset auth pages can safely see. Registered as a separate router in `admin.routes.ts` so the existing `adminRouter` can keep `requiresAuth: true`.
+- Nav overrides, toolbar overrides, user management, and all write endpoints stay authenticated. No changes to the admin DB schema.
+
+**Frontend:**
+- New `features/admin/context/BrandingContext.tsx` — `BrandingProvider` + `useBranding()`. Fetches from `/api/v1/branding` via TanStack Query with a 5-minute stale window. On resolution, also calls `styleRegistry.applyOverrides(styleOverrides)` so admin-configured theme tokens and CSS (e.g. `.auth-page-background` targeting) apply to auth pages too.
+- `App.tsx` — wraps `<RouterProvider>` with `<BrandingProvider>` at the root.
+- Auth pages (`SignInPage`, `SignUpPage`, `ForgotPasswordPage`, `ResetPasswordPage`) switched from `useAppSettingsValue()` to `useBranding()`. The hook is more forgiving — returns `DEFAULT_BRANDING` (app name from `VITE_APP_NAME`) if the provider isn't mounted, rather than throwing.
+- `AppSettingsProvider` stays where it is (inside `DashboardPage`). Still owns nav overrides, toolbar overrides, feature flags, and the admin-side view of styleOverrides. Still calls `applyOverrides` on its own fetch — idempotent with Branding's call, and the re-apply flow for admin UI updates is unchanged.
+- New `branding` key on `appQueryKeys` so the two providers don't collide on cache entries.
+
+### When auth pages see the real branding
+
+`BrandingProvider` fetches on mount — i.e. the first paint of any page, including sign-in. So:
+
+- **Fresh visitor (never signed in):** first paint uses `DEFAULT_BRANDING` (from `VITE_APP_NAME`); the fetch resolves within ~100ms and the page re-renders with DB-stored branding.
+- **Returning signed-out visitor:** TanStack Query serves the cached branding from memory, so the first paint already has the admin's branding. styleOverrides stay consistent (no reset-on-sign-out weirdness).
+- **Authenticated visitor:** same public fetch runs, plus `AppSettingsProvider` inside the shell fetches the full admin surface. Both providers call `applyOverrides` — idempotent.
+
+### Exposure tradeoff
+
+`styleOverrides` on the public endpoint is a map of `{ entryId: boolean }` — which styleRegistry entries the admin has toggled. It's necessary for auth pages to theme correctly (tokens + CSS from module-contributed entries), but it does reveal *which* style entries exist and their on/off state. That's a small information leak (module names only, no module code or admin data). If that's a concern for your deployment, override the endpoint in a downstream module to filter the map to a known-public allowlist. The typical starter deployment accepts the tradeoff for the sign-in UX.
+
+### Migration
+
+1. Run `npm run template:update` to pick up v1.24.0 (will also run `install:all`).
+2. No database migration required — the backend reads the same `AppSettings` row it always has; only the frontend provider topology changed.
+3. No action needed for existing modules. Code calling `useAppSettingsValue()` still works unchanged inside the authenticated shell. If a module has code that could render on unauthenticated routes (rare — most module UI is behind auth) and it reads only branding fields, prefer `useBranding()` — but it's a soft recommendation, not a breaking change.
+
+### Why minor, not patch
+
+New public API surface (`/api/v1/branding`), new frontend hook (`useBranding`), new provider in the root tree. Downstream apps that pulled v1.23.0 or later need a frontend change (provider at the root) on merge — minor captures "new capability plus a small structural shift" more honestly than patch.
+
+---
+
 ## v1.23.4
 
 **Ship `.vscode/settings.json` + `.vscode/extensions.json` so Tailwind v4 CSS warnings don't appear out of the box**
