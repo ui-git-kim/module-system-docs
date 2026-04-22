@@ -1,0 +1,225 @@
+---
+title: Thesaurus Import Format
+description: Canonical JSON shape for seeding the v2 colour thesaurus. Field-by-field reference, source-shape rules, worked examples, and the gotchas around hex-vs-name collisions.
+sidebar:
+  order: 21
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The v2 thesaurus admin imports through `/api/v1/colour/thesaurus/ingest`. The Import tab accepts JSON in the **editorial export shape** — `{ entries: [...] }` with each entry carrying its source records and editorial metadata in one place. This page documents the exact shape so seed files round-trip cleanly through every code path the importer touches.
+
+## Top-level structure
+
+```json
+{
+  "metadata": {
+    "source": "AS 2700 — Australian Colour Standard",
+    "sourceYear": 1985,
+    "authority": "Standards Australia",
+    "licence": "(notes for your own reference; ignored on import)",
+    "entryCount": 206,
+    "collectedOn": "2026-04-22",
+    "notes": ["any free-form admin notes here"]
+  },
+  "sourceConfigs": {
+    "tailwind": { "isDesignSystem": true },
+    "material": { "isDesignSystem": true },
+    "as2700":   { "isDesignSystem": false }
+  },
+  "entries": [
+    /* see below */
+  ]
+}
+```
+
+| Top-level key | Required | Used for |
+|---|---|---|
+| `metadata` | optional | Admin-only documentation. Ignored by the importer — keep it for your own provenance trail. |
+| `sourceConfigs` | optional | Per-source defaults. `isDesignSystem: true` cascades into the source upsert so every entry from that namespace inherits the flag. Per-source toggles in the Sources tab still win after import. |
+| `entries` | ✅ | The only field the importer actually reads. |
+
+<Aside type="tip">
+  The Import tab also accepts a bare array of entries (`[{...}, {...}]`) and the low-level `{ records: [...] }` ingest shape, but the editorial wrapper is the canonical format and gets the editorial-metadata merge phase that the bare-records path skips.
+</Aside>
+
+## Entry shape
+
+```json
+{
+  "masterName": "Rich Blue",
+  "altNames": ["B11"],
+  "deprecatedNames": [],
+  "hex": "#2b3770",
+  "oklch": { "l": 0.359, "c": 0.099, "h": 271.63 },
+
+  "sources": [
+    { "source": "as2700", "code": "B11", "name": "Rich Blue", "hex": "#2b3770" }
+  ],
+
+  "meaning": ["authority", "depth", "trust"],
+  "attributes": ["cool", "deep", "corporate"],
+  "psychologySummary": "Reads as authoritative without being severe.",
+  "psychologyPositive": ["confident", "stable"],
+  "psychologyNegative": ["distant", "cold"],
+  "origin": "Originally specified for Australian government signage in 1985.",
+
+  "isDesignSystem": false
+}
+```
+
+### Field-by-field
+
+| Field | Required | Lands on | Notes |
+|---|---|---|---|
+| `masterName` | ✅ | Entry's `name` (the display label, capitalisation preserved) | The display name your admin sees. Source-specific labels go in `sources[].name` and become altNames automatically when they differ. |
+| `hex` | ✅ | Entry's `hex` if a source doesn't override | `#rrggbb`, lowercase preferred. |
+| `sources[]` | ✅ | One ingest record per source — drives the `(sourceId, sourceCode, hex)` dedupe key | At least one. See source shape below. |
+| `altNames[]` | optional | Entry-level altNames (searchable aliases) | For names like BS381 codes, brand variants, or stylised spellings — anything you want autocomplete to find. |
+| `deprecatedNames[]` | optional | **Group** field — historical aliases not tied to a live entry | E.g. `"Mulbery"` (sic) for a renamed colour. Survives re-import via union merge. |
+| `oklch` | optional | Entry's OKLCH (preserved on the master-hex record only) | Skip for hex-only sources; the backend accepts null. |
+| `meaning[]` / `attributes[]` / `psychologySummary` / `psychologyPositive[]` / `psychologyNegative[]` / `origin` | optional | **Group** fields — applied via the editorial-merge phase | Lives on the group, not the entry. Re-imports union, never overwrite. |
+| `isDesignSystem` | optional | Entry-level override of the source's default | Use for one-off cases (e.g. a brand colour that happens to be in a design-system source). |
+
+## Source shape
+
+```json
+{
+  "source": "as2700",
+  "code": "B11",
+  "name": "Rich Blue",
+  "hex": "#2b3770",
+  "scaleKey": null,
+  "scaleStep": null
+}
+```
+
+| Field | Required | Used for |
+|---|---|---|
+| `source` | ✅ | Lowercased namespace key. Auto-creates a `colour_name_source` row if new. |
+| `code` | optional | Source-local identifier (`"B11"`, `"neutral-100"`, `"642"`). Combined with `source` and `hex` for the dedupe key — re-importing the same `(source, code, hex)` upserts in place. |
+| `name` | optional | Source's own label. If it differs from `masterName`, gets pushed to the entry's `altNames` automatically. |
+| `hex` | optional | Defaults to entry-level `hex`. Set when this source's hex differs from the master. |
+| `scaleKey` | optional | For design-system scales — `"tailwind:neutral"`, `"material:grey"`. Drives the Design Systems sibling lookup. |
+| `scaleStep` | optional | Position in the scale — `100`, `200`, `500`, `950`. Orders siblings on the Design Systems tab. |
+
+## Worked examples
+
+### 1. Single source, simple name
+
+```json
+{
+  "masterName": "Crimson",
+  "hex": "#dc143c",
+  "sources": [
+    { "source": "css", "code": "crimson", "name": "crimson", "hex": "#dc143c" }
+  ]
+}
+```
+
+Lands as: `name: "Crimson"`, `altNames: ["crimson"]` (lowercase keyword auto-added because it differs from the masterName casing).
+
+### 2. Source carrying multiple labels (BS381-style)
+
+```json
+{
+  "masterName": "Night",
+  "altNames": ["Night Blue"],
+  "hex": "#282b2f",
+  "sources": [
+    { "source": "bs381", "code": "642", "name": "Night", "hex": "#282b2f" }
+  ]
+}
+```
+
+Lands as: `name: "Night"`, `altNames: ["Night Blue"]`, `sourceCode: "642"`.
+
+### 3. Same colour in multiple sources
+
+```json
+{
+  "masterName": "White Smoke",
+  "hex": "#f5f5f5",
+  "sources": [
+    { "source": "css",      "code": "whitesmoke",  "name": "whitesmoke" },
+    { "source": "tailwind", "code": "neutral-100", "name": "Neutral 100", "scaleKey": "tailwind:neutral", "scaleStep": 100 },
+    { "source": "material", "code": "grey-100",    "name": "Grey 100",    "scaleKey": "material:grey",    "scaleStep": 100 }
+  ]
+}
+```
+
+Lands as **three entries** (one per source), all in **one group** via hex-match (rule 2 of the ingest pipeline). The group's master-name pointer aims at the first-imported entry by default; flip the crown toggles in the admin to change it.
+
+### 4. Design-system scale
+
+```json
+{
+  "masterName": "Tailwind Neutral 500",
+  "hex": "#737373",
+  "isDesignSystem": true,
+  "sources": [
+    {
+      "source": "tailwind",
+      "code": "neutral-500",
+      "name": "neutral-500",
+      "scaleKey": "tailwind:neutral",
+      "scaleStep": 500
+    }
+  ]
+}
+```
+
+Or set the source-wide flag once at the top via `sourceConfigs.tailwind.isDesignSystem: true` and skip the per-entry `isDesignSystem`.
+
+### 5. Editorial entry with full metadata
+
+```json
+{
+  "masterName": "Rebecca Purple",
+  "hex": "#663399",
+  "sources": [
+    { "source": "css", "code": "rebeccapurple", "name": "rebeccapurple", "hex": "#663399" }
+  ],
+  "meaning": ["memorial", "creativity"],
+  "psychologySummary": "Added to CSS4 in memory of Rebecca Meyer (2014).",
+  "origin": "Named after Rebecca Alison Meyer; added to CSS Color Module Level 4 by W3C following her death from brain cancer at age six. Eric Meyer (her father, a CSS expert) had requested the colour."
+}
+```
+
+Editorial fields land on the group via the editorial-merge phase. Re-importing later with extra meanings unions them in.
+
+## Gotchas
+
+<Aside type="caution" title="Common pitfalls">
+  These bite at import time and are easier to fix in the JSON than in the admin afterwards.
+</Aside>
+
+- **`source` keys are lowercased on the way in.** Use `"as2700"` not `"AS2700"` — the backend treats them as the same key, but consistency in the file makes it easier to scan and diff.
+- **`(source, code, hex)` is the dedupe key.** Re-importing the same tuple upserts in place (rule 1). A different `code` for the same colour creates a new entry — clean up via the entry editor.
+- **`hex` defaults to entry-level `hex` if a source omits it.** Only set source-level `hex` when it genuinely differs (e.g. XKCD's slightly different rendering of a named colour).
+- **Don't put editorial fields inside `sources[]`.** `meaning`, `psychology*`, `origin`, `attributes`, `deprecatedNames` belong at the entry level — they end up on the **group**, not the source row.
+- **Same-hex collision across the file** (e.g. CSS `aqua` and `cyan` both at `#00ffff`) — emit them as separate entries; rule 2 will hex-match them into one group on the second one. Order them in the file with the preferred name first if you care which becomes the master pointer (it auto-points to the first-imported entry of a fresh group).
+- **`oklch` is optional but worth supplying** when the source is OKLCH-native (Tailwind 4, Open Color v2). The first record per entry preserves it; later sources at the same hex don't clobber it.
+- **`sourceConfigs` only sets defaults.** Once an entry exists from that source, the per-entry `isDesignSystem` override (or admin toggle in the Sources tab) wins.
+
+## Idempotency
+
+Every record runs through rule 1 (exact `(source, code, hex)` match) before anything else. That means:
+
+- Re-running the same import is a no-op on existing rows — `name`, `altNames`, and `oklch` get refreshed; group memberships are untouched.
+- Editorial metadata merges via union — existing entries on the group survive, new entries are added.
+- The admin can edit fields between imports without losing the edits on the next re-run, because the editorial merge never overwrites a non-empty field.
+
+## What the importer does, end to end
+
+1. **Parse** — recognises `{ entries }`, bare array of entries, or `{ records }`. The first two route through the editorial path.
+2. **Expand** — each entry becomes one ingest record per source. The first record carries the entry's `altNames` and `oklch`; later records get the source-specific label as an altName if it differs from the entry's `masterName`.
+3. **Chunk + ingest** — records go to `/ingest` in 25-record sub-batches with progress reported between chunks. Each record runs in its own transaction (per the design doc — no batch-wide atomicity ceiling).
+4. **Stitch** — the per-record outcomes are grouped back by originating entry. Each entry's destination group is picked by outcome majority.
+5. **Merge editorial** — for each entry's destination group, the importer fetches the current `DerivedGroupView`, unions the entry's editorial fields (`meaning`, `psychology*`, `origin`, `attributes`, `deprecatedNames`) into it, and `PATCH`es only when the merge changed something.
+
+Total wall time for a 200-entry file against Neon ≈ 10 seconds. The Import tab shows a per-phase progress bar with `done / total (pct%)`.
+
+## See also
+
+- [Colour Thesaurus v2 — Design Doc](/colour-palette/thesaurus-v2/) for the schema, ingest rules, and merge semantics.
