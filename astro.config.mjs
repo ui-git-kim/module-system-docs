@@ -256,6 +256,8 @@ export default defineConfig({
                 { label: "Harmony Map", slug: "colour-palette/harmony-map" },
                 { label: "Gamut Mapping", slug: "colour-palette/gamut-mapping" },
                 { label: "Tonal Scale", slug: "colour-palette/tonal-scale" },
+                { label: "Thesaurus v2 — Design Doc", slug: "colour-palette/thesaurus-v2" },
+                { label: "Thesaurus Import Format", slug: "colour-palette/thesaurus-import-format" },
                 { label: "Developer Workflow", slug: "colour-palette/developer-workflow" },
                 { label: "Changelog", slug: "colour-palette/changelog" },
                 { label: "Roadmap", slug: "colour-palette/roadmap" },
