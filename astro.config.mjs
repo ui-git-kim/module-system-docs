@@ -215,6 +215,7 @@ export default defineConfig({
             { label: "Module Roadmap", slug: "modules/roadmap" },
             {
               label: "Structure",
+              collapsed: true,
               items: [
                 { label: "Overview", slug: "modules/structure" },
                 { label: "Configuration", slug: "modules/structure/configuration" },
@@ -227,6 +228,7 @@ export default defineConfig({
             },
             {
               label: "Builder",
+              collapsed: true,
               items: [
                 { label: "Overview", slug: "modules/builder" },
                 { label: "Configuration", slug: "modules/builder/configuration" },
@@ -239,6 +241,7 @@ export default defineConfig({
             },
             {
               label: "Style",
+              collapsed: true,
               items: [
                 { label: "Overview", slug: "modules/style" },
                 { label: "Design philosophy", slug: "modules/style/design" },
@@ -248,6 +251,7 @@ export default defineConfig({
             { label: "Billing", slug: "modules/billing" },
             {
               label: "Cog Ingest",
+              collapsed: true,
               items: [
                 { label: "Overview", slug: "modules/cog-ingest" },
                 { label: "Configuration", slug: "modules/cog-ingest/configuration" },
@@ -260,6 +264,7 @@ export default defineConfig({
             },
             {
               label: "Colour Palette",
+              collapsed: true,
               items: [
                 { label: "Overview", slug: "colour-palette" },
                 { label: "Configuration", slug: "colour-palette/configuration" },
@@ -277,6 +282,7 @@ export default defineConfig({
             },
             {
               label: "Pickers",
+              collapsed: true,
               items: [
                 { label: "Overview", slug: "modules/pickers" },
                 { label: "Configuration", slug: "modules/pickers/configuration" },
