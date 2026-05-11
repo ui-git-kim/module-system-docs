@@ -247,6 +247,18 @@ export default defineConfig({
             },
             { label: "Billing", slug: "modules/billing" },
             {
+              label: "Cog Ingest",
+              items: [
+                { label: "Overview", slug: "modules/cog-ingest" },
+                { label: "Configuration", slug: "modules/cog-ingest/configuration" },
+                { label: "Usage", slug: "modules/cog-ingest/usage" },
+                { label: "Integration", slug: "modules/cog-ingest/integration" },
+                { label: "Developer Workflow", slug: "modules/cog-ingest/developer-workflow" },
+                { label: "Changelog", slug: "modules/cog-ingest/changelog" },
+                { label: "Roadmap", slug: "modules/cog-ingest/roadmap" },
+              ],
+            },
+            {
               label: "Colour Palette",
               items: [
                 { label: "Overview", slug: "colour-palette" },

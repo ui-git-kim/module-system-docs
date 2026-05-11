@@ -1,0 +1,475 @@
+---
+title: Integration
+description: How other modules depend on and integrate with Cog Ingest
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+Cog Ingest fires action hooks when content is ingested or sources change, exposes filter hooks for transforming the ingest pipeline, and registers a service for runtime access. This page is the definitive guide for module developers who need to react to, extend, or consume ingest data.
+
+---
+
+## Integration Points at a Glance
+
+<CardGrid>
+  <Card title="React to Ingest Events" icon="rocket">
+    Listen to 5 action hooks — run logic when content is ingested, sources are created, updated, or deleted.
+  </Card>
+  <Card title="Transform the Pipeline" icon="list-format">
+    Apply filters before and after ingestion to modify input or enrich results.
+  </Card>
+  <Card title="Access the Service" icon="puzzle">
+    Call ingest operations programmatically via the service registry.
+  </Card>
+  <Card title="Register Preprocessors" icon="document">
+    Add custom content transformers that run before cognitive-db processing.
+  </Card>
+</CardGrid>
+
+| Integration | Frontend | Backend | Mechanism |
+|-------------|----------|---------|-----------|
+| React to ingest events | — | ✅ | `actionRegistry` |
+| Transform ingest input/output | — | ✅ | `filterRegistry` |
+| Access ingest service | — | ✅ | `serviceRegistry.get('cog-ingest')` |
+| Register preprocessors | — | ✅ | `preprocessorsRegistry` |
+| Display ingest data in UI | ✅ | — | Import hooks from `@/features/cog-ingest` |
+| Use ingest types | ✅ | ✅ | Import types from feature module |
+
+---
+
+## Declaring the Dependency
+
+If your module depends on Cog Ingest, declare it in your `module.ts`:
+
+```typescript
+export const moduleDefinition: ModuleDefinition = {
+  id: 'my-analysis',
+  requiredModules: ['cog-ingest'],
+  // ...
+};
+```
+
+The init script verifies Cog Ingest exists in both frontend and backend feature directories before proceeding.
+
+---
+
+## Action Hooks
+
+Cog Ingest fires **5 action hooks** that other modules can listen to. All hooks run via `actionRegistry.doAction()` in the backend.
+
+### Hook Reference
+
+| Hook | Fired When | Context Shape |
+|------|-----------|---------------|
+| `cog-ingest.ingest.completed` | An ingest job finishes successfully | `{ userId, job, result, source }` |
+| `cog-ingest.ingest.failed` | An ingest job fails | `{ userId, jobId, error, source }` |
+| `cog-ingest.source.created` | An admin creates a new ingest source | `{ userId, source }` |
+| `cog-ingest.source.updated` | An admin updates an ingest source | `{ userId, source }` |
+| `cog-ingest.source.deleted` | An admin deletes an ingest source | `{ userId, sourceId }` |
+
+### Context Type Details
+
+```typescript
+// cog-ingest.ingest.completed
+interface IngestCompletedContext {
+  userId: string;
+  job: {
+    id: string;
+    sourceId: string;
+    status: 'completed';
+    title: string | null;
+    tokensUsed: number;
+    nodesCreated: number;
+    connectionsFound: number;
+    durationMs: number;
+    structureNodeId: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+  };
+  result: {
+    contentNode: { id: string; name: string | null };
+    entityNodes: Array<{ id: string; name: string | null; subType: string | null }>;
+    connectionNodes: Array<{ id: string; connectionType: string | null }>;
+    emotionNodes: Array<{ id: string; name: string | null }>;
+    conceptNodes: Array<{ id: string; name: string | null; nodeType: string }>;
+    questionsRaised: Array<{
+      question: string;
+      about: string[];
+      priority: 'low' | 'medium' | 'high';
+    }>;
+    processingLevel: string;
+    tokensUsed: number;
+    durationMs: number;
+    warnings: string[];
+  };
+  source: {
+    id: string;
+    slug: string;
+    name: string;
+    sourceType: string;
+    processingLevel: string;
+    ontologyGrowthMode: string;
+  };
+}
+
+// cog-ingest.ingest.failed
+interface IngestFailedContext {
+  userId: string;
+  jobId: string;
+  error: string;
+  source: {
+    id: string;
+    slug: string;
+    name: string;
+    sourceType: string;
+    processingLevel: string;
+    ontologyGrowthMode: string;
+  };
+}
+
+// cog-ingest.source.created / cog-ingest.source.updated
+interface SourceEventContext {
+  userId: string;
+  source: {
+    id: string;
+    slug: string;
+    name: string;
+    description: string | null;
+    sourceType: string;
+    processingLevel: string;
+    ontologyGrowthMode: string;
+    isActive: boolean;
+    config: Record<string, unknown>;
+  };
+}
+
+// cog-ingest.source.deleted
+interface SourceDeletedContext {
+  userId: string;
+  sourceId: string;
+}
+```
+
+### Listening to Action Hooks
+
+Register your listener in a backend registration file:
+
+```typescript
+// backend/src/features/my-analysis/action.registration.ts
+import { actionRegistry } from '../../config/action.registry.js';
+import { createModuleLogger } from '../../lib/logger.js';
+
+const log = createModuleLogger('my-analysis:actions');
+
+// React to completed ingestions
+actionRegistry.addActionAsync(
+  'cog-ingest.ingest.completed',
+  'my-analysis-process-ingest',
+  async (context) => {
+    const { userId, job, result } = context;
+
+    log.info(
+      { userId, jobId: job.id, entities: result.entityNodes.length },
+      'Processing completed ingest for analysis'
+    );
+
+    // Your logic here — e.g. run additional analysis on extracted entities
+  },
+  50  // order
+);
+```
+
+<Aside type="caution" title="Use addActionAsync for async work">
+If your handler does async work (database queries, API calls), use `addActionAsync`. The `addAction` variant is synchronous only.
+</Aside>
+
+### Hooks Cog Ingest Listens To
+
+Cog Ingest itself listens to one Structure hook:
+
+| Hook | Handler ID | Behaviour |
+|------|-----------|-----------|
+| `structure.node.deleted` | `cog-ingest-cleanup-jobs` | Logs the deletion — ingest jobs remain as history (no cascade delete) |
+
+---
+
+## Filter Hooks
+
+Cog Ingest exposes **2 filter hooks** for transforming the ingest pipeline. Filters run via `filterRegistry.applyAll()`, which executes both sync and async filters in order.
+
+### Hook Reference
+
+| Hook | Value Type | Context | Purpose |
+|------|-----------|---------|---------|
+| `cog-ingest.beforeIngest` | Ingest input object | `{ userId, source, job }` | Transform content before cognitive-db processing |
+| `cog-ingest.afterIngest` | cognitive-db result | `{ userId, source, job }` | Enrich or transform results after processing |
+
+### Registering Filters
+
+```typescript
+// backend/src/features/my-enrichment/filter.registration.ts
+import { filterRegistry } from '../../config/filter.registry.js';
+
+// Add metadata before ingestion
+filterRegistry.registerAsync(
+  'cog-ingest.beforeIngest',
+  'my-enrichment-add-context',
+  async (input, context) => {
+    // Enrich the input with additional metadata
+    return {
+      ...input,
+      metadata: {
+        ...input.metadata,
+        enrichedAt: new Date().toISOString(),
+        analysisVersion: '2.0',
+      },
+    };
+  },
+  50  // order
+);
+
+// Transform results after ingestion
+filterRegistry.registerAsync(
+  'cog-ingest.afterIngest',
+  'my-enrichment-score-entities',
+  async (result, context) => {
+    // Score entities based on your custom logic
+    return {
+      ...result,
+      entityNodes: result.entityNodes.map((entity) => ({
+        ...entity,
+        data: {
+          ...(entity.data ?? {}),
+          relevanceScore: calculateRelevance(entity),
+        },
+      })),
+    };
+  },
+  50
+);
+```
+
+<Aside type="tip">
+The `beforeIngest` filter receives the input after prompt variable substitution but before content processors run. The `afterIngest` filter receives the full cognitive-db result before it's saved to the job record.
+</Aside>
+
+---
+
+## Service Registry
+
+Cog Ingest registers its service for programmatic access by other backend modules.
+
+### Service Registration
+
+```typescript
+// Registered as:
+serviceRegistry.register('cog-ingest', cogIngestService, {
+  feature: 'cog-ingest',
+  description: 'Content ingestion via cognitive-db',
+});
+```
+
+### Accessing the Service
+
+```typescript
+import { serviceRegistry } from '../../config/service.registry.js';
+
+const ingestService = serviceRegistry.get('cog-ingest');
+
+// Programmatic ingestion
+const { job, result } = await ingestService.ingest(userId, {
+  sourceId: 'source-id',
+  content: 'Text to ingest',
+  contentType: 'text',
+  title: 'My programmatic ingest',
+});
+```
+
+### Service Methods
+
+| Method | Parameters | Returns | Description |
+|--------|-----------|---------|-------------|
+| `getSources(userId)` | `string` | `IngestSource[]` | List all sources for a user |
+| `getSourceById(id, userId)` | `string, string` | `IngestSource` | Get a single source (throws `NotFoundError`) |
+| `createSource(userId, data)` | `string, CreateSourceInput` | `IngestSource` | Create a source + fire action |
+| `updateSource(id, userId, data)` | `string, string, UpdateSourceInput` | `IngestSource` | Update a source + fire action |
+| `deleteSource(id, userId)` | `string, string` | `void` | Delete a source + fire action |
+| `getMappings(sourceId, userId)` | `string, string` | `IngestMapping[]` | List mappings for a source |
+| `upsertMapping(sourceId, userId, data)` | `string, string, CreateMappingInput` | `IngestMapping` | Create or update a mapping |
+| `ingest(userId, data)` | `string, IngestRequestInput` | `{ job, result }` | Run ingestion pipeline |
+| `ingestBatch(userId, data)` | `string, { items, stopOnError? }` | `{ results, errors }` | Batch ingest |
+| `getJobs(userId, options?)` | `string, JobListOptions` | `JobListResponse` | Paginated job list |
+| `getJobById(id, userId)` | `string, string` | `IngestJob` | Single job (throws `NotFoundError`) |
+| `getStats(userId)` | `string` | `IngestStats` | Aggregate stats |
+| `getIngestedForNode(nodeId, userId)` | `string, string` | `IngestJob[]` | Jobs for a Structure node |
+
+### Type Augmentation
+
+For type-safe service access, add the type augmentation in your module:
+
+```typescript
+// backend/src/features/my-analysis/service.registration.ts
+import type { cogIngestService } from '../cog-ingest/cog-ingest.service.js';
+
+declare module '../../config/service.registry.js' {
+  interface ServiceTypes {
+    'cog-ingest': typeof cogIngestService;
+  }
+}
+```
+
+---
+
+## Preprocessors Registry
+
+The preprocessors registry lets other modules add content transformers that run before cognitive-db processing. Unlike filter hooks, preprocessors are content-type-aware and include a detection function.
+
+### Registration
+
+```typescript
+import { preprocessorsRegistry } from '../cog-ingest/preprocessors.registry.js';
+
+preprocessorsRegistry.register({
+  id: 'my-legal-doc-splitter',
+  name: 'Legal Document Section Splitter',
+  contentTypes: ['text'],
+  detect: (content) => /^SECTION\s+\d+/m.test(content),
+  process: async (content, metadata) => ({
+    content: content.replace(/\n(?=SECTION\s+\d+)/g, '\n===\n'),
+    metadata: { ...metadata, preprocessor: 'my-legal-doc-splitter' },
+  }),
+});
+```
+
+### Preprocessor Interface
+
+```typescript
+interface ContentPreprocessor {
+  id: string;
+  name: string;
+  contentTypes: string[];  // e.g. ['text', 'url', 'pdf']
+  detect: (content: string, metadata: Record<string, unknown>) => boolean;
+  process: (
+    content: string,
+    metadata: Record<string, unknown>
+  ) => Promise<{ content: string; metadata: Record<string, unknown> }>;
+}
+```
+
+Preprocessors run after content processors (image/URL/PDF → text) but before the `cog-ingest.beforeIngest` filter.
+
+---
+
+## Frontend Integration
+
+Other frontend modules can import hooks and types from the Cog Ingest feature:
+
+```typescript
+// Import hooks
+import {
+  useSubmitIngest,
+  useIngestStats,
+  useIngestSources,
+  useIngestJobs,
+  useIngestJob,
+  useIngestedForNode,
+} from '@/features/cog-ingest';
+
+// Import types
+import type {
+  IngestSource,
+  IngestJob,
+  IngestStats,
+  IngestRequestInput,
+  IngestResultResponse,
+  ContentType,
+} from '@/features/cog-ingest';
+```
+
+### Dashboard Widget
+
+Cog Ingest registers a `2x1` dashboard widget (`id: 'cog-ingest-activity'`) showing total jobs, nodes created, and connections found. Other modules don't need to register their own widget to display ingest data — they can use the hooks directly.
+
+### Structure Node Integration
+
+Cog Ingest registers two components with the Structure module:
+
+| Registration | Registry | Component | Purpose |
+|-------------|----------|-----------|---------|
+| Node tab | `nodeTabRegistry` | `IngestNodeTab` | "Ingested Content" tab on node detail pages |
+| Node widget | `nodeWidgetRegistry` | `IngestNodeWidget` | Ingest stats widget on node overview |
+
+Both are registered for all node types (`nodeTypes: '*'`). They use `useIngestedForNode(node.id)` internally.
+
+---
+
+## End-to-End Integration Example
+
+Here's a hypothetical "Analysis" module that reacts to completed ingestions, runs additional analysis, and displays results:
+
+```typescript
+// backend/src/features/analysis/action.registration.ts
+import { actionRegistry } from '../../config/action.registry.js';
+import { serviceRegistry } from '../../config/service.registry.js';
+import { createModuleLogger } from '../../lib/logger.js';
+
+const log = createModuleLogger('analysis:actions');
+
+actionRegistry.addActionAsync(
+  'cog-ingest.ingest.completed',
+  'analysis-post-ingest',
+  async (context) => {
+    const { userId, job, result, source } = context;
+
+    // Only process deep-level ingests
+    if (source.processingLevel !== 'deep') return;
+
+    // Access the ingest service for additional data
+    const ingestService = serviceRegistry.get('cog-ingest');
+    const allJobs = await ingestService.getJobs(userId, {
+      sourceId: source.id,
+      status: 'completed',
+      limit: 10,
+    });
+
+    log.info(
+      {
+        userId,
+        jobId: job.id,
+        entityCount: result.entityNodes.length,
+        priorJobs: allJobs.items.length,
+      },
+      'Running post-ingest analysis'
+    );
+
+    // Your analysis logic here...
+  },
+  60  // run after default handlers
+);
+```
+
+```typescript
+// frontend/src/features/analysis/components/IngestAnalysis.tsx
+import { useIngestedForNode } from '@/features/cog-ingest';
+import type { IngestJob } from '@/features/cog-ingest';
+
+interface IngestAnalysisProps {
+  nodeId: string;
+}
+
+export function IngestAnalysis({ nodeId }: IngestAnalysisProps) {
+  const { data: jobs } = useIngestedForNode(nodeId);
+
+  if (!jobs?.length) return null;
+
+  const totalEntities = jobs.reduce((sum, job) => sum + job.nodesCreated, 0);
+
+  return (
+    <div>
+      <p>{jobs.length} ingestions, {totalEntities} entities extracted</p>
+    </div>
+  );
+}
+```
