@@ -23,7 +23,7 @@ During `npx cognitive-ingest init`, you answer four questions. Your answers dete
 | **Default processing level** | Minimal, Standard, Deep | Standard | Default depth for new ingest sources |
 
 <Aside type="note">
-These prompt answers are stored as template variables (`{{llmProvider}}`, `{{embeddingProvider}}`, `{{embeddingDimensions}}`, `{{defaultProcessingLevel}}`) and baked into the generated config file at install time. To change providers after installation, you need to edit `backend/src/features/cog-ingest/cog-ingest.config.ts` directly.
+These prompt answers are stored as template variables (`{{llmProvider}}`, `{{embeddingProvider}}`, `{{embeddingDimensions}}`, `{{defaultProcessingLevel}}`) and baked into the generated config file at install time. These become the **static defaults**. From v1.4.0, you can override most settings at runtime via the admin UI — see [Runtime Configuration](#runtime-configuration-admin-ui) below.
 </Aside>
 
 ---
@@ -93,17 +93,126 @@ The module uses `voyage-3` for dimensions ≤ 1024 and `voyage-3-lite` for large
 
 ---
 
-## Runtime Configuration
+## Runtime Configuration (Admin UI)
 
-The generated config file (`cog-ingest.config.ts`) exports a `myFeatureConfig` object with additional settings that accept template variable defaults:
+From v1.4.0, engine configuration is managed at runtime through the admin page. The static config file provides **defaults**; the database provides **overrides**. Database overrides always win.
+
+The admin page has two tabs:
+- **Ingest Sources** — source CRUD (existing)
+- **Engine Configuration** — runtime settings management (new)
+
+### Config Sections
+
+The Engine Configuration tab is organised into collapsible sections:
+
+| Section | Key | What It Controls |
+|---------|-----|-----------------|
+| **LLM Configuration** | `engine` | Provider (Anthropic/OpenAI), model, API key status (read-only) |
+| **Embedding Configuration** | `engine` | Provider (Voyage/OpenAI), model. Dimensions are read-only (changing requires re-embedding) |
+| **Processing Defaults** | `processing` | Default level, batch size, pattern growth mode/threshold |
+| **Feature Flags** | `features` | Toggle switches for: understanding, patterns, proactive, entity extraction, relationship discovery, question detection, emotion detection |
+| **Prompts** | `prompts` | System context, content description, custom prompt overrides |
+| **Extraction Depth** | `extraction` | Visual analysis master toggle, per-type toggles (URL screenshots, PDF rendering, enhanced images), PDF sampling strategy |
+| **Import / Export** | — | JSON file import with preview, JSON export download |
+
+### Config Merging
+
+On backend startup, `initMyFeature()`:
+1. Loads static defaults from the generated config file
+2. Queries the `cog_ingest_config` table for overrides
+3. Merges overrides on top of defaults
+4. Initialises cognitive-db with the merged config
+
+When an admin saves a config change:
+1. The override is persisted to `cog_ingest_config`
+2. `reinitialiseEngine()` calls cognitive-db's `updateConfig()` to apply immediately
+3. No server restart required
+
+### Read-Only Fields
+
+Some settings cannot be changed at runtime and are shown as read-only in the admin UI:
+
+| Field | Reason |
+|-------|--------|
+| Embedding dimensions | Changing would require re-embedding all existing data |
+| Database mode | Set at install time (always `integrated`) |
+| API keys | Shown as status only (`configured` / `missing`) — never exposed |
+
+### JSON Import / Export
+
+Export the current configuration as a JSON file for backup or transfer between environments. Import a JSON file to bulk-apply settings with a preview diff before confirming.
+
+**JSON format** (all sections optional — only included sections update on import):
+
+```json
+{
+  "$schema": "cog-ingest-config-v1",
+  "engine": {
+    "llm": { "provider": "anthropic", "model": "claude-sonnet-4-20250514" },
+    "embedding": { "provider": "voyage", "model": "voyage-3" }
+  },
+  "processing": {
+    "defaultLevel": "standard",
+    "mode": "sync",
+    "batchSize": 10,
+    "patternGrowthMode": "off",
+    "patternGrowthThreshold": 0.85
+  },
+  "features": {
+    "understanding": true,
+    "patterns": true,
+    "proactive": true,
+    "entityExtraction": true,
+    "relationshipDiscovery": true,
+    "questionDetection": true,
+    "emotionDetection": true
+  },
+  "prompts": {
+    "systemContext": "",
+    "contentDescription": "",
+    "customPrompts": {
+      "entityExtraction": null,
+      "contentUnderstanding": null,
+      "relationshipExtraction": null,
+      "patternDescription": null,
+      "connectionExplanation": null,
+      "insightGeneration": null
+    }
+  },
+  "extraction": {
+    "visualAnalysisEnabled": false,
+    "urlScreenshots": false,
+    "screenshotViewport": { "width": 1440, "height": 900 },
+    "screenshotMaxHeight": 5000,
+    "pdfPageRendering": false,
+    "pdfSamplePages": "first-last-every-5th",
+    "pdfMaxPagesToRender": 20,
+    "enhancedImageAnalysis": false,
+    "visionAnalysisModel": ""
+  }
+}
+```
+
+---
+
+## Extraction Configuration
+
+The extraction section controls the deep multi-modal extraction pipeline. All visual analysis features are **off by default** and must be explicitly enabled.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `patternGrowthMode` | `'off'` | Controls automatic pattern detection: `'off'`, `'propose'`, or `'auto'` |
-| `patternGrowthThreshold` | `0.85` | Confidence threshold for automatic pattern growth |
-| `includeVisualDescriptions` | `true` | Whether image processing includes visual descriptions |
+| `visualAnalysisEnabled` | `false` | Master toggle — must be on for any visual analysis |
+| `urlScreenshots` | `false` | Capture page screenshots for URL content (requires Puppeteer) |
+| `pdfPageRendering` | `false` | Render PDF pages as images for visual analysis |
+| `enhancedImageAnalysis` | `false` | Use richer structured vision prompts for images |
+| `pdfSamplePages` | `'first-last-every-5th'` | Which pages to render: `first-only`, `first-last`, `first-last-every-5th`, `all` |
+| `pdfMaxPagesToRender` | `20` | Maximum pages to send through vision analysis |
+| `screenshotViewport` | `{ width: 1440, height: 900 }` | Browser viewport for URL screenshots |
+| `screenshotMaxHeight` | `5000` | Max pixel height for full-page screenshots |
 
-These can be overridden by editing the config file directly after installation.
+<Aside type="caution" title="Puppeteer is optional">
+URL screenshot capture requires Puppeteer, which is NOT installed by default (~400 MB with Chrome). Install it separately: `npm install puppeteer`. If not installed, URL processing falls back to text-only extraction with a log warning.
+</Aside>
 
 ---
 
@@ -113,23 +222,25 @@ The config file initialises cognitive-db with your app's Prisma client and provi
 
 ```typescript
 // Key exports from cog-ingest.config.ts
-export const llmModel;           // AI SDK model instance
-export const myFeatureConfig;    // Runtime settings object
-export function initMyFeature(); // Initialises cognitive-db
+export const llmModel;             // AI SDK model instance
+export const myFeatureConfig;      // Runtime settings object
+export async function initMyFeature();    // Initialises cognitive-db (loads DB overrides)
+export async function reinitialiseEngine(); // Re-applies config at runtime
 ```
 
-The `initMyFeature()` function is called during backend startup via the `hasInit: true` flag in the module definition. It configures cognitive-db with:
+The `initMyFeature()` function is called during backend startup via the `hasInit: true` flag in the module definition. It:
 
-- **Database** — integrated mode using the app's Prisma client
-- **LLM** — the configured model (Claude or GPT)
-- **Embedding** — custom embed/embedBatch/embedQuery functions using the selected provider
-- **Features** — understanding, patterns, proactive, entity extraction, relationship discovery
+1. Loads static defaults from the config file
+2. Queries `cog_ingest_config` for runtime overrides
+3. Merges overrides on top of defaults
+4. Configures cognitive-db with database, LLM, embedding, and features
+5. Logs which sections are using overrides vs defaults
 
 ---
 
 ## Database Schema
 
-The module creates 6 Prisma models — 3 cognitive-db engine tables and 3 module-specific tables.
+The module creates 7 Prisma models — 3 cognitive-db engine tables and 4 module-specific tables.
 
 ### Engine Tables
 
@@ -146,6 +257,7 @@ The module creates 6 Prisma models — 3 cognitive-db engine tables and 3 module
 | `cog_ingest_source` | `cog_ingest_sources` | Admin-configured ingest source definitions |
 | `cog_ingest_job` | `cog_ingest_jobs` | Individual ingest job records with results |
 | `cog_ingest_mapping` | `cog_ingest_mappings` | Source-to-Structure-node-type mappings |
+| `cog_ingest_config` | `cog_ingest_configs` | Runtime configuration overrides (key-value JSON) |
 
 <Aside type="caution">
 Engine tables use literal names (not the `my_feature` placeholder pattern) because the cognitive-db runtime depends on the exact column layout. The module tables also use literal names since they share the `cog_` prefix.
@@ -169,3 +281,8 @@ Engine tables use literal names (not the `my_feature` placeholder pattern) becau
 - `sourceId` + `structureNodeTypeSlug` — unique compound key
 - `entityTypes` / `relationshipTypes` — JSON arrays of types to extract
 - `customPrompt` — optional LLM prompt for extraction context
+
+**cog_ingest_config:**
+- `key` — unique config section key (`'engine'`, `'processing'`, `'features'`, `'prompts'`, `'extraction'`)
+- `value` — JSON object with the section's configuration values
+- `userId` — who last modified the config (audit trail)
