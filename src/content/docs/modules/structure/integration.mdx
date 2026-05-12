@@ -19,15 +19,15 @@ There are three levels of integration, and most modules use all three:
 
 ### 1. Attach UI to Nodes (Frontend Registries)
 
-Your module adds tabs, widgets, actions, columns, filters, and sidebar sections to Structure's node pages. For example, a Tasks module adds a "Tasks" tab to every project's detail page, a task count badge on project cards, and a "Task Status" filter on list pages. This is done through Structure's **8 content registries** — you register components, and Structure renders them in the right place.
+Your module adds tabs, widgets, actions, columns, filters, sidebar sections, and fields to Structure's node pages. For example, a Tasks module adds a "Tasks" tab to every project's detail page, a task count badge on project cards, and a "Task Status" filter on list pages. This is done through Structure's **8 content registries** plus `structureRegistry` for field injection — you register components and field definitions, and Structure renders them in the right place.
 
-<Aside type="note" title="9 registries total">
-Structure exposes **9 module-specific registries**. 8 are content registries (`nodeTabRegistry`, `nodeWidgetRegistry`, `nodeCardExtensionRegistry`, `nodeActionRegistry`, `nodeColumnRegistry`, `nodeFilterRegistry`, `nodeSidebarSectionRegistry`, `nodeFieldTypeRegistry`) — these are the ones other modules plug into. The 9th is `nodeTypeRegistry`, which is DB-synced and managed at runtime for node type configurations (see below).
+<Aside type="note" title="11 registries total">
+Structure exposes **11 module-specific registries**. 8 are content registries (`nodeTabRegistry`, `nodeWidgetRegistry`, `nodeCardExtensionRegistry`, `nodeActionRegistry`, `nodeColumnRegistry`, `nodeFilterRegistry`, `nodeSidebarSectionRegistry`, `nodeFieldTypeRegistry`). Two are DB-synced configuration registries (`nodeTypeRegistry` for node types, `connectionTypeRegistry` for typed connections — each with a dedicated admin tab). The 11th is `structureRegistry`, which handles module field injection, lifecycle hooks, and delete validation.
 </Aside>
 
 ### 2. React to Node Events (Backend Action Hooks)
 
-When nodes are created, updated, deleted, moved, or archived, Structure fires **16 action hooks**. Your module listens to these events and reacts: clean up tasks when a project is deleted, generate an invoice when a client is archived, send a notification when a node is moved. This is the primary mechanism for **cross-module coordination**.
+When nodes are created, updated, deleted, moved, archived, published, duplicated, or when workflow states change, Structure fires **26 action hooks**. Your module listens to these events and reacts: clean up tasks when a project is deleted, generate an invoice when a client is archived, send a notification when a node is moved. This is the primary mechanism for **cross-module coordination**.
 
 ### 3. Transform Node Data (Backend Filter Hooks)
 
@@ -43,7 +43,7 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 
 <CardGrid>
   <Card title="React to Events" icon="rocket">
-    Hook into 16 lifecycle events — run logic when nodes are created, updated, deleted, moved, archived, or connected.
+    Hook into 26 lifecycle events — run logic when nodes are created, updated, deleted, moved, archived, published, duplicated, or connected.
   </Card>
   <Card title="Add Tabs & Widgets" icon="list-format">
     Add tabs to node detail pages, widgets to the Overview tab, and sections to the sidebar.
@@ -66,7 +66,10 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 | Add filter controls to list pages | ✅ | — | `nodeFilterRegistry` |
 | Add sidebar sections to detail pages | ✅ | — | `nodeSidebarSectionRegistry` |
 | Register custom field types | ✅ | — | `nodeFieldTypeRegistry` |
+| Register fields on node types | ✅ | — | `structureRegistry.register({ fields })` |
+| Register connection types | ✅ | ✅ | `connectionTypeRegistry` + `structureService` |
 | Register new node types | ✅ | ✅ | `nodeTypeRegistry` + `structureService` |
+| Write namespaced metadata | — | ✅ | `structureService.updateNodeMetadata()` |
 | Reference nodes (NodeSelector) | ✅ | — | Component import |
 | Customise UI labels per type | ✅ | — | `getLabel()` utility |
 | Access Structure data at runtime | — | ✅ | `serviceRegistry.get('structure')` |
@@ -347,6 +350,38 @@ function TaskForm() {
 
 `NodeSelector` provides a searchable dialog with type filtering. It's the recommended way for any module to reference Structure nodes.
 
+### Registering Fields on Node Types
+
+Modules can inject their own fields onto node types without modifying the node type configuration directly. This is useful when your module needs to store data on nodes (e.g., a Billing module adding a "plan" field to all projects).
+
+```typescript
+// frontend/src/features/billing/registrations/structure.registration.ts
+import { structureRegistry } from '@/features/structure';
+
+structureRegistry.register({
+  moduleId: 'billing',
+  displayName: 'Billing',
+  fields: [
+    {
+      id: 'billing.plan_id',           // namespace with module ID
+      nodeTypes: ['project', 'client'], // or '*' for all types
+      order: 1000,                      // after admin-defined fields
+      field: {
+        type: 'select',
+        label: 'Billing Plan',
+        options: [
+          { label: 'Free', value: 'free' },
+          { label: 'Pro', value: 'pro' },
+          { label: 'Enterprise', value: 'enterprise' },
+        ],
+      },
+    },
+  ],
+});
+```
+
+Module-registered fields appear after admin-defined fields on the Info tab. Admins can control them on the **Integrations tab** of each node type — enabling/disabling, overriding the label, and changing display order. Field values are stored in the node's `data` JSON alongside admin-defined field values.
+
 ### Importing Structure Types
 
 ```typescript
@@ -563,7 +598,7 @@ import type { NodeSidebarSectionRegistration } from '@/features/structure';
 
 ### nodeFieldTypeRegistry
 
-Extends the field type system with custom field types beyond the 13 built-in types.
+Extends the field type system with custom field types beyond the 16 built-in types.
 
 ```typescript
 import { nodeFieldTypeRegistry } from '@/features/structure';
@@ -673,7 +708,7 @@ actionRegistry.addActionAsync(
 );
 ```
 
-**Available Structure action hooks:**
+**Available Structure action hooks (26 total):**
 
 | Hook | Context | Fires when |
 |------|---------|------------|
@@ -684,11 +719,21 @@ actionRegistry.addActionAsync(
 | `structure.node.archived` | `{ userId, node }` | A node is archived |
 | `structure.node.restored` | `{ userId, node }` | A node is restored from archive |
 | `structure.node.favorited` | `{ userId, node, isFavorite }` | Favourite is toggled |
+| `structure.node.published` | `{ userId, node }` | A node's `isPublished` changes to true |
+| `structure.node.unpublished` | `{ userId, node }` | A node's `isPublished` changes to false |
+| `structure.node.workflowStateChanged` | `{ userId, node, oldState, newState }` | A node's workflow state changes |
+| `structure.node.duplicated` | `{ userId, original, duplicate, options }` | A node is duplicated |
+| `structure.node.reordered` | `{ userId, parentId, nodeIds }` | Nodes are reordered within a parent |
+| `structure.node.metadataUpdated` | `{ userId, nodeId, moduleId }` | Namespaced metadata is written |
 | `structure.connection.created` | `{ userId, connection }` | A connection is created |
 | `structure.connection.deleted` | `{ userId, connectionId }` | A connection is deleted |
 | `structure.nodeType.created` | `{ userId, nodeType }` | A node type is created |
 | `structure.nodeType.updated` | `{ userId, slug, changes }` | A node type is updated |
 | `structure.nodeType.deleted` | `{ userId, slug }` | A node type is deleted |
+| `structure.nodeType.imported` | `{ userId, stats, mode }` | Node types are imported (merge or replace) |
+| `structure.connectionType.created` | `{ userId, connectionType }` | A connection type is created |
+| `structure.connectionType.updated` | `{ userId, slug, changes }` | A connection type is updated |
+| `structure.connectionType.deleted` | `{ userId, slug }` | A connection type is deleted |
 | `structure.template.created` | `{ userId, template }` | A template is created |
 | `structure.template.updated` | `{ userId, templateId, changes }` | A template is updated |
 | `structure.template.deleted` | `{ userId, templateId }` | A template is deleted |
@@ -827,6 +872,32 @@ export async function initTasks(): Promise<void> {
 Always set `moduleId` to your module's ID when creating node types. This lets the system know which module owns the type, and enables cleanup on module uninstall. Default node types seeded by Structure itself set `moduleId: 'structure'`.
 </Aside>
 
+### Namespaced Metadata Writes
+
+When your module needs to store small amounts of data on a node without defining custom fields, use the metadata isolation API. This performs an atomic `jsonb_set` operation scoped to your module's namespace, preventing cross-module data corruption.
+
+```typescript
+// backend/src/features/billing/billing.service.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+
+const structureService = serviceRegistry.get('structure');
+
+// Write billing data to node.metadata.billing namespace
+await structureService.updateNodeMetadata(
+  nodeId,
+  userId,
+  'billing',  // moduleId — becomes the namespace key
+  { planId: 'pro', trialEndsAt: '2025-06-01' }
+);
+// Result: node.metadata = { billing: { planId: 'pro', trialEndsAt: '2025-06-01' }, ...otherModules }
+```
+
+The API endpoint is `PATCH /api/v1/structure/nodes/:id/metadata` with body `{ moduleId, data }`. Each module's writes are isolated — updating the `billing` namespace never touches the `tasks` namespace. Fires the `structure.node.metadataUpdated` action hook.
+
+<Aside type="tip" title="Metadata vs custom fields">
+Use **custom fields** (defined in node type config or via module field registration) for data that users see and edit. Use **metadata** for internal module state that drives logic but isn't directly user-facing — like sync status, cached counts, or external IDs.
+</Aside>
+
 ---
 
 ## Storing Node References in Your Schema
@@ -938,7 +1009,7 @@ actionRegistry.addActionAsync(
 
 Admins can control module-provided content per node type in two places:
 
-1. **Integrations tab** in the node type form (Structure Types > Edit Type > Integrations) — control tabs, widgets, and card extensions per type
+1. **Integrations tab** in the node type form (Structure Types > Edit Type > Integrations) — control tabs, widgets, card extensions, and module-registered fields per type
 2. **Registries tab** on the App Structure admin page — browse all registered items across the 8 content registries (actions, columns, filters, sidebar sections, field types, tabs, widgets, card extensions)
 
 Your module's registered items can be:

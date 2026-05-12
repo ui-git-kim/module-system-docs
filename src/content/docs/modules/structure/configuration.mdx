@@ -129,7 +129,7 @@ When a module registers a node type with `moduleId` set, the system tracks owner
 
 ## Database Schema
 
-Structure creates four tables in your database.
+Structure creates six tables in your database.
 
 ### structure_node
 
@@ -154,6 +154,7 @@ The universal entity table — every node is stored here.
 | `toNodeId` | String? | Target node for connections |
 | `connectionType` | String? | Connection relationship label |
 | `status` | String | `active` / `archived` / `deleted` |
+| `workflowState` | String? | Current workflow state slug (null if no workflow configured) |
 | `isFavorite` | Boolean | Marked as favourite |
 | `isPublished` | Boolean | Publishing workflow state |
 | `publishedSlug` | String? | Public URL slug |
@@ -185,6 +186,8 @@ Configuration for each node type.
 | `features` | JSON | Enabled features |
 | `fields` | JSON | Custom field definitions |
 | `navigation` | JSON | Navigation config |
+| `workflowConfig` | JSON | WorkflowConfig — states, groups, transitions, defaultState |
+| `groupSlug` | String? | References `structure_node_type_group.slug` for sidebar grouping |
 | `cardTemplateId` | String? | FK → structure_template for card view |
 | `listItemTemplateId` | String? | FK → structure_template for list view |
 | `detailHeaderTemplateId` | String? | FK → structure_template for detail header |
@@ -223,11 +226,50 @@ User-specific preferences and UI state.
 | `createdAt` | DateTime | Creation timestamp |
 | `updatedAt` | DateTime | Last update timestamp |
 
+### structure_node_type_group
+
+Groups node types under collapsible sidebar section headers. Purely organisational — groups are labels for the sidebar, not containers that hold nodes.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | String | CUID primary key |
+| `userId` | String? | Owner (null = system default) |
+| `slug` | String | Unique identifier |
+| `name` | String | Display name (shown as sidebar section header) |
+| `icon` | String? | Lucide icon for the group |
+| `color` | String? | Theme colour |
+| `sortOrder` | Int | Display order (default 50) |
+
+### structure_connection_type
+
+Configuration for typed connections between nodes. Controls which node types can connect, cardinality, and optional field schemas on connections.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | String | CUID primary key |
+| `userId` | String? | Owner (null = system default) |
+| `slug` | String | Unique identifier (e.g., `related`, `depends-on`) |
+| `name` | String | Display name |
+| `namePlural` | String | Plural form |
+| `description` | String? | Type description |
+| `moduleId` | String? | Owning module ID |
+| `icon` | String? | Default Lucide icon |
+| `color` | String? | Default colour |
+| `fromTypes` | JSON | `string[]` — allowed source node types (`[]` = any) |
+| `toTypes` | JSON | `string[]` — allowed target node types (`[]` = any) |
+| `bidirectional` | Boolean | If true, A to B also means B to A (default true) |
+| `maxConnections` | Int? | Max connections of this type per node (null = unlimited) |
+| `isUnique` | Boolean | One connection per pair only (default false) |
+| `fields` | JSON | `ConnectionTypeField[]` — data fields on connections |
+| `isSystem` | Boolean | Protected from user editing |
+| `isEnabled` | Boolean | Whether the type is active |
+| `sortOrder` | Int | Display order (default 50) |
+
 ### Raw SQL access notes
 
 If your code queries these tables directly (outside of Prisma), note two things:
 
-- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_templates`). Use the plural names in raw SQL.
+- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`). Use the plural names in raw SQL.
 - **Unique constraints on `structure_node`.** Beyond the primary key, there are two compound uniques that the API surfaces as `400` errors:
   - `@@unique([userId, slug])` — a user can't have two nodes with the same slug
   - `@@unique([userId, parentId, name])` — a user can't have two siblings with the same name under the same parent
@@ -263,6 +305,16 @@ interface NodeTypeConfig {
   templateOverrides?: NodeTypeTemplateOverrides;
   labels?: NodeTypeLabels;
   integrations?: NodeTypeIntegrations;
+  // Workflow state machine (requires features.workflowStates: true)
+  workflowConfig?: WorkflowConfig;
+  // Context provider — hints for AI and assembled context endpoint
+  contextHints?: string;
+  contextConfig?: {
+    includeAncestors?: boolean;
+    ancestorDepth?: number;
+    includeConnections?: boolean;
+    includeChildCounts?: boolean;
+  };
 }
 ```
 
@@ -292,14 +344,15 @@ Each flag turns on an optional capability for entries of this type. Used by the 
 
 ```typescript
 interface NodeTypeFeatures {
-  slug?: boolean;         // Allow custom URL slug
-  description?: boolean;  // Show rich description field
-  color?: boolean;        // Allow custom colour override
-  icon?: boolean;         // Allow custom icon override
-  favorites?: boolean;    // Allow marking as favourite
-  archiving?: boolean;    // Allow archive (soft delete)
-  publishing?: boolean;   // Enable draft/published workflow
-  manualSort?: boolean;   // Allow drag-and-drop reordering
+  slug?: boolean;            // Allow custom URL slug
+  description?: boolean;     // Show rich description field
+  color?: boolean;           // Allow custom colour override
+  icon?: boolean;            // Allow custom icon override
+  favorites?: boolean;       // Allow marking as favourite
+  archiving?: boolean;       // Allow archive (soft delete)
+  publishing?: boolean;      // Enable draft/published workflow
+  manualSort?: boolean;      // Allow drag-and-drop reordering
+  workflowStates?: boolean;  // Enable workflow state machine (populate workflowConfig)
 }
 ```
 
@@ -383,7 +436,12 @@ interface NodeTypeField {
 }
 ```
 
-**Built-in field types:** text, textarea, number, date, datetime, select, multiselect, toggle, url, email, secret, node-reference, media
+**Built-in field types:** text, textarea, number, date, datetime, select, multiselect, toggle, boolean, url, email, secret, node-reference, media, field-group
+
+**New field types:**
+- `boolean` — renders as Yes/No radio buttons (not a toggle switch)
+- `field-group` — repeating field group (repeater). Contains sub-fields defined via `subFields` array. Each entry adds a row with all sub-fields. Edited in admin via a dedicated sub-fields editor.
+- `node-reference` — now supports `multiple: true` in options for multi-select node references
 
 ### Labels
 
@@ -399,6 +457,76 @@ interface NodeTypeLabels {
   searchPlaceholder?: string;
   createFirst?: string;
   confirmDelete?: string;
+}
+```
+
+### WorkflowConfig
+
+Optional per-node-type state machine. Enable with `features.workflowStates: true`.
+
+```typescript
+interface WorkflowConfig {
+  states: WorkflowState[];
+  groups?: WorkflowStateGroup[];
+  defaultState: string;             // slug of the initial state
+  transitions?: WorkflowTransition[];
+}
+
+interface WorkflowState {
+  slug: string;
+  name: string;
+  color?: string;    // hex colour for badge
+  icon?: string;     // Lucide icon name
+  group?: string;    // references WorkflowStateGroup.slug
+  sortOrder?: number;
+}
+
+interface WorkflowStateGroup {
+  slug: string;
+  name: string;
+  sortOrder?: number;
+}
+
+interface WorkflowTransition {
+  from: string;      // state slug
+  to: string[];      // allowed target state slugs
+}
+```
+
+When a node is created, the service auto-sets `workflowState` to `workflowConfig.defaultState`. State changes fire the `structure.node.workflowStateChanged` action hook with `{ userId, node, oldState, newState }`. If `transitions` are defined, the API validates that the transition is allowed before applying the change.
+
+### ConnectionTypeConfig
+
+Configuration for typed connections. Managed via the Connection Types admin tab or `structureRegistry.register()`.
+
+```typescript
+interface ConnectionTypeConfig {
+  slug: string;
+  name: string;
+  namePlural: string;
+  description?: string;
+  icon?: string;
+  color?: string;
+  moduleId?: string | null;
+  fromTypes?: string[];        // allowed source node types (empty = any)
+  toTypes?: string[];          // allowed target node types (empty = any)
+  bidirectional?: boolean;     // default true
+  maxConnections?: number;     // per node (null = unlimited)
+  unique?: boolean;            // one per pair only
+  fields?: ConnectionTypeField[];
+  isSystem?: boolean;
+  isEnabled?: boolean;
+  sortOrder?: number;
+}
+
+interface ConnectionTypeField {
+  id: string;
+  type: string;
+  label: string;
+  description?: string;
+  required?: boolean;
+  defaultValue?: unknown;
+  options?: Array<{ value: string; label: string }>;
 }
 ```
 
@@ -418,13 +546,16 @@ All endpoints are prefixed with `/api/v1/structure`.
 | PATCH | `/nodes/:id` | Update node |
 | DELETE | `/nodes/:id` | Soft delete |
 | POST | `/nodes/:id/move` | Move to different parent |
-| POST | `/nodes/:id/duplicate` | Duplicate node |
+| POST | `/nodes/bulk` | Bulk create nodes (transaction) |
+| POST | `/nodes/:id/duplicate` | Duplicate node (subtree copy) |
 | POST | `/nodes/:id/archive` | Archive |
 | POST | `/nodes/:id/restore` | Restore from archive |
 | POST | `/nodes/:id/favorite` | Toggle favourite |
 | GET | `/nodes/:id/path` | Get ancestor path |
 | GET | `/nodes/:id/children` | Get direct children |
 | GET | `/nodes/:id/descendants` | Get all descendants |
+| GET | `/nodes/:id/context` | Get assembled node context (node, type, ancestors, breadcrumb, counts, connections) |
+| PATCH | `/nodes/:id/metadata` | Atomic namespaced metadata write |
 
 ### Connections
 
@@ -450,6 +581,28 @@ All endpoints are prefixed with `/api/v1/structure`.
 | POST | `/types` | Create type (admin only) |
 | PATCH | `/types/:slug` | Update type (admin only) |
 | DELETE | `/types/:slug` | Delete type (admin only, fails if nodes exist) |
+| GET | `/types/export` | Export all types + connection types as JSON (admin only) |
+| POST | `/types/import` | Import types from JSON — `merge` or `replace` mode (admin only) |
+
+### Connection Types
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/connection-types` | List all connection types |
+| GET | `/connection-types/:slug` | Get connection type config |
+| POST | `/connection-types` | Create connection type (admin only) |
+| PATCH | `/connection-types/:slug` | Update connection type (admin only) |
+| DELETE | `/connection-types/:slug` | Delete connection type (admin only) |
+
+### Groups
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/groups` | List all node type groups |
+| GET | `/groups/:slug` | Get group by slug |
+| POST | `/groups` | Create group (admin only) |
+| PATCH | `/groups/:slug` | Update group (admin only) |
+| DELETE | `/groups/:slug` | Delete group (admin only) |
 
 ### Templates
 
@@ -485,6 +638,32 @@ All endpoints are prefixed with `/api/v1/structure`.
 | `includeChildrenDepth` | Depth of children to include |
 | `includePath` | `true` to include ancestor path |
 | `includeConnectionCounts` | `true` to include connection counts |
+| `pathPrefix` | Hierarchical scoping — return only descendants whose path starts with this prefix |
+| `dataFilters` | JSON array of `DataFilter` objects for filtering on custom field data (see below) |
+| `dataSortField` | Sort by a custom field in the `data` JSON column |
+| `dataSortType` | Type hint for data sort: `text`, `number`, or `date` |
+| `workflowState` | Filter by exact workflow state slug |
+| `workflowStates` | Comma-separated list of workflow state slugs |
+| `workflowGroup` | Filter by workflow state group slug |
+
+### Data Filters
+
+The `dataFilters` query parameter accepts an array of filter objects for advanced filtering on custom field values stored in the `data` JSON column:
+
+```typescript
+interface DataFilter {
+  fieldId: string;
+  operator: DataFilterOperator;
+  value?: unknown;
+}
+
+type DataFilterOperator =
+  | 'equals' | 'not_equals' | 'contains' | 'starts_with'
+  | 'gt' | 'gte' | 'lt' | 'lte' | 'between'
+  | 'in' | 'not_in' | 'is_empty' | 'is_not_empty';
+```
+
+Operators `is_empty` and `is_not_empty` do not require a `value`. The `between` operator expects `value` to be `[min, max]`. The `in` and `not_in` operators expect `value` to be an array.
 
 ---
 
