@@ -195,6 +195,167 @@ Export the current configuration as a JSON file for backup or transfer between e
 
 ---
 
+## Source Configuration (Per-Source)
+
+From v1.5.0, each ingest source has a rich, typed configuration stored in its `config` JSON field. Admins configure this via the **Settings** button on each source row in the admin page, which opens a four-tab config dialog.
+
+The source config controls:
+- **Context fields** — user-facing form fields shown on the ingest page
+- **Extraction focus** — which entities and relationships to prioritise
+- **Prompt overrides** — custom instructions for the LLM
+- **Auto-tags** — automatic tag application rules
+- **UI** — icon and colour for the source badge
+
+All sections are optional — an empty `config: {}` uses engine defaults. No schema migration is needed; everything goes into the existing JSON field.
+
+### Context Fields
+
+Context fields are the primary feature. They define form fields that appear on the ingest page when a user selects a source. Values from fields with usage `'context'` are assembled into a labelled section in the extraction prompt, giving the LLM critical human-provided context.
+
+| Property | Type | Required | Default | Description |
+|----------|------|----------|---------|-------------|
+| `key` | `string` | Yes | — | camelCase identifier (auto-generated from label) |
+| `label` | `string` | Yes | — | Display label |
+| `description` | `string` | No | — | Help text / placeholder |
+| `type` | enum | Yes | — | `text`, `textarea`, `select`, `multiselect`, `date`, `number`, `boolean`, `tags` |
+| `options` | `{value, label}[]` | For select/multiselect | — | Option list |
+| `required` | `boolean` | No | `false` | Prevents submission until filled |
+| `defaultValue` | mixed | No | — | Pre-populated when user selects the source |
+| `usage` | enum | No | `'context'` | `context` (→ prompt), `metadata` (→ stored only), `filter` (→ filtering) |
+| `order` | `number` | No | `0` | Display order on the form |
+
+**How context fields flow:**
+
+1. Admin configures fields on a source via the config dialog
+2. User selects that source on the ingest form → dynamic fields appear
+3. User fills in values alongside their content
+4. Backend validates required fields are provided
+5. Fields with `usage: 'context'` are assembled into a labelled prompt section:
+   ```
+   ADDITIONAL CONTEXT PROVIDED BY USER:
+   - Case Number: VCC-2025-001
+   - Court: County Court of Victoria
+   - Filing Type: Affidavit
+   ```
+6. This context string is passed to cognitive-db as `IngestInput.context`
+7. Fields with `usage: 'metadata'` are stored in the job metadata only
+
+### Extraction Focus
+
+Controls what entities and relationships the engine prioritises during extraction for this source.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `priorityEntityTypes` | `string[]` | `[]` | Ontology concept names to emphasise |
+| `ignoreEntityTypes` | `string[]` | `[]` | Entity types to skip |
+| `priorityRelationshipTypes` | `string[]` | `[]` | Relationship types to emphasise |
+| `extractDates` | `boolean` | `true` | Extract date references |
+| `extractEmotions` | `boolean` | `true` | Analyse emotional tone |
+| `extractActionItems` | `boolean` | `false` | Identify tasks and action items |
+
+### Prompt Overrides
+
+Custom instructions for the LLM when processing content from this source.
+
+| Property | Type | Max Length | Description |
+|----------|------|-----------|-------------|
+| `systemContext` | `string` | 4000 | Prepended to the system prompt — describe the domain |
+| `contentDescription` | `string` | 2000 | Describes what the content IS — helps the model understand |
+| `extractionInstructions` | `string` | 4000 | Appended to the extraction prompt — specific extraction instructions |
+
+### Auto-Tag Rules
+
+Automatically apply tags to ingested content based on rules.
+
+```json
+{
+  "autoTags": [
+    { "tag": "legal", "when": "always" },
+    { "tag": "confidential", "when": "condition", "conditionField": "confidential", "conditionValue": true }
+  ]
+}
+```
+
+Rules with `when: 'always'` add the tag to every ingest from this source. Rules with `when: 'condition'` check a context field value — the tag is only applied if the field's value matches `conditionValue`.
+
+### UI Config
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `icon` | `string` | `'file-text'` | Lucide icon name (e.g. `gavel`, `folder-open`) |
+| `colour` | `string` | `'#6366f1'` | Hex colour for the source badge |
+
+### Full Example
+
+A "Court Filing" source with context fields, extraction focus, prompt overrides, and auto-tags:
+
+```json
+{
+  "ui": { "icon": "gavel", "colour": "#dc2626" },
+  "contextFields": [
+    {
+      "key": "caseNumber", "label": "Case Number", "type": "text",
+      "required": true, "usage": "context", "order": 0
+    },
+    {
+      "key": "court", "label": "Court", "type": "select",
+      "options": [
+        { "value": "county_vic", "label": "County Court of Victoria" },
+        { "value": "supreme_vic", "label": "Supreme Court of Victoria" }
+      ],
+      "required": true, "usage": "context", "order": 1
+    },
+    {
+      "key": "filingType", "label": "Filing Type", "type": "select",
+      "options": [
+        { "value": "affidavit", "label": "Affidavit" },
+        { "value": "defence", "label": "Defence" }
+      ],
+      "required": true, "usage": "context", "order": 2
+    },
+    {
+      "key": "confidential", "label": "Confidential", "type": "boolean",
+      "defaultValue": false, "usage": "metadata", "order": 3
+    }
+  ],
+  "extraction": {
+    "priorityEntityTypes": ["person", "organisation", "event"],
+    "ignoreEntityTypes": ["colour"],
+    "extractEmotions": false,
+    "extractActionItems": true
+  },
+  "prompts": {
+    "systemContext": "You are analysing Australian court filings. Preserve legal terminology exactly.",
+    "extractionInstructions": "Extract all parties. Identify court orders and directions. Note all dates and cited legislation."
+  },
+  "autoTags": [
+    { "tag": "legal", "when": "always" },
+    { "tag": "confidential", "when": "condition", "conditionField": "confidential", "conditionValue": true }
+  ]
+}
+```
+
+With this configuration, when a user selects "Court Filing" and fills in the context fields, the backend assembles a context string like:
+
+```
+CONTENT TYPE: Court Filing
+Legal filings lodged with Australian courts
+
+FOCUS ON THESE ENTITY TYPES: person, organisation, event
+
+IGNORE THESE ENTITY TYPES: colour
+
+ADDITIONAL CONTEXT PROVIDED BY USER:
+- Case Number: VCC-2025-001
+- Court: County Court of Victoria
+- Filing Type: Affidavit
+
+ADDITIONAL INSTRUCTIONS:
+Extract all parties. Identify court orders and directions. Note all dates and cited legislation.
+```
+
+---
+
 ## Extraction Configuration
 
 The extraction section controls the deep multi-modal extraction pipeline. All visual analysis features are **off by default** and must be explicitly enabled.
