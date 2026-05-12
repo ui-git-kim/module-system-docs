@@ -111,6 +111,10 @@ export default defineConfig({
                   label: "Theme Utilities",
                   slug: "starter-template/theme",
                 },
+                {
+                  label: "Icon Picker",
+                  slug: "starter-template/icon-picker",
+                },
               ],
             },
             {
