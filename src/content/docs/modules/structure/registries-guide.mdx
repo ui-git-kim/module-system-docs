@@ -1,0 +1,825 @@
+---
+title: Registries Guide
+description: How modules extend Structure through its 11 registries — tabs, widgets, fields, connections, and more
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem, Aside, Steps, Card, CardGrid } from '@astrojs/starlight/components';
+
+Structure exposes **11 module-specific registries** that let other modules extend every aspect of the node experience — from the tabs on a detail page to the columns in a table view. This page is the definitive reference for each registry, module-registered fields, and the full set of backend hooks.
+
+<Aside type="tip" title="Quick orientation">
+If you're new to Structure integration, start with the [Integration](/modules/structure/integration/) page for a walkthrough. This page is a comprehensive reference — use it when you need the exact interface, hook name, or registration options.
+</Aside>
+
+---
+
+## Registry Categories
+
+Structure's 11 registries fall into three categories:
+
+<CardGrid>
+  <Card title="DB-Synced (2)" icon="setting">
+    `nodeTypeRegistry` and `connectionTypeRegistry` — configuration stored in the database, managed via admin tabs.
+  </Card>
+  <Card title="Content (8)" icon="puzzle">
+    Code-registered by modules at import time. Tabs, widgets, card extensions, actions, columns, filters, sidebar sections, and field types.
+  </Card>
+  <Card title="Master (1)" icon="rocket">
+    `structureRegistry` — the single entry point for modules to register fields, lifecycle hooks, and delete validation.
+  </Card>
+</CardGrid>
+
+| # | Registry | Category | How it's managed |
+|---|----------|----------|-----------------|
+| 1 | `nodeTypeRegistry` | DB-synced | Admin "Structure Types" tab |
+| 2 | `connectionTypeRegistry` | DB-synced | Admin "Connection Types" tab |
+| 3 | `nodeTabRegistry` | Content | Code registration |
+| 4 | `nodeWidgetRegistry` | Content | Code registration |
+| 5 | `nodeCardExtensionRegistry` | Content | Code registration |
+| 6 | `nodeActionRegistry` | Content | Code registration |
+| 7 | `nodeFieldTypeRegistry` | Content | Code registration |
+| 8 | `nodeColumnRegistry` | Content | Code registration |
+| 9 | `nodeFilterRegistry` | Content | Code registration |
+| 10 | `nodeSidebarSectionRegistry` | Content | Code registration |
+| 11 | `structureRegistry` | Master | Code registration |
+
+---
+
+## DB-Synced Registries
+
+These registries are backed by database tables. Their state is managed through the admin panel and synchronised to the frontend registry on load.
+
+### 1. nodeTypeRegistry
+
+Manages node type configurations. Each node type defines an entity in your application — Clients, Projects, Matters, etc. The registry syncs with the `structure_node_type` database table.
+
+**Admin location:** App Structure > Structure Types
+
+```typescript
+import { nodeTypeRegistry } from '@/features/structure';
+```
+
+**Methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getEnabledTypes()` | `NodeTypeConfig[]` | All enabled types, sorted by `sortOrder` |
+| `getConfig(slug)` | `NodeTypeConfig \| undefined` | Get the bare config for a single type |
+| `getAllTypes()` | `NodeTypeConfig[]` | All types (enabled and disabled), sorted by `sortOrder` |
+| `get(slug)` | `NodeTypeRegistration \| undefined` | Get the wrapper (config + optional component overrides) |
+| `getAll()` | `NodeTypeRegistration[]` | All registrations (wrappers) |
+| `getByModule(moduleId)` | `NodeTypeConfig[]` | Types owned by a specific module |
+| `getSlugs()` | `string[]` | All registered slugs |
+| `has(slug)` | `boolean` | Check if a slug exists |
+| `isLoadedFromDb()` | `boolean` | Whether `syncFromDatabase` has completed |
+| `syncFromDatabase(types)` | `void` | Replace registry state with database records; fires `onSync` |
+| `onSync(callback)` | `() => void` | Subscribe to sync events — returns an unsubscribe function |
+| `getGroups()` | `NodeTypeGroup[]` | All node type groups |
+| `syncGroups(groups)` | `void` | Replace group data in the registry |
+
+<Aside type="caution" title="get() vs getConfig()">
+`get(slug)` returns a `NodeTypeRegistration` wrapper that bundles the config with optional component overrides. Most of the time you want `getConfig(slug)` which returns the bare `NodeTypeConfig`. Use `getAll()` / `getAllTypes()` accordingly.
+</Aside>
+
+**Reactive hooks:**
+
+```typescript
+import { useEnabledNodeTypes, useStructureNavItems } from '@/features/structure';
+
+// Re-renders when node types are synced from the database
+const enabledTypes = useEnabledNodeTypes();
+const navItems = useStructureNavItems();
+```
+
+**Registering a node type from a module (backend):**
+
+```typescript
+// backend/src/features/tasks/tasks.init.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+
+export async function initTasks(): Promise<void> {
+  const structureService = serviceRegistry.get('structure');
+  const existing = await structureService.listNodeTypes(userId, true);
+
+  if (!existing.some(t => t.slug === 'task-board')) {
+    await structureService.createNodeType(userId, {
+      slug: 'task-board',
+      name: 'Task Board',
+      namePlural: 'Task Boards',
+      icon: 'Kanban',
+      moduleId: 'tasks',  // always set moduleId
+      isSystem: true,
+      // ... full config
+    });
+  }
+}
+```
+
+### 2. connectionTypeRegistry
+
+Manages typed connection configurations. Connection types define how nodes can be linked — "Related", "Depends On", "Party", etc. Backed by the `structure_connection_type` database table.
+
+**Admin location:** App Structure > Connection Types
+
+Connection types are managed entirely through the admin UI and API — there is no code-level `register()` call. Use the REST endpoints for CRUD:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/structure/connection-types` | List all connection types |
+| GET | `/api/v1/structure/connection-types/:slug` | Get a single type |
+| POST | `/api/v1/structure/connection-types` | Create (admin only) |
+| PATCH | `/api/v1/structure/connection-types/:slug` | Update (admin only) |
+| DELETE | `/api/v1/structure/connection-types/:slug` | Delete (admin only) |
+
+**Configuration interface:**
+
+```typescript
+interface ConnectionTypeConfig {
+  slug: string;
+  name: string;
+  namePlural: string;
+  description?: string;
+  icon?: string;
+  color?: string;
+  moduleId?: string | null;
+  fromTypes?: string[];        // allowed source node types (empty = any)
+  toTypes?: string[];          // allowed target node types (empty = any)
+  bidirectional?: boolean;     // default true
+  maxConnections?: number;     // per node (null = unlimited)
+  unique?: boolean;            // one connection per pair only
+  fields?: ConnectionTypeField[];
+  isSystem?: boolean;
+  isEnabled?: boolean;
+  sortOrder?: number;
+}
+```
+
+<Aside type="tip">
+Connection types support the same field system as node types. You can add data fields to connections — for example, a "Party" connection between a Matter and a Client might have a "Role" select field (Plaintiff, Defendant, Witness).
+</Aside>
+
+---
+
+## Content Registries
+
+These 8 registries are populated by module code at import time via side-effect imports. Each uses the same pattern: import the registry, call `register()` with a configuration object.
+
+<Aside type="note" title="Common properties">
+All content registrations share these properties: `id` (unique identifier), `moduleId` (your module's ID), `nodeTypes` (`'*'` for all types or `string[]` of slugs), and `order` (display position, default 50). Structure's built-in items use orders 10-25, so place yours at 30+.
+</Aside>
+
+### 3. nodeTabRegistry
+
+Adds tabs to node detail pages. This is the most common integration — your module adds a tab that appears on specific (or all) node types.
+
+```typescript
+import { nodeTabRegistry } from '@/features/structure';
+
+nodeTabRegistry.register({
+  id: 'tasks',
+  moduleId: 'tasks',
+  label: 'Tasks',
+  icon: 'CheckSquare',
+  nodeTypes: '*',           // or ['project', 'client']
+  order: 30,
+  component: TasksTab,
+  // Optional:
+  // getBadge: async (nodeId) => taskCountForNode(nodeId),
+  // isVisible: (node, nodeType) => nodeType.features?.tasks !== false,
+});
+```
+
+**Interface:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | Unique tab identifier |
+| `moduleId` | `string` | Yes | Your module's ID |
+| `label` | `string` | Yes | Tab display label |
+| `icon` | `string` | -- | Lucide icon name |
+| `nodeTypes` | `string[] \| '*'` | Yes | Which node types show this tab |
+| `order` | `number` | -- | Position in tab bar (default 50) |
+| `component` | `ComponentType<NodeTabProps>` | Yes | Receives `{ node, nodeType }` |
+| `getBadge` | `(nodeId: string) => Promise<string \| number \| null>` | -- | Async badge count/text |
+| `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
+
+**Admin control:** Admins can enable/disable, rename, and reorder tabs per node type on the Integrations tab.
+
+### 4. nodeWidgetRegistry
+
+Adds widgets to the Overview tab, dashboard, or node sidebar.
+
+```typescript
+import { nodeWidgetRegistry } from '@/features/structure';
+
+nodeWidgetRegistry.register({
+  id: 'recent-activity',
+  moduleId: 'activity',
+  title: 'Recent Activity',
+  icon: 'Activity',
+  location: 'node-overview',
+  nodeTypes: '*',
+  size: '2x1',
+  order: 20,
+  component: RecentActivityWidget,
+});
+```
+
+**Interface:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | Unique widget identifier |
+| `moduleId` | `string` | Yes | Your module's ID |
+| `title` | `string` | Yes | Widget display title |
+| `icon` | `string` | -- | Lucide icon name |
+| `location` | `'node-overview' \| 'dashboard' \| 'node-sidebar'` | Yes | Where the widget renders |
+| `nodeTypes` | `string[] \| '*'` | -- | Which node types show this widget |
+| `size` | `'1x1' \| '2x1' \| '1x2' \| '2x2' \| 'full'` | -- | Grid layout size |
+| `order` | `number` | -- | Position in widget layout (default 50) |
+| `component` | `ComponentType<NodeWidgetProps>` | Yes | Receives `{ node?, nodeType?, size }` |
+| `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
+
+**Admin control:** Admins can enable/disable and reorder widgets per node type on the Integrations tab. The Overview tab layout (single or two-column) is configured on the Templates tab.
+
+### 5. nodeCardExtensionRegistry
+
+Adds badges, actions, and content to node cards in grid and list views. Each extension renders in one of five positions on the card.
+
+```typescript
+import { nodeCardExtensionRegistry } from '@/features/structure';
+
+nodeCardExtensionRegistry.register({
+  id: 'task-count',
+  moduleId: 'tasks',
+  position: 'badge',
+  nodeTypes: '*',
+  order: 10,
+  component: TaskCountBadge,
+});
+```
+
+**Interface:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | Unique extension identifier |
+| `moduleId` | `string` | Yes | Your module's ID |
+| `position` | `CardExtensionPosition` | Yes | Where on the card (see below) |
+| `nodeTypes` | `string[] \| '*'` | Yes | Which node types show this extension |
+| `order` | `number` | -- | Position within the slot (default 50) |
+| `component` | `ComponentType<{ node: StructureNode }>` | Yes | Render component |
+
+**Card extension positions:**
+
+| Position | Card Part | Description | Example |
+|----------|-----------|-------------|---------|
+| `badge` | CardHeader (top-right) | Small status indicators | Task count, priority flag |
+| `action` | CardHeader (actions) | Interactive buttons | Quick-add, bookmark |
+| `header` | Below CardHeader | Additional header content | Progress bar, tags |
+| `content` | CardContent | Main body extension | Preview text, stats |
+| `footer` | CardFooter | Bottom of card | Timestamps, assignees |
+
+**Admin control:** Admins can enable/disable, reorder, and move extensions between card positions on the Integrations tab.
+
+### 6. nodeActionRegistry
+
+Adds action buttons to node detail headers, context menus, and bulk action bars.
+
+```typescript
+import { nodeActionRegistry } from '@/features/structure';
+
+nodeActionRegistry.register({
+  id: 'generate-invoice',
+  moduleId: 'invoicing',
+  label: 'Generate Invoice',
+  icon: 'Receipt',
+  locations: ['detail-header', 'context-menu'],
+  nodeTypes: ['client', 'project'],
+  order: 30,
+  variant: 'default',
+  handler: async (node) => {
+    await invoicingService.generateForNode(node.id);
+  },
+  confirm: {
+    title: 'Generate Invoice?',
+    description: 'This will create a new invoice for all unbilled items.',
+  },
+});
+```
+
+**Interface:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | Unique action identifier |
+| `moduleId` | `string` | Yes | Your module's ID |
+| `label` | `string` | Yes | Button/menu item label |
+| `icon` | `string` | -- | Lucide icon name |
+| `nodeTypes` | `string[] \| '*'` | Yes | Target node types |
+| `locations` | `NodeActionLocation[]` | Yes | `'detail-header'`, `'context-menu'`, `'bulk-action'` |
+| `order` | `number` | -- | Position in action list (default 50) |
+| `variant` | `'default' \| 'destructive' \| 'secondary'` | -- | Button style |
+| `handler` | `(node, nodeType) => Promise<void>` | Yes | Single-node action handler |
+| `bulkHandler` | `(nodes[], nodeType) => Promise<void>` | -- | Bulk action handler |
+| `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
+| `confirm` | `{ title, description, confirmLabel?, variant? }` | -- | Confirmation dialog |
+| `shortcut` | `string` | -- | Keyboard shortcut (e.g., `'mod+shift+i'`) |
+| `disabled` | `boolean \| (node, nodeType) => boolean` | -- | Disable condition |
+
+**Admin control:** Admins can enable/disable and reorder actions per node type via the Registries tab.
+
+### 7. nodeFieldTypeRegistry
+
+Extends the field type system with custom field types beyond the 16 built-in types. Once registered, admins can assign your field type to fields in the node type configuration.
+
+```typescript
+import { nodeFieldTypeRegistry } from '@/features/structure';
+
+nodeFieldTypeRegistry.register({
+  id: 'rich-text',
+  moduleId: 'editor',
+  label: 'Rich Text',
+  icon: 'Type',
+  category: 'content',
+  order: 50,
+  component: RichTextEditor,
+  displayComponent: RichTextDisplay,
+  // Optional:
+  // validate: (value, fieldConfig) => value ? null : 'Required',
+  // transformBeforeSave: (value) => sanitiseHtml(value),
+  // getDefaultValue: () => '',
+  // configSchema: [{ id: 'toolbar', type: 'select', label: 'Toolbar', ... }],
+});
+```
+
+**Interface:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | Field type identifier (e.g., `'rich-text'`) |
+| `moduleId` | `string` | Yes | Your module's ID |
+| `label` | `string` | Yes | Name shown in admin field picker |
+| `icon` | `string` | -- | Lucide icon for the picker |
+| `description` | `string` | -- | Help text in the selector |
+| `category` | `'text' \| 'media' \| 'reference' \| 'layout' \| 'custom'` | -- | Field categorisation |
+| `order` | `number` | -- | Position in field type picker (default 50) |
+| `component` | `ComponentType<FieldTypeRenderProps>` | Yes | Form field component for editing |
+| `displayComponent` | `ComponentType<FieldTypeDisplayProps>` | -- | Read-only display for cards/columns |
+| `validate` | `(value, fieldConfig) => string \| null` | -- | Custom validation |
+| `transformBeforeSave` | `(value) => unknown` | -- | Transform before saving |
+| `getDefaultValue` | `() => unknown` | -- | Default value factory |
+| `configSchema` | `NodeTypeField[]` | -- | Extra admin config fields |
+
+**Component props:**
+
+- **Edit:** `{ field: NodeTypeField, value: unknown, onChange: (value) => void, error?: string, disabled?: boolean }`
+- **Display:** `{ field: NodeTypeField, value: unknown }`
+
+The `NodeFieldRenderer` component automatically checks `nodeFieldTypeRegistry` for module-provided types before falling back to built-in rendering.
+
+### 8. nodeColumnRegistry
+
+Adds columns to the table view on list pages.
+
+```typescript
+import { nodeColumnRegistry } from '@/features/structure';
+
+nodeColumnRegistry.register({
+  id: 'open-tasks',
+  moduleId: 'tasks',
+  label: 'Open Tasks',
+  nodeTypes: ['project'],
+  order: 40,
+  width: '100px',
+  alignment: 'center',
+  sortable: true,
+  render: (node) => <span>{node.metadata?.openTaskCount ?? 0}</span>,
+  // For expensive data, use prefetch:
+  // needsPrefetch: true,
+  // prefetch: async (nodeIds) => { await batchLoadTaskCounts(nodeIds); },
+});
+```
+
+**Interface:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | Unique column identifier |
+| `moduleId` | `string` | Yes | Your module's ID |
+| `label` | `string` | Yes | Column header text |
+| `nodeTypes` | `string[] \| '*'` | Yes | Target node types |
+| `order` | `number` | -- | Column position (default 50) |
+| `render` | `(node, nodeType) => ReactNode` | Yes | Cell render function |
+| `renderCompact` | `(node) => ReactNode` | -- | Compact render for card/list views |
+| `width` | `string` | -- | CSS width (`'120px'`, `'15%'`) |
+| `minWidth` | `string` | -- | CSS min-width |
+| `alignment` | `'left' \| 'center' \| 'right'` | -- | Text alignment (default `'left'`) |
+| `sortable` | `boolean` | -- | Enable sorting by this column |
+| `getSortValue` | `(node) => string \| number` | -- | Custom sort value extractor |
+| `isVisible` | `(nodeType) => boolean` | -- | Dynamic visibility |
+| `needsPrefetch` | `boolean` | -- | Whether data must be loaded before rendering |
+| `prefetch` | `(nodeIds: string[]) => Promise<void>` | -- | Batch data loader |
+
+<Aside type="tip" title="Prefetch for performance">
+If your column displays data from your module's API (e.g., task count per node), use `needsPrefetch: true` and `prefetch` to batch-load data for all visible nodes in one request, rather than making per-row API calls.
+</Aside>
+
+### 9. nodeFilterRegistry
+
+Adds filter controls to list page filter bars. Supports client-side or server-side filtering.
+
+```typescript
+import { nodeFilterRegistry } from '@/features/structure';
+
+nodeFilterRegistry.register({
+  id: 'task-status',
+  moduleId: 'tasks',
+  label: 'Task Status',
+  icon: 'Filter',
+  mode: 'client',
+  nodeTypes: ['project'],
+  order: 30,
+  component: TaskStatusFilter,
+  filterFn: (node, filterValue) => {
+    if (!filterValue) return true;
+    return node.metadata?.taskStatus === filterValue;
+  },
+});
+```
+
+**Interface:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | Unique filter identifier |
+| `moduleId` | `string` | Yes | Your module's ID |
+| `label` | `string` | Yes | Filter label in the bar |
+| `icon` | `string` | -- | Lucide icon name |
+| `nodeTypes` | `string[] \| '*'` | Yes | Target node types |
+| `order` | `number` | -- | Position in filter bar (default 50) |
+| `mode` | `'client' \| 'server'` | Yes | Client-side or server-side filtering |
+| `component` | `ComponentType<FilterRenderProps>` | Yes | Filter UI component |
+| `filterFn` | `(node, filterValue) => boolean` | -- | Required when `mode: 'client'` |
+| `toQueryParams` | `(filterValue) => Record<string, string>` | -- | Required when `mode: 'server'` |
+| `isVisible` | `(nodeType) => boolean` | -- | Dynamic visibility |
+
+**Filter component props:** `{ value, onChange, nodeType, nodes? }`
+
+### 10. nodeSidebarSectionRegistry
+
+Adds sections to the detail page sidebar (when using sidebar navigation style).
+
+```typescript
+import { nodeSidebarSectionRegistry } from '@/features/structure';
+
+nodeSidebarSectionRegistry.register({
+  id: 'task-summary',
+  moduleId: 'tasks',
+  title: 'Task Summary',
+  icon: 'CheckSquare',
+  nodeTypes: ['project'],
+  order: 30,
+  collapsible: true,
+  defaultCollapsed: false,
+  component: TaskSummarySection,
+});
+```
+
+**Interface:**
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `id` | `string` | Yes | Unique section identifier |
+| `moduleId` | `string` | Yes | Your module's ID |
+| `title` | `string` | Yes | Section display title |
+| `icon` | `string` | -- | Lucide icon name |
+| `nodeTypes` | `string[] \| '*'` | Yes | Target node types |
+| `order` | `number` | -- | Position in sidebar (default 50) |
+| `component` | `ComponentType<{ node, nodeType }>` | Yes | Section content component |
+| `collapsible` | `boolean` | -- | Whether section can collapse (default `true`) |
+| `defaultCollapsed` | `boolean` | -- | Start collapsed? (default `false`) |
+| `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
+
+---
+
+## Master Registry
+
+### 11. structureRegistry
+
+The single entry point for modules that need to register fields, lifecycle hooks, or delete validation. This is the registry you use when your module needs to store data on nodes or react to deletion.
+
+```typescript
+import { structureRegistry } from '@/features/structure';
+
+structureRegistry.register({
+  moduleId: 'billing',
+  displayName: 'Billing',
+
+  // Fields injected onto node types
+  fields: [
+    {
+      id: 'billing.plan_id',
+      nodeTypes: ['project', 'client'],
+      order: 1000,
+      field: {
+        type: 'select',
+        label: 'Billing Plan',
+        options: [
+          { label: 'Free', value: 'free' },
+          { label: 'Pro', value: 'pro' },
+          { label: 'Enterprise', value: 'enterprise' },
+        ],
+      },
+    },
+  ],
+
+  // Optional: tabs, widgets, card extensions, actions, etc.
+  // These are shortcuts that call the individual registries internally
+  tabs: [/* NodeTabRegistration[] */],
+  widgets: [/* NodeWidgetRegistration[] */],
+  cardExtensions: [/* NodeCardExtension[] */],
+  actions: [/* NodeActionRegistration[] */],
+  fieldTypes: [/* NodeFieldTypeRegistration[] */],
+  columns: [/* NodeColumnRegistration[] */],
+  filters: [/* NodeFilterRegistration[] */],
+  sidebarSections: [/* NodeSidebarSectionRegistration[] */],
+
+  // Lifecycle hooks (optional)
+  // lifecycle: { ... },
+});
+```
+
+<Aside type="note">
+You can register tabs, widgets, and other content items either through `structureRegistry.register()` (as arrays in the configuration object) or by calling the individual registries directly. Both approaches work — `structureRegistry` simply forwards to the individual registries. Use whichever style you prefer; direct calls are more explicit, while `structureRegistry` keeps everything in one place.
+</Aside>
+
+---
+
+## Module-Registered Fields
+
+Modules can inject their own fields onto node types without modifying the node type configuration directly. This is the mechanism for cross-module data — a Billing module adds a "Plan" field to projects, a Time Tracking module adds an "Hourly Rate" field to clients.
+
+### How It Works
+
+<Steps>
+
+1. **Register fields via structureRegistry**
+
+    ```typescript
+    import { structureRegistry } from '@/features/structure';
+
+    structureRegistry.register({
+      moduleId: 'billing',
+      displayName: 'Billing',
+      fields: [
+        {
+          id: 'billing.plan_id',
+          nodeTypes: ['project', 'client'],
+          order: 1000,
+          field: {
+            type: 'select',
+            label: 'Billing Plan',
+            options: [
+              { label: 'Free', value: 'free' },
+              { label: 'Pro', value: 'pro' },
+              { label: 'Enterprise', value: 'enterprise' },
+            ],
+          },
+        },
+        {
+          id: 'billing.account_ref',
+          nodeTypes: ['client'],
+          order: 1010,
+          field: {
+            type: 'text',
+            label: 'Account Reference',
+            placeholder: 'e.g. ACC-001',
+          },
+        },
+      ],
+    });
+    ```
+
+2. **Fields appear on the Info tab** after admin-defined fields
+
+3. **Admins control visibility** on the Integrations tab of each node type — enable/disable, override the label, and change display order
+
+4. **Values are stored** in the node's `data` JSON alongside admin-defined field values
+
+</Steps>
+
+### NodeFieldRegistration Interface
+
+```typescript
+interface NodeFieldRegistration {
+  id: string;                           // Namespaced ID (e.g., 'billing.plan_id')
+  nodeTypes: string[] | '*';            // Which node types get this field
+  order: number;                        // Display order (use 1000+ for module fields)
+  field: {
+    type: string;                       // Any built-in or registered field type
+    label: string;
+    description?: string;
+    placeholder?: string;
+    required?: boolean;
+    options?: Array<{ label: string; value: string }>;
+    validation?: {
+      min?: number;
+      max?: number;
+      pattern?: string;
+      message?: string;
+    };
+    width?: 'full' | 'half';
+  };
+}
+```
+
+### Conventions
+
+- **Namespace field IDs** with your module ID: `billing.plan_id`, `tasks.default_assignee`, `time.hourly_rate`
+- **Use order 1000+** so module fields appear after admin-defined fields (which typically use 10-100)
+- **Target specific node types** rather than `'*'` where possible — a billing plan field only makes sense on projects, not folders
+- **Values are stored in `node.data`** alongside admin-defined field values. The field ID is the key: `node.data['billing.plan_id']`
+
+<Aside type="tip" title="Admin controls">
+Admins see module-registered fields on the **Integrations tab** of each node type (Structure Types > Edit Type > Integrations). They can enable/disable individual fields, override the display label, and adjust the sort order. Your module does not need to do anything special to support this — the registry handles it automatically.
+</Aside>
+
+---
+
+## Action Hooks
+
+Structure fires **26 action hooks** after every mutation. Other modules subscribe to these via the starter template's `actionRegistry` to react to node events — cleaning up data on delete, setting up defaults on create, syncing state on update.
+
+### Registering a Hook
+
+```typescript
+// backend/src/features/tasks/action.registration.ts
+import { actionRegistry } from '../../config/action.registry.js';
+
+actionRegistry.addActionAsync(
+  'structure.node.deleted',       // hook name
+  'tasks-cleanup-on-delete',      // unique listener ID
+  async (context) => {            // handler
+    const { userId, nodeId } = context;
+    await prisma.task.updateMany({
+      where: { nodeId, userId },
+      data: { status: 'archived' },
+    });
+  },
+  20                               // priority (lower = runs first)
+);
+```
+
+### Node Hooks (14)
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.node.created` | `{ userId, node, nodeType }` | A node is created |
+| `structure.node.updated` | `{ userId, node, changes }` | A node is updated |
+| `structure.node.deleted` | `{ userId, nodeId, nodeType }` | A node is deleted |
+| `structure.node.moved` | `{ userId, node, oldParentId, newParentId }` | A node moves to a different parent |
+| `structure.node.archived` | `{ userId, node }` | A node is archived |
+| `structure.node.restored` | `{ userId, node }` | A node is restored from archive |
+| `structure.node.favorited` | `{ userId, node, isFavorite }` | A favourite is toggled |
+| `structure.node.published` | `{ userId, node }` | A node's `isPublished` changes to true |
+| `structure.node.unpublished` | `{ userId, node }` | A node's `isPublished` changes to false |
+| `structure.node.workflowStateChanged` | `{ userId, node, oldState, newState }` | A node's workflow state changes |
+| `structure.node.duplicated` | `{ userId, original, duplicate, options }` | A node is duplicated |
+| `structure.node.reordered` | `{ userId, parentId, nodeIds }` | Nodes are reordered within a parent |
+| `structure.node.metadataUpdated` | `{ userId, nodeId, moduleId }` | Namespaced metadata is written |
+| `structure.node.bulkCreated` | `{ userId, nodes, nodeType }` | Nodes are created via the bulk API |
+
+### Connection Hooks (2)
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.connection.created` | `{ userId, connection }` | A connection is created |
+| `structure.connection.deleted` | `{ userId, connectionId }` | A connection is deleted |
+
+### Connection Type Hooks (3)
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.connectionType.created` | `{ userId, connectionType }` | A connection type is created |
+| `structure.connectionType.updated` | `{ userId, slug, changes }` | A connection type is updated |
+| `structure.connectionType.deleted` | `{ userId, slug }` | A connection type is deleted |
+
+### Node Type Hooks (4)
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.nodeType.created` | `{ userId, nodeType }` | A node type is created |
+| `structure.nodeType.updated` | `{ userId, slug, changes }` | A node type is updated |
+| `structure.nodeType.deleted` | `{ userId, slug }` | A node type is deleted |
+| `structure.nodeType.imported` | `{ userId, stats, mode }` | Node types are imported (merge or replace) |
+
+### Template Hooks (3)
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.template.created` | `{ userId, template }` | A template is created |
+| `structure.template.updated` | `{ userId, templateId, changes }` | A template is updated |
+| `structure.template.deleted` | `{ userId, templateId }` | A template is deleted |
+
+### Settings Hook (1)
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.settings.updated` | `{ userId, settings }` | User settings are updated |
+
+<Aside type="caution" title="Action hooks are the key to module integration">
+Without action hooks, modules are islands — they can display UI on nodes but cannot react to what happens to those nodes. Always register a `structure.node.deleted` listener to clean up your module's related data. Always register `structure.node.created` if your module needs to set up defaults for new nodes.
+</Aside>
+
+---
+
+## Filter Hooks
+
+Structure applies **4 filter hooks** at key points in the data pipeline. Filters run in sequence — each receives the output of the previous one, allowing multiple modules to transform the same data.
+
+### Registering a Filter
+
+```typescript
+// backend/src/features/billing/filter.registration.ts
+import { filterRegistry } from '../../config/filter.registry.js';
+
+filterRegistry.register(
+  'structure.node.response',       // hook name
+  'billing-enrich-node',           // unique listener ID
+  (node, context) => {             // handler — must return transformed data
+    return {
+      ...node,
+      metadata: {
+        ...node.metadata,
+        hasBilling: true,
+      },
+    };
+  },
+  20                                // priority (lower = runs first)
+);
+```
+
+### Available Filter Hooks
+
+| Hook | Receives | Returns | Purpose |
+|------|----------|---------|---------|
+| `structure.node.beforeCreate` | Node input data | Transformed input | Transform or validate data before a node is saved |
+| `structure.node.response` | Node object | Enriched node | Add computed properties before sending to the client |
+| `structure.node.listQuery` | Query parameters | Modified query | Modify list queries before execution (add constraints, scoping) |
+| `structure.nodeType.response` | Node type object | Transformed type | Enrich node type data before sending to the client |
+
+<Aside type="tip" title="Filters vs actions">
+**Actions** run after a mutation and are fire-and-forget — use them for side effects (cleanup, notifications, sync). **Filters** run during a request and must return a value — use them to transform data flowing through the pipeline.
+</Aside>
+
+---
+
+## Registration Pattern
+
+All content registries follow the same import and side-effect pattern:
+
+```typescript
+// frontend/src/features/tasks/registrations/structure-tabs.registration.ts
+import { nodeTabRegistry } from '@/features/structure';
+import { TasksTab } from '../components/TasksTab';
+
+nodeTabRegistry.register({
+  id: 'tasks',
+  moduleId: 'tasks',
+  label: 'Tasks',
+  icon: 'CheckSquare',
+  nodeTypes: '*',
+  order: 30,
+  component: TasksTab,
+});
+```
+
+Then import the registration file as a side-effect in your feature's `index.ts`:
+
+```typescript
+// frontend/src/features/tasks/index.ts
+
+// Side-effect imports (registrations) FIRST
+import './registrations/structure-tabs.registration';
+import './registrations/structure-widgets.registration';
+import './registrations/structure-cards.registration';
+
+// Then public exports
+export { taskRoutes } from './routes.config';
+```
+
+<Aside type="caution" title="Side-effect imports must come first">
+Registration imports are side-effect imports — they run code when imported. Always place them before your public exports in `index.ts`. This ensures registrations execute before any consuming code tries to read the registries.
+</Aside>
+
+---
+
+## Next Steps
+
+- [Integration](/modules/structure/integration/) — End-to-end walkthrough of building a module that extends Structure
+- [JSON Import & Export](/modules/structure/json-reference/) — Import and export Structure configurations
+- [Configuration](/modules/structure/configuration/) — Database schema, API endpoints, and TypeScript interfaces
+- [Usage](/modules/structure/usage/) — Admin page, components, and hooks reference
