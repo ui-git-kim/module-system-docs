@@ -300,6 +300,21 @@ export default defineConfig({
                 { label: "Changelog", slug: "modules/pickers/changelog" },
               ],
             },
+            {
+              label: "Document Management",
+              collapsed: true,
+              items: [
+                { label: "Overview", slug: "document-management" },
+                { label: "Configuration", slug: "document-management/configuration" },
+                { label: "Database", slug: "document-management/database" },
+                { label: "Usage", slug: "document-management/usage" },
+                { label: "Integration", slug: "document-management/integration" },
+                { label: "Developer Workflow", slug: "document-management/developer-workflow" },
+                { label: "Security", slug: "document-management/security" },
+                { label: "Changelog", slug: "document-management/changelog" },
+                { label: "Roadmap", slug: "document-management/roadmap" },
+              ],
+            },
           ],
         },
         {

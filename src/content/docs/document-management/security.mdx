@@ -1,0 +1,577 @@
+---
+title: Security
+description: The provider-delegated security model — credential encryption, Cloudflare Zero Trust, file proxying, content hashing, and legal/evidence considerations
+sidebar:
+  order: 6
+---
+
+import { Aside, Tabs, TabItem, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+Document Management is a **connector, not a storage system**. It connects to where your files already live (S3/R2, WebDAV, the local filesystem), browses and previews them, and keeps lightweight references in the database. Because file content never lives in the app's database, the security model is built around two ideas: **delegate each security layer to the provider that does it best**, and **encrypt the small amount of sensitive data the module does hold** (storage credentials) so it is useless even with full database access.
+
+This page explains the provider-delegated philosophy, walks through every security control the module implements, and covers the legal/evidence considerations that shaped the design.
+
+<Aside type="note" title="Where the sensitive data is — and isn't">
+The database stores **references, metadata, and your organisation** (favourites, tags, notes, node links). It never stores file content. The only secret it holds is each provider's connection config, and that is encrypted with AES-256-GCM before it is written. Files stay on the storage provider; only encrypted metadata sits in the cloud database.
+</Aside>
+
+---
+
+## Provider-Delegated Security
+
+The module does **not** implement its own authentication infrastructure, tunnel management, or TLS termination. Each layer of the security chain is handled by a dedicated provider that specialises in it. The app's only direct responsibility is encrypting storage credentials at the application layer.
+
+<CardGrid>
+  <Card title="Cloudflare Zero Trust Access" icon="approve-check">
+    Authentication, MFA, device posture, and access policies before any request reaches an origin. Audit logs for every access attempt. Free for up to 50 users.
+  </Card>
+  <Card title="Cloudflare Tunnel" icon="rocket">
+    Encryption in transit with no port forwarding and no inbound firewall holes. The local machine reaches out; nothing reaches in.
+  </Card>
+  <Card title="Neon PostgreSQL" icon="setting">
+    Database encryption at rest and in transit, managed by Neon. The module never rolls its own database encryption.
+  </Card>
+  <Card title="App-layer AES-256-GCM" icon="seti:lock">
+    The one thing the module does itself — encrypt storage credentials before they are written, with a key that lives only in the environment.
+  </Card>
+</CardGrid>
+
+### The Security Chain
+
+A request from the app flows down through five layers, each owned by a different provider. This is the canonical security chain for the module:
+
+```
+Request from app
+    ↓
+Cloudflare Zero Trust Access      ← Authentication & access policies
+    ↓                                (MFA, device posture, audit logs)
+Cloudflare Tunnel                 ← Encryption in transit, DDoS
+    ↓                                (no port forwarding, firewall-safe)
+Neon PostgreSQL                   ← Database encryption at rest & in transit
+    ↓
+App-layer AES-256-GCM             ← Storage credential encryption
+    ↓                                (DOC_ENCRYPTION_KEY in env vars)
+Storage Provider (S3/WebDAV/etc.) ← Provider-managed file security
+```
+
+<Aside type="tip" title="Why delegate?">
+Self-managed auth, tunnels, and TLS are the parts of a system most likely to be misconfigured. By delegating each layer to a provider whose entire job is that layer, the module's attack surface shrinks to a single well-understood control — credential encryption — and that control is implemented with a standard authenticated cipher.
+</Aside>
+
+#### Layer responsibilities
+
+| Layer | Provider | Responsibility |
+|-------|----------|----------------|
+| Access | Cloudflare Zero Trust Access | Authentication, MFA enforcement, device posture, location/account policies, audit logging |
+| Transport | Cloudflare Tunnel | Encryption in transit, DDoS protection, no port forwarding (outbound-only) |
+| Database | Neon PostgreSQL | Encryption at rest and in transit for the reference/metadata database |
+| Application | Document Management module | AES-256-GCM encryption of storage credentials with `DOC_ENCRYPTION_KEY` |
+| Storage | S3 / R2 / WebDAV / Local | Provider-managed file security, bucket policies, IAM, filesystem permissions |
+
+---
+
+## Credential Encryption
+
+Every storage provider you connect has a `config` object — access keys, WebDAV passwords, endpoints. This is the only secret the module persists, and it is encrypted at the application layer with **AES-256-GCM** before it is written to the `doc_storage_provider.config` column (`@db.Text`). Even with full database access, the config is unreadable without `DOC_ENCRYPTION_KEY`.
+
+### How the cipher works
+
+The key is derived by hashing `DOC_ENCRYPTION_KEY` with SHA-256, so you can supply a passphrase or a 32-character secret and always get a valid 256-bit key. Each encryption uses a fresh 12-byte GCM nonce, and the GCM auth tag detects any tampering on decrypt.
+
+```typescript
+// backend/src/features/document-management/utils/encryption.ts
+import crypto from 'node:crypto';
+
+const ALGORITHM = 'aes-256-gcm';
+const IV_BYTES = 12; // GCM standard nonce length
+
+function getKey(): Buffer {
+  const raw = process.env.DOC_ENCRYPTION_KEY;
+  if (!raw || raw.trim().length === 0) {
+    throw new Error(
+      'DOC_ENCRYPTION_KEY is not set. Storage credentials cannot be encrypted or decrypted. ' +
+        'Set a strong key (32+ chars) in the backend environment.'
+    );
+  }
+  return crypto.createHash('sha256').update(raw, 'utf8').digest();
+}
+
+/** Output format: `<ivHex>:<authTagHex>:<cipherHex>`. */
+export function encrypt(plaintext: string): string {
+  const iv = crypto.randomBytes(IV_BYTES);
+  const cipher = crypto.createCipheriv(ALGORITHM, getKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return [iv.toString('hex'), authTag.toString('hex'), encrypted.toString('hex')].join(':');
+}
+```
+
+Config objects are encrypted and decrypted through two thin wrappers:
+
+```typescript
+/** Encrypt a provider config object to a storable string. */
+export function encryptConfig(config: unknown): string {
+  return encrypt(JSON.stringify(config));
+}
+
+/** Decrypt a stored config string back to a typed object. */
+export function decryptConfig<T = Record<string, unknown>>(payload: string): T {
+  return JSON.parse(decrypt(payload)) as T;
+}
+```
+
+### The credential lifecycle
+
+<Steps>
+
+1. **You submit provider credentials** through the admin Storage Providers page (`POST /providers`).
+
+2. **The service encrypts the config** with `encryptConfig()` before the database write. The plaintext never touches the database.
+
+3. **Neon stores the ciphertext** in `doc_storage_provider.config`, itself encrypted at rest by Neon.
+
+4. **On use, the service decrypts** with `decryptConfig()` in memory, only when it needs to instantiate an adapter for a browse/download/upload.
+
+5. **API responses redact the config entirely** — see below.
+
+</Steps>
+
+### Redaction in responses
+
+The provider's `config` is never returned to the client. The `toProviderResponse()` mapper omits it and returns only safe, display-level fields:
+
+```typescript
+function toProviderResponse(p: StorageProvider): StorageProviderResponse {
+  const meta = (p.metadata ?? {}) as Record<string, unknown>;
+  const capabilities = Array.isArray(meta.capabilities) ? (meta.capabilities as string[]) : [];
+  return {
+    id: p.id,
+    name: p.name,
+    providerType: p.providerType,
+    isDefault: p.isDefault,
+    isReadOnly: p.isReadOnly,
+    status: p.status,
+    statusMessage: p.statusMessage,
+    lastCheckedAt: p.lastCheckedAt ? p.lastCheckedAt.toISOString() : null,
+    basePath: p.basePath,
+    capabilities,
+    createdAt: p.createdAt.toISOString(),
+    updatedAt: p.updatedAt.toISOString(),
+  };
+}
+```
+
+| Rule | Guarantee |
+|------|-----------|
+| Encrypt before write | Credentials are AES-256-GCM ciphertext in `doc_storage_provider.config` |
+| Key in env only | `DOC_ENCRYPTION_KEY` lives in the backend environment, never in the database |
+| Redact in responses | `toProviderResponse()` omits `config`; the client never sees credentials |
+| Never logged | Credentials are not logged, even at debug level |
+| Tamper-evident | GCM auth tag causes `decrypt()` to throw on any modified ciphertext |
+
+<Aside type="danger" title="Protect DOC_ENCRYPTION_KEY">
+`DOC_ENCRYPTION_KEY` is the single secret that protects every stored credential. Generate it with `openssl rand -hex 32`, store it only as a secret environment variable, and never commit it. If it is lost, stored credentials cannot be decrypted and providers must be re-connected. If it leaks, rotate it and re-encrypt all provider configs.
+</Aside>
+
+```bash
+# Generate a strong key for DOC_ENCRYPTION_KEY
+openssl rand -hex 32
+```
+
+---
+
+## Cloudflare Zero Trust Access for Local Machines
+
+The most security-sensitive scenario is connecting to files on a user's **local machine** (V2 ships a companion desktop app that runs a WebDAV server over those folders). Document Management treats this as a standard WebDAV provider — the security is delegated entirely to Cloudflare.
+
+```
+Local Machine                    Cloudflare                     Cloud App
+
+Local Connect app                Zero Trust Access              document-management
+  WebDAV server ──►  Tunnel  ──►  Authentication  ──►  module connects
+  port 8080          (encrypted)  MFA enforcement      as WebDAV provider
+                                  Access policies
+                                  Audit logging
+```
+
+The key insight: **Cloudflare is the gatekeeper, so the local server needs no authentication of its own.**
+
+- **Cloudflare Tunnel** carries traffic encrypted, with no port forwarding and no inbound firewall holes — the local machine makes an outbound connection only.
+- **Cloudflare Zero Trust Access** sits in front of the tunnel and requires authentication before any request reaches the local WebDAV server.
+- The **local WebDAV server does not implement its own auth** — Cloudflare authenticates first, so an unauthenticated request never reaches the origin.
+- Access policies can restrict by **user account, MFA requirement, device posture, and location**.
+- **Every access attempt is logged** by Cloudflare for auditing.
+
+<Aside type="tip" title="Free for up to 50 users">
+Cloudflare Zero Trust Access is free for up to 50 users, and Cloudflare Tunnel is free and encrypted with no port forwarding. For most single-tenant and small-team deployments, the entire access and transport security layer costs nothing and requires no self-managed infrastructure.
+</Aside>
+
+When you add the local machine as a provider, you point the WebDAV adapter at the tunnel hostname rather than `localhost`:
+
+```text
+# Local (same machine / LAN)
+http://localhost:8080
+
+# Remote (via Cloudflare Tunnel + Zero Trust Access)
+https://docs.yourdomain.com
+```
+
+---
+
+## File Access Proxying
+
+The frontend **never receives long-lived storage credentials**. All file bytes are proxied through the backend, which holds the decrypted config only in memory for the duration of the request.
+
+<CardGrid>
+  <Card title="Downloads are proxied" icon="document">
+    `GET /download/:providerId/*` streams bytes through the backend with a `Content-Disposition: attachment` header. The browser never talks to the storage provider directly.
+  </Card>
+  <Card title="Presigned URLs are short-lived" icon="external">
+    For S3/R2 previews, the backend may hand the client a short-lived presigned URL — preview only, never a long-lived credential.
+  </Card>
+</CardGrid>
+
+### The preview indirection
+
+The preview endpoint returns **JSON describing how to preview**, not the bytes themselves. This keeps authentication on the download path and avoids leaking credentials.
+
+```typescript
+// GET /preview/:providerId/*  →  JSON, not bytes
+// Presigned providers (S3/R2): { kind: 'url', url: '<short-lived presigned URL>' }
+// Everything else:             { kind: 'inline' }
+```
+
+| `kind` | Meaning | Client behaviour |
+|--------|---------|------------------|
+| `url` | The provider can mint a short-lived presigned URL (S3/R2) | Load the URL directly for preview — it expires quickly and is preview-only |
+| `inline` | No presigned URL available | Blob-fetch the bytes via `GET /download/:providerId/*`, preserving the backend's auth |
+
+<Aside type="note" title="A deliberate deviation">
+Returning JSON from the preview endpoint (rather than streaming inline) is a deliberate design choice. It lets the client blob-fetch through the authenticated `/download` path so credentials never reach the browser, while still allowing the fast presigned-URL path for S3/R2 where the provider issues its own short-lived, scoped URL.
+</Aside>
+
+### Content-Disposition safety
+
+File names are user-controlled, so the download `Content-Disposition` header is built defensively (RFC 5987): the ASCII fallback strips quotes, backslashes, and control characters, and the UTF-8 form is percent-encoded.
+
+```typescript
+function contentDisposition(fileName: string): string {
+  const ascii = Array.from(fileName)
+    .filter((ch) => {
+      const code = ch.charCodeAt(0);
+      // exclude control chars (<32, 127), double-quote (34), backslash (92)
+      return code >= 32 && code !== 34 && code !== 92 && code !== 127;
+    })
+    .join('');
+  const encoded = encodeURIComponent(fileName);
+  return 'attachment; filename="' + (ascii || 'download') + '"; filename*=UTF-8' + "''" + encoded;
+}
+```
+
+---
+
+## Read-Only Mode for Evidence and Legal
+
+Each provider carries an `isReadOnly` flag (`doc_storage_provider.isReadOnly`). When set, **all write operations are rejected at the adapter level** — before any request reaches the storage API. This is critical for evidence and legal files that must remain unaltered.
+
+Read-only is injected into the adapter at construction time via `createAdapter(type, config, { readOnly })`, and every write guard checks it:
+
+```typescript
+private assertWritable(): void {
+  if (this.readOnly) throw new ReadOnlyError();
+}
+```
+
+The `ReadOnlyError` maps to HTTP `403` with a stable `read_only` code:
+
+```typescript
+/** Thrown when a write is attempted against a read-only provider. */
+export class ReadOnlyError extends DocumentManagementError {
+  constructor(message = 'Provider is read-only: write operations are disabled') {
+    super(message, 403, 'read_only');
+    this.name = 'ReadOnlyError';
+  }
+}
+```
+
+| Operation | Read-only provider behaviour |
+|-----------|------------------------------|
+| `upload`, `delete`, `move`, `copy`, `createFolder`, `deleteFolder` | Rejected with `ReadOnlyError` (HTTP 403) at the adapter |
+| `listFolder`, `getFileInfo`, `exists`, `download` | Permitted — read access is unaffected |
+
+<Aside type="caution" title="Enforced at the adapter, not just the UI">
+Read-only is enforced inside the adapter, not merely hidden in the UI. Even a direct API call to `POST /upload/:providerId` against a read-only provider is rejected before any bytes reach the storage backend. This guarantees evidence integrity regardless of how the write is attempted.
+</Aside>
+
+---
+
+## Content Hashing for Integrity Verification
+
+When a `doc_document` reference is created, the service computes a **SHA-256 hash** of the file content server-side and stores it in `doc_document.contentHash`. This lets you later confirm a file has not been modified since it was referenced.
+
+```typescript
+// SHA-256 over a readable stream — no need to buffer the whole file in memory
+export function sha256Stream(stream: Readable): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+```
+
+The hash is computed during reference creation and persisted alongside the reference:
+
+```typescript
+let contentHash: string | undefined;
+// ... obtain a download stream for the file ...
+contentHash = await sha256Stream(stream);
+// ... persisted to doc_document.contentHash (or null if unavailable)
+```
+
+### The Verify Integrity flow
+
+To verify a referenced file later, re-hash the current content and compare it to the stored hash.
+
+<Steps>
+
+1. **Fetch the stored hash** from `doc_document.contentHash` for the reference.
+
+2. **Stream the current file** from the provider via the download path.
+
+3. **Re-hash with `sha256Stream()`** to produce the current digest.
+
+4. **Compare** — if the digests match, the file is unchanged since referencing; if they differ, the content has been modified.
+
+</Steps>
+
+```typescript
+const stored = document.contentHash;
+const current = await sha256Stream(await adapter.download(remotePath));
+const unchanged = stored != null && stored === current;
+// unchanged === true  →  integrity verified
+// unchanged === false →  content has changed since the reference was created
+```
+
+<Aside type="tip" title="SHA-256 everywhere">
+The same `contentHash` (SHA-256) underpins integrity verification for legal/evidence use. Combined with read-only providers and the access audit trail, it lets you prove a referenced file is byte-for-byte the file you first recorded.
+</Aside>
+
+---
+
+## The Access Audit Trail
+
+The `doc_recent_access` table powers the "Recent" view and **doubles as a chain-of-custody audit trail**. Every meaningful interaction with a file is logged with the action type and a timestamp.
+
+```prisma
+model doc_recent_access {
+  id          String   @id @default(cuid())
+  userId      String
+  providerId  String
+  remotePath  String
+  fileName    String
+  mimeType    String?
+  action      String   @default("view")   // view | download | upload | link | unlink
+  accessedAt  DateTime @default(now())
+
+  @@index([userId, accessedAt])
+  @@index([providerId, remotePath])
+  @@map("doc_recent_access")
+}
+```
+
+| `action` | Logged when |
+|----------|-------------|
+| `view` | A file is previewed |
+| `download` | A file is downloaded (single or as part of a bulk zip) |
+| `upload` | A file is uploaded to a provider |
+| `link` | A document is linked to a Structure node |
+| `unlink` | A document is unlinked from a node |
+
+Because each row records **who** (`userId`), **what** (`providerId` + `remotePath` + `fileName`), **which action**, and **when** (`accessedAt`), the table provides the access history needed for chain-of-custody evidence.
+
+<Aside type="note" title="Capped retention">
+The recent-access log is capped per user (`RECENT_ACCESS_CAP`, default 100 rows) with older rows pruned. For long-term legal retention, export or replicate the audit rows to durable storage rather than relying solely on the in-app capped log.
+</Aside>
+
+---
+
+## Path-Traversal Prevention (Local Adapter)
+
+The `LocalAdapter` is restricted to a configured base directory (`DOC_LOCAL_BASE_PATH`, default `./data/doc-local`). Path-traversal attempts are **rejected, not resolved** — `../` segments, absolute paths, and drive prefixes that would escape the base all throw.
+
+```typescript
+/** Resolve a provider-relative path to an absolute path within the base. */
+private safeResolve(p: string): string {
+  const root = path.resolve(this.base);
+  const resolved = path.resolve(root, p);
+  const rel = path.relative(root, resolved);
+  if (rel !== '' && (rel.startsWith('..') || path.isAbsolute(rel))) {
+    throw new PathTraversalError();
+  }
+  return resolved;
+}
+```
+
+The `PathTraversalError` maps to HTTP `403` with a stable `path_traversal` code:
+
+```typescript
+/** Thrown when a local-filesystem path escapes the configured base directory. */
+export class PathTraversalError extends DocumentManagementError {
+  constructor(message = 'Path is outside the allowed base directory') {
+    super(message, 403, 'path_traversal');
+    this.name = 'PathTraversalError';
+  }
+}
+```
+
+<Aside type="caution" title="Local adapter is development-first">
+The `LocalAdapter` is intended for development and logs a warning when `NODE_ENV === 'production'`. Prefer S3/R2 or WebDAV in production. When you do use it, the base-directory restriction is the boundary that keeps file access inside the intended folder tree.
+</Aside>
+
+---
+
+## Upload Size Enforced on the Stream
+
+Upload size is enforced on the **byte stream**, not just the spoofable `Content-Length` header. A counting transform aborts the upload the moment the running total exceeds `DOC_MAX_UPLOAD_SIZE` (default `52428800`, i.e. 50MB).
+
+```typescript
+/** Passthrough stream that aborts once maxBytes have flowed through it. */
+function createSizeLimiter(maxBytes: number): Transform {
+  let total = 0;
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      total += chunk.length;
+      if (total > maxBytes) {
+        const err = new Error('Upload exceeds maximum size') as Error & { code?: string };
+        err.code = 'UPLOAD_TOO_LARGE';
+        cb(err);
+        return;
+      }
+      cb(null, chunk);
+    },
+  });
+}
+```
+
+The controller checks the declared `Content-Length` as a fast-fail and then pipes the request body through the limiter so an under-reported length can't sneak past:
+
+```typescript
+if (contentLength > MAX_UPLOAD_SIZE) {
+  res.status(413).json({ error: 'File exceeds the maximum upload size', code: 'too_large' });
+  return;
+}
+const limited = req.pipe(createSizeLimiter(MAX_UPLOAD_SIZE));
+// ... if the stream limiter aborts, respond 413 'too_large'
+```
+
+<Aside type="tip" title="Raw body uploads">
+Uploads use the raw request body with a `?path=` query parameter (which names the destination including the filename), rather than multipart form data. This avoids a dependency on a specific multipart middleware and lets the size limit be enforced directly on the byte stream as it flows.
+</Aside>
+
+| Control | Where | Limit |
+|---------|-------|-------|
+| `Content-Length` fast-fail | Controller, before streaming | `DOC_MAX_UPLOAD_SIZE` (default 50MB) → HTTP 413 `too_large` |
+| Stream byte count | `createSizeLimiter` transform | `DOC_MAX_UPLOAD_SIZE` → abort with `UPLOAD_TOO_LARGE` → HTTP 413 |
+
+---
+
+## Legal and Evidence Considerations
+
+Document Management was designed with legal and evidence workflows in mind. Three controls combine to support **chain of custody**, and the connector architecture supports **data sovereignty**.
+
+<CardGrid>
+  <Card title="Chain of custody" icon="approve-check">
+    `doc_recent_access` records who accessed or downloaded what, and when. SHA-256 `contentHash` proves the file is unchanged. Read-only providers prevent alteration.
+  </Card>
+  <Card title="Data sovereignty" icon="seti:lock">
+    Files stay on the machine or provider that holds them. Only encrypted metadata references live in the cloud database — never file content.
+  </Card>
+</CardGrid>
+
+### Chain of custody
+
+Three controls work together to establish and preserve chain of custody:
+
+1. **Integrity** — `contentHash` (SHA-256) is computed server-side at reference creation. A Verify Integrity re-hash confirms the file is byte-for-byte the file you first recorded.
+2. **Immutability** — `isReadOnly` providers reject every write at the adapter level, so evidence cannot be modified, moved, or deleted through the module.
+3. **Access history** — `doc_recent_access` logs each `view`, `download`, `upload`, `link`, and `unlink` with `userId` and `accessedAt`, providing an auditable record of who did what and when.
+
+### Data sovereignty
+
+Because the module is a **connector, not storage**, file content never leaves the storage provider. For a user's local machine served over WebDAV through Cloudflare Tunnel, the files physically remain on that machine. The cloud database holds only:
+
+- **References** — provider ID, remote path, file name, MIME type, size
+- **Integrity data** — the SHA-256 `contentHash`
+- **User organisation** — favourites, tags, notes, node links
+- **Encrypted credentials** — the provider config, AES-256-GCM ciphertext
+
+```prisma
+model doc_document {
+  id             String   @id @default(cuid())
+  userId         String
+  providerId     String                 // references doc_storage_provider
+  remotePath     String                 // pointer into the provider — not content
+  fileName       String
+  mimeType       String?
+  fileSize       Int?
+  contentHash    String?                // SHA-256 for integrity verification
+  isFavourite    Boolean  @default(false)
+  status         String   @default("active")   // active | archived
+  tags           String[]
+  notes          String?  @db.Text
+  thumbnailPath  String?
+  metadata       Json?
+  lastAccessedAt DateTime?
+  lastSyncedAt   DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([userId, providerId, remotePath])
+  @@index([userId, createdAt])
+  @@index([userId, isFavourite])
+  @@index([userId, status])
+  @@map("doc_documents")
+}
+```
+
+<Aside type="caution" title="Encrypted metadata, not content, in the cloud">
+The cloud database stores references and encrypted credentials — not files. Even a full database compromise exposes no file content and no usable credentials (without `DOC_ENCRYPTION_KEY`). The files, and the data sovereignty over them, remain with the storage provider.
+</Aside>
+
+---
+
+## Security Controls Reference
+
+A consolidated lookup of every control described on this page.
+
+| Control | Mechanism | Where it lives |
+|---------|-----------|----------------|
+| Authentication / MFA / device posture | Cloudflare Zero Trust Access | In front of every origin (free ≤ 50 users) |
+| Encryption in transit | Cloudflare Tunnel (no port forwarding) + Neon TLS | Transport layer |
+| Database encryption at rest | Neon PostgreSQL | Managed database |
+| Credential encryption | AES-256-GCM, key derived via SHA-256 from `DOC_ENCRYPTION_KEY` | `utils/encryption.ts` |
+| Credential storage | Encrypted ciphertext in `doc_storage_provider.config` (`@db.Text`) | Database |
+| Credential redaction | `toProviderResponse()` omits `config` | `document-management.service.ts` |
+| Tamper detection | GCM auth tag throws on modified ciphertext | `utils/encryption.ts` |
+| File proxying | Backend streams bytes; frontend never holds long-lived credentials | `download` / `preview` controller |
+| Short-lived presigned URLs | Preview-only, provider-issued (S3/R2) | `preview` endpoint (`{ kind: 'url' }`) |
+| Read-only enforcement | `assertWritable()` → `ReadOnlyError` (403) at the adapter | Adapters |
+| Content integrity | SHA-256 `contentHash` + Verify Integrity re-hash | `utils/encryption.ts`, `doc_document` |
+| Access audit trail | `doc_recent_access` (who / what / action / when) | Database |
+| Path-traversal prevention | `safeResolve()` → `PathTraversalError` (403) | `LocalAdapter` |
+| Upload size enforcement | Counting transform aborts at `DOC_MAX_UPLOAD_SIZE` | `createSizeLimiter` |
+
+### Security-relevant environment variables
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `DOC_ENCRYPTION_KEY` | Yes (secret) | — | 32+ char key for AES-256-GCM credential encryption. Generate with `openssl rand -hex 32` |
+| `DOC_MAX_UPLOAD_SIZE` | No | `52428800` (50MB) | Maximum upload size, enforced on the byte stream |
+| `DOC_LOCAL_BASE_PATH` | No | `./data/doc-local` | Base directory the `LocalAdapter` is restricted to |
+| `DOC_THUMBNAIL_CACHE_DIR` | No | `./data/doc-thumbnails` | On-disk thumbnail cache directory |
+
+<Aside type="note" title="Per-provider credentials are not env vars">
+Storage credentials (access keys, WebDAV passwords) are not environment variables — they live encrypted in `doc_storage_provider.config`. This lets you connect multiple providers of the same type, each with its own credentials, all protected by the single `DOC_ENCRYPTION_KEY`.
+</Aside>

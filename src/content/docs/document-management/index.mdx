@@ -1,0 +1,194 @@
+---
+title: Overview
+description: Document Management — a connector module that browses, previews, and links files from external storage providers to Structure nodes
+sidebar:
+  order: 1
+---
+
+import { Aside, Card, CardGrid, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The **Document Management** module turns your app into a single window over the files you already keep elsewhere. You connect external storage — an S3 bucket or Cloudflare R2, a WebDAV server such as ownCloud, Nextcloud or a NAS, or a local folder in development — and the module browses, previews, downloads, and uploads files against it. Alongside that, it keeps lightweight **document references**: a row per file that records your organisation (favourites, tags, notes) and links the file to a [Structure](/modules/structure/integration/) node. You install it with one command:
+
+```bash
+npx document-management init
+```
+
+The defining principle is **connector, not storage**. The database never holds file content. It stores references, metadata, and your organisation — the bytes stay with the storage provider you connected. That keeps the module light, keeps your data portable, and means the provider's own security, durability, and access controls remain in force. The local adapter even reads files straight off disk during development. V1 is a renderer and connector; V2 adds in-app creation (Plate), versioning, workflow states, export, and a companion desktop app.
+
+<Aside type="note" title="What "reference" means">
+A `doc_document` row points at a file by `providerId` + `remotePath`. It carries a SHA-256 `contentHash`, a `fileName`, `mimeType`, `fileSize`, your `tags` and `notes`, an `isFavourite` flag, and a `status` of `active` or `archived`. It does **not** carry the file's bytes. If the provider goes offline the reference still appears in your documents list — the file just isn't reachable until the provider is back.
+</Aside>
+
+## Key features
+
+<CardGrid>
+  <Card title="Connect any provider" icon="cloud-download">
+    Three storage adapters out of the box — S3 / Cloudflare R2, WebDAV (ownCloud, Nextcloud, NAS), and a local filesystem adapter for development. Credentials are encrypted at rest with AES-256-GCM.
+  </Card>
+  <Card title="Browse and preview" icon="document">
+    A file browser with list and grid views, breadcrumbs, and folder bookmarks. Inline preview for images, PDFs (react-pdf), text, code, video, and audio; a download prompt for office documents and archives.
+  </Card>
+  <Card title="Organise with references" icon="bookmark">
+    Mark favourites, add tags and notes, and keep a recent-access trail. References survive provider outages and double as a chain-of-custody audit log.
+  </Card>
+  <Card title="Link to Structure" icon="puzzle">
+    Optional Structure integration adds a Documents tab, an overview widget, a count badge, upload/link actions, and a pinned-documents sidebar to every node — all inert when Structure isn't installed.
+  </Card>
+</CardGrid>
+
+- Connect **S3 / R2**, **WebDAV**, and **local filesystem** storage providers
+- Browse, preview, and download files with **list and grid** views
+- **AES-256-GCM** encryption of storage credentials at rest
+- Document references with **favourites, tags, and notes**
+- **Folder bookmarks** and a **recent-access** trail per user
+- **Read-only providers** plus **SHA-256** content hashing for legal and evidence use
+- Optional **Structure node integration** — tabs, widgets, actions, and sidebar sections
+- Downloads **proxied through the backend** — the browser never receives long-lived credentials
+- A public **service interface** and **action hooks** other modules can build on
+
+## Architecture
+
+Document Management sits inside your application as a peer to the Structure module. It talks "up" to Structure (to link documents to nodes) and "down" to whichever storage adapters you enabled. The adapters are the only part that reaches outside your app — to an S3 bucket, a WebDAV server, or the local disk.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Your Application                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌───────────────┐  ┌─────────────────────────┐                │
+│  │  Structure     │  │  Document Management    │                │
+│  │  Module        │  │  Module                 │                │
+│  │  (optional)    │  │                         │                │
+│  │  • Hierarchy   │  │  • Storage adapters     │                │
+│  │  • Node types  │◄─┤  • File browsing        │                │
+│  │  • Fields      │  │  • Preview / rendering  │                │
+│  │  • Connections │  │  • Upload / download    │                │
+│  │               │  │  • Document references   │                │
+│  └───────────────┘  └──────────┬──────────────┘                │
+│                                │                                │
+│                    ┌───────────┴───────────┐                    │
+│                    │  Storage Adapters      │                    │
+│                    ├───────────────────────┤                    │
+│                    │  S3 / R2              │                    │
+│                    │  WebDAV (ownCloud/NAS)│                    │
+│                    │  Local filesystem     │                    │
+│                    └──────────┬────────────┘                    │
+│                               │                                 │
+└───────────────────────────────┼─────────────────────────────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          │                     │                     │
+     ┌────┴────┐         ┌─────┴──────┐        ┌─────┴──────┐
+     │  S3/R2  │         │  ownCloud  │        │  Local     │
+     │  Bucket │         │  / NAS     │        │  disk      │
+     │         │         │  (WebDAV)  │        │  (dev)     │
+     └─────────┘         └────────────┘        └────────────┘
+```
+
+Every adapter implements the same `StorageAdapter` interface (`connect`, `disconnect`, `testConnection`, `listFolder`, `getFileInfo`, `exists`, `download`, `upload`, `delete`, `move`, `copy`, `createFolder`, `deleteFolder`, plus optional `getPreviewUrl`, `getThumbnailUrl`, and `search`). A factory builds the right one for each provider:
+
+```typescript
+// createAdapter injects readOnly so write ops throw ReadOnlyError
+// at the adapter level — before any provider call is made.
+const adapter = createAdapter(provider.providerType, config, {
+  readOnly: provider.isReadOnly,
+});
+
+const entries = await adapter.listFolder(remotePath);
+```
+
+All three adapter SDKs (`@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner`, `webdav`) are **always installed**, regardless of which adapters you select at init, so the generated app always type-checks. The runtime constant `ENABLED_ADAPTERS` in `document-management.config.ts` derives the active set from your selection — choosing `all` enables all three.
+
+<Aside type="tip" title="Structure is optional">
+Document Management is standalone. Structure integration is detected at runtime, and the Structure registration imports are **commented out** in the generated `index.ts`. When you install Structure, you uncomment them — the Documents tab, node widgets, count badge, upload/link actions, and pinned-documents sidebar light up. See [Integration](/document-management/integration/) for the full wiring.
+</Aside>
+
+## Prerequisites
+
+You need very little to get started — no third-party SaaS account is required, because the module connects to storage **you** already control.
+
+| Requirement | Details |
+|-------------|---------|
+| **Starter template app** | The module installs into an app built from the `unique-react-fullstack-starter` template. |
+| **Neon PostgreSQL** | The app's database. Stores the five `doc_*` tables (references, providers, links, bookmarks, recent access) — never file content. |
+| **`DOC_ENCRYPTION_KEY`** | **Required** backend secret. A 32+ character key for AES-256-GCM credential encryption. Generate with `openssl rand -hex 32`. |
+| **Structure module** | **Optional.** Adds node tabs, widgets, badges, actions, and a sidebar section. The module works fully without it. |
+| **A storage provider** | An S3 bucket / R2, a WebDAV server, or a local folder. Per-provider credentials are entered in-app and encrypted — they are **not** environment variables. |
+
+<Aside type="caution" title="Set DOC_ENCRYPTION_KEY before connecting providers">
+`DOC_ENCRYPTION_KEY` is collected interactively at init and lives **only** in your backend environment. It encrypts every provider's credentials before they touch the database. Without it the module cannot store a provider config. Generate one with:
+
+```bash
+openssl rand -hex 32
+```
+</Aside>
+
+## Quick install
+
+<Steps>
+
+1. **Run the installer** in your starter template app:
+
+    ```bash
+    npx document-management init
+    ```
+
+2. **Answer the prompts.** You choose which storage providers to support (`s3`, `webdav`, `local`, or `all`) and, for S3/R2, a default region:
+
+    | Prompt | Type | Default | Shown when |
+    |--------|------|---------|------------|
+    | `storageAdapters` | select (`s3` \| `webdav` \| `local` \| `all`) | `s3` | always |
+    | `defaultRegion` | input | `ap-southeast-2` | `storageAdapters` is `s3` or `all` |
+
+3. **Provide the required secret.** Set `DOC_ENCRYPTION_KEY` when prompted (generate it with `openssl rand -hex 32`). The remaining env vars have sensible defaults:
+
+    | Variable | Required | Default |
+    |----------|----------|---------|
+    | `DOC_ENCRYPTION_KEY` | ✅ | — (generate with `openssl rand -hex 32`) |
+    | `DOC_MAX_UPLOAD_SIZE` | — | `52428800` (50 MB) |
+    | `DOC_THUMBNAIL_CACHE_DIR` | — | `./data/doc-thumbnails` |
+    | `DOC_S3_DEFAULT_REGION` | — | `ap-southeast-2` |
+    | `DOC_LOCAL_BASE_PATH` | — | `./data/doc-local` |
+
+4. **Migrate and run.** The CLI creates the `doc_*` tables, generates the frontend and backend code, registers navigation and routes, and installs the shadcn components. Open `/documents` to browse, or `/admin/documents` to add a storage provider.
+
+</Steps>
+
+<Aside type="note" title="The deliberate deviations">
+A few install details differ from the original design spec — honestly, because the bundled scaffold (v1.10.2) has limits. Adapter selection is a single `select` (with an `all` option) rather than a true multi-select; all adapter SDKs are installed unconditionally; the encryption key is a required secret env var rather than an auto-generating prompt; uploads use the raw request body with `?path=` rather than multipart; and the preview endpoint returns JSON so the client can blob-fetch with auth preserved. [Configuration](/document-management/configuration/) documents each one in full.
+</Aside>
+
+## Next steps
+
+<CardGrid>
+  <Card title="Configuration" icon="setting">
+    Install prompts, environment variables, the five `doc_*` tables, the full API surface, and the deliberate deviations from the spec.
+
+    [Read the configuration guide →](/document-management/configuration/)
+  </Card>
+  <Card title="Usage" icon="open-book">
+    Connect a provider, browse and preview files, create references, and manage favourites, tags, and bookmarks from the UI.
+
+    [Read the usage guide →](/document-management/usage/)
+  </Card>
+  <Card title="Integration" icon="puzzle">
+    Wire the module into Structure nodes, consume the public service interface, and subscribe to the action hooks it fires.
+
+    [Read the integration guide →](/document-management/integration/)
+  </Card>
+  <Card title="Security" icon="approve-check">
+    The provider-delegated security model — Cloudflare Zero Trust, encrypted credentials, proxied downloads, and stream-enforced upload limits.
+
+    [Read the security guide →](/document-management/security/)
+  </Card>
+  <Card title="Developer Workflow" icon="laptop">
+    Build, link, and test the module locally, and how the templates map to generated files.
+
+    [Read the developer workflow →](/document-management/developer-workflow/)
+  </Card>
+  <Card title="Roadmap" icon="rocket">
+    What V2 adds — in-app creation with Plate, versioning, workflow states, export, and the companion desktop app.
+
+    [Read the roadmap →](/document-management/roadmap/)
+  </Card>
+</CardGrid>

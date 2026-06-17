@@ -1,0 +1,752 @@
+---
+title: Integration
+description: How other modules consume, react to, and extend the Document Management module
+sidebar:
+  order: 4
+---
+
+import { Aside, Tabs, TabItem, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+This is the most important page for anyone building **another** module that needs to talk to Document Management. It explains the four ways your module connects to this one:
+
+<CardGrid>
+  <Card title="Consume the service" icon="puzzle">
+    Resolve `document-management` from the `serviceRegistry` and call its typed interface to fetch references and download streams.
+  </Card>
+  <Card title="React to events" icon="rocket">
+    Subscribe to the six `documents.*` action hooks this module fires when documents and providers change.
+  </Card>
+  <Card title="Extend Structure UI" icon="list-format">
+    The module ships tabs, widgets, a card badge, two actions, and a sidebar section for Structure node pages — commented out until Structure is present.
+  </Card>
+  <Card title="Reference app registries" icon="setting">
+    Navigation, dashboard, preferences, and admin registrations that other features may need to coordinate with.
+  </Card>
+</CardGrid>
+
+<Aside type="note" title="Connector, not storage">
+Document Management is a **connector** in V1 — it stores references, metadata, and user organisation (favourites, tags, node links), never file content. When you request a download stream, the bytes are proxied live from the underlying storage provider. Keep that in mind when designing your integration: a reference can exist while its provider is temporarily unavailable.
+</Aside>
+
+---
+
+## Consuming the Service
+
+The module registers a backend service under the id `document-management`. This is the **only** supported way for another module to read documents — never import directly from the `document-management` feature folder, or you break module isolation and the system can no longer detect a missing dependency.
+
+### The public service interface
+
+Document Management exposes a deliberately small, stable surface for cross-module use. The full interface (from `document-management.types.ts`) is reproduced here in its entirety:
+
+```typescript
+export interface DocumentManagementServiceInterface {
+  /** Get the document references linked to a Structure node. */
+  getDocumentsForNode(nodeId: string, userId: string): Promise<DocumentReference[]>;
+
+  /** Get a single document reference (ownership-checked). */
+  getDocument(documentId: string, userId: string): Promise<DocumentReference | null>;
+
+  /** Get a readable download stream for a document's underlying file. */
+  getDownloadStream(documentId: string, userId: string): Promise<Readable>;
+
+  /** Get live file metadata from the provider for a document. */
+  getFileInfo(documentId: string, userId: string): Promise<FileInfo>;
+
+  /** Count the documents linked to a Structure node. */
+  getDocumentCount(nodeId: string, userId: string): Promise<number>;
+
+  /** Whether the module is available (for optional detection by consumers). */
+  isAvailable(): boolean;
+}
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getDocumentsForNode(nodeId, userId)` | `Promise<DocumentReference[]>` | All document references linked to a Structure node, ownership-checked against `userId`. |
+| `getDocument(documentId, userId)` | `Promise<DocumentReference \| null>` | A single reference, or `null` if it does not exist or is not owned by `userId`. |
+| `getDownloadStream(documentId, userId)` | `Promise<Readable>` | A Node `Readable` of the underlying file, streamed live from the provider. |
+| `getFileInfo(documentId, userId)` | `Promise<FileInfo>` | Live metadata (name, size, MIME type, timestamps) fetched from the provider. |
+| `getDocumentCount(nodeId, userId)` | `Promise<number>` | The number of references linked to a node — cheaper than fetching them all. |
+| `isAvailable()` | `boolean` | Always `true` once registered; lets soft consumers confirm the module is present. |
+
+The two return shapes you will work with most are `DocumentReference` and `FileInfo`. Both are reproduced in full so you do not have to import them just to read this page:
+
+```typescript
+/** Full document reference (detail views). */
+export interface DocumentReference {
+  id: string;
+  userId: string;
+  providerId: string;
+  remotePath: string;
+  fileName: string;
+  mimeType: string | null;
+  fileSize: number | null;
+  contentHash: string | null;      // SHA-256, computed server-side at creation
+  isFavourite: boolean;
+  status: 'active' | 'archived';
+  tags: string[];
+  notes: string | null;
+  thumbnailPath: string | null;
+  metadata: Record<string, unknown> | null;
+  lastAccessedAt: Date | null;
+  lastSyncedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface FileInfo {
+  name: string;
+  path: string;
+  isFolder: boolean;
+  mimeType?: string;
+  size?: number;
+  lastModified?: Date;
+  created?: Date;
+  metadata?: Record<string, unknown>;
+}
+```
+
+### Resolving the service (hard dependency)
+
+If your module genuinely cannot function without Document Management, declare it with `requiredModules` in your `module.ts` and resolve the service with `serviceRegistry.get`:
+
+```typescript
+// src/module.ts (your module)
+export const moduleDefinition: ModuleDefinition = {
+  id: 'my-feature',
+  name: 'My Feature',
+  version: '1.0.0',
+  requiredModules: ['document-management'],
+  // ...
+};
+```
+
+```typescript
+// backend/src/features/my-feature/my-feature.service.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+
+export const myFeatureService = {
+  async listNodeFiles(nodeId: string, userId: string) {
+    // Type-safe — the module augments ServiceTypes for 'document-management'
+    const docs = serviceRegistry.get('document-management');
+    return docs.getDocumentsForNode(nodeId, userId);
+  },
+};
+```
+
+<Aside type="caution" title="Never import across module boundaries">
+Do NOT `import { documentManagementService } from '../../features/document-management/...'`. Always go through `serviceRegistry.get('document-management')`. The module augments `ServiceTypes` in its `service.registration.ts`, so `get('document-management')` is fully typed without any direct import.
+</Aside>
+
+### Resolving the service (soft dependency)
+
+If Document Management is optional for your module, use `getOptional` and guard the result. This is exactly the pattern Document Management itself uses to detect Structure — so it is the idiomatic approach:
+
+```typescript
+// backend/src/features/my-feature/my-feature.service.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+import type { DocumentManagementServiceInterface } from './types.js';
+
+export const myFeatureService = {
+  async maybeAttachFiles(nodeId: string, userId: string) {
+    const docs = serviceRegistry.getOptional('document-management') as
+      | DocumentManagementServiceInterface
+      | undefined;
+
+    if (!docs?.isAvailable()) {
+      return [];               // degrade gracefully — module not installed
+    }
+
+    return docs.getDocumentsForNode(nodeId, userId);
+  },
+};
+```
+
+<Aside type="tip" title="get vs getOptional">
+`serviceRegistry.get('document-management')` throws if the module is not installed — use it only when you have declared `requiredModules: ['document-management']`. `serviceRegistry.getOptional('document-management')` returns `undefined` when absent — use it for soft dependencies and always null-check before calling.
+</Aside>
+
+---
+
+## Reacting to Events (Action Hooks Fired)
+
+Document Management fires six action hooks from its service as documents and providers change. Any module can subscribe with `actionRegistry.addActionAsync` and react — index a newly uploaded file, clean up derived data when a document is deleted, or refresh a cache when a provider connects.
+
+The exact event ids and context shapes (from `action.registration.ts` and the service) are:
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `documents.document.linked` | `{ userId, documentId, nodeId, linkType }` | A document reference is linked to a Structure node. `linkType` is `'attachment' \| 'reference' \| 'primary'`. |
+| `documents.document.unlinked` | `{ userId, documentId, nodeId }` | A document reference is unlinked from a node. |
+| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName }` | A file is uploaded to a provider through the module. |
+| `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` | A document reference (and optionally its underlying file) is deleted. |
+| `documents.provider.connected` | `{ userId, providerId, providerType }` | A storage provider is created/connected. `providerType` is `s3 \| webdav \| local`. |
+| `documents.provider.disconnected` | `{ userId, providerId }` | A storage provider is removed. |
+
+### Subscribing to a fired hook
+
+```typescript
+// backend/src/features/my-feature/action.registration.ts
+import { actionRegistry } from '../../config/action.registry.js';
+import { myFeatureService } from './my-feature.service.js';
+
+// Index every file uploaded through Document Management
+actionRegistry.addActionAsync(
+  'documents.document.uploaded',
+  'my-feature-index-upload',
+  async (context) => {
+    const { userId, providerId, remotePath, fileName } =
+      context as { userId: string; providerId: string; remotePath: string; fileName: string };
+    await myFeatureService.indexFile(userId, providerId, remotePath, fileName);
+  },
+  30 // priority — Document Management's own Structure subscriptions run at 20
+);
+
+// React when a document reference is deleted (clean up derived data)
+actionRegistry.addActionAsync(
+  'documents.document.deleted',
+  'my-feature-cleanup-on-delete',
+  async (context) => {
+    const { userId, documentId } = context as { userId: string; documentId: string };
+    await myFeatureService.removeDerivedData(userId, documentId);
+  },
+  30
+);
+```
+
+<Aside type="note" title="Hooks are inert until something fires them">
+These hooks are emitted by the Document Management service itself, so they always fire when the module is installed — no Structure dependency required. If your subscriber is registered but Document Management is not installed, nothing ever calls your listener, which is harmless.
+</Aside>
+
+---
+
+## Structure Hook Subscriptions
+
+Document Management is a **standalone** module — Structure is optional and detected at runtime. When Structure *is* installed, the module keeps its document links and references in sync with node lifecycle events by subscribing to three Structure action hooks. All three are registered at priority `20` and are completely inert when Structure is absent (nothing emits the hooks).
+
+| Subscribed hook | Context | What Document Management does |
+|-----------------|---------|-------------------------------|
+| `structure.node.deleted` | `{ userId, nodeId, nodeType }` | Calls `handleNodeDeleted(nodeId, userId)` — removes the `doc_node_link` rows for that node so links don't dangle. The document references themselves survive. |
+| `structure.node.archived` | `{ userId, node }` | Calls `handleNodeArchived(node.id, userId)` — sets `status = 'archived'` on `doc_document` references linked to the node. |
+| `structure.node.moved` | `{ userId, node, oldParentId, newParentId }` | Calls `handleNodeMoved(node.id, userId)` — nulls `lastSyncedAt` on the linked documents so cached context is refreshed on next access. |
+
+This is the relevant slice of `action.registration.ts`:
+
+```typescript
+import { actionRegistry } from '../../config/action.registry.js';
+import { documentManagementService } from './document-management.service.js';
+
+// Clean up document links when a node is deleted.  Context: { userId, nodeId, nodeType }
+actionRegistry.addActionAsync(
+  'structure.node.deleted',
+  'document-management-node-deleted',
+  async (context) => {
+    const { userId, nodeId } = context as { userId: string; nodeId: string };
+    await documentManagementService.handleNodeDeleted(nodeId, userId);
+  },
+  20
+);
+
+// Archive linked documents when a node is archived.  Context: { userId, node }
+actionRegistry.addActionAsync(
+  'structure.node.archived',
+  'document-management-node-archived',
+  async (context) => {
+    const { userId, node } = context as { userId: string; node: { id: string } };
+    await documentManagementService.handleNodeArchived(node.id, userId);
+  },
+  20
+);
+
+// Refresh cached context when a node moves parent.  Context: { userId, node, oldParentId, newParentId }
+actionRegistry.addActionAsync(
+  'structure.node.moved',
+  'document-management-node-moved',
+  async (context) => {
+    const { userId, node } = context as { userId: string; node: { id: string } };
+    await documentManagementService.handleNodeMoved(node.id, userId);
+  },
+  20
+);
+```
+
+<Aside type="tip" title="Soft Structure detection at the data layer too">
+Beyond these hooks, the service also calls `serviceRegistry.getOptional('structure')` inside `linkDocument` to verify a node exists before creating a `doc_node_link`. If Structure is absent, that check is skipped and links are created without node validation. Your module gets the same graceful-degradation behaviour for free if you follow the `getOptional` pattern above.
+</Aside>
+
+---
+
+## Structure Registry Registrations
+
+When Structure is installed, Document Management contributes a full set of UI extensions to node pages: a Documents tab, an Overview widget, a card badge, two header actions, and a sidebar section. Each is generated as its own registration file under `registrations/`.
+
+<Aside type="caution" title="Commented out by default — you must enable them">
+The Structure registrations import from `@/features/structure`, which does not exist in a standalone install — so the side-effect imports are **commented out** in the generated `index.ts`. After installing Structure, uncomment them to activate the integration. The backend action subscriptions above need no such gating; they are inert without Structure but always compile.
+</Aside>
+
+This is the block you uncomment in `frontend/src/features/document-management/index.ts`:
+
+```typescript
+// ────────────────────────────────────────────────────────────────────────
+// STRUCTURE INTEGRATION (optional)
+// These registrations import from '@/features/structure'. Uncomment them
+// only when the Structure module is installed; otherwise the build cannot
+// resolve the import.
+// ────────────────────────────────────────────────────────────────────────
+// import './registrations/structure-tabs.registration';
+// import './registrations/structure-widgets.registration';
+// import './registrations/structure-cards.registration';
+// import './registrations/structure-actions.registration';
+// import './registrations/structure-sidebar.registration';
+```
+
+<Steps>
+
+1. **Install Structure** into the same app (`npx structure init` or your equivalent), so `@/features/structure` resolves.
+
+2. **Uncomment the five side-effect imports** shown above in the module's `index.ts`.
+
+3. **Rebuild the frontend.** The Documents tab, node widget, card badge, the two header actions, and the Pinned Documents sidebar section now appear on node detail pages and cards.
+
+</Steps>
+
+### nodeTabRegistry — "Documents" tab
+
+Adds a Documents tab to node detail pages. The tab also listens for the `document-management:upload` and `document-management:link` window events fired by the node actions below.
+
+| Property | Value |
+|----------|-------|
+| `id` | `documents` |
+| `moduleId` | `document-management` |
+| `label` | `Documents` |
+| `icon` | `FileText` |
+| `nodeTypes` | `'*'` (admin-configurable per node type) |
+| `order` | `35` |
+| `component` | `NodeDocumentsTab` |
+
+```typescript
+import { nodeTabRegistry } from '@/features/structure';
+import { NodeDocumentsTab } from '../components/structure/NodeDocumentsTab';
+
+nodeTabRegistry.register({
+  id: 'documents',
+  moduleId: 'document-management',
+  label: 'Documents',
+  icon: 'FileText',
+  nodeTypes: '*',
+  order: 35,
+  component: NodeDocumentsTab,
+});
+```
+
+### nodeWidgetRegistry — "Recent Documents" node widget
+
+Adds a Recent Documents widget to a node's Overview tab.
+
+| Property | Value |
+|----------|-------|
+| `id` | `node-recent-documents` |
+| `moduleId` | `document-management` |
+| `title` | `Recent Documents` |
+| `icon` | `FileText` |
+| `location` | `node-overview` |
+| `nodeTypes` | `'*'` |
+| `order` | `25` |
+| `component` | `NodeDocumentsWidget` |
+
+```typescript
+import { nodeWidgetRegistry } from '@/features/structure';
+import { NodeDocumentsWidget } from '../components/widgets/NodeDocumentsWidget';
+
+nodeWidgetRegistry.register({
+  id: 'node-recent-documents',
+  moduleId: 'document-management',
+  title: 'Recent Documents',
+  icon: 'FileText',
+  location: 'node-overview',
+  nodeTypes: '*',
+  order: 25,
+  component: NodeDocumentsWidget,
+});
+```
+
+### nodeCardExtensionRegistry — document-count badge
+
+Adds a paperclip + count badge to node cards in grid/list views. The badge is mounted via `createElement` (not a bare function call) so its hooks run correctly.
+
+| Property | Value |
+|----------|-------|
+| `id` | `document-count` |
+| `moduleId` | `document-management` |
+| `position` | `badge` (CardHeader top-right) |
+| `nodeTypes` | `'*'` |
+| `order` | `15` |
+| `render` | `(node) => createElement(NodeDocumentsBadge, { nodeId: node.id })` |
+
+```typescript
+import { createElement } from 'react';
+import { nodeCardExtensionRegistry } from '@/features/structure';
+import { NodeDocumentsBadge } from '../components/structure/NodeDocumentsBadge';
+
+nodeCardExtensionRegistry.register({
+  id: 'document-count',
+  moduleId: 'document-management',
+  position: 'badge',
+  nodeTypes: '*',
+  order: 15,
+  render: (node) => createElement(NodeDocumentsBadge, { nodeId: node.id }),
+});
+```
+
+### nodeActionRegistry — "Upload File" and "Link Document"
+
+Two header actions. Rather than owning React state, each handler dispatches a window `CustomEvent` that `NodeDocumentsTab` listens for and opens the relevant UI.
+
+| Property | "Upload File" | "Link Document" |
+|----------|---------------|-----------------|
+| `id` | `upload-file` | `link-document` |
+| `moduleId` | `document-management` | `document-management` |
+| `label` | `Upload File` | `Link Document` |
+| `icon` | `Upload` | `Link` |
+| `nodeTypes` | `'*'` | `'*'` |
+| `locations` | `['detail-header']` | `['detail-header']` |
+| `order` | `30` | `31` |
+| `handler` dispatches | `document-management:upload` | `document-management:link` |
+
+```typescript
+import { nodeActionRegistry } from '@/features/structure';
+
+nodeActionRegistry.register({
+  id: 'upload-file',
+  moduleId: 'document-management',
+  label: 'Upload File',
+  icon: 'Upload',
+  nodeTypes: '*',
+  locations: ['detail-header'],
+  order: 30,
+  handler: async (node) => {
+    window.dispatchEvent(
+      new CustomEvent('document-management:upload', { detail: { nodeId: node.id } })
+    );
+  },
+});
+
+nodeActionRegistry.register({
+  id: 'link-document',
+  moduleId: 'document-management',
+  label: 'Link Document',
+  icon: 'Link',
+  nodeTypes: '*',
+  locations: ['detail-header'],
+  order: 31,
+  handler: async (node) => {
+    window.dispatchEvent(
+      new CustomEvent('document-management:link', { detail: { nodeId: node.id } })
+    );
+  },
+});
+```
+
+### nodeSidebarSectionRegistry — "Pinned Documents"
+
+Adds a collapsible Pinned Documents section to the detail-page sidebar (favourites first, then recent).
+
+| Property | Value |
+|----------|-------|
+| `id` | `pinned-documents` |
+| `moduleId` | `document-management` |
+| `title` | `Pinned Documents` |
+| `icon` | `Pin` |
+| `nodeTypes` | `'*'` |
+| `order` | `35` |
+| `collapsible` | `true` |
+| `defaultCollapsed` | `false` |
+| `component` | `NodeDocumentsSidebar` |
+
+```typescript
+import { nodeSidebarSectionRegistry } from '@/features/structure';
+import { NodeDocumentsSidebar } from '../components/structure/NodeDocumentsSidebar';
+
+nodeSidebarSectionRegistry.register({
+  id: 'pinned-documents',
+  moduleId: 'document-management',
+  title: 'Pinned Documents',
+  icon: 'Pin',
+  nodeTypes: '*',
+  order: 35,
+  collapsible: true,
+  defaultCollapsed: false,
+  component: NodeDocumentsSidebar,
+});
+```
+
+<Aside type="note" title="Admins can override these">
+Once registered, admins control these items per node type from Structure's Integrations tab — enabling/disabling, renaming, reordering, and (for card extensions) reassigning the slot. Your module does not need to do anything to support that; the registries check each node type's `integrations` config before returning items.
+</Aside>
+
+---
+
+## App Registry Registrations Other Features May Reference
+
+Outside of Structure, Document Management registers itself with the standard starter-template registries. Other features generally don't modify these, but may need to coordinate with them (e.g. linking to the Documents area, or knowing which dashboard/admin slots are taken).
+
+| Registry | Key values |
+|----------|------------|
+| `navigationRegistry.registerMain` | `id: document-management`, `title: Documents`, `url: /documents`, `icon: FileText`, `order: 25` |
+| `dashboardRegistry.register` | `id: document-management-recent`, `title: Recent Documents`, `component: RecentDocumentsWidget`, `size: 2x1`, `order: 35`, `category: documents` |
+| `preferencesRegistry.register` | `id: document-management`, `title: Documents`, `component: DocumentPreferences`, `order: 60` |
+| `adminPagesRegistry.register` | `id: documents` (→ `/admin/documents`), `title: Storage Providers`, `icon: FolderCog`, `component: AdminStoragePage`, `order: 40` |
+| `routeRegistry.register` (backend) | `path: /document-management`, `versions: ['v1']`, `requiresAuth: true` |
+| `serviceRegistry.register` (backend) | `'document-management'` → `documentManagementService` |
+
+```typescript
+// Navigation — adds the "Documents" item to the main sidebar
+navigationRegistry.registerMain({
+  id: 'document-management',
+  title: 'Documents',
+  url: '/documents',
+  icon: FileText,
+  order: 25,
+});
+
+// Dashboard — "Recent Documents" widget
+dashboardRegistry.register({
+  id: 'document-management-recent',
+  title: 'Recent Documents',
+  component: RecentDocumentsWidget,
+  size: '2x1',
+  order: 35,
+  category: 'documents',
+  canHide: true,
+});
+```
+
+<Aside type="tip" title="Link into the Documents area">
+If your module wants to deep-link to a document, route to `/documents/preview/:documentId`; to a provider folder, route to `/documents/browse/:providerId/*`. Storage providers are managed by admins at `/admin/documents`.
+</Aside>
+
+---
+
+## Worked Example: Requesting a Reference and Download Stream
+
+A common pattern for processing modules such as `cog-ingest` or `ai-chat` is: create a **stable document reference** (which gives you a durable `documentId` to record as a source), then later fetch the **download stream** to read the bytes. Creating the reference also computes a SHA-256 `contentHash` for integrity, which is exactly what an evidence or provenance trail wants.
+
+<Tabs>
+  <TabItem label="cog-ingest">
+
+```typescript
+// backend/src/features/cog-ingest/cog-ingest.service.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+
+export const cogIngestService = {
+  async ingestProviderFile(
+    userId: string,
+    providerId: string,
+    remotePath: string,
+    fileName: string,
+  ) {
+    const docs = serviceRegistry.getOptional('document-management');
+    if (!docs?.isAvailable()) {
+      throw new Error('Document Management is required to ingest provider files');
+    }
+
+    // 1. Create a stable reference. We get a durable documentId + contentHash
+    //    to store as the ingest job's sourceId for provenance.
+    //    createDocument is part of the full service (used internally and by
+    //    the frontend service); request computeHash for an evidence trail.
+    const ref = await (docs as any).createDocument(userId, {
+      providerId,
+      remotePath,
+      fileName,
+      computeHash: true,        // server-side SHA-256 at creation
+    });
+
+    // 2. Later (or immediately), pull the bytes via the public interface.
+    const stream = await docs.getDownloadStream(ref.id, userId);
+
+    // 3. Feed the stream into the cognitive pipeline, tagging the source.
+    await this.processStream(stream, {
+      sourceId: ref.id,
+      contentHash: ref.contentHash,
+      mimeType: ref.mimeType,
+    });
+
+    return { documentId: ref.id, contentHash: ref.contentHash };
+  },
+};
+```
+
+  </TabItem>
+  <TabItem label="ai-chat">
+
+```typescript
+// backend/src/features/ai-chat/ai-chat.tools.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+
+// An AI tool that lets the assistant read a node's documents
+export async function readNodeDocuments(nodeId: string, userId: string) {
+  const docs = serviceRegistry.getOptional('document-management');
+  if (!docs?.isAvailable()) return { available: false, documents: [] };
+
+  const refs = await docs.getDocumentsForNode(nodeId, userId);
+
+  // Stream the first text-like document into the model context
+  const textDoc = refs.find((r) => r.mimeType?.startsWith('text/'));
+  if (!textDoc) return { available: true, documents: refs, content: null };
+
+  const stream = await docs.getDownloadStream(textDoc.id, userId);
+  const content = await streamToString(stream);
+
+  return { available: true, documents: refs, content };
+}
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="caution" title="Public vs. full service surface">
+`getDownloadStream`, `getDocumentsForNode`, `getDocument`, `getFileInfo`, `getDocumentCount`, and `isAvailable` are the **guaranteed** cross-module contract in `DocumentManagementServiceInterface`. Methods like `createDocument` exist on the concrete `documentManagementService` and are stable in practice, but if you depend on them, pin your `requiredModules` to a known version and treat them as a tighter coupling than the interface above.
+</Aside>
+
+---
+
+## End-to-End Example: A Hypothetical Module
+
+Here is how a hypothetical `contract-review` module would integrate with Document Management across the backend — declaring the dependency, consuming the service, reacting to fired hooks, and storing self-contained node references.
+
+<Tabs>
+  <TabItem label="module.ts">
+
+```typescript
+// src/module.ts
+export const moduleDefinition: ModuleDefinition = {
+  id: 'contract-review',
+  name: 'Contract Review',
+  version: '1.0.0',
+  // Hard dependency — we cannot review contracts without their files
+  requiredModules: ['document-management'],
+  // ...
+};
+```
+
+  </TabItem>
+  <TabItem label="service.ts">
+
+```typescript
+// backend/src/features/contract-review/contract-review.service.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+import { prisma } from '../../config/prisma.js';
+
+export const contractReviewService = {
+  // Pull every document on a node and queue a review for each
+  async queueReviewsForNode(nodeId: string, userId: string) {
+    const docs = serviceRegistry.get('document-management');
+    const refs = await docs.getDocumentsForNode(nodeId, userId);
+
+    for (const ref of refs) {
+      const fileInfo = await docs.getFileInfo(ref.id, userId);
+      await prisma.cr_review.create({
+        data: {
+          userId,
+          nodeId,                       // plain string FK — no @relation
+          documentId: ref.id,          // plain string FK to doc_document
+          fileName: ref.fileName,
+          fileSize: fileInfo.size ?? null,
+          status: 'queued',
+        },
+      });
+    }
+  },
+
+  // Actually read the bytes when a review runs
+  async runReview(documentId: string, userId: string) {
+    const docs = serviceRegistry.get('document-management');
+    const stream = await docs.getDownloadStream(documentId, userId);
+    return this.analyse(stream);
+  },
+};
+```
+
+  </TabItem>
+  <TabItem label="action.registration.ts">
+
+```typescript
+// backend/src/features/contract-review/action.registration.ts
+import { actionRegistry } from '../../config/action.registry.js';
+import { contractReviewService } from './contract-review.service.js';
+
+// When a new file is uploaded, queue a contract review automatically
+actionRegistry.addActionAsync(
+  'documents.document.uploaded',
+  'contract-review-on-upload',
+  async (context) => {
+    const { userId, providerId, remotePath, fileName } =
+      context as { userId: string; providerId: string; remotePath: string; fileName: string };
+    if (fileName.toLowerCase().endsWith('.pdf')) {
+      await contractReviewService.queueFromUpload(userId, providerId, remotePath, fileName);
+    }
+  },
+  30,
+);
+
+// When a document reference is deleted, discard its pending reviews
+actionRegistry.addActionAsync(
+  'documents.document.deleted',
+  'contract-review-on-delete',
+  async (context) => {
+    const { userId, documentId } = context as { userId: string; documentId: string };
+    await contractReviewService.cancelReviews(userId, documentId);
+  },
+  30,
+);
+```
+
+  </TabItem>
+  <TabItem label="schema.prisma">
+
+```prisma
+model cr_review {
+  id         String   @id @default(cuid())
+  userId     String
+  nodeId     String              // references structure_node.id
+  documentId String              // references doc_document.id
+  fileName   String
+  fileSize   Int?
+  status     String   @default("queued")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([userId])
+  @@index([nodeId])
+  @@index([documentId])          // fast cleanup on documents.document.deleted
+}
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="caution" title="Self-contained schemas only">
+Note the schema uses plain string fields (`nodeId`, `documentId`) with `@@index` — never `@relation` across module boundaries. This keeps `contract-review` independently installable and uninstallable, exactly as Document Management's own `doc_node_link` references nodes by plain string.
+</Aside>
+
+---
+
+## Integration Checklist
+
+Use this when building a module that integrates with Document Management:
+
+- [ ] **Dependency declared** — `requiredModules: ['document-management']` for a hard dependency, or `getOptional` + `isAvailable()` guards for a soft one.
+- [ ] **Service access via the registry** — `serviceRegistry.get('document-management')` (or `getOptional`), never a direct feature-folder import.
+- [ ] **Public interface only where possible** — prefer the six `DocumentManagementServiceInterface` methods; treat anything beyond them as tighter coupling.
+- [ ] **Event subscriptions** — `addActionAsync` on the `documents.*` hooks you care about, with priority 30+ (the module's own subscriptions run at 20).
+- [ ] **Provenance** — pass `computeHash: true` when creating references for evidence/audit use, and persist the returned `contentHash`.
+- [ ] **Graceful degradation** — never assume Document Management (or Structure) is present; check `isAvailable()` and handle absence.
+- [ ] **Self-contained schema** — reference `documentId` / `nodeId` with plain string fields and `@@index`, never `@relation`.
+
+---
+
+## Next Steps
+
+- [Configuration](/document-management/configuration/) — database schema, API endpoints, and environment variables
+- [Usage](/document-management/usage/) — pages, components, and hooks
+- [Security](/document-management/security/) — the provider-delegated security model and credential encryption

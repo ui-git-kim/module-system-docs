@@ -1,0 +1,243 @@
+---
+title: Database
+description: The five doc_ tables that back the Document Management module
+sidebar:
+  order: 3
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Document Management ships a **self-contained** Prisma schema: five tables, all prefixed with `doc_`. The schema adds **no `@relation` directives** and never modifies the `User` model or the Structure module's tables. Foreign keys to other modules (the owning user, a Structure node) are stored as plain `String` fields with `@@index` for fast lookups.
+
+<Aside type="note" title="Connector, not storage">
+These tables hold **references, metadata, and your organisation** of files (favourites, tags, node links, audit trail). They never store file content — the bytes stay in the external storage provider. `doc_document` is a pointer to a file that lives in S3, WebDAV, or a local folder.
+</Aside>
+
+The scaffold appends these models to your app's Prisma schema at `init` and runs `prisma migrate dev`. After installing, run:
+
+```bash
+npx prisma generate
+npx prisma migrate dev --name add_document_management
+```
+
+---
+
+## `doc_storage_provider`
+
+A configured connection to an external storage service. The `config` column holds **AES-256-GCM encrypted JSON** (credentials) — never plaintext. See [Security](/document-management/security/) for the encryption model.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | `String` | `@id @default(cuid())` |
+| `userId` | `String` | Owner |
+| `name` | `String` | e.g. `"My NAS"`, `"Company R2 Bucket"` |
+| `providerType` | `String` | `s3` \| `r2` \| `webdav` \| `local` |
+| `config` | `String` `@db.Text` | Encrypted JSON connection details |
+| `isDefault` | `Boolean` | `@default(false)` |
+| `isReadOnly` | `Boolean` | `@default(false)` — blocks upload/modify/delete via the module |
+| `status` | `String` | `@default("pending")` — `connected` \| `error` \| `pending` \| `unavailable` |
+| `statusMessage` | `String?` | Human-readable status detail |
+| `lastCheckedAt` | `DateTime?` | Last connection test |
+| `basePath` | `String?` | Optional root path within the provider |
+| `metadata` | `Json?` | Provider settings/capabilities cache |
+| `createdAt` | `DateTime` | `@default(now())` |
+| `updatedAt` | `DateTime` | `@updatedAt` |
+
+```prisma
+model doc_storage_provider {
+  id            String    @id @default(cuid())
+  userId        String
+  name          String
+  providerType  String
+  config        String    @db.Text
+  isDefault     Boolean   @default(false)
+  isReadOnly    Boolean   @default(false)
+  status        String    @default("pending")
+  statusMessage String?
+  lastCheckedAt DateTime?
+  basePath      String?
+  metadata      Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("doc_storage_providers")
+}
+```
+
+---
+
+## `doc_document`
+
+A lightweight reference to a file in connected storage. A row is created when you interact meaningfully with a file (favourite, tag, note, link to a node) **or** when another module requests a stable reference via the service registry (for example cog-ingest needing a `sourceId`). Not every browsed file gets a row.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | `String` | `@id @default(cuid())` |
+| `userId` | `String` | Owner |
+| `providerId` | `String` | References `doc_storage_provider.id` |
+| `remotePath` | `String` | Full path within the provider |
+| `fileName` | `String` | |
+| `mimeType` | `String?` | |
+| `fileSize` | `Int?` | Bytes |
+| `contentHash` | `String?` | SHA-256 of the file at reference time (integrity) |
+| `isFavourite` | `Boolean` | `@default(false)` |
+| `status` | `String` | `@default("active")` — `active` \| `archived` |
+| `tags` | `String[]` | `@default([])` |
+| `notes` | `String?` `@db.Text` | User notes |
+| `thumbnailPath` | `String?` | Cached thumbnail path/URL |
+| `metadata` | `Json?` | Provider metadata cache |
+| `lastAccessedAt` | `DateTime?` | |
+| `lastSyncedAt` | `DateTime?` | Last metadata refresh from the provider |
+| `createdAt` | `DateTime` | `@default(now())` |
+| `updatedAt` | `DateTime` | `@updatedAt` |
+
+```prisma
+model doc_document {
+  id             String    @id @default(cuid())
+  userId         String
+  providerId     String
+  remotePath     String
+  fileName       String
+  mimeType       String?
+  fileSize       Int?
+  contentHash    String?
+  isFavourite    Boolean   @default(false)
+  status         String    @default("active")
+  tags           String[]  @default([])
+  notes          String?   @db.Text
+  thumbnailPath  String?
+  metadata       Json?
+  lastAccessedAt DateTime?
+  lastSyncedAt   DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([userId, providerId, remotePath])
+  @@index([userId, createdAt])
+  @@index([userId, isFavourite])
+  @@index([userId, status])
+  @@map("doc_documents")
+}
+```
+
+The `@@unique([userId, providerId, remotePath])` constraint backs the `upsert` used when you favourite or link a file, so re-referencing the same file updates the existing row rather than duplicating it.
+
+---
+
+## `doc_node_link`
+
+A junction table linking documents to Structure nodes. A document can be linked to multiple nodes. `nodeId` is a plain string (a Structure node id) — there is no `@relation` to the Structure module.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | `String` | `@id @default(cuid())` |
+| `documentId` | `String` | References `doc_document.id` |
+| `nodeId` | `String` | References a Structure node |
+| `userId` | `String` | Owner |
+| `linkType` | `String` | `@default("attachment")` — `attachment` \| `reference` \| `primary` |
+| `order` | `Int` | `@default(0)` |
+| `notes` | `String?` | |
+| `createdAt` | `DateTime` | `@default(now())` |
+
+```prisma
+model doc_node_link {
+  id         String   @id @default(cuid())
+  documentId String
+  nodeId     String
+  userId     String
+  linkType   String   @default("attachment")
+  order      Int      @default(0)
+  notes      String?
+  createdAt  DateTime @default(now())
+
+  @@unique([documentId, nodeId])
+  @@index([nodeId])
+  @@index([documentId])
+  @@index([userId])
+  @@map("doc_node_links")
+}
+```
+
+---
+
+## `doc_folder_bookmark`
+
+Saved folder locations for quick navigation within a provider (rendered in the `ProviderSidebar`).
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | `String` | `@id @default(cuid())` |
+| `userId` | `String` | Owner |
+| `providerId` | `String` | References `doc_storage_provider.id` |
+| `folderPath` | `String` | |
+| `label` | `String` | |
+| `icon` | `String?` | Lucide icon name |
+| `order` | `Int` | `@default(0)` |
+| `createdAt` | `DateTime` | `@default(now())` |
+| `updatedAt` | `DateTime` | `@updatedAt` |
+
+```prisma
+model doc_folder_bookmark {
+  id         String   @id @default(cuid())
+  userId     String
+  providerId String
+  folderPath String
+  label      String
+  icon       String?
+  order      Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([userId])
+  @@map("doc_folder_bookmarks")
+}
+```
+
+---
+
+## `doc_recent_access`
+
+Tracks file access for the "Recent" view, and doubles as a **chain-of-custody audit trail** for legal/evidence use cases (who accessed or downloaded what, and when). The service caps this table at 100 rows per user, pruning the oldest.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | `String` | `@id @default(cuid())` |
+| `userId` | `String` | Owner |
+| `providerId` | `String` | |
+| `remotePath` | `String` | |
+| `fileName` | `String` | |
+| `mimeType` | `String?` | |
+| `action` | `String` | `@default("view")` — `view` \| `download` \| `upload` \| `link` \| `unlink` |
+| `accessedAt` | `DateTime` | `@default(now())` |
+
+```prisma
+model doc_recent_access {
+  id         String   @id @default(cuid())
+  userId     String
+  providerId String
+  remotePath String
+  fileName   String
+  mimeType   String?
+  action     String   @default("view")
+  accessedAt DateTime @default(now())
+
+  @@index([userId, accessedAt])
+  @@index([providerId, remotePath])
+  @@map("doc_recent_access")
+}
+```
+
+---
+
+## Conventions
+
+- **Self-contained.** No `@relation` directives; foreign keys are plain `String` fields with `@@index`. This lets the module install independently without modifying other modules' tables. See the [Module Database](/module-starter/database/) guide.
+- **User-owned.** Every table carries `userId`; queries always filter by it and ownership is enforced in the service layer.
+- **Plural table names.** Each model `@@map`s to its plural snake_case table (`doc_storage_providers`, `doc_documents`, `doc_node_links`, `doc_folder_bookmarks`, `doc_recent_access`).
+
+## Next steps
+
+- [Configuration](/document-management/configuration/) — environment variables and adapter setup
+- [Security](/document-management/security/) — credential encryption and the audit trail
+- [Integration](/document-management/integration/) — the service interface and hooks other modules use

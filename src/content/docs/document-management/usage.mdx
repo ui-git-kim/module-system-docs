@@ -1,0 +1,651 @@
+---
+title: Usage
+description: How to use Document Management after install — connect a provider, browse, preview, favourite, link, and the full component, hook, and API reference
+sidebar:
+  order: 3
+---
+
+import { Aside, Tabs, TabItem, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+Once Document Management is installed (`npx document-management init`), it adds a **Documents** item to your main navigation, a **Storage Providers** admin page, a **Recent Documents** dashboard widget, and a preferences panel. This page walks you through the day-to-day flow — connecting a provider, browsing, previewing, favouriting, and linking documents to Structure nodes — and then gives you the complete reference for the frontend components, data hooks, and backend API.
+
+<Aside type="tip" title="Connector, not storage">
+Remember the core principle: this module is a **connector, not a store**. The database keeps references, metadata, and your organisation (favourites, tags, node links) — it never holds file content. Files always live in the storage provider you connect.
+</Aside>
+
+---
+
+## Getting Started: The Core Flow
+
+The typical journey runs from the admin page (connect a provider) to the browser (find a file) to a document reference (organise it). Here is the end-to-end sequence.
+
+<Steps>
+
+1. **Add a storage provider** at `/admin/documents`
+
+    Open the **Storage Providers** admin page (registered as `adminPagesRegistry` id `documents`, so the route is `/admin/documents`). Click **Add Provider**, choose a `providerType` (`s3`, `webdav`, or `local` — whichever your install enabled), and fill in the connection details. Credentials are encrypted with AES-256-GCM before they hit the database and are redacted from every API response.
+
+    ```ts
+    // The dialog calls useCreateProvider() under the hood:
+    const createProvider = useCreateProvider();
+
+    await createProvider.mutateAsync({
+      name: 'Evidence Bucket',
+      providerType: 's3',
+      isDefault: true,
+      isReadOnly: true,            // legal/evidence stores — writes throw ReadOnlyError
+      config: {
+        bucket: 'evidence-au',
+        region: 'ap-southeast-2',
+        accessKeyId: 'AKIA...',
+        secretAccessKey: '...',    // encrypted before the DB write, never returned
+      },
+    });
+    ```
+
+2. **Test the connection**
+
+    Click **Test** on the provider card. This calls `POST /providers/:id/test`, which connects through the adapter, refreshes `status` (`connected` | `error` | `pending` | `unavailable`) and `statusMessage`, and stamps `lastCheckedAt`. A green status means you are ready to browse.
+
+3. **Browse files** at `/documents`
+
+    The **Documents** nav item (`navigationRegistry` id `document-management`, icon `FileText`, order 25) opens `DocumentBrowserPage`. The `ProviderSidebar` lists your providers and folder bookmarks; the `FileBrowser` shows the current folder in grid or list view. Navigating into a folder routes to `/documents/browse/:providerId/*` (`FolderViewPage`).
+
+4. **Preview a file**
+
+    Selecting a file opens `FilePreview` (or routes to `/documents/preview/:documentId` via `DocumentPreviewPage`). The component picks a renderer from the file's MIME category — inline image, `react-pdf`, code block, HTML5 video/audio, or a download prompt. See [File Preview Strategy](#file-preview-strategy) below.
+
+5. **Favourite and tag it**
+
+    Marking a file as a favourite (or adding tags/notes) creates a `doc_document` reference via `POST /documents` and flips `isFavourite`. The reference stores `remotePath`, `fileName`, `mimeType`, `fileSize`, a server-computed `contentHash` (SHA-256), and your `tags`/`notes`. Favourites appear under `GET /documents/favourites` and in the `RecentDocumentsWidget`.
+
+6. **Link it to a Structure node** (optional)
+
+    If the Structure module is installed, the `DocumentLinkDialog` (which uses Structure's `NodeSelector`) links a document to a node via `POST /nodes/:nodeId/documents`, creating a `doc_node_link` row with a `linkType` of `attachment`, `reference`, or `primary`. The link fires the `documents.document.linked` action hook so other modules can react.
+
+</Steps>
+
+<Aside type="caution" title="Structure integration is opt-in">
+The Structure side-effect imports in the generated `index.ts` are **commented out** by default. Uncomment them only once the Structure module is installed — then the Documents tab, node widgets, badges, actions, and sidebar section appear on node detail pages. Without Structure, the module runs perfectly well as a standalone document browser.
+</Aside>
+
+---
+
+## Adding a Storage Provider
+
+The admin page at `/admin/documents` is where you register the external stores the module connects to. Each provider maps to one row in `doc_storage_provider` and one of three adapters.
+
+<CardGrid>
+  <Card title="S3 / Cloudflare R2" icon="cloud-download">
+    S3-compatible cloud storage via `@aws-sdk/client-s3`. Supports presigned preview and thumbnail URLs. Needs `bucket`, `region`, `accessKeyId`, `secretAccessKey` (and an optional `endpoint` for R2).
+  </Card>
+  <Card title="WebDAV" icon="external">
+    ownCloud, Nextcloud, or a NAS via the `webdav` npm package. Authenticates with basic auth or a bearer token. Needs `baseUrl` plus credentials.
+  </Card>
+  <Card title="Local filesystem" icon="laptop">
+    Node `fs`, for development only. Restricted to a base directory (`DOC_LOCAL_BASE_PATH`) and rejects `../` and absolute path traversal.
+  </Card>
+</CardGrid>
+
+Key fields you set when creating a provider:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `name` | `string` | Human-readable label shown in the sidebar |
+| `providerType` | `s3` \| `webdav` \| `local` | Which adapter backs this provider |
+| `config` | object (encrypted) | Connection details + credentials — encrypted at rest, redacted in responses |
+| `isDefault` | `boolean` | Pre-selected provider in the browser |
+| `isReadOnly` | `boolean` | Injected into `createAdapter(...,{ readOnly })`; write ops throw `ReadOnlyError` at the adapter level |
+| `basePath` | `string` | Optional path prefix scoping the provider to a subtree |
+
+<Aside type="note" title="Which adapters are available?">
+The install prompt (`storageAdapters`: `s3` | `webdav` | `local` | `all`, default `s3`) decides which adapter types the UI offers, exposed at runtime as the `ENABLED_ADAPTERS` constant in `document-management.config.ts`. All three adapter SDKs are **always** installed regardless of the selection, so the generated app always type-checks — only the offered set changes.
+</Aside>
+
+---
+
+## Browsing and Organising
+
+After a provider tests green, head to `/documents`. From here you can:
+
+- **Navigate folders** — click into folders; the URL updates to `/documents/browse/:providerId/*` and the breadcrumb tracks your path.
+- **Switch views** — toggle between `FileGrid` and `FileList` with the `viewMode` control.
+- **Bookmark a folder** — pin a frequently used folder with `useCreateBookmark()`, writing a `doc_folder_bookmark` row that then appears in the `ProviderSidebar`.
+- **Upload a file** — drop a file to upload it via the raw-body endpoint (`POST /upload/:providerId?path=...`); size is enforced on the byte stream at `DOC_MAX_UPLOAD_SIZE` (50MB default), not the spoofable `Content-Length`.
+- **Favourite / tag** — create a `doc_document` reference to organise the file independently of where it lives.
+- **Bulk download** — select several files and `POST /bulk-download` to stream a zip (built with `archiver`).
+
+Every view, download, upload, link, and unlink is recorded in `doc_recent_access`, which doubles as a chain-of-custody audit trail and feeds the recent-documents lists.
+
+---
+
+## Frontend Components
+
+These components are generated into `frontend/src/features/document-management/components/` and are importable from the feature barrel. The two primary, reusable building blocks are `FileBrowser` and `FilePreview`.
+
+| Component | Props | Description |
+|-----------|-------|-------------|
+| `FileBrowser` | `providerId: string`, `initialPath?: string`, `viewMode?: ViewMode`, `onFileSelect?: (file: FileInfo) => void`, `onNavigate?: (path: string) => void` | Folder browser with grid/list views, breadcrumb navigation, and an unavailable state. The workhorse of `/documents`. |
+| `FilePreview` | `file: FileInfo`, `providerId: string` | Renders a single file by MIME category — image, PDF, text/code, video, audio, or a download prompt. |
+| `FileGrid` | (internal) file array + selection handlers | Grid layout of file cards; used inside `FileBrowser`. |
+| `FileList` | (internal) file array + selection handlers | Dense table layout; used inside `FileBrowser`. |
+| `ProviderSidebar` | provider + bookmark selection handlers | Lists connected providers and folder bookmarks; drives navigation. |
+| `DocumentLinkDialog` | node + document context (Structure-only) | Link dialog built on Structure's `NodeSelector`; creates `doc_node_link` rows. |
+| `DocumentPreferences` | — | User preferences panel (registered via `preferencesRegistry`, order 60). |
+| `file-utils` | — | Exports `FileIcon`, `formatBytes`, and `fileCategory` helpers used across the module. |
+
+### Widgets
+
+| Widget | Where it appears | Description |
+|--------|------------------|-------------|
+| `RecentDocumentsWidget` | Dashboard (`dashboardRegistry`, "Recent Documents", size `2x1`, order 35, category `documents`) | Recently accessed documents, drawn from `GET /documents/recent`. |
+| `NodeDocumentsWidget` | Structure node overview (`nodeWidgetRegistry` id `node-recent-documents`, order 25) | Recent documents linked to the current node. Structure-only. |
+
+### Structure-Context Components
+
+These live in `components/structure/` and only render when Structure is installed and the registrations are uncommented.
+
+| Component | Registry | Description |
+|-----------|----------|-------------|
+| `NodeDocumentsTab` | `nodeTabRegistry` id `documents`, order 35 | A "Documents" tab on every node detail page (`nodeTypes: '*'`). |
+| `NodeDocumentsSidebar` | `nodeSidebarSectionRegistry` id `pinned-documents`, order 35 | "Pinned Documents" sidebar section with a `Pin` icon. |
+| `NodeDocumentsBadge` | `nodeCardExtensionRegistry` id `document-count`, position `badge`, order 15 | A document-count badge on node cards, rendered via `createElement(NodeDocumentsBadge)`. |
+
+<Aside type="note" title="Node actions">
+Two node actions are also registered (`nodeActionRegistry`): **Upload File** (id `upload-file`, order 30) and **Link Document** (id `link-document`, order 31), both in the `detail-header` location. Their handlers dispatch `window` CustomEvents — `document-management:upload` and `document-management:link` — which the Documents tab listens for.
+</Aside>
+
+---
+
+## Data Hooks
+
+All data access goes through the TanStack Query hooks in `hooks/useDocumentManagement.ts`. Consume these from components rather than calling the service directly — the shared `QueryClient` handles caching, deduplication, background refetch, and request cancellation. Keys are namespaced with `document-management`.
+
+| Hook | Kind | Description |
+|------|------|-------------|
+| `useProviders()` | query | List all storage providers for the user. |
+| `useProvider(id)` | query | Fetch a single provider by id. |
+| `useCreateProvider()` | mutation | Create a provider; invalidates the providers list. |
+| `useUpdateProvider()` | mutation | Update a provider (`{ id, input }`). |
+| `useDeleteProvider()` | mutation | Delete a provider by id. |
+| `useTestProvider()` | mutation | Run a connection test; refreshes status/capabilities. |
+| `useFolder(providerId, path, options?)` | query | List a folder's contents (browse). |
+| `useFileInfo(providerId, path)` | query | Fetch metadata for a single file. |
+| `useUpload()` | mutation | Upload a file (`{ providerId, path, file, onProgress? }`); invalidates folder + recent. |
+| `useDocuments(options?)` | query | List document references with filters (`limit`, `cursor`, `providerId`, `status`, `isFavourite`, `tag`). |
+| `useDocument(id)` | query | Fetch a single document reference. |
+| `useRecentDocuments()` | query | Recently accessed documents. |
+| `useFavourites()` | query | Documents flagged `isFavourite`. |
+| `useCreateDocument()` | mutation | Create a document reference; invalidates documents + favourites. |
+| `useUpdateDocument()` | mutation | Update a reference (`{ id, input }`); patches the cache. |
+| `useDeleteDocument()` | mutation | Delete a reference by id. |
+| `useNodeDocuments(nodeId)` | query | Documents linked to a Structure node. |
+| `useNodeDocumentCount(nodeId)` | query | Count of documents linked to a node (drives the badge). |
+| `useLinkDocument()` | mutation | Link a document to a node (`{ nodeId, input }`). |
+| `useUnlinkDocument()` | mutation | Remove a node link (`{ nodeId, documentId }`). |
+| `useSearch(q, params?)` | query | Search across files (`providerId`, `limit`); disabled when `q` is empty. |
+| `useBookmarks(providerId?)` | query | List folder bookmarks, optionally scoped to a provider. |
+| `useCreateBookmark()` | mutation | Create a folder bookmark. |
+| `useDeleteBookmark()` | mutation | Delete a bookmark by id. |
+
+```tsx
+// Example: a favourites list using two hooks
+import { useFavourites, useUpdateDocument } from '@/features/document-management';
+
+function FavouritesList() {
+  const { data: favourites, isLoading } = useFavourites();
+  const updateDocument = useUpdateDocument();
+
+  if (isLoading) return <Skeleton />;
+
+  return (
+    <ul>
+      {favourites?.map((doc) => (
+        <li key={doc.id}>
+          {doc.fileName}
+          <button
+            onClick={() =>
+              updateDocument.mutate({ id: doc.id, input: { isFavourite: false } })
+            }
+          >
+            Unfavourite
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+---
+
+## Backend API Reference
+
+All endpoints are served under the base path **`/api/v1/document-management`** and require authentication (`requireAuth: true`). The design spec defines **22 endpoints across 5 groups**; this implementation adds **3 folder-bookmark endpoints**. Paths shown below are relative to the base path. The `*` in browse/file paths is a wildcard capturing the remote path within the provider.
+
+<Aside type="caution" title="Credentials are never returned">
+Provider responses are produced by `toProviderResponse`, which omits the encrypted `config`. The frontend never receives long-lived credentials. For S3 previews, the client may receive a short-lived presigned URL — for preview only.
+</Aside>
+
+### Storage Providers
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/providers` | List the user's providers |
+| `POST` | `/providers` | Create a provider |
+| `GET` | `/providers/:id` | Get one provider |
+| `PUT` | `/providers/:id` | Update a provider |
+| `DELETE` | `/providers/:id` | Delete a provider |
+| `POST` | `/providers/:id/test` | Test the connection, refresh status |
+
+<Tabs>
+  <TabItem label="POST /providers">
+
+```jsonc
+// Request
+POST /api/v1/document-management/providers
+{
+  "name": "Evidence Bucket",
+  "providerType": "s3",
+  "isDefault": true,
+  "isReadOnly": true,
+  "config": {
+    "bucket": "evidence-au",
+    "region": "ap-southeast-2",
+    "accessKeyId": "AKIA...",
+    "secretAccessKey": "..."
+  }
+}
+
+// Response 201 — config is redacted
+{
+  "id": "prov_01H...",
+  "name": "Evidence Bucket",
+  "providerType": "s3",
+  "isDefault": true,
+  "isReadOnly": true,
+  "status": "pending",
+  "statusMessage": null,
+  "basePath": null,
+  "lastCheckedAt": null,
+  "createdAt": "2026-06-17T02:14:00.000Z"
+}
+```
+
+  </TabItem>
+  <TabItem label="POST /providers/:id/test">
+
+```jsonc
+// Request
+POST /api/v1/document-management/providers/prov_01H.../test
+
+// Response 200
+{
+  "id": "prov_01H...",
+  "status": "connected",
+  "statusMessage": "Connected. 1,284 objects visible.",
+  "lastCheckedAt": "2026-06-17T02:15:31.000Z",
+  "capabilities": { "preview": true, "thumbnails": true, "search": false }
+}
+```
+
+  </TabItem>
+</Tabs>
+
+### File Browsing
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/browse/:providerId` | List the provider root |
+| `GET` | `/browse/:providerId/*` | List a folder by remote path |
+| `GET` | `/file/:providerId/*` | File metadata for a remote path |
+| `GET` | `/preview/:providerId/*` | Preview directive — JSON `{kind:"url",url}` (presigned) or `{kind:"inline"}` |
+| `GET` | `/download/:providerId/*` | Stream the bytes (`Content-Disposition: attachment`) |
+| `POST` | `/upload/:providerId` | Upload — raw request body is the file; `?path=` names the destination |
+| `POST` | `/bulk-download` | Body `{providerId, paths[]}` — returns a zip stream |
+
+<Tabs>
+  <TabItem label="GET /browse/:providerId/*">
+
+```jsonc
+// Request
+GET /api/v1/document-management/browse/prov_01H.../matters/2026
+
+// Response 200
+{
+  "path": "matters/2026",
+  "entries": [
+    { "name": "brief.pdf", "type": "file", "mimeType": "application/pdf",
+      "size": 482113, "modifiedAt": "2026-05-02T10:00:00.000Z" },
+    { "name": "exhibits", "type": "folder", "size": null,
+      "modifiedAt": "2026-05-04T08:30:00.000Z" }
+  ]
+}
+```
+
+  </TabItem>
+  <TabItem label="GET /preview/:providerId/*">
+
+```jsonc
+// Request
+GET /api/v1/document-management/preview/prov_01H.../matters/2026/photo.jpg
+
+// Response 200 — presigned provider (S3)
+{ "kind": "url", "url": "https://evidence-au.s3.ap-southeast-2.amazonaws.com/...&X-Amz-Expires=120" }
+
+// Response 200 — non-presigned provider
+{ "kind": "inline" }
+```
+
+  </TabItem>
+  <TabItem label="POST /upload/:providerId">
+
+```jsonc
+// Request — raw body IS the file bytes
+POST /api/v1/document-management/upload/prov_01H...?path=matters/2026/notes.txt
+Content-Type: text/plain
+
+<...raw file bytes...>
+
+// Response 201
+{
+  "path": "matters/2026/notes.txt",
+  "fileName": "notes.txt",
+  "mimeType": "text/plain",
+  "size": 2048,
+  "contentHash": "9f86d081884c7d659a2feaa0c55ad015a..."
+}
+```
+
+  </TabItem>
+  <TabItem label="POST /bulk-download">
+
+```jsonc
+// Request
+POST /api/v1/document-management/bulk-download
+{
+  "providerId": "prov_01H...",
+  "paths": ["matters/2026/brief.pdf", "matters/2026/exhibits/ex-1.png"]
+}
+
+// Response 200 — application/zip stream
+// Content-Disposition: attachment; filename="documents.zip"
+<...zip stream...>
+```
+
+  </TabItem>
+</Tabs>
+
+### Document References
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/documents` | List references (filters: `limit`, `cursor`, `providerId`, `status`, `isFavourite`, `tag`) |
+| `POST` | `/documents` | Create a reference |
+| `GET` | `/documents/recent` | Recently accessed documents |
+| `GET` | `/documents/favourites` | Favourited documents |
+| `GET` | `/documents/:id` | Get one reference |
+| `PUT` | `/documents/:id` | Update a reference |
+| `DELETE` | `/documents/:id` | Delete a reference |
+
+<Tabs>
+  <TabItem label="POST /documents">
+
+```jsonc
+// Request
+POST /api/v1/document-management/documents
+{
+  "providerId": "prov_01H...",
+  "remotePath": "matters/2026/brief.pdf",
+  "fileName": "brief.pdf",
+  "mimeType": "application/pdf",
+  "fileSize": 482113,
+  "isFavourite": true,
+  "tags": ["matter-447", "pleadings"],
+  "notes": "Lead brief for the hearing."
+}
+
+// Response 201 — contentHash computed server-side
+{
+  "id": "doc_01H...",
+  "providerId": "prov_01H...",
+  "remotePath": "matters/2026/brief.pdf",
+  "fileName": "brief.pdf",
+  "mimeType": "application/pdf",
+  "fileSize": 482113,
+  "contentHash": "e3b0c44298fc1c149afbf4c8996fb924...",
+  "isFavourite": true,
+  "status": "active",
+  "tags": ["matter-447", "pleadings"],
+  "notes": "Lead brief for the hearing.",
+  "createdAt": "2026-06-17T02:20:00.000Z"
+}
+```
+
+  </TabItem>
+  <TabItem label="GET /documents">
+
+```jsonc
+// Request
+GET /api/v1/document-management/documents?isFavourite=true&limit=2
+
+// Response 200 — cursor-paginated
+{
+  "items": [
+    { "id": "doc_01H...", "fileName": "brief.pdf", "isFavourite": true,
+      "status": "active", "tags": ["matter-447"], "providerId": "prov_01H..." }
+  ],
+  "nextCursor": "doc_01G..."
+}
+```
+
+  </TabItem>
+  <TabItem label="PUT /documents/:id">
+
+```jsonc
+// Request
+PUT /api/v1/document-management/documents/doc_01H...
+{ "isFavourite": false, "tags": ["matter-447", "archived-evidence"] }
+
+// Response 200
+{ "id": "doc_01H...", "isFavourite": false,
+  "tags": ["matter-447", "archived-evidence"], "updatedAt": "2026-06-17T03:00:00.000Z" }
+```
+
+  </TabItem>
+</Tabs>
+
+### Node Integration
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/nodes/:nodeId/documents` | Documents linked to a node |
+| `POST` | `/nodes/:nodeId/documents` | Link a document to a node |
+| `DELETE` | `/nodes/:nodeId/documents/:documentId` | Remove a node link |
+| `GET` | `/nodes/:nodeId/documents/count` | Count of linked documents |
+
+<Tabs>
+  <TabItem label="POST /nodes/:nodeId/documents">
+
+```jsonc
+// Request
+POST /api/v1/document-management/nodes/node_01H.../documents
+{ "documentId": "doc_01H...", "linkType": "attachment", "order": 0,
+  "notes": "Filed exhibit" }
+
+// Response 201 — fires documents.document.linked
+{
+  "id": "link_01H...",
+  "documentId": "doc_01H...",
+  "nodeId": "node_01H...",
+  "linkType": "attachment",
+  "order": 0,
+  "createdAt": "2026-06-17T03:10:00.000Z"
+}
+```
+
+  </TabItem>
+  <TabItem label="GET /nodes/:nodeId/documents/count">
+
+```jsonc
+// Request
+GET /api/v1/document-management/nodes/node_01H.../documents/count
+
+// Response 200
+{ "count": 7 }
+```
+
+  </TabItem>
+</Tabs>
+
+### Search
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/search?q=&providerId=&limit=` | Search files across (or within) a provider |
+
+```jsonc
+// Request
+GET /api/v1/document-management/search?q=brief&providerId=prov_01H...&limit=2
+
+// Response 200
+{
+  "query": "brief",
+  "results": [
+    { "providerId": "prov_01H...", "path": "matters/2026/brief.pdf",
+      "fileName": "brief.pdf", "mimeType": "application/pdf", "size": 482113 }
+  ]
+}
+```
+
+### Folder Bookmarks (additional)
+
+These three endpoints are added by this implementation beyond the 22-endpoint design spec.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/bookmarks?providerId=` | List folder bookmarks (optionally scoped) |
+| `POST` | `/bookmarks` | Create a folder bookmark |
+| `DELETE` | `/bookmarks/:id` | Delete a bookmark |
+
+<Tabs>
+  <TabItem label="POST /bookmarks">
+
+```jsonc
+// Request
+POST /api/v1/document-management/bookmarks
+{ "providerId": "prov_01H...", "folderPath": "matters/2026", "label": "2026 Matters",
+  "icon": "Folder", "order": 0 }
+
+// Response 201
+{
+  "id": "bm_01H...",
+  "providerId": "prov_01H...",
+  "folderPath": "matters/2026",
+  "label": "2026 Matters",
+  "icon": "Folder",
+  "order": 0,
+  "createdAt": "2026-06-17T03:20:00.000Z"
+}
+```
+
+  </TabItem>
+  <TabItem label="GET /bookmarks">
+
+```jsonc
+// Request
+GET /api/v1/document-management/bookmarks?providerId=prov_01H...
+
+// Response 200
+{
+  "items": [
+    { "id": "bm_01H...", "folderPath": "matters/2026", "label": "2026 Matters",
+      "icon": "Folder", "order": 0 }
+  ]
+}
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="note" title="Uploads use a raw body, not multipart">
+`POST /upload/:providerId` reads the raw request body as the file and takes the destination (including filename) from `?path=`, deliberately avoiding a dependency on a specific multipart middleware. The upload size is enforced by a counting transform on the byte stream that aborts at `DOC_MAX_UPLOAD_SIZE` — not the spoofable `Content-Length` header.
+</Aside>
+
+---
+
+## File Preview Strategy
+
+`FilePreview` derives a category from the file name and MIME type (via `fileCategory` in `file-utils`) and renders accordingly. Where bytes are needed, the client blob-fetches them through `/download` so authentication is preserved — which is why the `/preview` endpoint returns a JSON directive rather than streaming inline.
+
+| MIME category | Example extensions | Rendering approach | Library |
+|---------------|--------------------|--------------------|---------|
+| Image | `jpg`, `png`, `gif`, `webp`, `svg` | Inline `<img>` with zoom | native |
+| PDF | `pdf` | Paginated document viewer | `react-pdf` |
+| Text | `txt`, `md`, `csv` | Code block (bytes fetched via `/download`, read as text) | native |
+| Code | `js`, `ts`, `py`, `json`, and more | Code block (bytes fetched via `/download`, read as text) | native |
+| Video | `mp4`, `webm` | HTML5 `<video>` player | native |
+| Audio | `mp3`, `wav`, `ogg` | HTML5 `<audio>` player | native |
+| Office | `docx`, `xlsx`, `pptx` | Download prompt + file icon (no inline preview in v1) | — |
+| Archive | `zip`, `tar`, `gz` | Download prompt + file icon (no inline preview in v1) | — |
+| Other | anything unrecognised | Download prompt + file icon | — |
+
+```tsx
+import { FilePreview } from '@/features/document-management';
+
+// FilePreview picks the renderer from the file's MIME category internally
+<FilePreview file={selectedFile} providerId={providerId} />
+```
+
+<Aside type="tip" title="Why preview returns JSON">
+For presigned providers (S3/R2) the preview directive is `{ kind: "url", url }` with a short-lived URL the client loads directly. For everyone else it is `{ kind: "inline" }`, signalling the client to blob-fetch through the authenticated `/download` route. This keeps long-lived credentials off the client while still allowing fast in-browser previews.
+</Aside>
+
+---
+
+## When a Provider Is Offline
+
+A provider's `status` is one of `connected`, `error`, `pending`, or `unavailable`. Storage providers go down, credentials rotate, and NAS boxes reboot — the UI is built to degrade gracefully rather than break.
+
+<CardGrid>
+  <Card title="Unavailable card" icon="warning">
+    When a provider is unreachable, `FileBrowser` swaps the file grid for an **unavailable card** that explains the problem and offers a **Retry** button instead of showing an empty or broken folder.
+  </Card>
+  <Card title="Cached references survive" icon="document">
+    Your `doc_document` references still appear in the documents, favourites, and recent lists even while the provider is down — because they are stored independently of file content. You keep your organisation; only live browsing is interrupted.
+  </Card>
+  <Card title="Retry / test" icon="random">
+    The Retry button (and the admin **Test** action) call `POST /providers/:id/test`, which re-runs the connection, refreshes `status`, `statusMessage`, `capabilities`, and `lastCheckedAt`. A successful test restores normal browsing.
+  </Card>
+</CardGrid>
+
+```tsx
+import { useFolder, useTestProvider } from '@/features/document-management';
+
+function FolderArea({ providerId, path }: { providerId: string; path: string }) {
+  const { data, error } = useFolder(providerId, path);
+  const testProvider = useTestProvider();
+
+  if (error) {
+    return (
+      <div className="unavailable-card">
+        <p>This storage provider is currently unavailable.</p>
+        <button onClick={() => testProvider.mutate(providerId)}>Retry</button>
+      </div>
+    );
+  }
+
+  return <FileBrowser providerId={providerId} initialPath={path} />;
+}
+```
+
+<Aside type="note" title="Read-only providers">
+A provider created with `isReadOnly: true` rejects every write (upload, delete, move, copy) at the **adapter level** with a `ReadOnlyError` — `createAdapter(type, config, { readOnly })` injects the flag. This is the recommended setting for legal and evidence stores, where the SHA-256 `contentHash` and the `doc_recent_access` audit trail together give you tamper-evidence and chain of custody.
+</Aside>
+
+---
+
+## Next Steps
+
+- [Configuration](/document-management/configuration/) — database schema, environment variables, and install prompts
+- [Integration](/document-management/integration/) — the public service interface, action hooks, and Structure registries

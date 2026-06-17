@@ -1,0 +1,359 @@
+---
+title: Roadmap
+description: What is shipped in V1, the open questions to resolve next, and the V2/V3 plans for in-app creation, versioning, and the Local Connect companion app
+sidebar:
+  order: 8
+---
+
+import { Aside, Tabs, TabItem, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+This page is the forward-looking plan for Document Management. It records what V1 ships today, the implementation-time open questions that should be resolved next, and the deferred work that V2 and beyond will build on top of the V1 foundation.
+
+V1 is deliberately a **renderer/connector**: it connects to external storage, browses, previews, downloads, and keeps lightweight document references that link to Structure nodes. It does **not** create file content. Everything that creates, edits, or versions content is V2 work — and the V1 schema and service layer were designed so V2 extends them rather than replacing them.
+
+<Aside type="note" title="Connector, not storage">
+The core principle constrains the roadmap. The database stores references, metadata, and user organisation (favourites, tags, node links) — never file content. V2's in-app documents are the first feature that stores authored content in the database (`doc_content`), and they sit alongside the reference model rather than replacing it.
+</Aside>
+
+---
+
+## Known Issues
+
+There are no known issues at this time.
+
+V1 has shipped at release version `1.1.2`. As defects are found in connected-provider behaviour, preview rendering, or the encryption/credential path, they will be listed here with a short description and a workaround. Until then this section is intentionally empty — treat it as "nothing currently outstanding" rather than "not yet reviewed".
+
+<Aside type="tip" title="Where to look first when something breaks">
+Most field issues fall into one of three buckets: a provider is unreachable (check `status` and `statusMessage` on `doc_storage_provider`, then re-run `POST /providers/:id/test`), a credential failed to decrypt (`DOC_ENCRYPTION_KEY` changed or is missing), or a preview type isn't supported inline in V1 (office, archives — these intentionally show a download prompt). None of these are bugs; they are documented behaviour.
+</Aside>
+
+---
+
+## Planned Improvements
+
+The planned work is grouped by horizon. **Short-term** resolves the open questions left for implementation time. **Medium-term / V2** is the content layer and companion app. **Long-term** is the broader vision once V2 is stable.
+
+### Short-term
+
+These are the five open questions the design spec deliberately deferred to implementation. Each is small in scope but affects browse performance, navigation ergonomics, or admin workflow. Resolving them does not require a major version bump.
+
+| # | Open question | Current V1 behaviour | What to decide |
+|---|---------------|----------------------|----------------|
+| 1 | Folder-listing caching vs live fetch | Folder contents are fetched live from the provider on every browse (`GET /browse/:providerId/*`). | Whether to cache folder listings in the database for faster repeat access, and how to invalidate the cache. |
+| 2 | WebDAV breadcrumb truncation depth | Breadcrumbs render the full path. | The maximum path depth before truncating the breadcrumb trail (deep WebDAV/Nextcloud trees can be very long). |
+| 3 | Drag-and-drop provider reordering | The admin page lists providers in insertion order; there is no manual reorder. | Whether `AdminStoragePage` should support drag-and-drop reordering (a `sortOrder` column on `doc_storage_provider` would back this). |
+| 4 | Office document preview | `docx`/`xlsx`/`pptx` show a download prompt plus a file icon — no inline preview in V1. | Whether a lightweight inline office preview is worth attempting now, or should be deferred entirely to V2. |
+| 5 | Provider-native thumbnails | Thumbnails are generated server-side with `sharp` and cached under `DOC_THUMBNAIL_CACHE_DIR`. | Whether to use provider-native thumbnails where available (ownCloud/Nextcloud expose them) instead of, or in addition to, generating our own. |
+
+#### 1. Folder-listing caching vs live fetch
+
+Today every folder browse calls the adapter's `listFolder(path, options)` and returns live results. This is always correct but adds provider round-trip latency on repeat navigation. The decision is whether to introduce a short-lived cache keyed on `(providerId, folderPath)`, and if so how to invalidate it — on upload, on the periodic `POST /providers/:id/test`, or on a TTL. Any cache must respect the connector principle: cache *listings*, never file content.
+
+```typescript
+// Current: always live
+const contents = await adapter.listFolder(path, { limit: 50, sortBy: 'name' });
+
+// Candidate: cache listing metadata only, fall back to live on miss/stale
+// Cache shape mirrors FolderContents: { path, items: FileInfo[], totalCount, hasMore }
+```
+
+<Aside type="caution" title="Stale listings are worse than slow ones">
+If you add caching, an upload, delete, or external change must invalidate the affected folder's entry — a user who uploads a file and doesn't see it in the listing will read it as a bug. Prefer event-driven invalidation (on upload/delete) over a long TTL.
+</Aside>
+
+#### 2. WebDAV breadcrumb truncation depth
+
+The `FileBrowser` component renders a breadcrumb trail from the current path. WebDAV trees (ownCloud, Nextcloud, NAS shares) can nest very deeply, and the full trail overflows the toolbar. The decision is a maximum visible depth (for example, show the first segment, an ellipsis, then the last two), and whether the collapsed middle expands on click. This is purely a frontend concern in `components/FileBrowser.tsx`; no schema or API change.
+
+#### 3. Drag-and-drop provider reordering
+
+`AdminStoragePage` (`/admin/documents`) lists configured providers. There is currently no manual ordering — `isDefault` is the only signal of priority. Supporting drag-and-drop would need a persisted order. Note `doc_storage_provider` has no `order` column today (unlike `doc_folder_bookmark`, which has `order`), so this is a schema addition and therefore a version bump when it lands.
+
+#### 4. Office document preview
+
+`FilePreview` dispatches by MIME category. Office formats currently fall through to the download-prompt branch:
+
+```tsx
+// components/FilePreview.tsx — office/archive/other branch
+// docx, xlsx, pptx, zip, tar, gz → download prompt + file icon (no inline preview in V1)
+```
+
+The decision is whether a lightweight client-side renderer is worth adding now (the trade-off is bundle size and fidelity), or whether office preview waits for V2, where in-app editing makes a richer office story coherent anyway. The spec's recommendation leans toward deferring to V2.
+
+#### 5. Provider-native thumbnails vs self-generated
+
+V1 generates image thumbnails with `sharp` and caches them under `DOC_THUMBNAIL_CACHE_DIR`. Some providers expose their own thumbnails — ownCloud/Nextcloud over WebDAV, and S3 via the optional `getThumbnailUrl()` adapter capability (presigned). The decision is whether to prefer provider-native thumbnails when the adapter advertises the capability (via `ConnectionTestResult.capabilities` including `'thumbnail'`), falling back to `sharp` generation otherwise. This reduces compute and cache storage for providers that already have thumbnails.
+
+```typescript
+// StorageAdapter optional capability already in the interface
+getThumbnailUrl?(path: string, size?: ThumbnailSize): Promise<string | null>;
+// ConnectionTestResult.capabilities may include: 'search' | 'preview' | 'thumbnail' | 'versioning'
+```
+
+### Medium-term / V2
+
+V2 turns the renderer into a content platform. These features add new tables alongside the V1 schema and new adapters/services — they do not replace the reference model. The headline deliverables are the **Local Connect companion app**, **in-app document creation and editing** (Plate), **versioning**, and **workflow states inherited from Structure**.
+
+<CardGrid>
+  <Card title="Local Connect companion app" icon="laptop">
+    An Electron desktop app in its own repo (`unique-local-connect`) that runs a WebDAV server over chosen local folders, fronted by Cloudflare Tunnel. The module connects to it as a standard WebDAV provider — no new adapter type.
+  </Card>
+  <Card title="In-app creation (Plate)" icon="pencil">
+    Author rich-text documents inside the app with the Plate editor, stored as Plate JSON in a new `doc_content` table — the first content stored in the database rather than a provider.
+  </Card>
+  <Card title="In-app editing of external files" icon="document">
+    Read an external file via its adapter, present it in Plate, and write the edited content back through the same adapter. The file is modified in place, with no duplication.
+  </Card>
+  <Card title="Versioning & workflow" icon="random">
+    Major snapshots and minor change descriptions in a new `doc_version` table, plus workflow states inherited from Structure's workflow system rather than reimplemented here.
+  </Card>
+</CardGrid>
+
+#### Local Connect companion app
+
+The companion app is what gives users secure access to files on their own machine without port forwarding or self-managed security. It is a **separate repository** (`unique-local-connect`), built with **Electron + React + TypeScript**:
+
+- **Main process** runs a WebDAV server (`webdav-server` npm package) pointed at user-selected folders.
+- **Renderer** is a React settings UI for picking shared folders and toggling read-only mode.
+- **System tray** shows status (green when running) and provides start/stop controls.
+- **Folder picker** lets the user choose which directories to expose; a read-only toggle keeps evidence folders unaltered.
+- **Cloudflare Tunnel** publishes the local server at a stable URL with no port forwarding.
+
+Because it speaks WebDAV, the main app needs **no new adapter** — the user adds it as a standard `WebDAVAdapter` provider. The user flow:
+
+<Steps>
+
+1. Download and install Local Connect, then select folders to share and click **Start** — the tray icon goes green.
+
+2. In the main app, open `AdminStoragePage` and add a WebDAV provider:
+   - Local network: `http://localhost:8080`
+   - Remote: `https://docs.yourdomain.com` (via Cloudflare Tunnel)
+
+3. Run `POST /providers/:id/test` (the **Test Connection** button) to verify reachability and capabilities.
+
+4. Files appear in the document browser exactly like any other WebDAV provider.
+
+</Steps>
+
+<Aside type="note" title="Security is delegated to Cloudflare, not the companion app">
+The local WebDAV server does **not** implement its own authentication. Cloudflare Zero Trust Access sits in front of the tunnel and enforces auth, MFA, device posture, and audit logging before any request reaches the local server. Cloudflare Tunnel provides encryption in transit with no port forwarding. Zero Trust Access is free for up to 50 users. This matches the V1 provider-delegated security model — the module and the companion app stay out of the auth business.
+</Aside>
+
+#### In-app document creation (Plate)
+
+V2 adds a new `doc_content` table holding documents authored inside the app. Content is stored as **Plate JSON in the database**, not in a storage provider — these documents have no `remotePath` and no provider. This is the first deliberate exception to "the database never stores content", and it is additive: the V1 `doc_document` reference model is untouched. The editor choice (Plate) is a standard stack decision recorded in the design spec.
+
+```text
+doc_content   — in-app created documents (Plate JSON)
+```
+
+#### In-app editing of external files
+
+This is the bridge between the connector model and the content model. The flow reads an external file through its adapter, parses it into Plate's document model, presents it for editing, and writes the result back through the **same** adapter:
+
+<Steps>
+
+1. Read the file via the provider adapter (`download(path)` on `WebDAVAdapter` or `S3Adapter`).
+
+2. Parse the content into Plate's editor model.
+
+3. Edit in the Plate editor in-app.
+
+4. Write the edited content back via the adapter (`upload(path, ...)`) — the file is modified in place, with no duplication.
+
+</Steps>
+
+<Aside type="caution" title="Read-only providers must still reject writes">
+The V1 read-only enforcement carries straight into V2 editing. `createAdapter(type, config, { readOnly })` injects `readOnly`, and write operations throw `ReadOnlyError` at the adapter level. In-app editing must surface that error gracefully — a provider marked `isReadOnly` (typically evidence/legal storage) cannot be edited, by design.
+</Aside>
+
+#### Document versioning
+
+A new `doc_version` table records history. The storage model is **hybrid**: major versions keep a full content JSON snapshot, while minor versions keep a change description plus timestamp, distinguished by an `isMajor: boolean` flag. This keeps storage bounded while preserving restorable checkpoints.
+
+```text
+doc_version   — major versions: full content snapshot; minor versions: change description
+```
+
+This complements the V1 `contentHash` (SHA-256) on `doc_document`, which already supports integrity verification for referenced files. Versioning extends that idea from "has this file changed?" to "what did it look like at each checkpoint?".
+
+#### Workflow states inheriting from Structure
+
+V1 ships a deliberately simple `status` string on `doc_document` (`active` | `archived`). V2 does **not** add a custom workflow engine. Instead, when Structure ships its planned workflow-states feature, Document Management opts into it: documents subscribe to the `structure.workflow.transitioned` hook and adopt the node's workflow state. This mirrors the V1 design decision to inherit workflow from Structure rather than reimplement it, and it keeps the module's schema self-contained.
+
+### Long-term
+
+These are the V2-and-beyond items from the deferred list. They are sequenced after the content layer is stable because most depend on it (export, comments, templates) or on other modules (AI via cog-ingest, OAuth-based cloud adapters via an Integrations module).
+
+| Feature | Approach | Depends on |
+|---------|----------|------------|
+| **Export to PDF/DOCX** | Server-side generation — PDF via `react-pdf` or Puppeteer, DOCX via the `docx` npm package — downloaded as a file. | In-app content / versioning |
+| **Comments & annotations** | New `doc_comment` table. Inline comments anchored by character offsets. Personal comments only (single-tenant focus). | In-app content |
+| **Content templates** | Stored as `doc_content` records with `isTemplate: true`; stamp out new documents from a template. | In-app content |
+| **AI integration** | When cog-ingest is detected via `serviceRegistry`, offer an "Ingest to Knowledge Base" action and use AI processors for summarisation/analysis. | cog-ingest module |
+| **OneDrive / Google Drive adapters** | New `StorageAdapter` implementations. Likely depend on an Integrations module for OAuth token management. | Integrations module (OAuth) |
+| **Collaborative editing** | Real-time multi-user editing on top of the Plate content model. | In-app content |
+| **Unified cross-provider full-text search** | Full-text **content** search across all connected providers, beyond V1's filename/metadata search (`GET /search`). | Indexing pipeline |
+
+<Aside type="tip" title="Cross-provider search is the big leap">
+V1 search (`GET /search?q=&providerId=&limit=`) matches filenames and cached metadata only. True full-text content search across heterogeneous providers requires an indexing pipeline (extract text on reference creation, store it, query it) — this is why it sits in the long-term tier rather than as an incremental search improvement.
+</Aside>
+
+#### New adapters extend the existing interface
+
+Every long-term storage target (OneDrive, Google Drive, and the companion app's WebDAV server) plugs into the **existing** `StorageAdapter` interface — the same contract the three V1 adapters implement. No new abstraction is needed; new providers just implement the methods.
+
+```typescript
+interface StorageAdapter {
+  // Connection
+  connect(config: ProviderConfig): Promise<void>;
+  disconnect(): Promise<void>;
+  testConnection(): Promise<ConnectionTestResult>;
+
+  // Browsing
+  listFolder(path: string, options?: ListOptions): Promise<FolderContents>;
+  getFileInfo(path: string): Promise<FileInfo>;
+  exists(path: string): Promise<boolean>;
+
+  // File operations
+  download(path: string): Promise<ReadableStream>;
+  upload(path: string, file: Buffer | ReadableStream, metadata?: FileMetadata): Promise<UploadResult>;
+  delete(path: string): Promise<void>;
+  move(fromPath: string, toPath: string): Promise<void>;
+  copy(fromPath: string, toPath: string): Promise<void>;
+
+  // Folders
+  createFolder(path: string): Promise<void>;
+  deleteFolder(path: string, recursive?: boolean): Promise<void>;
+
+  // Optional capabilities
+  getPreviewUrl?(path: string, options?: PreviewOptions): Promise<string | null>;
+  getThumbnailUrl?(path: string, size?: ThumbnailSize): Promise<string | null>;
+  search?(query: string, path?: string): Promise<SearchResult[]>;
+}
+```
+
+---
+
+## Completed
+
+Everything below is shipped in V1 (release version `1.1.2`). This is the foundation the roadmap above builds on.
+
+### Core
+
+<CardGrid>
+  <Card title="Storage providers" icon="setting">
+    Add, edit, remove, and test S3/R2, WebDAV, and local-filesystem connections. Status monitoring (`connected` | `error` | `pending` | `unavailable`) with graceful offline degradation — cached references still show when a provider is unreachable.
+  </Card>
+  <Card title="Browse & preview" icon="document">
+    File browser with folder navigation and breadcrumbs, switchable list/grid views, and inline preview for images, PDFs (`react-pdf`), text, and code.
+  </Card>
+  <Card title="Download & upload" icon="download">
+    Backend-proxied single-file download, bulk zip download, and upload (raw body with `?path=`) with stream-enforced size limits.
+  </Card>
+  <Card title="Document references" icon="bookmark">
+    Lightweight DB records pointing at external files — favourites, tags, notes, folder bookmarks, recent-access tracking, and SHA-256 content hashing.
+  </Card>
+</CardGrid>
+
+- **Storage provider configuration** — full CRUD plus `POST /providers/:id/test` for connection testing and capability discovery.
+- **Graceful offline state** — when a provider is unreachable, the `FileBrowser` shows an unavailable card with a Retry button; cached `doc_document` references still appear in the documents list.
+- **File browser** — folder navigation, breadcrumbs, and switchable list/grid views (`FileBrowser`, `FileList`, `FileGrid`).
+- **File preview** — images (inline with zoom), PDF (`react-pdf`), text and code (fetched via `/download`, read as text, shown as a code block), video and audio (HTML5 players). Office and archives show a download prompt.
+- **Upload** — raw request body with `?path=` naming the destination; size enforced on the byte stream (a counting transform aborts at `DOC_MAX_UPLOAD_SIZE`), not on the spoofable `Content-Length`. Respects the per-provider read-only flag.
+- **Download** — single file streamed with `Content-Disposition: attachment`, plus bulk zip via `POST /bulk-download`.
+- **Document references** — created on meaningful user interaction (favourite/link/tag/notes) or on cross-module request via `serviceRegistry`.
+- **Favourites, folder bookmarks, and recent-access tracking** — the recent-access log doubles as a chain-of-custody audit trail.
+- **Search** — filename and metadata search across providers (`GET /search`).
+- **Content hashing** — SHA-256 computed server-side at reference creation for integrity verification.
+- **Read-only mode per provider** — enforced at the adapter level; writes throw `ReadOnlyError`.
+
+### Storage adapters
+
+All three V1 adapters implement the `StorageAdapter` interface, and all adapter SDKs are always installed so the generated app type-checks regardless of the init selection.
+
+| Adapter | Providers | SDK | Notes |
+|---------|-----------|-----|-------|
+| `S3Adapter` | AWS S3, Cloudflare R2, Wasabi, MinIO | `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner` | Custom endpoints for R2/MinIO/Wasabi; presigned preview/thumbnail URLs. |
+| `WebDAVAdapter` | ownCloud, Nextcloud, NAS | `webdav` | Basic auth or bearer token. |
+| `LocalAdapter` | Local filesystem | Node `fs` | Development only; restricted to the base dir; rejects path traversal. |
+
+### Starter-template integration
+
+| Registry | Registration | Key options |
+|----------|--------------|-------------|
+| `navigationRegistry` | Main "Documents" nav item | id `document-management`, url `/documents`, icon `FileText`, order 25 |
+| `dashboardRegistry` | "Recent Documents" widget | component `RecentDocumentsWidget`, size 2x1, order 35, category `documents` |
+| `preferencesRegistry` | Document preferences | component `DocumentPreferences`, order 60 |
+| `adminPagesRegistry` | Storage providers admin page | id `documents` (→ `/admin/documents`), component `AdminStoragePage`, order 40 |
+| `routeRegistry` | Backend API routes | path `/document-management`, versions `[v1]`, `requiresAuth: true` |
+| `serviceRegistry` | Cross-module service | `serviceRegistry.register("document-management", documentManagementService)` |
+
+### Structure integration (optional)
+
+Structure registrations are generated with their side-effect imports **commented out** in `index.ts`. You uncomment them once Structure is installed; until then the module runs standalone as a document browser.
+
+| Registry | Registration | Key options |
+|----------|--------------|-------------|
+| `nodeTabRegistry` | "Documents" tab | id `documents`, nodeTypes `*`, order 35, component `NodeDocumentsTab` |
+| `nodeWidgetRegistry` | "Recent Documents" widget | id `node-recent-documents`, location `node-overview`, order 25, component `NodeDocumentsWidget` |
+| `nodeCardExtensionRegistry` | Document-count badge | id `document-count`, position `badge`, order 15, rendered via `createElement(NodeDocumentsBadge)` |
+| `nodeActionRegistry` | "Upload File" / "Link Document" | ids `upload-file` (order 30) / `link-document` (order 31), locations `['detail-header']`, dispatch `document-management:upload` / `document-management:link` CustomEvents |
+| `nodeSidebarSectionRegistry` | "Pinned Documents" section | id `pinned-documents`, nodeTypes `*`, order 35, component `NodeDocumentsSidebar` |
+
+The backend subscribes to Structure hooks (`actionRegistry.addActionAsync`, order 20; inert if Structure is absent):
+
+- `structure.node.deleted` removes `doc_node_link` rows for the node.
+- `structure.node.archived` sets linked `doc_document.status = archived`.
+- `structure.node.moved` nulls `lastSyncedAt` on linked documents.
+
+### Public service interface
+
+Other modules resolve the service via `serviceRegistry.get("document-management")` on the backend. The full V1 contract:
+
+```typescript
+interface DocumentManagementServiceInterface {
+  // Documents linked to a Structure node
+  getDocumentsForNode(nodeId: string, userId: string): Promise<DocumentReference[]>;
+
+  // A specific document reference
+  getDocument(documentId: string, userId: string): Promise<DocumentReference | null>;
+
+  // A download stream for a document
+  getDownloadStream(documentId: string, userId: string): Promise<Readable>;
+
+  // File metadata from the provider
+  getFileInfo(documentId: string, userId: string): Promise<FileInfo>;
+
+  // Document count for a node
+  getDocumentCount(nodeId: string, userId: string): Promise<number>;
+
+  // Optional-detection helper
+  isAvailable(): boolean;
+}
+```
+
+### Action hooks fired
+
+V1 already fires the hooks other modules need to react to. These remain stable into V2:
+
+| Hook | Payload |
+|------|---------|
+| `documents.document.linked` | `{ userId, documentId, nodeId, linkType }` |
+| `documents.document.unlinked` | `{ userId, documentId, nodeId }` |
+| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName }` |
+| `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` |
+| `documents.provider.connected` | `{ userId, providerId, providerType }` |
+| `documents.provider.disconnected` | `{ userId, providerId }` |
+
+<Aside type="note" title="V1 was built to be extended">
+The schema is self-contained (plain string foreign keys, `@@index`, no `@relation`), the adapter interface already has optional capability slots (`getPreviewUrl`, `getThumbnailUrl`, `search`), the service is exposed via `serviceRegistry`, and workflow is delegated to Structure rather than hard-coded. Each of these is a seam the V2 work plugs into without rewriting V1.
+</Aside>
+
+---
+
+## Next Steps
+
+- [Integration](/document-management/integration/) — how other modules consume the documents service and react to its hooks.
+- [Configuration](/document-management/configuration/) — environment variables, install prompts, and the database schema.
+- [Security](/document-management/security/) — the provider-delegated security model and credential encryption.

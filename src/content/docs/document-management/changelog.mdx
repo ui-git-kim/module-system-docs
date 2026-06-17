@@ -1,0 +1,374 @@
+---
+title: Changelog
+description: Version history and release notes for the Document Management module
+sidebar:
+  order: 7
+---
+
+import { Aside, Badge, Card, CardGrid, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+This page documents notable changes to the **Document Management** module. The module follows semantic versioning — **major.minor.patch**.
+
+- **Major** (1.0.0 → 2.0.0): Breaking changes requiring migration
+- **Minor** (1.0.0 → 1.1.0): New features, backwards compatible
+- **Patch** (1.0.0 → 1.0.1): Bug fixes, documentation updates
+
+Each entry groups changes under **Added**, **Changed**, and **Security** so you can scan for what affects your installation.
+
+<Aside type="tip" title="Connector, not storage">
+Document Management V1 is a **renderer and connector**. It connects to external storage, browses, previews, and downloads files, and keeps lightweight document references that link to Structure nodes. The database stores references, metadata, and your organisation (favourites, tags, node links) — never file content. In-app file creation (Plate), versioning, workflow states, export, and the companion desktop app are planned for V2.
+</Aside>
+
+---
+
+## v1.1.2 <Badge text="Current" variant="success" /> <Badge text="17 June 2026" variant="note" />
+
+The initial public release of Document Management. V1 ships the full connector feature set: storage adapters, provider management with encrypted credentials, file browsing and preview, upload/download, document references, folder bookmarks, a recent-access audit trail, search, four frontend pages, the starter-template and optional Structure registry integrations, the public service interface, and the provider-delegated security model.
+
+Install it with:
+
+```bash
+npx document-management init
+```
+
+<CardGrid>
+  <Card title="Connect Storage" icon="cloud-download">
+    S3 / Cloudflare R2, WebDAV (ownCloud, Nextcloud, NAS), and the local filesystem. Credentials are encrypted at rest with AES-256-GCM.
+  </Card>
+  <Card title="Browse & Preview" icon="document">
+    List and grid views, breadcrumb navigation, graceful offline handling, and MIME-aware preview for images, PDFs, text, code, video, and audio.
+  </Card>
+  <Card title="Organise" icon="star">
+    Document references with favourites, tags, and notes; folder bookmarks; a recent-access trail; and full-text search across your providers.
+  </Card>
+  <Card title="Integrate" icon="puzzle">
+    Starter-template registries (navigation, dashboard, preferences, admin) plus optional Structure node tabs, widgets, badges, actions, and a sidebar section.
+  </Card>
+</CardGrid>
+
+### Added
+
+#### Storage adapters
+
+Three storage adapters implement a common `StorageAdapter` interface (`connect`, `disconnect`, `testConnection`, `listFolder`, `getFileInfo`, `exists`, `download`, `upload`, `delete`, `move`, `copy`, `createFolder`, `deleteFolder`, plus optional `getPreviewUrl`, `getThumbnailUrl`, and `search`).
+
+| Adapter | Backing store | SDK | Notes |
+|---------|---------------|-----|-------|
+| `S3Adapter` | S3 / Cloudflare R2 | `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner` | Presigned URLs for preview and thumbnails |
+| `WebDAVAdapter` | ownCloud, Nextcloud, NAS | `webdav` | Basic auth or bearer token |
+| `LocalAdapter` | Node `fs` (development) | — | Restricted to the base dir; rejects `../` and absolute paths |
+
+The `createAdapter(type, config, { readOnly })` factory injects the `readOnly` flag so write operations throw `ReadOnlyError` at the adapter level. All adapter SDKs are always installed regardless of your selection, so the generated app always type-checks.
+
+```typescript
+import { createAdapter } from './adapters/index.js';
+
+const adapter = createAdapter('s3', providerConfig, { readOnly: provider.isReadOnly });
+await adapter.connect();
+const entries = await adapter.listFolder('/contracts');
+```
+
+#### Provider management
+
+Full CRUD for storage providers, with encrypted credential storage and live connection testing.
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/providers` | List the current user's providers |
+| POST | `/providers` | Create a provider (credentials encrypted before the DB write) |
+| GET | `/providers/:id` | Fetch a provider (config redacted) |
+| PUT | `/providers/:id` | Update a provider |
+| DELETE | `/providers/:id` | Remove a provider |
+| POST | `/providers/:id/test` | Test the connection and refresh status/capabilities |
+
+Provider status is one of `connected`, `error`, `pending`, or `unavailable`. The `toProviderResponse` serialiser omits `config`, so encrypted credentials are never returned to the client.
+
+#### File browsing
+
+List and grid views with breadcrumb navigation, backed by the `FileBrowser`, `FileGrid`, `FileList`, and `ProviderSidebar` components and the `useFolder` / `useFileInfo` hooks.
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/browse/:providerId` | List the root folder |
+| GET | `/browse/:providerId/*` | List a subfolder by path |
+| GET | `/file/:providerId/*` | File info for a path |
+
+When a provider is unreachable, the `FileBrowser` shows an **unavailable** card with a **Retry** button (which calls `POST /providers/:id/test`), while cached `doc_document` references still appear in the documents list.
+
+#### Preview by MIME type
+
+The `FilePreview` component renders inline previews based on the file's MIME type:
+
+| Category | Extensions | Strategy |
+|----------|------------|----------|
+| Images | jpg, png, gif, webp, svg | Inline `<img>` with zoom |
+| PDF | pdf | `react-pdf` |
+| Text / code | txt, md, csv, js, ts, py, json, … | Code block (bytes fetched via `/download`, read as text) |
+| Video | mp4, webm | HTML5 `<video>` |
+| Audio | mp3, wav, ogg | HTML5 `<audio>` |
+| Office / archives / other | docx, xlsx, pptx, zip, tar, gz, … | Download prompt + file icon (no inline preview in V1) |
+
+```typescript
+// GET /preview/:providerId/* returns JSON, not a stream:
+//   { kind: "url", url }   — presigned providers (S3)
+//   { kind: "inline" }     — client blob-fetches via /download with auth preserved
+```
+
+#### Upload, download, and bulk download
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/download/:providerId/*` | Stream bytes with `Content-Disposition: attachment` |
+| POST | `/upload/:providerId` | Raw request body is the file; `?path=` names the destination (including filename) |
+| POST | `/bulk-download` | Body `{ providerId, paths[] }` returns a zip stream (`archiver`) |
+
+Uploads use the raw request body rather than multipart, and upload size is enforced on the byte stream — a counting transform aborts at `DOC_MAX_UPLOAD_SIZE` (default 50 MB) rather than trusting the spoofable `Content-Length` header.
+
+#### Document references
+
+Lightweight references to remote files, with favourites, tags, notes, and SHA-256 content hashing for integrity verification. References are stored in `doc_document` and never contain file content.
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/documents` | List references (filters: `limit`, `cursor`, `providerId`, `status`, `isFavourite`, `tag`) |
+| POST | `/documents` | Create a reference (`contentHash` computed server-side) |
+| GET | `/documents/recent` | Recently accessed references |
+| GET | `/documents/favourites` | Favourited references |
+| GET | `/documents/:id` | Fetch one reference |
+| PUT | `/documents/:id` | Update tags, notes, favourite, status |
+| DELETE | `/documents/:id` | Delete a reference |
+
+The hooks `useDocuments`, `useDocument`, `useRecentDocuments`, `useFavourites`, `useCreateDocument`, `useUpdateDocument`, and `useDeleteDocument` wrap these endpoints.
+
+#### Folder bookmarks
+
+Pin frequently used folders for one-click navigation. These three endpoints are **additional** to the design spec's 22 (they are not part of the original 5 endpoint groups).
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/bookmarks?providerId=` | List bookmarks (optionally per provider) |
+| POST | `/bookmarks` | Create a bookmark |
+| DELETE | `/bookmarks/:id` | Remove a bookmark |
+
+Backed by `doc_folder_bookmark` and the `useBookmarks`, `useCreateBookmark`, and `useDeleteBookmark` hooks.
+
+#### Recent-access audit trail
+
+Every meaningful interaction is recorded in `doc_recent_access` with an `action` of `view`, `download`, `upload`, `link`, or `unlink`. This table powers the recent-documents views and doubles as a chain-of-custody audit trail.
+
+#### Search
+
+Cross-provider search exposed through `GET /search?q=&providerId=&limit=` and the `useSearch` hook, delegating to each adapter's optional `search` capability.
+
+#### Frontend pages
+
+<CardGrid>
+  <Card title="DocumentBrowserPage">
+    `/documents` — the main entry point with the provider sidebar and file browser.
+  </Card>
+  <Card title="FolderViewPage">
+    `/documents/browse/:providerId/*` — browse a folder by path.
+  </Card>
+  <Card title="DocumentPreviewPage">
+    `/documents/preview/:documentId` — full-page preview of a referenced document.
+  </Card>
+  <Card title="AdminStoragePage">
+    `/admin/documents` — manage storage providers (registered via `adminPagesRegistry`).
+  </Card>
+</CardGrid>
+
+#### Starter-template registry integrations
+
+The module wires itself into the host app through the starter template's registries:
+
+| Registry | Registration |
+|----------|--------------|
+| `navigationRegistry` | `registerMain` — id `document-management`, title **Documents**, url `/documents`, icon `FileText`, order 25 |
+| `dashboardRegistry` | **Recent Documents** — component `RecentDocumentsWidget`, size 2×1, order 35, category `documents` |
+| `preferencesRegistry` | component `DocumentPreferences`, order 60 |
+| `adminPagesRegistry` | id `documents` (→ `/admin/documents`), title **Storage Providers**, component `AdminStoragePage`, order 40 |
+| `routeRegistry` | path `/document-management`, versions `[v1]`, `requiresAuth: true` |
+| `serviceRegistry` | `register("document-management", documentManagementService)` |
+
+#### Optional Structure integrations
+
+When the [Structure](/modules/structure/integration/) module is installed, you uncomment the side-effect imports in the generated `index.ts` to light up node-level UI. These registrations are **commented out by default** so the module remains standalone.
+
+| Registry | Item |
+|----------|------|
+| `nodeTabRegistry` | id `documents`, label **Documents**, icon `FileText`, nodeTypes `*`, order 35, component `NodeDocumentsTab` |
+| `nodeWidgetRegistry` | id `node-recent-documents`, title **Recent Documents**, location `node-overview`, nodeTypes `*`, order 25, component `NodeDocumentsWidget` |
+| `nodeCardExtensionRegistry` | id `document-count`, position `badge`, nodeTypes `*`, order 15, rendered via `createElement(NodeDocumentsBadge)` |
+| `nodeActionRegistry` | **Upload File** (id `upload-file`, order 30) and **Link Document** (id `link-document`, order 31), locations `["detail-header"]` — handlers dispatch `window` CustomEvents `document-management:upload` and `document-management:link` |
+| `nodeSidebarSectionRegistry` | id `pinned-documents`, title **Pinned Documents**, icon `Pin`, nodeTypes `*`, order 35, component `NodeDocumentsSidebar` |
+
+The module also subscribes to Structure lifecycle hooks (via `actionRegistry.addActionAsync`, order 20; inert if Structure is absent):
+
+| Hook | Effect |
+|------|--------|
+| `structure.node.deleted` | Removes `doc_node_link` rows for the node |
+| `structure.node.archived` | Sets linked `doc_document.status` to `archived` |
+| `structure.node.moved` | Nulls `lastSyncedAt` on linked documents |
+
+#### Node integration endpoints
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/nodes/:nodeId/documents` | Documents linked to a node |
+| POST | `/nodes/:nodeId/documents` | Link a document to a node |
+| DELETE | `/nodes/:nodeId/documents/:documentId` | Unlink a document |
+| GET | `/nodes/:nodeId/documents/count` | Count of linked documents |
+
+Links are stored in `doc_node_link` with a `linkType` of `attachment`, `reference`, or `primary`, and are managed from the frontend via the `useNodeDocuments`, `useNodeDocumentCount`, `useLinkDocument`, and `useUnlinkDocument` hooks.
+
+#### Public service interface
+
+Other backend modules resolve the service via `serviceRegistry.get("document-management")` and consume the `DocumentManagementServiceInterface`:
+
+```typescript
+interface DocumentManagementServiceInterface {
+  getDocumentsForNode(nodeId: string, userId: string): Promise<DocumentReference[]>;
+  getDocument(documentId: string, userId: string): Promise<DocumentReference | null>;
+  getDownloadStream(documentId: string, userId: string): Promise<Readable>;
+  getFileInfo(documentId: string, userId: string): Promise<FileInfo>;
+  getDocumentCount(nodeId: string, userId: string): Promise<number>;
+  isAvailable(): boolean;
+}
+```
+
+#### Action hooks fired
+
+Other modules can subscribe to these events through the backend `actionRegistry`:
+
+| Action | Context |
+|--------|---------|
+| `documents.document.linked` | `{ userId, documentId, nodeId, linkType }` |
+| `documents.document.unlinked` | `{ userId, documentId, nodeId }` |
+| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName }` |
+| `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` |
+| `documents.provider.connected` | `{ userId, providerId, providerType }` |
+| `documents.provider.disconnected` | `{ userId, providerId }` |
+
+#### Database tables
+
+Five self-contained tables (all prefixed `doc_`, with plain string foreign keys and `@@index`, never `@relation`):
+
+| Table | Purpose |
+|-------|---------|
+| `doc_storage_provider` | Connected providers — encrypted `config`, `isDefault`, `isReadOnly`, `status`, `basePath` |
+| `doc_document` | Document references — `remotePath`, `fileName`, `mimeType`, `contentHash`, `isFavourite`, `tags`, `notes`, `status` |
+| `doc_node_link` | Links between documents and Structure nodes — `linkType`, `order` |
+| `doc_folder_bookmark` | Pinned folders — `folderPath`, `label`, `icon`, `order` |
+| `doc_recent_access` | Recent-access / audit trail — `action`, `accessedAt` |
+
+#### Frontend deps & components
+
+- **Frontend dependencies:** `date-fns`, `react-pdf`
+- **Backend dependencies:** `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner`, `webdav`, `archiver`, `mime-types`, `sharp`
+- **Components:** `FileBrowser`, `FilePreview`, `FileGrid`, `FileList`, `ProviderSidebar`, `DocumentLinkDialog` (Structure-only; uses `NodeSelector`), `file-utils` (`FileIcon`, `formatBytes`, `fileCategory`), `DocumentPreferences`
+- **Widgets:** `RecentDocumentsWidget`, `NodeDocumentsWidget`
+- **Structure components:** `NodeDocumentsTab`, `NodeDocumentsSidebar`, `NodeDocumentsBadge`
+
+### Security
+
+The release ships the full **provider-delegated** security model. A request flows through layered protection:
+
+<Steps>
+
+1. **Cloudflare Zero Trust Access** — authentication, MFA, device posture, and audit logs (free for up to 50 users).
+
+2. **Cloudflare Tunnel** — encryption in transit with no port forwarding.
+
+3. **Neon PostgreSQL** — encryption at rest and in transit.
+
+4. **App-layer AES-256-GCM** — storage credentials are encrypted with `DOC_ENCRYPTION_KEY` before the DB write and redacted from API responses.
+
+5. **Storage provider** — provider-managed file security.
+
+</Steps>
+
+- **Credential handling** — credentials are encrypted before being written, redacted in responses (`toProviderResponse` omits `config`), never logged, and the encryption key lives only in env. They are **not** environment variables — each provider's credentials live encrypted in `doc_storage_provider.config`.
+- **Proxied downloads** — file downloads are proxied through the backend; the frontend never receives long-lived credentials. S3 may hand the client a short-lived presigned URL for **preview only**.
+- **Local adapter hardening** — the local adapter is restricted to its base directory and rejects `../` and absolute paths.
+- **Stream-enforced upload limits** — upload size is enforced on the byte stream (a counting transform aborts at `DOC_MAX_UPLOAD_SIZE`), not just the spoofable `Content-Length`.
+- **Read-only providers** — read-only providers reject writes at the adapter level (`ReadOnlyError`).
+- **Integrity & audit** — `contentHash` (SHA-256) is computed server-side at reference creation, and `doc_recent_access` doubles as a chain-of-custody audit trail.
+
+<Aside type="caution" title="Set DOC_ENCRYPTION_KEY before going live">
+`DOC_ENCRYPTION_KEY` is a **required secret** environment variable — a 32+ character key for AES-256-GCM credential encryption. It is collected interactively at `init` (the scaffold cannot generate values at prompt time). Generate one with `openssl rand -hex 32` and keep it stable: rotating or losing it makes existing encrypted provider credentials unreadable.
+</Aside>
+
+### Changed
+
+These are deliberate deviations from the original design spec, documented here for transparency. They affect generated output and how you configure the module.
+
+<Tabs>
+  <TabItem label="Adapter selection">
+
+Adapter selection is a single **select** (`s3` | `webdav` | `local` | `all`), not a true multi-select, because the bundled scaffold (v1.10.2) has no multi-select prompt type and `{{#if}}` supports only truthiness plus single-literal string equality (no array membership). The runtime constant `ENABLED_ADAPTERS` in `document-management.config.ts` derives the active set; `all` enables all three.
+
+```typescript
+// document-management.config.ts
+const SELECTED = '{{storageAdapters|s3}}';
+
+export const ENABLED_ADAPTERS: AdapterId[] =
+  SELECTED === 'all' ? ['s3', 'webdav', 'local'] : [SELECTED as AdapterId];
+```
+
+  </TabItem>
+  <TabItem label="Always-installed SDKs">
+
+All adapter SDKs are installed unconditionally (not gated on the selection), so the generated target app always type-checks regardless of which adapters you enabled.
+
+  </TabItem>
+  <TabItem label="Encryption key">
+
+The design-spec `encryptionKey` install prompt with auto-generate is **not** a prompt — the scaffold cannot execute code at prompt time, and env-var defaults are written literally (no `{{}}` substitution in env defaults). Instead `DOC_ENCRYPTION_KEY` is a required secret env var collected interactively at `init`; generate it with `openssl rand -hex 32`. Only `storageAdapters` and `defaultRegion` feed `{{...}}` template variables.
+
+  </TabItem>
+  <TabItem label="Raw-body uploads">
+
+Uploads use the raw request body with `?path=` (not multipart) to avoid depending on a specific multipart middleware. Size is enforced on the stream.
+
+  </TabItem>
+  <TabItem label="JSON preview endpoint">
+
+The preview endpoint returns JSON (`{ kind: "url" | "inline" }`) so the client blob-fetches via `/download` with authentication preserved, rather than streaming inline.
+
+  </TabItem>
+</Tabs>
+
+#### Install prompts
+
+| Prompt | Type | Options / Default | Shown when |
+|--------|------|-------------------|------------|
+| `storageAdapters` | select | `s3` \| `webdav` \| `local` \| `all` (default `s3`) | Always |
+| `defaultRegion` | input | default `ap-southeast-2` | `storageAdapters` is `s3` or `all` |
+
+#### Environment variables
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `DOC_ENCRYPTION_KEY` | ✅ (secret) | — | 32+ char key for AES-256-GCM credential encryption |
+| `DOC_MAX_UPLOAD_SIZE` | — | `52428800` (50 MB) | Maximum upload size, enforced on the byte stream |
+| `DOC_THUMBNAIL_CACHE_DIR` | — | `./data/doc-thumbnails` | Thumbnail cache directory |
+| `DOC_S3_DEFAULT_REGION` | — (when s3 / all) | `ap-southeast-2` | Default AWS/R2 region |
+| `DOC_LOCAL_BASE_PATH` | — (when local / all) | `./data/doc-local` | Base directory for the local adapter |
+
+Per-provider credentials are **not** env vars — they live encrypted in `doc_storage_provider.config`.
+
+---
+
+## Roadmap
+
+V2 builds on the V1 connector foundation:
+
+- **In-app creation** — author documents directly in the app with [Plate](https://platejs.org/).
+- **Versioning** — track document revisions over time.
+- **Workflow states** — drive documents through review and approval states.
+- **Export** — render and export documents to common formats.
+- **Companion desktop app** — a native companion for local-first workflows.
+
+<Aside type="note">
+For version bump commands and the module update workflow, see the [Module Starter — Versioning](/module-starter/) docs. Apps already running the module can pull template and schema updates with `npx document-management update`.
+</Aside>

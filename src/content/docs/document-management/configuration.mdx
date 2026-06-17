@@ -1,0 +1,442 @@
+---
+title: Configuration
+description: Environment variables, storage adapter configuration, credential encryption, install prompts, and read-only mode for the Document Management module
+sidebar:
+  order: 2
+---
+
+import { Aside, Tabs, TabItem, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+Document Management is a **connector, not a store** — it never holds file content. What you configure here is how the backend reaches your external storage, how it protects the credentials it uses to do so, and how the install prompts shape the generated code. This page is the authoritative reference for every environment variable, every provider config shape, the credential encryption model, the install prompts, and read-only mode.
+
+<Aside type="note" title="Where credentials actually live">
+Only **one** secret belongs in your environment: `DOC_ENCRYPTION_KEY`. Per-provider credentials (S3 access keys, WebDAV passwords, bearer tokens) are **not** environment variables — they are encrypted with that key and stored in the `doc_storage_provider.config` column. This is what lets you connect multiple providers of the same type (two S3 buckets, two Nextcloud servers) without colliding env vars.
+</Aside>
+
+---
+
+## Environment Variables
+
+The backend reads five environment variables. Only `DOC_ENCRYPTION_KEY` is required — the rest have sensible defaults and two are only relevant when the matching adapter is enabled.
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DOC_ENCRYPTION_KEY` | ✅ Yes | — (secret) | 32+ character key used to derive the AES-256-GCM key that encrypts storage-provider credentials at rest. Generate with `openssl rand -hex 32`. Lives only in the backend environment, never in the database. |
+| `DOC_MAX_UPLOAD_SIZE` | No | `52428800` | Maximum upload size in **bytes** (default 50 MB). Enforced on the byte stream, not the spoofable `Content-Length` header. |
+| `DOC_THUMBNAIL_CACHE_DIR` | No | `./data/doc-thumbnails` | Directory where generated image thumbnails are cached (keyed by a hash of provider + path + size). |
+| `DOC_S3_DEFAULT_REGION` | No (S3 only) | `ap-southeast-2` | Default AWS/R2 region applied when an S3 provider config omits `region`. Only emitted when `storageAdapters` is `s3` or `all`. |
+| `DOC_LOCAL_BASE_PATH` | No (local only) | `./data/doc-local` | Base directory the local filesystem adapter is restricted to. Only emitted when `storageAdapters` is `local` or `all`. |
+
+### Example `.env`
+
+```bash
+# REQUIRED — generate a fresh value, never reuse across environments
+DOC_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+
+# Optional — shown with their defaults
+DOC_MAX_UPLOAD_SIZE=52428800          # 50 MB, in bytes
+DOC_THUMBNAIL_CACHE_DIR=./data/doc-thumbnails
+
+# Only when the S3 adapter is enabled
+DOC_S3_DEFAULT_REGION=ap-southeast-2
+
+# Only when the local adapter is enabled (development)
+DOC_LOCAL_BASE_PATH=./data/doc-local
+```
+
+<Aside type="danger" title="Rotating DOC_ENCRYPTION_KEY is destructive">
+The key is used for both encryption and decryption. If you change `DOC_ENCRYPTION_KEY` after providers have been saved, every existing `doc_storage_provider.config` blob becomes **undecryptable** and the adapter will throw on connect. Treat the key as permanent for the life of the data, or re-enter every provider's credentials after a deliberate rotation.
+</Aside>
+
+<Aside type="tip" title="How the defaults are read in code">
+`DOC_MAX_UPLOAD_SIZE` and `DOC_THUMBNAIL_CACHE_DIR` are resolved in `document-management.config.ts`; `DOC_S3_DEFAULT_REGION` in `adapters/s3.adapter.ts`; `DOC_LOCAL_BASE_PATH` in `adapters/local.adapter.ts`. Each falls back to the default above when unset, so the module boots even with only `DOC_ENCRYPTION_KEY` provided.
+
+```typescript
+// document-management.config.ts
+export const MAX_UPLOAD_SIZE = Number(process.env.DOC_MAX_UPLOAD_SIZE ?? 50 * 1024 * 1024);
+export const THUMBNAIL_CACHE_DIR = process.env.DOC_THUMBNAIL_CACHE_DIR || './data/doc-thumbnails';
+```
+</Aside>
+
+---
+
+## Storage Adapter Configuration
+
+A **storage provider** is a saved connection to one external system. Its credentials are supplied as a typed `ProviderConfig` (plaintext on input, encrypted before it touches the database). Each provider type has its own config shape, and all three are defined in `document-management.types.ts`.
+
+The `type` discriminator selects the shape and the adapter:
+
+```typescript
+export type ProviderConfig =
+  | ({ type: 's3' | 'r2' } & S3ProviderConfig)
+  | ({ type: 'webdav' } & WebDAVProviderConfig)
+  | ({ type: 'local' } & LocalProviderConfig);
+```
+
+When you create a provider, the controller wraps your config with the right `type`, encrypts it with `encryptConfig()`, and writes the ciphertext to `doc_storage_provider.config`. The plaintext is never persisted and is **redacted** from every API response (`toProviderResponse` omits `config` entirely).
+
+```typescript
+export interface CreateProviderInput {
+  name: string;
+  providerType: ProviderType;       // 's3' | 'r2' | 'webdav' | 'local'
+  config: ProviderConfig;           // plaintext on input; encrypted before persistence
+  isDefault?: boolean;
+  isReadOnly?: boolean;
+  basePath?: string;
+}
+```
+
+<CardGrid>
+  <Card title="S3 / R2" icon="cloud-download">
+    AWS S3 and any S3-compatible store (Cloudflare R2, MinIO, Wasabi). Supports short-lived presigned preview URLs.
+  </Card>
+  <Card title="WebDAV" icon="external">
+    ownCloud, Nextcloud, and NAS appliances. Basic auth or bearer token. Bytes are proxied through the backend.
+  </Card>
+  <Card title="Local" icon="laptop">
+    Node `fs` adapter for development and the companion app. Locked to a base directory; path traversal is rejected.
+  </Card>
+</CardGrid>
+
+### S3 / R2 (and S3-compatible)
+
+The S3 adapter (`adapters/s3.adapter.ts`) serves both the `s3` and `r2` provider types via the AWS SDK (`@aws-sdk/client-s3`) and `@aws-sdk/s3-request-presigner`. For AWS itself you supply `region` and let the SDK use the default endpoint; for **R2, MinIO, and Wasabi** you set a custom `endpoint` and the adapter automatically switches on path-style addressing.
+
+```typescript
+/** S3 / R2 / S3-compatible connection details (stored encrypted). */
+export interface S3ProviderConfig {
+  endpoint?: string;        // Custom endpoint for R2 / MinIO / Wasabi
+  region?: string;
+  bucket: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+  forcePathStyle?: boolean; // Required for MinIO and some S3-compatibles
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `bucket` | ✅ | Bucket name. |
+| `accessKeyId` | ✅ | Access key ID (encrypted at rest). |
+| `secretAccessKey` | ✅ | Secret access key (encrypted at rest). |
+| `region` | — | AWS/R2 region. Falls back to `DOC_S3_DEFAULT_REGION` when omitted. |
+| `endpoint` | — | Custom endpoint URL. Set this for R2, MinIO, or Wasabi; leave unset for AWS S3. |
+| `forcePathStyle` | — | Path-style addressing. Defaults to `true` whenever an `endpoint` is set, which is what MinIO and most S3-compatibles need. |
+
+<Aside type="note" title="Path-style is inferred from the endpoint">
+You rarely need to set `forcePathStyle` by hand. The adapter computes `forcePathStyle: c.forcePathStyle ?? Boolean(c.endpoint)` — so providing a custom endpoint (R2/MinIO/Wasabi) turns it on automatically, while plain AWS S3 stays on virtual-hosted-style. Presigned preview URLs are minted with a 300-second TTL.
+</Aside>
+
+<Tabs>
+  <TabItem label="AWS S3">
+
+```typescript
+const awsConfig: S3ProviderConfig = {
+  bucket: 'my-firm-documents',
+  region: 'ap-southeast-2',
+  accessKeyId: 'AKIA...',
+  secretAccessKey: '...',
+  // no endpoint — uses AWS virtual-hosted-style addressing
+};
+```
+
+  </TabItem>
+  <TabItem label="Cloudflare R2">
+
+```typescript
+const r2Config: S3ProviderConfig = {
+  bucket: 'my-firm-documents',
+  endpoint: 'https://<accountid>.r2.cloudflarestorage.com',
+  region: 'auto',
+  accessKeyId: '<r2-access-key-id>',
+  secretAccessKey: '<r2-secret-access-key>',
+  // forcePathStyle is inferred true because endpoint is set
+};
+```
+
+  </TabItem>
+  <TabItem label="MinIO / Wasabi">
+
+```typescript
+const minioConfig: S3ProviderConfig = {
+  bucket: 'documents',
+  endpoint: 'https://minio.internal.example.com',
+  region: 'us-east-1',
+  accessKeyId: 'minioadmin',
+  secretAccessKey: '...',
+  forcePathStyle: true, // explicit, though inferred from endpoint anyway
+};
+```
+
+  </TabItem>
+</Tabs>
+
+### WebDAV
+
+The WebDAV adapter (`adapters/webdav.adapter.ts`) uses the `webdav` npm client to talk to ownCloud, Nextcloud, and NAS appliances. Authenticate with **either** a username/password pair **or** a bearer token. WebDAV has no URL-based preview capability, so its files are streamed through the backend `/download` and `/preview` endpoints rather than handed to the client as presigned URLs.
+
+```typescript
+/** WebDAV (ownCloud / Nextcloud / NAS) connection details (stored encrypted). */
+export interface WebDAVProviderConfig {
+  baseUrl: string;          // e.g. https://cloud.example.com/remote.php/dav/files/user
+  username?: string;
+  password?: string;
+  token?: string;           // Bearer token alternative to username/password
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `baseUrl` | ✅ | WebDAV root URL. For Nextcloud/ownCloud this is typically `https://host/remote.php/dav/files/<user>`. |
+| `username` | — | Basic-auth username. Pair with `password`. |
+| `password` | — | Basic-auth password (encrypted at rest). |
+| `token` | — | Bearer token, used instead of username/password. Sent as `Authorization: Bearer <token>`. |
+
+<Tabs>
+  <TabItem label="Basic auth">
+
+```typescript
+const nextcloudConfig: WebDAVProviderConfig = {
+  baseUrl: 'https://cloud.example.com/remote.php/dav/files/alice',
+  username: 'alice',
+  password: '<app-password>',
+};
+```
+
+  </TabItem>
+  <TabItem label="Bearer token">
+
+```typescript
+const tokenConfig: WebDAVProviderConfig = {
+  baseUrl: 'https://cloud.example.com/remote.php/dav/files/alice',
+  token: '<oauth-bearer-token>',
+};
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="tip" title="Use app passwords, not your login">
+For Nextcloud/ownCloud, generate a dedicated **app password** rather than supplying the account login. It is scoped, revocable, and limits the blast radius if the encrypted config is ever exposed.
+</Aside>
+
+### Local Filesystem
+
+The local adapter (`adapters/local.adapter.ts`) is for **development and the companion app**. It uses Node `fs` and is restricted to a single base directory — every requested path is resolved and verified to stay inside the base. Traversal attempts (`../`, absolute paths, drive prefixes) are rejected rather than resolved.
+
+```typescript
+/** Local filesystem connection details (development / companion app). */
+export interface LocalProviderConfig {
+  basePath: string;         // Restricted root directory; path traversal is rejected
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `basePath` | ✅ | Root directory the adapter is locked to. Falls back to `DOC_LOCAL_BASE_PATH`, then `./data/doc-local`, when empty. |
+
+```typescript
+const localConfig: LocalProviderConfig = {
+  basePath: './data/doc-local',
+};
+```
+
+<Aside type="caution" title="Not for production">
+The local adapter logs a warning when `NODE_ENV === 'production'`. Prefer S3 or WebDAV for real deployments. In production, local folders are better shared via the WebDAV companion app, which the module connects to as a standard WebDAV provider — no new adapter type required.
+</Aside>
+
+### The Adapter Factory
+
+Regardless of which provider type you save, the service decrypts the config, augments it with `type`, and asks the factory for a connected adapter. The `readOnly` flag is injected here, before any I/O — that is the single enforcement point for read-only mode (see below).
+
+```typescript
+export async function createAdapter(
+  type: ProviderType,
+  config: ProviderConfig,
+  options: CreateAdapterOptions = {}, // { readOnly?: boolean }
+): Promise<StorageAdapter> {
+  const AdapterClass = getAdapterClass(type); // s3|r2 → S3Adapter, webdav → WebDAVAdapter, local → LocalAdapter
+  const adapter = new AdapterClass();
+  (adapter as { readOnly: boolean }).readOnly = options.readOnly ?? false;
+  await adapter.connect({ ...(config as object), type } as ProviderConfig);
+  return adapter;
+}
+```
+
+<Aside type="note" title="All SDKs are always installed">
+The `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner`, and `webdav` packages are installed **regardless** of your adapter selection, and all three adapter files are always generated. This is a deliberate deviation (see [Install Prompts](#install-prompts) below) so the generated app type-checks no matter what you pick. The runtime constant `ENABLED_ADAPTERS` decides which provider types the "Add Provider" UI actually offers.
+</Aside>
+
+---
+
+## Credential Encryption Model
+
+Storage credentials are encrypted at the **application layer** with AES-256-GCM before they are written to `doc_storage_provider.config`. Even with full database access, an attacker cannot read credentials without `DOC_ENCRYPTION_KEY` — and that key lives only in the backend environment.
+
+### How the key is derived
+
+`DOC_ENCRYPTION_KEY` can be any non-empty string (a passphrase or a 32-character secret). It is hashed with **SHA-256 to produce exactly 32 bytes**, guaranteeing a valid 256-bit AES key whatever length you supply. If the variable is missing or blank, encryption and decryption throw immediately with an actionable error.
+
+```typescript
+const ALGORITHM = 'aes-256-gcm';
+const IV_BYTES = 12; // GCM standard nonce length
+
+function getKey(): Buffer {
+  const raw = process.env.DOC_ENCRYPTION_KEY;
+  if (!raw || raw.trim().length === 0) {
+    throw new Error('DOC_ENCRYPTION_KEY is not set. Storage credentials cannot be encrypted or decrypted. ...');
+  }
+  return crypto.createHash('sha256').update(raw, 'utf8').digest(); // 32 bytes
+}
+```
+
+### The stored payload format
+
+Each encrypted value is a single colon-delimited string of three hex fields — `iv:authTag:ciphertext`. A fresh random 12-byte IV is generated per encryption, and the GCM auth tag means any tampering with the stored ciphertext is detected on decrypt (it throws rather than returning corrupt data).
+
+```text
+<ivHex>:<authTagHex>:<cipherHex>
+```
+
+```typescript
+export function encrypt(plaintext: string): string {
+  const iv = crypto.randomBytes(IV_BYTES);
+  const cipher = crypto.createCipheriv(ALGORITHM, getKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return [iv.toString('hex'), authTag.toString('hex'), encrypted.toString('hex')].join(':');
+}
+```
+
+Provider configs are encrypted as a whole object via two helpers, so the entire credential blob is a single ciphertext column:
+
+```typescript
+export function encryptConfig(config: unknown): string {
+  return encrypt(JSON.stringify(config));
+}
+export function decryptConfig<T = Record<string, unknown>>(payload: string): T {
+  return JSON.parse(decrypt(payload)) as T;
+}
+```
+
+<Aside type="tip" title="Defence in depth">
+Application-layer encryption is one layer of the provider-delegated security model. Around it sit Cloudflare Zero Trust Access (auth, MFA, device posture, audit logs), Cloudflare Tunnel (encryption in transit, no port forwarding), and Neon PostgreSQL (encryption at rest and in transit). The encrypted `config` column means credentials stay protected even if the database layer is compromised. Credentials are never logged and are redacted from API responses.
+</Aside>
+
+---
+
+## Install Prompts
+
+`npx document-management init` asks two interactive prompts. Their answers feed `{{...}}` template variables baked into the generated code. The required encryption key is collected separately as a secret environment variable, not as a prompt.
+
+```bash
+npx document-management init
+```
+
+| Prompt | Type | Question | Options | Default |
+|--------|------|----------|---------|---------|
+| `storageAdapters` | select | Which storage providers do you want to support? | `s3` · `webdav` · `local` · `all` | `s3` |
+| `defaultRegion` | input | Default AWS/R2 region? | — | `ap-southeast-2` |
+
+The `defaultRegion` prompt is **only shown** when `storageAdapters` is `s3` or `all` (it has no meaning otherwise). The selection is baked into `document-management.config.ts`, where a runtime constant derives the active provider set:
+
+```typescript
+export type AdapterId = 's3' | 'webdav' | 'local';
+
+// Selected at init: 's3' | 'webdav' | 'local' | 'all'
+const SELECTED = '{{storageAdapters|s3}}';
+
+export const ENABLED_ADAPTERS: AdapterId[] =
+  SELECTED === 'all' ? ['s3', 'webdav', 'local'] : [SELECTED as AdapterId];
+```
+
+`ENABLED_ADAPTERS` controls which provider types the admin "Add Provider" UI offers and which the search aggregation iterates. Choosing `all` enables all three.
+
+### Deliberate deviations from the design spec
+
+The original design spec described `storageAdapters` as a **multi-select** and an `encryptionKey` **input prompt with auto-generate**. The bundled scaffold (v1.10.2) cannot support either as written, so this implementation makes two honest, documented changes:
+
+<Steps>
+
+1. **`storageAdapters` is a single select, not a multi-select.** The scaffold has no multi-select prompt type, and `{{#if}}` supports only truthiness and single-literal string equality — it cannot test array membership. So the prompt offers `s3 | webdav | local | all`, and `ENABLED_ADAPTERS` expands `all` to the full set at runtime. As a corollary, **all three adapter SDKs are always installed** (not conditionally), so the generated app type-checks no matter what you select.
+
+2. **The encryption key is a required secret env var, not a prompt.** The scaffold cannot execute code at prompt time (so it cannot auto-generate a value), and it writes env-var defaults literally with no `{{}}` substitution. So instead of an `encryptionKey` prompt, `DOC_ENCRYPTION_KEY` is collected interactively as a required secret environment variable during init. Generate it yourself:
+
+    ```bash
+    openssl rand -hex 32
+    ```
+
+</Steps>
+
+<Aside type="note" title="Net effect">
+You get the same end state as the spec intended — pick your adapters, set a region, supply a strong encryption key — but through mechanisms the scaffold can actually deliver reliably. The `storageAdapters` and `defaultRegion` prompts still drive `{{...}}` template substitution; the key is just handled as a secret rather than a generated prompt value.
+</Aside>
+
+---
+
+## Read-Only Mode
+
+For legal and evidence workflows, a provider can be marked **read-only** so the module can browse, preview, download, and reference its files but can never alter them. Read-only is enforced at the **adapter level** — every write operation throws `ReadOnlyError` *before* it reaches the storage API.
+
+Set `isReadOnly: true` when creating (or updating) the provider:
+
+```typescript
+const evidenceProvider: CreateProviderInput = {
+  name: 'Matter 2024-117 Evidence',
+  providerType: 's3',
+  isReadOnly: true,          // blocks upload, delete, move, copy, createFolder, deleteFolder
+  config: {
+    type: 's3',
+    bucket: 'evidence-2024-117',
+    region: 'ap-southeast-2',
+    accessKeyId: 'AKIA...',
+    secretAccessKey: '...',
+  },
+};
+```
+
+The flag flows from the provider row into `createAdapter(..., { readOnly })`, and each adapter guards its mutating methods:
+
+```typescript
+private assertWritable(): void {
+  if (this.readOnly) throw new ReadOnlyError();
+}
+
+async upload(p, file, metadata) {
+  this.assertWritable(); // throws ReadOnlyError before any I/O
+  // ...
+}
+```
+
+This guard sits on `upload`, `delete`, `move`, `copy`, `createFolder`, and `deleteFolder` in all three adapters (S3/R2, WebDAV, Local). Read operations — `listFolder`, `getFileInfo`, `download`, presigned previews — are unaffected.
+
+<Aside type="caution" title="Why enforce at the adapter, not the route">
+Enforcing at the adapter means **no code path** can mutate a read-only provider — not a route, not the public service interface, not a future feature that forgets to check. Combined with server-side SHA-256 `contentHash` computed at reference creation and the `doc_recent_access` audit trail (which doubles as a chain-of-custody log), this gives evidence files integrity guarantees that survive refactors.
+</Aside>
+
+<Aside type="tip" title="Pairs with content hashing">
+For evidence integrity, create document references with `computeHash: true` so a SHA-256 digest of the file is stored on `doc_document.contentHash` at reference time. You can later re-hash the file and compare to prove it has not been altered. See the [Database](/document-management/database/) page for the `doc_document` and `doc_recent_access` schemas.
+</Aside>
+
+---
+
+## Configuration Checklist
+
+Use this when standing up the module in a target app:
+
+- [ ] **`DOC_ENCRYPTION_KEY` set** — generated with `openssl rand -hex 32` and stored as a secret, never committed
+- [ ] **Upload limit reviewed** — `DOC_MAX_UPLOAD_SIZE` left at 50 MB or raised deliberately
+- [ ] **Thumbnail cache writable** — `DOC_THUMBNAIL_CACHE_DIR` exists and the process can write to it
+- [ ] **S3 region set** — `DOC_S3_DEFAULT_REGION` matches your bucket's region (when S3 is enabled)
+- [ ] **Local base path scoped** — `DOC_LOCAL_BASE_PATH` points at an intended directory (development only)
+- [ ] **Adapters selected** — `storageAdapters` chosen at init; `ENABLED_ADAPTERS` reflects what the UI should offer
+- [ ] **Custom endpoints for non-AWS** — R2/MinIO/Wasabi providers set `endpoint` (path-style is then inferred)
+- [ ] **Read-only on evidence** — providers holding evidence/legal files created with `isReadOnly: true`
+
+---
+
+## Next Steps
+
+- [Database](/document-management/database/) — the five `doc_` tables, including `doc_storage_provider.config` and `doc_document.contentHash`
+- [Integration](/document-management/integration/) — the public service interface, action hooks, and optional Structure registries
+- [Security](/document-management/security/) — the full provider-delegated security model end to end

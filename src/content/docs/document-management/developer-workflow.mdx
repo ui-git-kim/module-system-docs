@@ -1,0 +1,557 @@
+---
+title: Developer Workflow
+description: How to work on, build, version, and maintain the Document Management module repository
+sidebar:
+  order: 5
+---
+
+import { Aside, Tabs, TabItem, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+This page is for developers who **maintain the Document Management module itself** — not for app builders consuming it. It covers the local development loop, version management, scaffold updates, the common change scenarios you will hit, debugging, and the documentation push sequence.
+
+The mental model to keep front of mind: **this repository is a code generator, not the running app.** You edit *templates* — backtick-delimited TypeScript strings that hold the source of generated files — then build the module to an npm package, then run `npx document-management init` inside a starter-template app to generate real files from those templates. Nothing in `src/templates/` runs in this repo; it runs in the *target app* after generation.
+
+<Aside type="caution" title="Edit templates, never scaffold">
+You only ever edit `src/module.ts`, `src/templates/**`, `README.md`, `docs/**`, and `package.json`. Everything under `src/scaffold/` and `src/cli.ts` is shared infrastructure synced from the module starter — editing it locally will be overwritten by the next scaffold update and can break installation. If you find a scaffold bug, report it upstream.
+</Aside>
+
+---
+
+## Setup and the Development Loop
+
+### One-time setup
+
+<Steps>
+
+1. **Clone the repository**
+
+    ```bash
+    git clone <document-management-repo-url>
+    cd document-management
+    ```
+
+2. **Install dependencies**
+
+    ```bash
+    npm install
+    ```
+
+3. **Build once and link for local testing**
+
+    ```bash
+    npm run build      # compiles src/ to dist/ with tsup
+    npm link           # exposes `document-management` on your PATH globally
+    ```
+
+    `npm link` registers this package's `bin` (`document-management` → `./dist/cli.js`) into your global npm prefix, so `npx document-management <command>` resolves to your local build instead of the published version.
+
+</Steps>
+
+### The edit → build → test loop
+
+You change a template, rebuild the module, then regenerate (or update) the module inside a real starter-template app and inspect the output.
+
+<Steps>
+
+1. **Edit a template** under `src/templates/` (or `src/module.ts`).
+
+2. **Rebuild**
+
+    ```bash
+    npm run build
+    # or leave a watcher running in a second terminal:
+    npm run dev        # tsup --watch — rebuilds on every save
+    ```
+
+3. **Type-check** (catches template-string and module-definition type errors before you generate anything):
+
+    ```bash
+    npm run type-check     # tsc --noEmit
+    ```
+
+4. **Test inside a starter-template app.** In a separate checkout of an app built from the starter template:
+
+    <Tabs>
+      <TabItem label="Fresh install">
+
+    ```bash
+    cd ../my-starter-app
+    npx document-management init        # interactive: prompts + env vars
+    ```
+
+      </TabItem>
+      <TabItem label="Re-run / overwrite">
+
+    ```bash
+    npx document-management init --force   # overwrite existing generated files
+    ```
+
+      </TabItem>
+      <TabItem label="Update in place">
+
+    ```bash
+    npx document-management update             # re-sync templates + schema
+    npx document-management update --dry-run   # preview what WOULD change, write nothing
+    npx document-management update --skip-schema   # templates only, leave schema alone
+    ```
+
+      </TabItem>
+    </Tabs>
+
+5. **Inspect the generated output** in the target app — `frontend/src/features/document-management/` and `backend/src/features/document-management/` — and confirm it type-checks and runs there.
+
+</Steps>
+
+<Aside type="tip" title="Always start with --dry-run">
+When testing an `update`, run `npx document-management update --dry-run` first. It lists every file the scaffold would create, overwrite, or skip (based on content-hash comparison) without touching the working tree, so you can confirm your template change lands where you expect before committing the target app to it.
+</Aside>
+
+### CLI commands you will use while developing
+
+| Command | What it does |
+|---------|-------------|
+| `npx document-management init` | Fresh install — runs prompts, collects env vars, generates all files, writes schema, installs deps/shadcn components |
+| `npx document-management init --force` | Same as `init` but overwrites files that already exist |
+| `npx document-management update` | Re-applies templates and merges schema changes into an already-installed app |
+| `npx document-management update --dry-run` | Previews the update (create/overwrite/skip per file); writes nothing |
+| `npx document-management update --skip-schema` | Updates templates only; leaves the Prisma schema untouched |
+| `npx document-management uninstall` | Removes generated files and the module's schema models |
+| `npx document-management info` | Prints module id, name, version, feature list, env vars, and prompts — use it to verify your build picked up changes |
+
+<Aside type="note" title="`info` is your build sanity check">
+After `npm run build`, run `npx document-management info` and confirm the version and feature list match what you just edited in `src/module.ts`. If `info` shows a stale version, your `dist/` is out of date or `npm link` is pointing at a different build.
+</Aside>
+
+---
+
+## Version Management
+
+Every generated file carries a version header derived from the module's `version` field. Apps use that header — and a content-hash comparison — to detect when an update is available and which files actually changed. **If you change generated output but don't bump the version, consuming apps won't know an update exists.**
+
+### When to bump (and when not to)
+
+| You changed… | Bump required? |
+|--------------|----------------|
+| `src/templates/**/*.ts` (any template) | ✅ Yes |
+| `src/module.ts` (config, prompts, env vars, registrations) | ✅ Yes |
+| `README.md` | ❌ No |
+| `docs/**` | ❌ No |
+| `CLAUDE.md` | ❌ No |
+
+**Rule of thumb:** if the change affects the bytes of a generated file, bump the version.
+
+### Bump commands
+
+The version scripts call the same bumper; the `release:*` variants additionally create a git **tag** and are intended to push tags for publishing.
+
+```bash
+# Bump + commit only (no tag)
+npm run version:patch   # bug fix in a template          → x.x.X
+npm run version:minor   # new template / new feature      → x.X.0
+npm run version:major   # breaking change to generated API → X.0.0
+
+# Bump + commit + tag (for a release)
+npm run release:patch
+npm run release:minor
+npm run release:major
+```
+
+| Script | Underlying command | Commits? | Tags? |
+|--------|-------------------|----------|-------|
+| `version:patch\|minor\|major` | `bump-module-version <level> --commit` | ✅ | ❌ |
+| `release:patch\|minor\|major` | `bump-module-version <level> --commit --tag` | ✅ | ✅ |
+
+<Aside type="caution" title="Don't confuse module version with scaffold version">
+`version:*` / `release:*` bump the **module** version (the number consumers see). The separate `scaffold:version:*` scripts bump the bundled **scaffold** infrastructure version and are only relevant when syncing the shared scaffold — you will rarely run them by hand.
+</Aside>
+
+### Why the bump matters
+
+<CardGrid>
+  <Card title="Version headers" icon="document">
+    Each generated file is stamped with the module version. The stamp is how an installed app knows which version produced its files.
+  </Card>
+  <Card title="Update detection" icon="rocket">
+    `update` compares the installed module version against the published one to decide whether to offer an update at all.
+  </Card>
+  <Card title="Hash comparison" icon="approve-check">
+    Within an update, each file's content hash is compared so untouched files are skipped and only genuinely changed files are rewritten — preserving any local edits to files you didn't change.
+  </Card>
+</CardGrid>
+
+---
+
+## Scaffold Updates
+
+The scaffold (everything under `src/scaffold/`, `src/cli.ts`, and supporting build scripts) is shared across all modules and maintained upstream in the module starter. You pull improvements down rather than editing those files directly.
+
+```bash
+npm run scaffold:check    # update-scaffold --preview — show upstream changes, write nothing
+npm run scaffold:update   # update-scaffold --merge — apply the upstream scaffold changes
+```
+
+<Steps>
+
+1. **Preview first.** Run `npm run scaffold:check` to see which scaffold files have upstream changes. Nothing is written.
+
+2. **Ensure a clean working tree.** `scaffold:update` requires no uncommitted changes — commit or stash your template work first, so a merge conflict is unambiguously between *your tree* and *upstream scaffold*.
+
+3. **Merge.** Run `npm run scaffold:update`. It updates the scaffold infrastructure in place.
+
+4. **Resolve conflicts, if any.** Conflicts should only occur in scaffold files (which you should not have edited). If you see a conflict in `src/templates/` or `src/module.ts`, that means something edited a file it shouldn't have — investigate before resolving.
+
+5. **Rebuild and re-test** with `npm run build` and an `init`/`update --dry-run` against a sample app.
+
+</Steps>
+
+| Updated by `scaffold:update` | Not touched |
+|------------------------------|-------------|
+| `src/scaffold/**` (init, update, types, utils, index) | `src/module.ts` |
+| `src/cli.ts` | `src/templates/**` |
+| Build/release scripts under `scripts/` | `README.md`, `docs/**`, `CLAUDE.md` |
+
+<Aside type="danger" title="Clean tree required">
+`scaffold:update` will refuse to run (or will produce a messy merge) against a dirty tree. Always commit your template changes before pulling scaffold updates.
+</Aside>
+
+---
+
+## Common Development Scenarios
+
+Concrete steps for the changes you will make most often. Every one of these touches `src/templates/**` or `src/module.ts`, so **every one ends with a version bump**.
+
+### Add a new storage adapter
+
+All adapter SDKs are always installed and all three adapters are always generated, so the target app type-checks regardless of the `storageAdapters` selection. To add a fourth adapter type:
+
+<Steps>
+
+1. **Add the adapter template** in `src/templates/backend/adapters.ts`, implementing the `StorageAdapter` interface (`connect`, `disconnect`, `testConnection`, `listFolder`, `getFileInfo`, `exists`, `download`, `upload`, `delete`, `move`, `copy`, `createFolder`, `deleteFolder`, plus optional `getPreviewUrl`, `getThumbnailUrl`, `search`).
+
+2. **Wire it into `createAdapter`** in the adapters factory so `createAdapter(type, config, { readOnly })` returns it. Honour `readOnly` by throwing `ReadOnlyError` from write operations at the adapter level.
+
+3. **Register the file** in `src/module.ts` under `backend.templates`:
+
+    ```typescript
+    'adapters/ftp.adapter.ts': backend.FTP_ADAPTER_TEMPLATE,
+    ```
+
+4. **Add its SDK** to `backend.dependencies` so it's always installed.
+
+5. **Extend `ENABLED_ADAPTERS` / `getSelectableProviderTypes()`** logic in the config template and add the new value to the `storageAdapters` prompt options in `src/module.ts`.
+
+6. **Bump, build, and test** with `npx document-management init` selecting the new adapter.
+
+</Steps>
+
+### Add a new frontend page or component
+
+<Steps>
+
+1. **Add the template constant** to `src/templates/frontend/` (e.g. a new `MY_PAGE` export).
+
+2. **Register the file** in `src/module.ts` under `frontend.templates`:
+
+    ```typescript
+    'pages/MyNewPage.tsx': frontend.MY_NEW_PAGE,
+    ```
+
+3. **If it's a route**, add it to `frontend.routes.protectedRoutes` with `path` and `element`.
+
+4. **If it needs a directory** that doesn't exist yet, add it to `frontend.directories`.
+
+5. **If it uses a new shadcn primitive**, add the component name to `frontend.shadcnComponents`.
+
+6. **Export it** from the frontend barrel (`index.ts`) if other module files import it.
+
+</Steps>
+
+### Add a new backend endpoint
+
+<Steps>
+
+1. **Add the route** in the routes template (`document-management.routes.ts`) under the `/api/v1/document-management` base path.
+
+2. **Add the controller handler** and the **service method** in their respective templates.
+
+3. **Add a Zod schema** in the validation template if the endpoint takes a body or query params.
+
+4. **Use `.js` extensions** on every relative import in backend templates (see the debugging section — this is the single most common backend mistake).
+
+</Steps>
+
+### Add a new database table
+
+<Steps>
+
+1. **Add the model** to `src/templates/schema.ts`. Keep it self-contained: plain string foreign keys with `@@index`, **never** `@relation`. Follow the `doc_` prefix convention.
+
+2. **Add the model name** to `schema.modelNames` in `src/module.ts` so uninstall knows to remove it:
+
+    ```typescript
+    modelNames: [
+      'doc_storage_provider',
+      'doc_document',
+      'doc_node_link',
+      'doc_folder_bookmark',
+      'doc_recent_access',
+      'doc_my_new_table',   // ← add here
+    ],
+    ```
+
+3. **Test the schema merge** with `npx document-management update --dry-run` to confirm the model lands without colliding with existing app models.
+
+</Steps>
+
+### Add a new registry registration
+
+<Steps>
+
+1. **Write the registration template.** For typed starter-template registries (`dashboard`, `preferences`, `adminPage`) add an entry to `frontend.registrations` with its `type`, `path`, and `content`. For other registries (navigation, structure tabs/widgets/cards/actions/sidebar) add the file to `frontend.templates` and import it as a **side-effect import** in the barrel.
+
+2. **Side-effect imports come first** in `index.ts`, before any public exports:
+
+    ```typescript
+    // Registrations FIRST (side-effect imports)
+    import './navigation.registration';
+    // import './registrations/structure-tabs.registration'; // ← uncomment when Structure is installed
+
+    // Then public exports
+    export { documentManagementRoutes } from './routes.config';
+    ```
+
+3. **Structure registrations stay commented out** in the generated barrel by default — the consuming app uncomments them once the Structure module is present.
+
+</Steps>
+
+### Add an environment variable
+
+Add it to `envVariables.backend` in `src/module.ts`. Use `required: true` + `secret: true` for credentials, `default` for optional tunables, and `when` to make it conditional on a prompt answer:
+
+```typescript
+{
+  name: 'DOC_NEW_SETTING',
+  description: 'What it controls (and how to generate it, if secret)',
+  default: 'some-default',
+  when: (answers) => answers.storageAdapters === 's3' || answers.storageAdapters === 'all',
+},
+```
+
+<Aside type="caution" title="Env defaults are literal — no substitution">
+Environment-variable defaults are written **literally**; `{{...}}` template substitution does **not** run in env defaults, and the scaffold cannot execute code at prompt time. That is why `DOC_ENCRYPTION_KEY` is a required interactive secret (generate with `openssl rand -hex 32`) rather than an auto-generated default.
+</Aside>
+
+### Add a prompt variable
+
+Add to the `prompts` array in `src/module.ts`. Prompt answers feed `{{variableName}}` substitution in templates (with `{{var|default}}` fallback). The bundled scaffold has **no multi-select** prompt type — that's why adapter selection is a single `select` with an `all` option, and `ENABLED_ADAPTERS` derives the active set at runtime in `document-management.config.ts`.
+
+```typescript
+{
+  id: 'storageAdapters',
+  type: 'select',
+  question: 'Which storage providers do you want to support?',
+  options: [
+    { value: 's3', label: 'S3 / Cloudflare R2' },
+    { value: 'webdav', label: 'WebDAV' },
+    { value: 'local', label: 'Local filesystem' },
+    { value: 'all', label: 'All adapters' },
+  ],
+  default: 's3',
+},
+```
+
+Reference the answer in a template as `{{storageAdapters|s3}}`. Remember `{{#if}}` supports only truthiness and single-literal string equality — no array membership.
+
+### Add a module dependency
+
+If a change makes the module require another module, declare it with `requiredModules` in `src/module.ts` (this is a **module-to-module** dependency, distinct from the npm-package `frontend.dependencies` / `backend.dependencies` arrays):
+
+```typescript
+export const moduleDefinition: ModuleDefinition = {
+  id: 'document-management',
+  requiredModules: ['structure'],   // installed first; validated at install time
+  // ...
+};
+```
+
+Document Management is **standalone by design** — Structure integration is detected at runtime via `serviceRegistry.getOptional('structure')`, so it does **not** declare `requiredModules`. Only add this if a future change makes Structure mandatory.
+
+### Add a lifecycle hook
+
+Backend action subscriptions live in the action registration template (`action.registration.ts`) and are wired as a side-effect import in the backend barrel. The module already subscribes (at order 20, inert if Structure is absent):
+
+| Structure hook | Effect on Document Management data |
+|----------------|-----------------------------------|
+| `structure.node.deleted` | Removes `doc_node_link` rows for the node |
+| `structure.node.archived` | Sets linked `doc_document.status = archived` |
+| `structure.node.moved` | Nulls `lastSyncedAt` on linked documents |
+
+The module also **fires** its own action hooks other modules can subscribe to — `documents.document.linked`, `documents.document.unlinked`, `documents.document.uploaded`, `documents.document.deleted`, `documents.provider.connected`, `documents.provider.disconnected`. To add a new fired hook, dispatch it from the relevant service method and document its payload.
+
+---
+
+## Debugging and Troubleshooting
+
+### Inspecting generated output
+
+The fastest way to debug a template is to generate from it and read the result in a target app:
+
+```bash
+npm run build
+cd ../my-starter-app
+npx document-management init --force
+# then read the generated files:
+#   frontend/src/features/document-management/
+#   backend/src/features/document-management/
+```
+
+Use `npx document-management update --dry-run` to see *which* files a change would rewrite without actually writing them, and `npx document-management info` to confirm the built module's version, prompts, and env vars.
+
+### The critical escaping rule (backticks and `${...}`)
+
+Every template is itself a **backtick-delimited TypeScript template literal**. So any backtick or `${...}` that should appear in the *generated* code must be escaped in the *template* — otherwise it terminates the template string early or gets evaluated at build time instead of being emitted verbatim.
+
+<Tabs>
+  <TabItem label="Wrong">
+
+```typescript
+// Inside a template string — these break the build or get evaluated now:
+export const MY_TEMPLATE = `
+  const url = `https://api/${path}`;   // ← unescaped backtick ENDS the template here
+  log.info(`size=${size}`);            // ← ${size} evaluates at build time, not runtime
+`;
+```
+
+  </TabItem>
+  <TabItem label="Right">
+
+```typescript
+// Escape every backtick and every ${ that belongs to the GENERATED code:
+export const MY_TEMPLATE = `
+  const url = \`https://api/\${path}\`;   // emits a real template literal
+  log.info(\`size=\${size}\`);             // emits ${'$'}{size} literally
+`;
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="caution" title="Two different `${...}` meanings">
+Only escape the `${...}` that belongs to the **generated** file. The scaffold's own `{{variableName}}` placeholders are a *separate* substitution syntax and must **not** be escaped — they're plain text that the scaffold replaces at init. Mixing the two up is a frequent source of broken output.
+</Aside>
+
+### Common template-placeholder mistakes
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `MyFeature` / `my-feature` appears literally in output | You hardcoded a name instead of using the placeholder, or used the wrong case variant |
+| A `{{variable}}` shows up unreplaced in generated files | Typo in the prompt `id`, or the prompt's `when` condition skipped it so it had no value and no `{{var|default}}` fallback |
+| Conditional block always (or never) renders | `{{#if}}` only does truthiness and single-literal string equality — it has no array-membership test |
+| Build fails with "Unterminated template literal" | An unescaped backtick inside a template string (see escaping rule above) |
+
+### Build errors
+
+```bash
+npm run type-check   # tsc --noEmit — catches type errors in module.ts and template typings
+npm run build        # tsup — fails on unterminated/invalid template strings
+```
+
+Because templates are strings, the TypeScript compiler **cannot** check the code *inside* them — `type-check` only validates `module.ts` and the template *exports'* types. The only way to type-check generated code is to generate it into a target app and run that app's `tsc`. Build (`tsup`) failures are almost always an escaping problem inside a template literal.
+
+### Verifying `.js` extensions in backend imports
+
+Backend templates emit ESM, so **every relative import in a backend template must end in `.js`** even though the source is `.ts`:
+
+```typescript
+// ✅ Correct (in a backend template)
+import { documentManagementService } from './document-management.service.js';
+import type { ProviderType } from './document-management.types.js';
+
+// ❌ Wrong — will fail at runtime in the target app
+import { documentManagementService } from './document-management.service';
+```
+
+A missing `.js` won't be caught by this repo's build (it's inside a string); it only surfaces as a module-resolution error when the *generated app* runs. Grep your backend templates for relative imports before bumping:
+
+```bash
+# Find backend-template relative imports missing a .js extension
+grep -rnE "from '\.\.?/[^']*[^s]'" src/templates/backend/
+```
+
+### File headers
+
+Every generated file starts with the standard banner header. Keep it on new templates:
+
+```typescript
+// ========================================================================
+// FILE: backend/src/features/document-management/<filename>.ts
+// PURPOSE: One-line description of what this file does
+// ========================================================================
+```
+
+---
+
+## Documentation Workflow
+
+The `docs/` directory is a **git submodule** shared across the starter template, module starter, and every module. Because it's a submodule, doc changes are committed and pushed in the submodule first, then the parent repo records the new submodule pointer in a second commit.
+
+<Aside type="note" title="Docs changes don't need a version bump">
+Editing `docs/**`, `README.md`, or `CLAUDE.md` does not change generated output, so no `version:*` bump is required. Only template or `module.ts` changes warrant a bump.
+</Aside>
+
+<Steps>
+
+1. **Edit the page(s)** under `docs/src/content/docs/document-management/`.
+
+2. **Commit and push inside the submodule:**
+
+    ```bash
+    cd docs
+    git add .
+    git commit -m "Docs: describe the change"
+    git push
+    ```
+
+3. **Record the new submodule pointer in the parent repo:**
+
+    ```bash
+    cd ..
+    git add docs
+    git commit -m "docs: update docs submodule"
+    git push
+    ```
+
+</Steps>
+
+<Aside type="caution" title="Push the submodule first">
+If you push the parent repo's submodule-pointer commit before pushing the `docs` submodule itself, anyone cloning the parent will get a pointer to a commit that doesn't exist on the docs remote. Always `cd docs && git push` **before** `git add docs` in the parent.
+</Aside>
+
+---
+
+## Before You Finish Checklist
+
+<CardGrid>
+  <Card title="Bumped?" icon="approve-check">
+    `npm run version:patch` (or minor/major) for ANY change to `src/templates/**` or `src/module.ts`. Not for docs/README.
+  </Card>
+  <Card title="Built?" icon="rocket">
+    `npm run build` and `npm run type-check` pass; `npx document-management info` shows the new version.
+  </Card>
+  <Card title="Generated cleanly?" icon="document">
+    `npx document-management update --dry-run` in a target app shows the expected files; backend imports end in `.js`.
+  </Card>
+  <Card title="Docs pushed?" icon="list-format">
+    If docs changed: pushed the `docs` submodule, then committed the submodule pointer in the parent.
+  </Card>
+</CardGrid>
+
+- [ ] **Version bumped** for template / `module.ts` changes (`version:*` or `release:*`)
+- [ ] **No scaffold files edited** — only templates and `module.ts`
+- [ ] **File headers** present on every new template
+- [ ] **`.js` extensions** on all backend-template relative imports
+- [ ] **Placeholders** (`my-feature`, `MyFeature`, `myFeature`, `my_feature`) used instead of hardcoded names
+- [ ] **Backticks and `${...}` escaped** inside template literals
+- [ ] **Registries used** — generated code extends via registries, never edits core starter files
+- [ ] **`npm run build` passes** with no errors
+- [ ] **Docs submodule pushed** (if `docs/**` changed), then parent pointer committed
