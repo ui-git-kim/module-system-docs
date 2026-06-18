@@ -1,0 +1,520 @@
+---
+title: Thesaurus
+description: The admin-global colour thesaurus — DB-backed data model, idempotent ingest rules, derived views, and the canonical JSON import format with worked examples.
+sidebar:
+  order: 9
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The **Colour Thesaurus** is the module's admin-global reference of named colours — a dictionary that maps working hexes to names, alt names, design-system scale memberships (Tailwind, Material, Open Color, CSS, BS381, XKCD…), and editorial metadata (meaning, psychology, origin). It powers the name readouts on the [Colour Profile](/colour-palette/colour/)'s Analyse tab and the toolbar autocomplete. Reads are public within the app; writes are admin-only.
+
+<Aside type="note">
+This page is the combined reference for the thesaurus: the **data model** (built), the **ingest rules**, and the **import format** for seeding it. The v2 DB-backed model replaced the original client-side store; a short list of remaining refinements is at the [end of the page](#status--remaining-work).
+</Aside>
+
+## Why the v2 Model
+
+The v1 thesaurus lived in client-side Zustand storage and coupled two orthogonal concepts — **source provenance** and **editorial grouping** — into the same `sources[]` array. That coupling is why a source row with its own hex (BS381 Night at `#282b2f` vs XKCD night blue at `#040348`) didn't surface cleanly as an alt colour, why design-system scales needed special-cased hex matching, and why import dedupe had to walk tuples instead of doing a flat lookup.
+
+v2 splits the concepts into four tables, moves the store to the backend as admin-global reference data, and derives every "alt names / alt colours" display list from relationships rather than storing them redundantly.
+
+### Goals
+
+1. **One place per concept.** A colour's *source provenance* (where it was imported from) lives on the entry. A colour's *editorial grouping* (what family it belongs to) lives on the group. A source is a namespace with its own config, not a tag squeezed into the entry row.
+2. **Admin-global, read-only for users.** The thesaurus is reference data like a dictionary. Any user reads it; only admins write.
+3. **Idempotent imports.** Re-running the same import produces no duplicates and no mutations to entries or groups.
+4. **Ambiguous imports handled structurally.** When an incoming record's hex matches one group and its name matches a different group, the resolution is a schema-level many-to-many link rather than a separate chain table.
+
+## The Four Tables
+
+<Aside type="note">
+  All tables follow the module-starter database conventions: `snake_case` names with a module prefix, `camelCase` fields, plain `String` foreign key fields with companion `@@index`, **no** `@relation` directives. Integrity between rows is enforced in the service layer.
+</Aside>
+
+### `colour_name_source`
+
+Namespace rows — one per source the thesaurus knows about (`bs381`, `xkcd`, `tailwind`, `material`, `css`, `open-color`, brand-specific sources). Each carries a default `isDesignSystem` classification which entries inherit and may override.
+
+```prisma
+model colour_name_source {
+  id             String   @id @default(cuid())
+  name           String   @unique        // lowercased key
+  displayName    String                  // original casing
+  isDesignSystem Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+```
+
+### `colour_name_entry`
+
+One row per `(sourceId, sourceCode, hex)` tuple — every imported colour record gets an entry. Hex is **indexed but not unique**: three sources can all describe `#f5f5f5` with their own names and their own source codes, giving three entries that later share a group.
+
+```prisma
+model colour_name_entry {
+  id             String   @id @default(cuid())
+  hex            String
+  oklchL         Float?
+  oklchC         Float?
+  oklchH         Float?
+  name           String
+  nameNorm       String
+  altNames       String[] @default([])
+  sourceId       String
+  sourceCode     String?
+  isDesignSystem Boolean  @default(false)
+  scaleKey       String?
+  scaleStep      Int?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([hex])
+  @@index([nameNorm])
+  @@index([sourceId])
+  @@index([scaleKey, scaleStep])
+  @@unique([sourceId, sourceCode, hex])
+}
+```
+
+**Why OKLCH fields.** Tailwind 4 and Open Color v2 define their palettes natively in OKLCH and hex is a derived projection. Preserving the native OKLCH keeps round-trips lossless — we never reverse-engineer OKLCH from hex when the source provided it directly. Fields stay null for sources that specified hex only; a later import from an OKLCH-native source backfills them on the same entry.
+
+**Why `altNames[]` on the entry.** British Standards commonly lists two labels on a single row (`BS381 642 — "Night" / "Night Blue"`). Both belong on the one entry rather than forcing a synthetic sibling. These are source-provided aliases for the same hex, distinct from editorial alt names (which are derived from other entries in the group).
+
+**Why `scaleKey` + `scaleStep`.** Design-system sources come in ladders. Tailwind `neutral-100` is a sibling of `neutral-50`, `neutral-200`, …, `neutral-950`. The `scaleKey` (e.g. `"tailwind:neutral"`) and `scaleStep` (`100`) give the Design Systems tab a trivial query:
+
+```ts
+await prisma.colour_name_entry.findMany({
+  where: { scaleKey: 'tailwind:neutral' },
+  orderBy: { scaleStep: 'asc' },
+});
+```
+
+Both fields stay null for editorial sources (XKCD, BS381, CSS1).
+
+### `colour_name_group`
+
+Editorial grouping — what family a set of colours belongs to. The master name and master hex are **pointers to entries**, admin-selectable. They're usually the same entry but can diverge when the name canonical hex and the visual canonical hex come from different sources.
+
+```prisma
+model colour_name_group {
+  id                 String   @id @default(cuid())
+  masterNameEntryId  String?  @unique
+  masterHexEntryId   String?  @unique
+  deprecatedNames    String[] @default([])
+  meaning            String[] @default([])
+  attributes         String[] @default([])
+  psychologySummary  String?
+  psychologyPositive String[] @default([])
+  psychologyNegative String[] @default([])
+  origin             String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+```
+
+**What isn't on the group.** Master name, alt names, alt colours — none of them are stored. They're all derived at read time from the group's primary members:
+
+- `masterName` = `entries.find(e => e.id === group.masterNameEntryId).name`
+- `masterHex` = `entries.find(e => e.id === group.masterHexEntryId).hex`
+- `altNames` = union of every primary member's `name` and `altNames[]`, minus the master-name entry's contribution, de-duplicated case-insensitively
+- `altColours` = unique hexes among primary members, minus the master hex
+
+The single source of truth is always the entry rows. The group never has to keep a redundant cache in sync.
+
+### `colour_name_entry_group`
+
+Many-to-many membership with a reason. This replaces what would otherwise be a "chain table" between groups — because the ambiguity lives on a specific entry, not on the whole group.
+
+```prisma
+model colour_name_entry_group {
+  id        String   @id @default(cuid())
+  entryId   String
+  groupId   String
+  reason    String     // "primary" | "hex-match" | "name-match" | "manual"
+  createdAt DateTime @default(now())
+
+  @@unique([entryId, groupId])
+  @@index([entryId])
+  @@index([groupId])
+  @@index([groupId, reason])
+}
+```
+
+**Reason values:**
+
+| Reason | When it's written | Effect on render |
+|---|---|---|
+| `primary` | Every entry has exactly one. Written on import rules 2, 3, 4. | The entry appears as a main member of this group — contributes to altNames / altColours / master pointer candidates. |
+| `hex-match` | Ambiguous import: incoming hex matches this group but the primary link went elsewhere (to the name-matched group). | The entry appears in a secondary "Also referenced here" block on the group's profile. |
+| `name-match` | Symmetric partner to `hex-match`. Written on the *other* group in the ambiguous case when primary went by hex. | Same as above — secondary block. |
+| `manual` | Admin hand-linked the entry to an additional group via the UI. | Same as above. |
+
+**Invariant:** every entry has exactly one row with `reason='primary'`. Enforced in the service layer (a guard on every write), not at the DB level, because Postgres doesn't allow partial unique indexes through Prisma's declarative schema alone. The invariant is documented and tested.
+
+## Ingest Rules
+
+For each incoming record `{ hex, name, altNames?, sourceKey, sourceCode, oklch? }`:
+
+### Rule 1 — exact row match
+
+An entry with the same `(sourceId, sourceCode, hex)` already exists.
+→ **Upsert:** update `name`, `altNames[]`, `oklch*` fields if changed. Membership rows untouched.
+
+### Rule 2 — hex match only
+
+No exact row match, but an entry at this hex exists (via any source).
+→ **Create** a new entry.
+→ Add `colour_name_entry_group { entryId: new.id, groupId: matchedEntry.primaryGroupId, reason: 'primary' }`.
+
+### Rule 3 — name match only
+
+No exact row match and no hex match, but an entry with this `nameNorm` exists.
+→ **Create** a new entry.
+→ Add `colour_name_entry_group { entryId: new.id, groupId: matchedEntry.primaryGroupId, reason: 'primary' }`.
+
+### Rule 4 — no match
+
+No matches anywhere.
+→ **Create** a new group.
+→ **Create** a new entry.
+→ Add `colour_name_entry_group { entryId: new.id, groupId: new.groupId, reason: 'primary' }`.
+→ Set `group.masterNameEntryId = new.id` and `group.masterHexEntryId = new.id`.
+
+### Rule 5 — ambiguous
+
+Incoming hex matches an entry in group `X`; incoming name matches an entry in group `Y`; `X ≠ Y`.
+→ **Hex wins.** Create the entry and link it primary to `X`.
+→ Also add `colour_name_entry_group { entryId: new.id, groupId: Y, reason: 'name-match' }` so the name collision is recorded without forcing a merge.
+→ Surface both groups in the import report so the admin can resolve (merge, split, or accept).
+
+### Normalisation
+
+- **Hex:** lowercase, strip leading `#`, re-prefix. `#FF00aa` and `ff00aa` collide on lookup.
+- **Name:** lowercase, trim, collapse whitespace runs to a single space. Punctuation is preserved (so `Grey 100` and `Grey-100` stay distinct — different design systems use different conventions).
+
+### Transaction scope
+
+Each record ingests inside a `withTransaction` block. Multi-record imports run the batch as a single transaction so a mid-import failure rolls back cleanly. Reports collect per-record outcomes (`created`, `merged-by-hex`, `merged-by-name`, `ambiguous`, `upserted`, `failed`) for the admin UI.
+
+## Derived Views
+
+All the reading surfaces — the profile page's Names card, the toolbar autocomplete, the Design Systems tab — compute from the base tables rather than reading stored summaries.
+
+### Names card (by working hex)
+
+```ts
+// 1. Find entries at this hex. Usually 1; may be several when multiple
+//    sources describe the same hex.
+const entriesAtHex = await prisma.colour_name_entry.findMany({
+  where: { hex: workingHex },
+});
+
+// 2. For each, pull its primary group plus all entries in that group.
+//    Pick the featured entry — the one whose group has it as master
+//    name, else the one whose group has it as master hex, else the
+//    first by createdAt.
+
+// 3. Derived altNames = union of (primary member.name + primary
+//    member.altNames[]), minus the master-name entry's contribution,
+//    lowercased-dedupe.
+
+// 4. Derived altColours = unique hex values among primary members at
+//    a different hex to the master hex, with source/displayName hints
+//    for the render.
+
+// 5. Design system row = primary members whose source.isDesignSystem
+//    (or entry.isDesignSystem override) is true and whose hex equals
+//    the working hex. Rendered inline like "css whitesmoke, tailwind
+//    neutral-100, material grey-100".
+```
+
+### Toolbar autocomplete (by text query)
+
+```ts
+// Simple prefix match on nameNorm:
+await prisma.colour_name_entry.findMany({
+  where: { nameNorm: { startsWith: queryNorm } },
+  orderBy: [
+    // Exact match first, then prefix, then length.
+    { nameNorm: 'asc' },
+  ],
+  take: 16,
+});
+```
+
+Trigram or tsvector indexes are a future upgrade if the seed grows past tens of thousands of entries; prefix match + btree is sufficient for v1.
+
+### Design Systems tab (by group, by scale)
+
+```ts
+// The scale a given entry belongs to:
+const siblings = entry.scaleKey
+  ? await prisma.colour_name_entry.findMany({
+      where: { scaleKey: entry.scaleKey },
+      orderBy: { scaleStep: 'asc' },
+    })
+  : [];
+```
+
+## Auth Model
+
+- **Reads** — public within the app; no role gate. The thesaurus is reference data.
+- **Writes** — admin role only, enforced at the route layer via the existing admin gate used by the thesaurus admin page.
+- **Workspace scope** — none. All four tables are module-global. There is no `workspaceId` column anywhere.
+
+## Merge, Split, Rename
+
+Editorial operations on groups that the admin UI surfaces:
+
+- **Merge** `groupA` → `groupB`: update every `colour_name_entry_group` row with `groupId = groupA` to `groupId = groupB`, de-duping on `(entryId, groupId)` by keeping the stronger reason (`primary` over others). Union the editorial string arrays. Delete `groupA`.
+- **Split**: move an entry's primary membership to a new group. Create the new group, flip one row's `groupId`, optionally seed the new group's master pointers from that entry.
+- **Rename** the group's master name or master hex: repoint `masterNameEntryId` / `masterHexEntryId` to a different entry that is already a primary member of this group. The service validates membership before accepting.
+
+All three run inside `withTransaction`.
+
+---
+
+## Import Format
+
+The thesaurus admin imports through `/api/v1/colour/thesaurus/ingest`. The Import tab accepts JSON in the **editorial export shape** — `{ entries: [...] }` with each entry carrying its source records and editorial metadata in one place. This section documents the exact shape so seed files round-trip cleanly through every code path the importer touches.
+
+<Aside type="tip" title="Downloadable starter template">
+  Grab <a href="/templates/thesaurus-template.json" download>thesaurus-template.json</a> as a starting point. It has the full top-level structure, two worked entries showing every optional field, and the comment-ish `notes` array where you can document your own provenance. Delete the examples and replace them with your data.
+</Aside>
+
+### Top-level structure
+
+```json
+{
+  "metadata": {
+    "source": "AS 2700 — Australian Colour Standard",
+    "sourceYear": 1985,
+    "authority": "Standards Australia",
+    "licence": "(notes for your own reference; ignored on import)",
+    "entryCount": 206,
+    "collectedOn": "2026-04-22",
+    "notes": ["any free-form admin notes here"]
+  },
+  "sourceConfigs": {
+    "tailwind": { "isDesignSystem": true },
+    "material": { "isDesignSystem": true },
+    "as2700":   { "isDesignSystem": false }
+  },
+  "entries": [
+    /* see below */
+  ]
+}
+```
+
+| Top-level key | Required | Used for |
+|---|---|---|
+| `metadata` | optional | Admin-only documentation. Ignored by the importer — keep it for your own provenance trail. |
+| `sourceConfigs` | optional | Per-source defaults. `isDesignSystem: true` cascades into the source upsert so every entry from that namespace inherits the flag. Per-source toggles in the Sources tab still win after import. |
+| `entries` | ✅ | The only field the importer actually reads. |
+
+<Aside type="tip">
+  The Import tab also accepts a bare array of entries (`[{...}, {...}]`) and the low-level `{ records: [...] }` ingest shape, but the editorial wrapper is the canonical format and gets the editorial-metadata merge phase that the bare-records path skips.
+</Aside>
+
+### Entry shape
+
+```json
+{
+  "masterName": "Rich Blue",
+  "altNames": ["B11"],
+  "deprecatedNames": [],
+  "hex": "#2b3770",
+  "oklch": { "l": 0.359, "c": 0.099, "h": 271.63 },
+
+  "sources": [
+    { "source": "as2700", "code": "B11", "name": "Rich Blue", "hex": "#2b3770" }
+  ],
+
+  "meaning": ["authority", "depth", "trust"],
+  "attributes": ["cool", "deep", "corporate"],
+  "psychologySummary": "Reads as authoritative without being severe.",
+  "psychologyPositive": ["confident", "stable"],
+  "psychologyNegative": ["distant", "cold"],
+  "origin": "Originally specified for Australian government signage in 1985.",
+
+  "isDesignSystem": false
+}
+```
+
+#### Field-by-field
+
+| Field | Required | Lands on | Notes |
+|---|---|---|---|
+| `masterName` | ✅ | Entry's `name` (the display label, capitalisation preserved) | The display name your admin sees. Source-specific labels go in `sources[].name` and become altNames automatically when they differ. |
+| `hex` | ✅ | Entry's `hex` if a source doesn't override | `#rrggbb`, lowercase preferred. |
+| `sources[]` | ✅ | One ingest record per source — drives the `(sourceId, sourceCode, hex)` dedupe key | At least one. See source shape below. |
+| `altNames[]` | optional | Entry-level altNames (searchable aliases) | For names like BS381 codes, brand variants, or stylised spellings — anything you want autocomplete to find. |
+| `deprecatedNames[]` | optional | **Group** field — historical aliases not tied to a live entry | E.g. `"Mulbery"` (sic) for a renamed colour. Survives re-import via union merge. |
+| `oklch` | optional | Entry's OKLCH (preserved on the master-hex record only) | Skip for hex-only sources; the backend accepts null. |
+| `meaning[]` / `attributes[]` / `psychologySummary` / `psychologyPositive[]` / `psychologyNegative[]` / `origin` | optional | **Group** fields — applied via the editorial-merge phase | Lives on the group, not the entry. Re-imports union, never overwrite. |
+| `isDesignSystem` | optional | Entry-level override of the source's default | Use for one-off cases (e.g. a brand colour that happens to be in a design-system source). |
+
+### Source shape
+
+```json
+{
+  "source": "as2700",
+  "code": "B11",
+  "name": "Rich Blue",
+  "hex": "#2b3770",
+  "scaleKey": null,
+  "scaleStep": null
+}
+```
+
+| Field | Required | Used for |
+|---|---|---|
+| `source` | ✅ | Lowercased namespace key. Auto-creates a `colour_name_source` row if new. |
+| `code` | optional | Source-local identifier (`"B11"`, `"neutral-100"`, `"642"`). Combined with `source` and `hex` for the dedupe key — re-importing the same `(source, code, hex)` upserts in place. |
+| `name` | optional | Source's own label. If it differs from `masterName`, gets pushed to the entry's `altNames` automatically. |
+| `hex` | optional | Defaults to entry-level `hex`. Set when this source's hex differs from the master. |
+| `scaleKey` | optional | For design-system scales — `"tailwind:neutral"`, `"material:grey"`. Drives the Design Systems sibling lookup. |
+| `scaleStep` | optional | Position in the scale — `100`, `200`, `500`, `950`. Orders siblings on the Design Systems tab. |
+
+### Worked examples
+
+#### 1. Single source, simple name
+
+```json
+{
+  "masterName": "Crimson",
+  "hex": "#dc143c",
+  "sources": [
+    { "source": "css", "code": "crimson", "name": "crimson", "hex": "#dc143c" }
+  ]
+}
+```
+
+Lands as: `name: "Crimson"`, `altNames: ["crimson"]` (lowercase keyword auto-added because it differs from the masterName casing).
+
+#### 2. Source carrying multiple labels (BS381-style)
+
+```json
+{
+  "masterName": "Night",
+  "altNames": ["Night Blue"],
+  "hex": "#282b2f",
+  "sources": [
+    { "source": "bs381", "code": "642", "name": "Night", "hex": "#282b2f" }
+  ]
+}
+```
+
+Lands as: `name: "Night"`, `altNames: ["Night Blue"]`, `sourceCode: "642"`.
+
+#### 3. Same colour in multiple sources
+
+```json
+{
+  "masterName": "White Smoke",
+  "hex": "#f5f5f5",
+  "sources": [
+    { "source": "css",      "code": "whitesmoke",  "name": "whitesmoke" },
+    { "source": "tailwind", "code": "neutral-100", "name": "Neutral 100", "scaleKey": "tailwind:neutral", "scaleStep": 100 },
+    { "source": "material", "code": "grey-100",    "name": "Grey 100",    "scaleKey": "material:grey",    "scaleStep": 100 }
+  ]
+}
+```
+
+Lands as **three entries** (one per source), all in **one group** via hex-match (rule 2 of the ingest pipeline). The group's master-name pointer aims at the first-imported entry by default; flip the crown toggles in the admin to change it.
+
+#### 4. Design-system scale
+
+```json
+{
+  "masterName": "Tailwind Neutral 500",
+  "hex": "#737373",
+  "isDesignSystem": true,
+  "sources": [
+    {
+      "source": "tailwind",
+      "code": "neutral-500",
+      "name": "neutral-500",
+      "scaleKey": "tailwind:neutral",
+      "scaleStep": 500
+    }
+  ]
+}
+```
+
+Or set the source-wide flag once at the top via `sourceConfigs.tailwind.isDesignSystem: true` and skip the per-entry `isDesignSystem`.
+
+#### 5. Editorial entry with full metadata
+
+```json
+{
+  "masterName": "Rebecca Purple",
+  "hex": "#663399",
+  "sources": [
+    { "source": "css", "code": "rebeccapurple", "name": "rebeccapurple", "hex": "#663399" }
+  ],
+  "meaning": ["memorial", "creativity"],
+  "psychologySummary": "Added to CSS4 in memory of Rebecca Meyer (2014).",
+  "origin": "Named after Rebecca Alison Meyer; added to CSS Color Module Level 4 by W3C following her death from brain cancer at age six. Eric Meyer (her father, a CSS expert) had requested the colour."
+}
+```
+
+Editorial fields land on the group via the editorial-merge phase. Re-importing later with extra meanings unions them in.
+
+### Gotchas
+
+<Aside type="caution" title="Common pitfalls">
+  These bite at import time and are easier to fix in the JSON than in the admin afterwards.
+</Aside>
+
+- **`source` keys are lowercased on the way in.** Use `"as2700"` not `"AS2700"` — the backend treats them as the same key, but consistency in the file makes it easier to scan and diff.
+- **`(source, code, hex)` is the dedupe key.** Re-importing the same tuple upserts in place (rule 1). A different `code` for the same colour creates a new entry — clean up via the entry editor.
+- **`hex` defaults to entry-level `hex` if a source omits it.** Only set source-level `hex` when it genuinely differs (e.g. XKCD's slightly different rendering of a named colour).
+- **Don't put editorial fields inside `sources[]`.** `meaning`, `psychology*`, `origin`, `attributes`, `deprecatedNames` belong at the entry level — they end up on the **group**, not the source row.
+- **Same-hex collision across the file** (e.g. CSS `aqua` and `cyan` both at `#00ffff`) — emit them as separate entries; rule 2 will hex-match them into one group on the second one. Order them in the file with the preferred name first if you care which becomes the master pointer (it auto-points to the first-imported entry of a fresh group).
+- **`oklch` is optional but worth supplying** when the source is OKLCH-native (Tailwind 4, Open Color v2). The first record per entry preserves it; later sources at the same hex don't clobber it.
+- **`sourceConfigs` only sets defaults.** Once an entry exists from that source, the per-entry `isDesignSystem` override (or admin toggle in the Sources tab) wins.
+
+### Idempotency
+
+Every record runs through rule 1 (exact `(source, code, hex)` match) before anything else. That means:
+
+- Re-running the same import is a no-op on existing rows — `name`, `altNames`, and `oklch` get refreshed; group memberships are untouched.
+- Editorial metadata merges via union — existing entries on the group survive, new entries are added.
+- The admin can edit fields between imports without losing the edits on the next re-run, because the editorial merge never overwrites a non-empty field.
+
+### What the importer does, end to end
+
+1. **Parse** — recognises `{ entries }`, bare array of entries, or `{ records }`. The first two route through the editorial path.
+2. **Expand** — each entry becomes one ingest record per source. The first record carries the entry's `altNames` and `oklch`; later records get the source-specific label as an altName if it differs from the entry's `masterName`.
+3. **Chunk + ingest** — records go to `/ingest` in 25-record sub-batches with progress reported between chunks. Each record runs in its own transaction (no batch-wide atomicity ceiling).
+4. **Stitch** — the per-record outcomes are grouped back by originating entry. Each entry's destination group is picked by outcome majority.
+5. **Merge editorial** — for each entry's destination group, the importer fetches the current `DerivedGroupView`, unions the entry's editorial fields (`meaning`, `psychology*`, `origin`, `attributes`, `deprecatedNames`) into it, and `PATCH`es only when the merge changed something.
+
+Total wall time for a 200-entry file against Neon ≈ 10 seconds. The Import tab shows a per-phase progress bar with `done / total (pct%)`.
+
+---
+
+## Migration from v1 (Zustand) to v2 (DB)
+
+v1 persisted to `localStorage` via `zustand/persist`. The migration path is:
+
+1. **Export** the current Zustand store to a JSON payload (the existing admin export panel already does this).
+2. **Run the reseed** against an empty v2 schema using the standard import endpoints.
+3. The ingest rules above merge duplicates naturally — a Tailwind entry and a CSS entry at `#f5f5f5` land as two primary members in one group automatically, no manual grouping required.
+4. **Discard the localStorage state** once the server-side thesaurus is authoritative. The frontend admin store shrinks to ephemeral UI state only (selected entry, open tabs, dialog visibility).
+
+## Status & Remaining Work
+
+The four-table model, ingest rules, and import pipeline are in place. A few refinements remain (none blocking):
+
+- **FTS vs prefix match** for the toolbar — decide between full-text search and prefix match once the seed size is known. Prefix match + btree is sufficient for now.
+- **Admin import-report UI** — a table row per ingested record with its outcome, and click-through resolution for ambiguous rows.
+- **Source editor** — the Sources admin panel maps cleanly onto `colour_name_source`; decide whether adding/editing sources manually (outside import) is a supported flow.
+- **API shape** — REST endpoints under `/api/v1/colour/thesaurus/...` match the rest of the module; no GraphQL.
+
+## See Also
+
+- [Colour](/colour-palette/colour/) — the colour engine and Colour Profile that surface thesaurus names
+- [Usage](/colour-palette/usage/) — the admin Colour Thesaurus panels (browse, import, add, export)
