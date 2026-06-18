@@ -19,6 +19,7 @@ export default defineConfig({
         src: "./public/modularSystem_logo.png",
       },
       title: "Module System",
+      customCss: ["./src/styles/sidebar-fix.css"],
       social: [
         {
           icon: "github",
