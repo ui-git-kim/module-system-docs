@@ -1226,6 +1226,36 @@ Neon Auth handles token refresh automatically. If issues occur:
 
 ---
 
+## Session & token security (hardening)
+
+Authentication is **delegated to Neon Auth** — the starter does not build its own session system. The token model is Neon's: the client SDK caches a short-lived JWT and `api.ts` forwards it as `Authorization: Bearer <token>`; the backend verifies it via JWKS.
+
+<Aside type="caution" title="The exposure, and the right (non-DIY) fix">
+The JWT is **readable by JavaScript** (`authClient.getSession()` returns it), so its one real risk is **XSS exfiltration**. The correct fix is **not** a hand-built cookie/session vault — it is to remove the thing that steals tokens (XSS) and to lean on the provider's own protections.
+</Aside>
+
+The provider-delegated hardening, in order of impact:
+
+1. **Prevent XSS — the root cause.** Set a strict **Content-Security-Policy on the frontend HTML at the edge / hosting layer (Cloudflare)** — this is the CSP that matters, because the SPA document is what executes scripts. Keep React's auto-escaping (never `dangerouslySetInnerHTML` on untrusted input). Cloudflare WAF + bot management reduce the surface that delivers XSS. *(The backend API also sets a locked-down `default-src 'none'` CSP via helmet, but that only hardens the JSON API — it is not the XSS defence for the app.)*
+2. **Rely on Neon Auth's short-lived + auto-refreshing tokens.** The theft window is minutes; never extend token lifetime. Token refresh is the provider's job — don't reimplement it.
+3. **Use Neon Auth's own cookie/session mode where the deployment topology allows it** (e.g. same-origin app + API, or Neon's server SDK) — *Neon's* httpOnly cookie handling, not a cookie system you build.
+4. **MFA + step-up via Neon Auth, by tier.** MFA is available at `standard`, enforced for admins at `hardened`, mandatory at `strict`; step-up re-auth for sensitive actions at `hardened+`. All configured on the Neon side, surfaced by `securityProfile` — see the [Security feature](/starter-template/security-feature/).
+
+<Aside type="note" title="What the starter deliberately does NOT do">
+No bespoke session table, no app-issued auth cookies, no hand-rolled CSRF, no custom token storage. An earlier draft started a custom cookie/session/CSRF layer; it was **reverted** as DIY security. We delegate to Neon Auth and harden the edges. See the [security roadmap](/starter-template/roadmap/#security-floor-v200).
+</Aside>
+
+**Hardening checklist:**
+
+- [ ] Frontend **CSP** set at the edge/hosting (Cloudflare) — restrict `script-src`, `connect-src` (your API + Neon Auth origins), `default-src`
+- [ ] Cloudflare **WAF + bot management** enabled (hardened+)
+- [ ] No `dangerouslySetInnerHTML` on untrusted content anywhere
+- [ ] Neon Auth token lifetime left at the provider default (short); refresh untouched
+- [ ] MFA configured per tier in the Neon Console
+- [ ] Considered Neon Auth cookie mode if the deployment is same-origin
+
+---
+
 ## Production Considerations
 
 ### JWKS Caching
@@ -1239,28 +1269,18 @@ No additional caching configuration is needed.
 
 ### Rate Limiting
 
-Consider adding rate limiting to protect API endpoints:
-
-```typescript
-import rateLimit from 'express-rate-limit';
-
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,  // 15 minutes
-  max: 100,                   // 100 requests per window
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-app.use('/api/', limiter);
-```
+**Shipped since v1.27.0** — a global per-IP `express-rate-limit` is applied to `/api` in `app.ts`, env-tunable via `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` (health checks are skipped). No setup required; tune the env vars per traffic profile. Mutation- or auth-heavy routes may warrant a stricter per-route limiter on top, and Cloudflare adds an edge rate-limit at `hardened+`.
 
 ### Security Checklist
 
-Transport and app-layer:
+Transport and app-layer (most are shipped — verify the deployment-side items):
 
-- [ ] **HTTPS** — Always use HTTPS in production
-- [ ] **CORS** — Restrict `FRONTEND_URL` to your production domain
-- [ ] **Rate Limiting** — Add limits to prevent abuse
+- [ ] **HTTPS** — Always use HTTPS in production (edge/hosting)
+- [x] **CORS** — no-origin rejected in production; set `FRONTEND_URL` to your production domain (shipped v1.27.0)
+- [x] **Rate Limiting** — global limiter shipped (v1.27.0); tune `RATE_LIMIT_*`
+- [x] **Error sanitisation** — generic messages in production (shipped v1.27.0)
+- [x] **API security headers / CSP** — helmet with a locked-down CSP (shipped v1.29.0)
+- [ ] **Frontend CSP at the edge** — the XSS-relevant CSP (Cloudflare/hosting) — see [Session & token security](#session--token-security-hardening)
 - [ ] **Auth URL Match** — Verify `VITE_NEON_AUTH_URL` and `NEON_AUTH_URL` are identical
 - [ ] **Dependency Audit** — Run `npm audit` regularly
 
