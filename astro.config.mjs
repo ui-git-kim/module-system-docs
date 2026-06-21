@@ -95,6 +95,10 @@ export default defineConfig({
                   slug: "starter-template/dashboard-feature",
                 },
                 { label: "Admin", slug: "starter-template/admin-feature" },
+                {
+                  label: "Security",
+                  slug: "starter-template/security-feature",
+                },
               ],
             },
             {

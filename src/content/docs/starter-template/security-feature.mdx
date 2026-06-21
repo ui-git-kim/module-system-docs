@@ -1,0 +1,68 @@
+---
+title: Security Feature
+description: The foundation-owned security feature — tier profile, security registry, and the enforcement layers
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The **security feature** (`features/security/`, frontend + backend) is a foundation feature — a sibling to `auth`, **not a module**. It is too pivotal to be installable, uninstallable, replaceable, or downgradable by a module. It owns the security tier configuration, the data-isolation enforcement layer, the crypto/key primitives, and the deletion orchestrator.
+
+<Aside type="note">
+This is the **shell** introduced in v1.28.0: the tier config + the `securityRegistry` contract. The isolation (RLS/tenant), crypto, and deletion layers land in subsequent releases — see the [roadmap](/starter-template/roadmap/). This page grows with each phase.
+</Aside>
+
+## Principles
+
+- **Isolation is the floor, not a tier.** Owner isolation is a template primitive enforced once and inherited by every module.
+- **Tiers are additive configuration, not forks.** `standard ⊂ hardened ⊂ strict` — a higher tier only ever *adds* controls. One `securityProfile` setting toggles the expensive ones; no per-tier branches.
+- **Secure by default.** The floor ships on with zero configuration. The foundation default tier is **`hardened`**.
+- **Foundation enforces; modules declare.** Modules never hand-roll isolation, encryption, audit, or deletion. They **declare** their security surface to the `securityRegistry`; the foundation enforces it centrally. This is the mitigation for a template's one failure mode — per-module drift.
+
+## Security tier (`securityProfile`)
+
+The headline knob is `SECURITY_PROFILE` (backend env) / `VITE_SECURITY_PROFILE` (frontend), one of `standard | hardened | strict`. It resolves to a full `SecurityConfig` via per-tier defaults plus optional per-knob env overrides — an app changes posture through configuration, never by editing code.
+
+```typescript
+import { securityConfig } from '@/features/security';
+
+securityConfig.profile;          // 'hardened'
+securityConfig.fieldEncryption;  // tier default, overridable via SECURITY_FIELD_ENCRYPTION
+securityConfig.auditMode;        // 'activity' | 'compliance'
+```
+
+| Knob | standard | hardened | strict |
+|------|:--:|:--:|:--:|
+| `mfaRequired` | false | false¹ | true |
+| `fieldEncryption` | false | true | true |
+| `auditMode` | activity | activity | compliance |
+| `keyProvider` | env | kms² | kms² |
+| `sessionStepUp` | false | true | true |
+
+¹ At hardened, MFA is *available* and enforced for admins — admin enforcement is handled in the auth layer, not this all-users boolean. ² Only the `env` key adapter ships working today; the KMS adapter is an interface wired per-deployment (the crypto phase resolves it and falls back to `env` with a warning at non-strict tiers). Override with `SECURITY_KEY_PROVIDER=env`.
+
+See [Configuration](/starter-template/configuration/#security-tier) for every env var.
+
+## The security registry
+
+Modules declare a **security manifest** into `securityRegistry`; the foundation reads it to apply RLS policies + ownership scoping, field encryption, hashed-secret handling, audit subscriptions, and deletion cascades. A module with **no** manifest still inherits the floor (RLS + ownership) but cannot use field encryption, hashed secrets, audit, or deletion hooks until it declares them.
+
+```typescript
+// features/<module>/security.registration.ts  (side-effect import from index.ts)
+import { securityRegistry } from '@/features/security';
+
+securityRegistry.register({
+  moduleId: 'billing',
+  ownedModels: [{ model: 'Invoice', ownerColumn: 'tenantId' }],
+  hashedSecrets: [{ model: 'ApiKey', field: 'token' }],
+  encryptedFields: [{ model: 'Invoice', field: 'taxId' }],
+  dataCategories: [{ name: 'invoices', classification: 'owned' }],
+  auditEvents: ['invoice.created', 'invoice.voided'],
+  // minimumTier: 'strict',  // refuse to run below this tier
+});
+```
+
+See the [Registry Reference](/starter-template/registries/#securityregistry-backend) for the full manifest contract and query API.
+
+<Aside type="caution" title="ownerColumn is internal plumbing">
+`ownerColumn: 'tenantId'` is the isolation key. In the common **solo-owner** deployment it is the user's invisible personal space — users never see it, and most module code reads it through the foundation helpers rather than by name. Multi-user "shared spaces" (e.g. a family) are an opt-in capability layered on the same key, not enterprise team tenancy. The tenant model + this framing land in a later release.
+</Aside>
