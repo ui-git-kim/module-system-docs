@@ -370,56 +370,59 @@ const [user, log] = await batchTransaction([
 
 ---
 
-## Strict-tier user-data isolation (RLS)
+## User-data isolation (Neon RLS)
 
-The starter enforces per-user data isolation at the **application layer**: every query for a user-owned record is scoped to `req.user.id`, and cross-user operations are gated by `requireAdmin` / `requireRole`. For most apps that is sufficient. For **strict tiers** — legal, evidence, health, or any system where a single missed `where` clause would be catastrophic — add the database-level backstop below so an application-layer mistake cannot leak another user's rows.
+Cross-user isolation is **delegated to the database** — Neon's [Row-Level Security](https://neon.com/docs/guides/neon-rls) is the wall, with the `owned()` helper as application-layer defence-in-depth. Both layers scope on the **isolation key `tenantId`**.
 
-### Always scope owned queries with `owned()`
+<Aside type="note" title="Two ids on every owned model">
+Owned models carry **`tenantId`** (the isolation key — what RLS scopes on) and **`userId`** (the actor — who created the row). In **solo apps `tenantId === userId`** (the deployment's own database is the wall); the column is present from the start so growing to multi-user is a *data* change, not a schema rewrite. `req.user.tenantId` is set at auth time (= the user id in solo mode). The starter ships no owned *resource* models yet — `User` is the actor/identity and `AppSettings` is a global singleton — so these policies apply to the owned models your modules add.
+</Aside>
 
-`@/lib/owned` ships a helper so ownership is impossible to forget. It always sets `userId`, overriding any client-supplied value:
+### Neon RLS — the wall
 
-```typescript
-import { owned } from '../../lib/owned.js';
-
-// Read by id, but only if it belongs to the caller — no IDOR:
-const doc = await prisma.document.findFirst({
-  where: owned(req.user!.id, { id }),
-});
-if (!doc) throw new NotFoundError('Document not found');
-
-// List only the caller's rows:
-const docs = await prisma.document.findMany({ where: owned(req.user!.id) });
-```
-
-Use it for **every** read/update/delete of a user-owned record. This is the primary mechanism and is required regardless of whether you also enable RLS.
-
-### Opt-in Postgres Row-Level Security backstop
-
-Row-Level Security makes the database itself refuse to return another user's rows. Because the Prisma `pg`/`neon` adapter connects as the **table owner**, you must declare `FORCE ROW LEVEL SECURITY` (owners bypass RLS otherwise) and publish the current user's id to the session. `@/lib/owned` provides `withUserContext()` for exactly that — it runs your callback in a transaction with `app.user_id` set:
+RLS makes the database itself refuse to return another tenant's rows. Because the Prisma `pg`/`neon` adapter connects as the **table owner** (which bypasses RLS), every owned table needs `FORCE ROW LEVEL SECURITY` plus a policy keyed on `tenantId`. `@/lib/owned` provides `withTenantContext()` to publish the caller's tenant to the transaction so the policy can read it:
 
 ```typescript
-import { withUserContext } from '../../lib/owned.js';
+import { withTenantContext } from '../../lib/owned.js';
 
-// RLS policy: USING (user_id = current_setting('app.user_id', true))
-const docs = await withUserContext(req.user!.id, (tx) =>
-  tx.document.findMany(), // RLS restricts rows to the caller automatically
+// RLS policy: USING ("tenantId" = current_setting('app.tenant_id', true))
+const docs = await withTenantContext(req.user!.tenantId!, (tx) =>
+  tx.document.findMany(), // RLS restricts rows to the caller's tenant
 );
 ```
 
-Add the policy in a migration (the template ships no user-owned models, so this is per-app):
+Add the policy in a migration (per-app, since the starter ships no owned models):
 
 ```sql
 -- backend/prisma/migrations/<timestamp>_rls_documents/migration.sql
 ALTER TABLE "Document" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "Document" FORCE ROW LEVEL SECURITY; -- owners (Prisma) are NOT exempt
 
-CREATE POLICY "owner_isolation" ON "Document"
-  USING ("userId" = current_setting('app.user_id', true))
-  WITH CHECK ("userId" = current_setting('app.user_id', true));
+CREATE POLICY tenant_isolation ON "Document"
+  USING ("tenantId" = current_setting('app.tenant_id', true))
+  WITH CHECK ("tenantId" = current_setting('app.tenant_id', true));
 ```
 
+### `owned()` — application-layer defence-in-depth
+
+```typescript
+import { owned } from '../../lib/owned.js';
+
+// Read by id, but only within the caller's tenant — no cross-tenant IDOR:
+const doc = await prisma.document.findFirst({ where: owned(req.user!.tenantId!, { id }) });
+
+// List only the caller's tenant's rows:
+const docs = await prisma.document.findMany({ where: owned(req.user!.tenantId!) });
+```
+
+Both layers active together are the backstop: a forgotten `WHERE` can't leak (RLS catches it); a misapplied RLS context can't leak (`owned()` scopes it).
+
 <Aside type="caution">
-RLS is a backstop, not a replacement for application-layer scoping. Keep using `owned()` everywhere — RLS only catches the case where a bug slipped through. Any query that must read across users (admin reports, the last-admin count) must run **outside** `withUserContext()` (or under a role exempt from the policy), or it will see zero rows.
+Cross-tenant reads (admin reports, the last-admin count) must run **outside** `withTenantContext()` (or under a role exempt from the policy), or they will see zero rows.
+</Aside>
+
+<Aside type="tip" title="Need hard isolation? database-per-tenant">
+For strict/multi-tenant apps, **database-per-tenant** (a Neon **project** per tenant) makes cross-tenant leakage *structurally impossible* — no shared tables — with per-tenant residency and point-in-time restore. RLS is the shared-DB floor; database-per-tenant is the opt-in capability. See the [security roadmap](/starter-template/roadmap/#security-floor-v200).
 </Aside>
 
 ---
