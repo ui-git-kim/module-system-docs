@@ -107,6 +107,8 @@ Replace CLI-based module operations with an admin panel UI. Currently modules ar
 - Restart or hot-reload mechanism after module changes take effect
 - Permission-gated to admin role
 
+**Trust boundary (flagged in the v1.26.0 audit):** installing a module from the admin UI means executing untrusted code — arbitrary side-effect imports run on the frontend at registration time, and the backend would spawn `npx`. There is no sandboxing or isolation today, and none is yet designed. Before this feature ships, decide what runs untrusted module code and how it is contained (signed modules / allowlist registry / out-of-process execution). Also note today's **build-time coupling** that blocks true runtime install-uninstall: features are wired via static side-effect imports in `app.ts` and `routeRegistry.mountAll()` is one-shot (it sets `mounted = true` and warns that late registration "may not work"). Runtime module management needs a dynamic mount/unmount story, not just a UI over the CLI.
+
 ### Email OTP / magic link sign-in
 
 **Priority:** Medium — builds on v1.23.0's custom auth pages.
@@ -409,6 +411,78 @@ Optional documentation setup for apps created from the template:
 - Separate from the shared module system documentation
 
 **Current state:** Apps inherit the `docs/` submodule from the template, which points to the shared module system docs. Apps should either have no docs folder or their own dedicated docs.
+
+### Production security hardening
+
+**Priority:** Medium — closes the medium-severity items from the v1.26.0 security audit. Overlaps the security checklist in [Deployment Guide](#deployment-guide); track the concrete code changes here.
+
+- **Request param/query validation** — `validate()` middleware covers `req.body` only. Add a `source: 'body' | 'params' | 'query'` option (or a `validateParams` helper) and validate `:userId` on the admin routes. Low exploitability today (admin-gated + Prisma-parameterised), but inconsistent with the careful body validation elsewhere.
+- **Explicit Content-Security-Policy** — Helmet runs on defaults; set explicit CSP directives (the existing `app.ts` TODO).
+- **`trust proxy`** — not configured, so `req.ip` / `X-Forwarded-*` / `X-Request-ID` are client-spoofable, which would undermine the rate limiting and audit integrity added above. Set `app.set('trust proxy', …)` to the platform's hop count.
+- **`Cache-Control: no-store` on authenticated responses** — prevents proxy/browser caching of sensitive JSON.
+- **HTTP request/response timeout** — no socket timeout is set (Slowloris / slow-write exposure); DB query timeout alone does not cover this.
+- **Gate `/api/docs` in production** — the public route-map endpoint aids reconnaissance.
+- **Client-side admin route role guard** — `/admin/*` is auth-gated but not role-gated client-side (server `requireAdmin` is the real boundary). Add a `RoleProtectedRoute` mirroring `AuthProtectedRoute` for defence-in-depth.
+
+### Runtime enable/disable for navigation & dashboard registries
+
+**Priority:** Medium — extends the `styleRegistry` override pattern to the other collection registries.
+
+Today only `styleRegistry` honours an admin enable/disable flag (persisted in `AppSettings.styleOverrides`); the navigation, dashboard, and route registries have no `enabled` gate. So a feature an admin expects to "turn off" still renders its nav item / widget and its API stays mounted. Generalise the per-entry override + `AppSettings` persistence pattern across the collection registries. Prerequisite for [Admin Module Management](#admin-module-management) and [Dashboard Widget Admin](#dashboard-widget-admin).
+
+---
+
+## Known Security Issues
+
+Findings from the v1.26.0 security & architecture audit (backend + frontend, audited against live code). Application-layer access control is sound for the current surface — the `User` model is the only user-owned data and every access path is scoped to `req.user.id` — but the items below must be closed before any deployment that stores sensitive or multi-tenant data, especially the legal/evidence-grade apps on this stack.
+
+<Aside type="danger" title="Blockers before production (sensitive-data tiers)">
+  No database-level user-data isolation backstop, error-message leakage in production, and absent global rate limiting are pre-production blockers for any app holding regulated or evidentiary data. App-layer scoping is correct today but has no safety net the moment a downstream app adds its first user-owned model.
+</Aside>
+
+### Database-level user-data isolation backstop
+
+**Priority:** Critical (strict tier) — the headline gap for legal/evidence apps.
+
+User-data isolation is enforced **only** at the application layer (JWT → `req.user.id` → `where: { userId }`). There is no Postgres Row-Level Security and no reusable ownership-check helper shipped by the template. The only user-owned model today is `User`, and every path is correctly scoped — but the commented example relation (`prisma.post.findMany({ where: { userId } })` in `user.service.ts`) is the pattern downstream developers copy by hand, so the first user-owned model added is one forgotten `where` clause away from full cross-user leakage.
+
+- Ship an ownership-scoped query helper (e.g. `owned(userId, where)`) so isolation is not hand-rolled per query.
+- Document an opt-in **RLS profile** for strict tiers: `FORCE ROW LEVEL SECURITY` plus a per-request `SET app.user_id` inside `withTransaction` (the Prisma table-owner connection bypasses RLS otherwise). See [Database & Prisma](/starter-template/database/#alternative-the-neon-data-api).
+
+### Error-message leakage in production
+
+**Priority:** High.
+
+`backend/src/middleware/error.middleware.ts` returns `err.message` to the client for **all** errors including unexpected 500s; only `stack` is gated behind `NODE_ENV === 'development'`. Unwrapped Prisma/internal errors leak schema and query detail to clients in production. Fix: when the error is not an operational `AppError`, return a generic message and log the real one server-side only.
+
+### No global rate limiting
+
+**Priority:** High.
+
+`backend/src/app.ts` carries only a commented-out `express-rate-limit` TODO; the sole limiter anywhere is the 1-per-hour data-export check in `user.service.ts`. Auth, role-change, and delete endpoints have no throttle. The `TooManyRequestsError` + `Retry-After` plumbing already exists — only the limiter middleware is missing. (New dependency goes through the `create-app` set, not a direct install.)
+
+### Non-atomic role checks (TOCTOU races)
+
+**Priority:** High.
+
+Two role invariants are checked non-atomically (`count()` then mutate):
+
+- **First-user-becomes-admin** (`user.service.ts` `getOrCreateProfile`) — concurrent first logins can mint multiple admins; a pre-admin attacker who calls the API first gains admin.
+- **Last-admin guard** (`admin.service.ts` `updateUserRole` / `deleteUser`) — concurrent demotions/deletes can leave zero admins and lock the system.
+
+Fix: wrap each in `withTransaction` with row locking, or enforce via a DB constraint / unique partial index.
+
+### CORS allows no-origin requests with credentials
+
+**Priority:** High.
+
+`backend/src/app.ts` returns `callback(null, true)` for requests with no `Origin` header while `credentials: true` is set (an acknowledged, unresolved `DECISION NEEDED` in the code). The API authenticates via `Authorization: Bearer`, so classic CSRF exposure is currently limited — but this is the wrong default and becomes critical once any cookie/session auth is in play (`better-auth` uses session cookies). Reject no-origin requests in production.
+
+### Dependency vulnerabilities
+
+**Priority:** High.
+
+`npm audit` (lockfile-only, as the template ships no `node_modules`): **frontend 1 critical + 15 high**, **backend 10 high**. Most material: **`better-auth`** (critical — 2FA bypass via premature session caching, OAuth `state` mismatch without PKCE), **`axios`** (SSRF / prototype-pollution / credential leakage), **`react-router`** (turbo-stream RCE, XSS, open redirect), and runtime **`ws`** / **`path-to-regexp`** on the backend (several backend highs are Prisma 7 dev-tooling, not runtime). Refresh the lockfiles, bump the `create-app` dependency set, and add a recurring audit gate.
 
 ---
 
