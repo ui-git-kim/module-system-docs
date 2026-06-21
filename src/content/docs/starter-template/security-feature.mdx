@@ -14,7 +14,7 @@ The starter does **not** hand-build auth, sessions, encryption, or isolation. Th
 </Aside>
 
 <Aside type="note">
-v1.28.0 shipped the **shell**: the tier config + the `securityRegistry`. The provider wiring (Neon RLS isolation, `pgcrypto` field encryption, the deletion cascade, the Cloudflare edge) lands in subsequent releases — see the [roadmap](/starter-template/roadmap/#security-floor-v200). This page grows with each phase.
+v1.28.0 shipped the **shell**: the tier config + the `securityRegistry`. The provider wiring (Neon RLS isolation, app-layer field encryption, the deletion cascade, the Cloudflare edge) lands in subsequent releases — see the [roadmap](/starter-template/roadmap/#security-floor-v200). This page grows with each phase.
 </Aside>
 
 ## Principles
@@ -34,7 +34,7 @@ The providers and libraries security is delegated to:
 | Identity, sessions, MFA, OAuth, reset | **Neon Auth** (managed Better Auth) | The auth lifecycle |
 | Cross-user isolation | **Neon RLS** / **database-per-tenant** | Row- or instance-level isolation |
 | Encryption at rest + key storage | **Neon** (AES-256, KMS-backed) | Disk encryption + key custody |
-| Field-level encryption | **Postgres `pgcrypto`** / managed KMS | DB-native crypto (not hand-rolled JS) |
+| Field-level encryption | **Node `crypto` (AES-256-GCM)** + managed KMS | App-layer encryption; key never sent to the DB |
 | Edge: DDoS, WAF, bot, Zero Trust | **Cloudflare** | The perimeter |
 | Errors / audit storage | **Sentry/Datadog** + the Audit module | Capture + retention |
 | Input validation | **Zod** | Schema validation |
@@ -44,7 +44,7 @@ For each concern: the provider owns the mechanism, the starter does the thin wir
 
 **The named bespoke allow-list** — the *only* app-side security code, because no provider covers it:
 
-1. **Field encryption via `pgcrypto`** (a thin declare-and-encrypt helper over the DB-native primitive).
+1. **Field encryption** — a thin `encryptField`/`decryptField` over Node's standard **AES-256-GCM** (`crypto`), with the key from env/KMS and **never sent to the database** (app-layer, *not* `pgcrypto`, so Neon only ever holds ciphertext).
 2. **The deletion cascade wiring** — a small orchestrator that calls each provider's delete API (Neon Auth identity, R2, Stripe, …) in order; no provider deletes across *all* your stores.
 3. **A thin `owned()` helper** as defence-in-depth behind Neon RLS.
 
@@ -97,4 +97,27 @@ See the [Registry Reference](/starter-template/registries/#securityregistry-back
 
 <Aside type="caution" title="Isolation is delegated to Neon; the ownerColumn is internal plumbing">
 Cross-user isolation is **enforced by Neon**, not by hand-rolled checks: **Neon RLS** policies (the configurable floor) and, for apps needing hard isolation, **database-per-tenant** (a Neon project per tenant — cross-tenant leakage becomes *structurally impossible*). The registry's `ownerColumn` is just the **isolation key** those policies scope on. In the common **solo-owner** deployment it is the user's invisible personal space (key on `userId`; the deployment's own database is the wall); multi-user "shared spaces" (e.g. a family) add a shared key — an opt-in capability, **not** enterprise team tenancy. The exact default key and the database-per-tenant control-plane are finalised in the isolation phase — see the [roadmap](/starter-template/roadmap/#security-floor-v200).
+</Aside>
+
+## Field encryption
+
+Modules declare `encryptedFields` / `hashedSecrets` in their manifest and call the foundation primitive — they never hand-roll crypto. Added in v1.31.0.
+
+- **`encryptField(plaintext, { tenantId? })` / `decryptField(envelope, { tenantId? })`** — **AES-256-GCM** via Node's `crypto` (OpenSSL): a fresh random IV per call and the GCM auth tag verified on decrypt (tamper → throws). The **key comes from env/KMS and is never sent to the database**, so Neon only ever holds ciphertext (a dump / console / leaked connection string is useless).
+- **`hashSecret(token)` / `verifySecret(token, hash)`** — SHA-256 + constant-time compare, for **high-entropy tokens / license keys** (not passwords — those are Neon Auth's).
+
+```typescript
+import { encryptField, decryptField, hashSecret, verifySecret } from '@/features/security';
+
+const sealed = await encryptField(taxId, { tenantId: req.user!.tenantId });
+const value  = await decryptField(sealed, { tenantId: req.user!.tenantId });
+
+const stored = hashSecret(apiToken);          // store this
+const ok     = verifySecret(presented, stored);
+```
+
+**Keys (`keyProvider`):** the **`env`** adapter ships working — `SECURITY_ENCRYPTION_KEY`, base64 32 bytes (`openssl rand -base64 32`). A **`kms`** adapter is an interface: wire a managed KMS per-deployment via `setKeyProvider()` (required at `strict`, where per-tenant keys enable crypto-shred). Field encryption is off at `standard`, on at `hardened`+ (the `fieldEncryption` tier knob).
+
+<Aside type="caution" title="Why app-layer, not pgcrypto">
+`pgcrypto` runs inside Postgres, so the key would travel to Neon on every query — defeating "the database can't read it." App-layer AES-256-GCM keeps the key in the app; Neon only ever sees ciphertext. The stronger **zero-knowledge** guarantee (where even the app can't decrypt — client-side E2EE) has no provider and stays on the [roadmap](/starter-template/roadmap/#security-floor-v200).
 </Aside>
