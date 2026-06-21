@@ -414,21 +414,17 @@ Optional documentation setup for apps created from the template:
 
 ### Production security hardening
 
-**Priority:** Medium — closes the medium-severity items from the v1.26.0 security audit. Overlaps the security checklist in [Deployment Guide](#deployment-guide); track the concrete code changes here.
+**Priority:** Medium. Most items landed in **v1.27.0**; the remaining one is tracked here. Overlaps the security checklist in [Deployment Guide](#deployment-guide).
 
-- **Request param/query validation** — `validate()` middleware covers `req.body` only. Add a `source: 'body' | 'params' | 'query'` option (or a `validateParams` helper) and validate `:userId` on the admin routes. Low exploitability today (admin-gated + Prisma-parameterised), but inconsistent with the careful body validation elsewhere.
-- **Explicit Content-Security-Policy** — Helmet runs on defaults; set explicit CSP directives (the existing `app.ts` TODO).
-- **`trust proxy`** — not configured, so `req.ip` / `X-Forwarded-*` / `X-Request-ID` are client-spoofable, which would undermine the rate limiting and audit integrity added above. Set `app.set('trust proxy', …)` to the platform's hop count.
-- **`Cache-Control: no-store` on authenticated responses** — prevents proxy/browser caching of sensitive JSON.
-- **HTTP request/response timeout** — no socket timeout is set (Slowloris / slow-write exposure); DB query timeout alone does not cover this.
-- **Gate `/api/docs` in production** — the public route-map endpoint aids reconnaissance.
-- **Client-side admin route role guard** — `/admin/*` is auth-gated but not role-gated client-side (server `requireAdmin` is the real boundary). Add a `RoleProtectedRoute` mirroring `AuthProtectedRoute` for defence-in-depth.
+- **Explicit Content-Security-Policy** — Helmet still runs on defaults; set explicit CSP directives (the existing `app.ts` TODO). Not yet shipped.
 
-### Runtime enable/disable for navigation & dashboard registries
+✅ **Shipped in v1.27.0:** `validateParams` / `validateQuery` middleware + admin `:userId` validation, `trust proxy` (`TRUST_PROXY_HOPS`), `Cache-Control: no-store` on API responses, HTTP request timeout (`REQUEST_TIMEOUT`), `/api/docs` prod-gating, and the client-side `RoleProtectedRoute` on `/admin/*`.
 
-**Priority:** Medium — extends the `styleRegistry` override pattern to the other collection registries.
+### Runtime enable/disable for collection registries
 
-Today only `styleRegistry` honours an admin enable/disable flag (persisted in `AppSettings.styleOverrides`); the navigation, dashboard, and route registries have no `enabled` gate. So a feature an admin expects to "turn off" still renders its nav item / widget and its API stays mounted. Generalise the per-entry override + `AppSettings` persistence pattern across the collection registries. Prerequisite for [Admin Module Management](#admin-module-management) and [Dashboard Widget Admin](#dashboard-widget-admin).
+**Priority:** Medium. Partially shipped in **v1.27.0**.
+
+v1.27.0 added a generic admin enable/disable gate to the frontend `BaseRegistry` (`getActive()` / `applyAdminOverrides()` / `isAdminHidden()`) and wired it to the **dashboard** registry, persisted in `AppSettings.dashboardOverrides`. Navigation and toolbar already had admin hide via `navigationOverrides` / `toolbarOverrides`. Remaining: extend the gate to other collection registries as needed, and ship the admin UI for toggling widgets (see [Dashboard Widget Admin](#dashboard-widget-admin) — the backend + registry plumbing now exists). Backend **route** registry gating stays blocked on the build-time-coupling work (see [Admin Module Management](#admin-module-management)).
 
 ---
 
@@ -436,34 +432,36 @@ Today only `styleRegistry` honours an admin enable/disable flag (persisted in `A
 
 Findings from the v1.26.0 security & architecture audit (backend + frontend, audited against live code). Application-layer access control is sound for the current surface — the `User` model is the only user-owned data and every access path is scoped to `req.user.id` — but the items below must be closed before any deployment that stores sensitive or multi-tenant data, especially the legal/evidence-grade apps on this stack.
 
-<Aside type="danger" title="Blockers before production (sensitive-data tiers)">
-  No database-level user-data isolation backstop, error-message leakage in production, and absent global rate limiting are pre-production blockers for any app holding regulated or evidentiary data. App-layer scoping is correct today but has no safety net the moment a downstream app adds its first user-owned model.
+<Aside type="tip" title="Mostly addressed in v1.27.0">
+  The error-leak, rate-limiting, TOCTOU-race, and CORS items below were fixed in **v1.27.0**, and the user-data isolation backstop now ships (`owned()` + opt-in RLS). Remaining: the frontend `better-auth` Critical (coupled to Neon's auth upgrade — see Dependency vulnerabilities) and explicit CSP (see [Production security hardening](#production-security-hardening)). Per-item status is noted below.
 </Aside>
 
 ### Database-level user-data isolation backstop
 
 **Priority:** Critical (strict tier) — the headline gap for legal/evidence apps.
 
+**Status:** ✅ Addressed in **v1.27.0** — `@/lib/owned` ships `owned(userId, where)` for app-layer scoping and `withUserContext()` for the opt-in RLS backstop; the strict-tier RLS profile is documented. Adopt both for any user-owned model.
+
 User-data isolation is enforced **only** at the application layer (JWT → `req.user.id` → `where: { userId }`). There is no Postgres Row-Level Security and no reusable ownership-check helper shipped by the template. The only user-owned model today is `User`, and every path is correctly scoped — but the commented example relation (`prisma.post.findMany({ where: { userId } })` in `user.service.ts`) is the pattern downstream developers copy by hand, so the first user-owned model added is one forgotten `where` clause away from full cross-user leakage.
 
 - Ship an ownership-scoped query helper (e.g. `owned(userId, where)`) so isolation is not hand-rolled per query.
-- Document an opt-in **RLS profile** for strict tiers: `FORCE ROW LEVEL SECURITY` plus a per-request `SET app.user_id` inside `withTransaction` (the Prisma table-owner connection bypasses RLS otherwise). See [Database & Prisma](/starter-template/database/#alternative-the-neon-data-api).
+- Document an opt-in **RLS profile** for strict tiers: `FORCE ROW LEVEL SECURITY` plus a per-request `SET app.user_id` inside `withTransaction` (the Prisma table-owner connection bypasses RLS otherwise). See [Database & Prisma → Strict-tier isolation](/starter-template/database/#strict-tier-user-data-isolation-rls).
 
 ### Error-message leakage in production
 
-**Priority:** High.
+**Priority:** High. **Status:** ✅ Fixed in **v1.27.0** — non-operational errors now return a generic message in production.
 
 `backend/src/middleware/error.middleware.ts` returns `err.message` to the client for **all** errors including unexpected 500s; only `stack` is gated behind `NODE_ENV === 'development'`. Unwrapped Prisma/internal errors leak schema and query detail to clients in production. Fix: when the error is not an operational `AppError`, return a generic message and log the real one server-side only.
 
 ### No global rate limiting
 
-**Priority:** High.
+**Priority:** High. **Status:** ✅ Fixed in **v1.27.0** — global `express-rate-limit` on `/api` (env-tunable, health checks skipped).
 
 `backend/src/app.ts` carries only a commented-out `express-rate-limit` TODO; the sole limiter anywhere is the 1-per-hour data-export check in `user.service.ts`. Auth, role-change, and delete endpoints have no throttle. The `TooManyRequestsError` + `Retry-After` plumbing already exists — only the limiter middleware is missing. (New dependency goes through the `create-app` set, not a direct install.)
 
 ### Non-atomic role checks (TOCTOU races)
 
-**Priority:** High.
+**Priority:** High. **Status:** ✅ Fixed in **v1.27.0** — both guards now run in Serializable transactions (`withTransaction({ isolationLevel: 'Serializable' })`).
 
 Two role invariants are checked non-atomically (`count()` then mutate):
 
@@ -474,15 +472,17 @@ Fix: wrap each in `withTransaction` with row locking, or enforce via a DB constr
 
 ### CORS allows no-origin requests with credentials
 
-**Priority:** High.
+**Priority:** High. **Status:** ✅ Fixed in **v1.27.0** — no-origin requests are rejected in production.
 
 `backend/src/app.ts` returns `callback(null, true)` for requests with no `Origin` header while `credentials: true` is set (an acknowledged, unresolved `DECISION NEEDED` in the code). The API authenticates via `Authorization: Bearer`, so classic CSRF exposure is currently limited — but this is the wrong default and becomes critical once any cookie/session auth is in play (`better-auth` uses session cookies). Reject no-origin requests in production.
 
 ### Dependency vulnerabilities
 
-**Priority:** High.
+**Priority:** High. **Status:** ⚠️ Partially fixed in **v1.27.0** — backend now reports **0 high / 0 critical**; the frontend `better-auth` Critical remains (see below).
 
-`npm audit` (lockfile-only, as the template ships no `node_modules`): **frontend 1 critical + 15 high**, **backend 10 high**. Most material: **`better-auth`** (critical — 2FA bypass via premature session caching, OAuth `state` mismatch without PKCE), **`axios`** (SSRF / prototype-pollution / credential leakage), **`react-router`** (turbo-stream RCE, XSS, open redirect), and runtime **`ws`** / **`path-to-regexp`** on the backend (several backend highs are Prisma 7 dev-tooling, not runtime). Refresh the lockfiles, bump the `create-app` dependency set, and add a recurring audit gate.
+Original audit (`npm audit`, lockfile-only): frontend 1 critical + 15 high, backend 10 high. v1.27.0 bumped `axios` (`^1.18.0`), `react-router-dom` (`^7.18.0`), `ws` (`^8.21.0`) and regenerated all lockfiles — the existing `^` ranges already permitted the patched versions, so the highs were stale-lockfile pins. Result: **backend 0 high / 0 critical** (3 moderate dev-tooling remain); frontend highs reduced.
+
+**Still open:** the **`better-auth`** Critical (2FA bypass, OAuth `state`/PKCE) is transitive via `@neondatabase/neon-js` and pinned to Neon's Better Auth 1.4.6 server — it tracks the same Neon upgrade as the [forgot-password flow](#finalise-the-forgot-password--reset-password-flow) and **cannot be unilaterally bumped without breaking auth**. The remaining frontend highs are that auth cluster (`fastify` / `kysely` / `fast-uri`) or dev-only build tooling (`vite` / `rollup`). Re-run `npm audit` after the Neon upgrade lands, and add a recurring audit gate (CI).
 
 ---
 

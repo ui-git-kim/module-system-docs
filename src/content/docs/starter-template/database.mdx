@@ -370,6 +370,60 @@ const [user, log] = await batchTransaction([
 
 ---
 
+## Strict-tier user-data isolation (RLS)
+
+The starter enforces per-user data isolation at the **application layer**: every query for a user-owned record is scoped to `req.user.id`, and cross-user operations are gated by `requireAdmin` / `requireRole`. For most apps that is sufficient. For **strict tiers** — legal, evidence, health, or any system where a single missed `where` clause would be catastrophic — add the database-level backstop below so an application-layer mistake cannot leak another user's rows.
+
+### Always scope owned queries with `owned()`
+
+`@/lib/owned` ships a helper so ownership is impossible to forget. It always sets `userId`, overriding any client-supplied value:
+
+```typescript
+import { owned } from '../../lib/owned.js';
+
+// Read by id, but only if it belongs to the caller — no IDOR:
+const doc = await prisma.document.findFirst({
+  where: owned(req.user!.id, { id }),
+});
+if (!doc) throw new NotFoundError('Document not found');
+
+// List only the caller's rows:
+const docs = await prisma.document.findMany({ where: owned(req.user!.id) });
+```
+
+Use it for **every** read/update/delete of a user-owned record. This is the primary mechanism and is required regardless of whether you also enable RLS.
+
+### Opt-in Postgres Row-Level Security backstop
+
+Row-Level Security makes the database itself refuse to return another user's rows. Because the Prisma `pg`/`neon` adapter connects as the **table owner**, you must declare `FORCE ROW LEVEL SECURITY` (owners bypass RLS otherwise) and publish the current user's id to the session. `@/lib/owned` provides `withUserContext()` for exactly that — it runs your callback in a transaction with `app.user_id` set:
+
+```typescript
+import { withUserContext } from '../../lib/owned.js';
+
+// RLS policy: USING (user_id = current_setting('app.user_id', true))
+const docs = await withUserContext(req.user!.id, (tx) =>
+  tx.document.findMany(), // RLS restricts rows to the caller automatically
+);
+```
+
+Add the policy in a migration (the template ships no user-owned models, so this is per-app):
+
+```sql
+-- backend/prisma/migrations/<timestamp>_rls_documents/migration.sql
+ALTER TABLE "Document" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "Document" FORCE ROW LEVEL SECURITY; -- owners (Prisma) are NOT exempt
+
+CREATE POLICY "owner_isolation" ON "Document"
+  USING ("userId" = current_setting('app.user_id', true))
+  WITH CHECK ("userId" = current_setting('app.user_id', true));
+```
+
+<Aside type="caution">
+RLS is a backstop, not a replacement for application-layer scoping. Keep using `owned()` everywhere — RLS only catches the case where a bug slipped through. Any query that must read across users (admin reports, the last-admin count) must run **outside** `withUserContext()` (or under a role exempt from the policy), or it will see zero rows.
+</Aside>
+
+---
+
 ## Alternative: the Neon Data API
 
 The starter uses **Prisma + Express** for all database access: the frontend never talks to the database directly, and every authenticated query goes through a route handler that has already verified the JWT. This is the recommended architecture for this template and for any module that ships inside it — it keeps business logic, validation, and cross-module composition in one place (the service registry) and matches the rest of the starter's patterns.
