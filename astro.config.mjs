@@ -202,6 +202,10 @@ export default defineConfig({
                   label: "File Reference",
                   slug: "module-starter/file-reference",
                 },
+                {
+                  label: "Security",
+                  slug: "module-starter/security",
+                },
               ],
             },
             {
