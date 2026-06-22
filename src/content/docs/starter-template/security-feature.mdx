@@ -14,7 +14,7 @@ The starter does **not** hand-build auth, sessions, encryption, or isolation. Th
 </Aside>
 
 <Aside type="note">
-v1.28.0 shipped the **shell**: the tier config + the `securityRegistry`. The provider wiring (Neon RLS isolation, app-layer field encryption, the deletion cascade, the Cloudflare edge) lands in subsequent releases — see the [roadmap](/starter-template/roadmap/#security-floor-v200). This page grows with each phase.
+v1.28.0 shipped the **shell** (tier config + the `securityRegistry`); subsequent releases wired the providers — Neon RLS isolation (v1.30.0), app-layer field encryption (v1.31.0), the deletion cascade (v1.32.0), AWS KMS key custody (v1.33.0), and the **Cloudflare edge + startup posture guardrail** (v1.36.0). See the [roadmap](/starter-template/roadmap/#security-floor-v200) for the phase tracker.
 </Aside>
 
 ## Principles
@@ -200,3 +200,34 @@ Self-service deletion (`user.service.deleteUser`) and admin deletion (`admin.ser
 </Aside>
 
 See the [Registry Reference](/starter-template/registries/#securityregistry-backend) for the deletion-handler API and the full `DeletionReport` shape.
+
+## Cloudflare edge & the startup posture guardrail
+
+The perimeter — DDoS, WAF, bot management, edge rate limiting, TLS/HSTS, the frontend XSS-CSP, optional Zero Trust — is delegated to **Cloudflare**, the last entry on the [delegation map](#who-owns-what-the-delegation-map). It is **additive**: the app-layer floor (RLS, auth, validation, rate limiting, field encryption) runs and protects you with or without it. Added in v1.36.0. Full setup + the per-tier checklist: [Cloudflare edge](/getting-started/cloudflare-edge/).
+
+There is almost no app code for the edge itself (it's dashboard configuration), so the code half of this phase is a **startup posture guardrail** — `runStartupPostureCheck()` (`features/security/posture.ts`), called at the end of `app.ts` bootstrap once every feature and module has registered. It evaluates the resolved posture and surfaces misconfiguration you'd otherwise hit at runtime:
+
+| Check | Severity | Fatal when enforced? |
+|------|----------|----------------------|
+| No `SECURITY_EDGE` at `hardened`+ in production | warn | No (edge is additive) |
+| `SECURITY_EDGE=cloudflare` but `TRUST_PROXY_HOPS=0` | warn | No |
+| Field encryption on but key/KMS not ready | warn / **error** at `strict` | **Yes** |
+| No auth-identity deleter wired | info / warn | No |
+| A module's `minimumTier` exceeds the active tier | **error** | **Yes** |
+| `REQUEST_TIMEOUT=0` in production | warn | No |
+
+Findings log at their severity. **Enforcement** — halting startup on an `error` finding — is on by default **only at `strict` in production**; `SECURITY_POSTURE_ENFORCE` overrides it (`true` everywhere, `false` never — which at `strict` defeats the guard). The check is also exposed as a pure function for tests / a future health surface:
+
+```typescript
+import { evaluateStartupPosture } from '@/features/security';
+
+const report = evaluateStartupPosture(); // no logging, no exit
+// report.worst → 'ok' | 'info' | 'warn' | 'error'
+// report.findings → [{ id, title, severity, detail, remediation? }]
+```
+
+<Aside type="tip" title="The edge is additive; the floor stands alone">
+The guardrail never *requires* Cloudflare — it can't see Cloudflare's dashboard, and the floor doesn't need it. What it halts on (at `strict`) is genuine **app-side** misconfiguration: an unwired key at the tier that mandates encryption, or a module running below the tier it declared it needs. A separate one-shot middleware (`edgePostureMiddleware`) watches the first real request for Cloudflare headers and warns if traffic is reaching the origin directly — the one edge fault a startup check can't see, only observed traffic can.
+</Aside>
+
+New env knobs (see [Configuration → Security tier](/starter-template/configuration/#security-tier)): `SECURITY_EDGE` (`cloudflare` \| `none`) and `SECURITY_POSTURE_ENFORCE` (`true` \| `false`).

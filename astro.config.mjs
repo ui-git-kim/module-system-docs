@@ -44,6 +44,10 @@ export default defineConfig({
               label: "Field Encryption with AWS KMS",
               slug: "getting-started/aws-kms-setup",
             },
+            {
+              label: "Cloudflare Edge",
+              slug: "getting-started/cloudflare-edge",
+            },
             { label: "LLM Rules", slug: "getting-started/llm-rules" },
           ],
         },

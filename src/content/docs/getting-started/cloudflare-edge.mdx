@@ -1,0 +1,201 @@
+---
+title: Cloudflare Edge
+description: Put the additive Cloudflare perimeter (DDoS, WAF, bot, edge CSP, Zero Trust) in front of your app — and let the startup guardrail confirm the posture
+---
+
+This guide puts **Cloudflare** in front of your app as the **perimeter**: DDoS absorption, a WAF, bot management, edge rate limiting, TLS + HSTS, the frontend's XSS-relevant **Content-Security-Policy**, and optional **Zero Trust** on privileged routes.
+
+The edge is **additive**. The app-layer floor — Neon RLS isolation, Neon Auth, Zod validation, `express-rate-limit`, locked-down API headers, field encryption — runs and protects you **with or without** Cloudflare. Adding the edge moves a class of attacks (volumetric floods, generic exploit scanning, bad bots) off your origin entirely. Removing it never disables the floor.
+
+:::note[Why this is a thin wiring job, not a build]
+Like the rest of the [security feature](/starter-template/security-feature/), the perimeter is **delegated to a provider** whose job is to get it right. There is almost no app code here — the work is **configuration in the Cloudflare dashboard** plus two env knobs, and a [startup guardrail](#the-startup-posture-guardrail) that tells you whether the posture is actually in place.
+:::
+
+## What the edge adds
+
+| Control | What it stops | Where it's configured |
+|--------|----------------|------------------------|
+| **DDoS / volumetric** | L3/L4 floods never reach your origin | On by default once DNS is proxied |
+| **WAF (managed rules)** | Generic exploit scanning (SQLi/XSS probes, CVE sweeps) | WAF → Managed rules |
+| **Bot management** | Credential-stuffing bots, scrapers | Security → Bots |
+| **Edge rate limiting** | Auth/expensive-route abuse, before it hits Node | Security → Rate limiting rules |
+| **TLS + HSTS** | Downgrade / cleartext | SSL/TLS → Edge certificates |
+| **Frontend CSP** | XSS on the HTML app (the API serves JSON, so its CSP is already locked) | Transform rule on the frontend host |
+| **Zero Trust (Access)** | Unauthenticated reach to `/admin` and other privileged surfaces | Cloudflare Access |
+
+:::tip[The frontend CSP lives here, on purpose]
+The backend's `helmet` CSP is locked to `default-src 'none'` — correct for a JSON API, but it protects nothing the browser renders. **XSS protection is the CSP on the frontend HTML**, and the right place to set it is the edge (or your static host), not the API. This guide includes a starter policy in [Step 5](#step-5-set-the-frontend-csp).
+:::
+
+## Two surfaces sit behind Cloudflare
+
+A typical deployment has **two** origins, and both should be proxied:
+
+- the **frontend** (static `dist/` on Pages, a CDN, or cPanel/nginx) — gets TLS, HSTS, and the CSP;
+- the **backend API** (Node origin on a VPS/container) — gets the WAF, edge rate limiting, and the origin lock.
+
+## Prerequisites
+
+- A domain managed by Cloudflare (nameservers pointed at Cloudflare — Cloudflare dashboard → **Add a site**).
+- Your app deployed and reachable at its origin(s).
+
+## Step 1: Proxy your DNS (the orange cloud)
+
+For **each** host (frontend + API), the DNS record must be **Proxied** — the orange cloud — not "DNS only" (grey). Only proxied traffic flows through Cloudflare's edge; a grey-cloud record exposes your origin IP directly and bypasses everything below.
+
+1. Cloudflare dashboard → **DNS** → **Records**.
+2. For your frontend record (e.g. `app.example.com`) and API record (e.g. `api.example.com`), set **Proxy status: Proxied**.
+
+## Step 2: Force HTTPS and HSTS
+
+1. **SSL/TLS** → **Overview** → set the mode to **Full (strict)** (Cloudflare ↔ origin is encrypted *and* the origin presents a valid certificate). Avoid **Flexible** — it leaves the origin leg cleartext.
+2. **SSL/TLS** → **Edge Certificates** → enable **Always Use HTTPS** and **Automatic HTTPS Rewrites**.
+3. Enable **HSTS** (Edge Certificates → HTTP Strict Transport Security) once you're confident every subdomain is HTTPS-only — start with a short `max-age`, then raise it.
+
+## Step 3: Turn on the WAF
+
+1. **Security** → **WAF** → **Managed rules** → deploy the **Cloudflare Managed Ruleset** (and the **OWASP Core Ruleset** at hardened+).
+2. Start in **Log** mode for a day to catch false positives on your own API shapes, then switch the action to **Block**.
+
+## Step 4: Add edge rate-limiting rules
+
+The app already runs a global `express-rate-limit`. An **edge** rule throttles abuse *before* it reaches Node — stack it on auth and expensive routes:
+
+1. **Security** → **Rate limiting rules** → **Create rule**.
+2. Example: path `/api/auth/*` or your login route → **10 requests / 1 min / per IP** → **Block** for 1 min.
+3. Add a second rule for account-deletion / role-change / export endpoints.
+
+:::caution[Keep `TRUST_PROXY_HOPS` correct — and lock the origin first]
+Behind Cloudflare the client's real IP arrives in `CF-Connecting-IP` / `X-Forwarded-For`. Express only trusts those when `trust proxy` is set, so the app's **per-IP** rate limiting and audit logging depend on `TRUST_PROXY_HOPS` matching the real hop count (**Cloudflare = 1**; add 1 per extra load balancer). With `TRUST_PROXY_HOPS=0` behind the edge, every request looks like it came from Cloudflare and the per-IP limiter buckets *all* traffic together. The [startup guardrail](#the-startup-posture-guardrail) warns when this is wrong.
+
+**Setting `trust proxy` to any non-zero value is only safe once the origin is locked to Cloudflare ([Step 6](#step-6-lock-the-origin-to-cloudflare)).** Until then, a request that reaches your origin IP directly *is* the right-most hop, so it can forge `X-Forwarded-For` / `CF-Connecting-IP` and set `req.ip` to any value — spoofing per-IP rate-limit buckets and audit-log client IPs regardless of the hop count. Lock the origin before, or in the same change as, enabling `trust proxy`.
+:::
+
+## Step 5: Set the frontend CSP
+
+Add a `Content-Security-Policy` response header to the **frontend** host (not the API). Cloudflare → **Rules** → **Transform Rules** → **Modify Response Header** → **Set static**, on requests for your frontend hostname. A reasonable starting policy for a Vite SPA that talks to Neon Auth + your API:
+
+```
+default-src 'self';
+script-src 'self';
+style-src 'self' 'unsafe-inline';
+img-src 'self' data: blob:;
+font-src 'self' data:;
+connect-src 'self' https://api.example.com https://*.neon.tech;
+frame-ancestors 'none';
+base-uri 'self';
+form-action 'self';
+object-src 'none'
+```
+
+`connect-src` is the **exfiltration-relevant** directive for a token-holding SPA — keep it an explicit allow-list of your real origins (your API + `https://*.neon.tech`, which covers Neon Auth), never a broad or TLD-wildcard host. Tighten it to your actual hosts, and drop `'unsafe-inline'` from `style-src` if your build allows. Start in **report-only** (`Content-Security-Policy-Report-Only`) and promote to enforcing once the console is clean.
+
+## Step 6: Lock the origin to Cloudflare
+
+The edge is worthless if an attacker can skip it by hitting your origin IP directly. Close that door:
+
+1. **Restrict the origin firewall** to [Cloudflare's IP ranges](https://www.cloudflare.com/ips/) only (security group / `ufw` / host firewall) so the origin refuses non-Cloudflare traffic.
+2. Enable **Authenticated Origin Pulls** (SSL/TLS → Origin Server) so the origin accepts TLS only from Cloudflare.
+
+The [edge-header observability check](#the-startup-posture-guardrail) confirms real traffic is arriving via Cloudflare — but it only *detects* a bypass; this step *prevents* it.
+
+## Step 7: Tell the app, and let the guardrail confirm
+
+Set two env knobs on the **backend**:
+
+```env
+SECURITY_EDGE=cloudflare        # declares the perimeter; enables the edge checks
+TRUST_PROXY_HOPS=1              # Cloudflare = 1 hop (add 1 per extra load balancer)
+```
+
+:::caution
+`TRUST_PROXY_HOPS=1` is only safe **after** the origin is locked ([Step 6](#step-6-lock-the-origin-to-cloudflare)). On an unlocked origin a direct request can forge the IP headers at any hop count. Do Step 6 first.
+:::
+
+Restart. On boot the [startup posture guardrail](#the-startup-posture-guardrail) logs the resolved posture; on the first real request it *observes* whether Cloudflare headers are present (and warns if they're absent). That header signal is observational only — the authoritative proof that traffic can't bypass the edge is [Step 6](#step-6-lock-the-origin-to-cloudflare) plus the direct-origin test in [Verify](#verify).
+
+## Step 8 (hardened+/strict): Zero Trust on privileged routes
+
+For admin and other privileged surfaces, put **Cloudflare Access** in front so a request must pass identity *before* it reaches the app:
+
+1. **Zero Trust** → **Access** → **Applications** → **Add an application** (self-hosted).
+2. Scope it to the admin host/path (e.g. `app.example.com/admin`).
+3. Add a policy (email domain / IdP group / one-time PIN).
+
+This is **additive** to the app's own `requireAuth` + `RoleProtectedRoute` — Access gates reachability, the app still authorises every request.
+
+---
+
+## The startup posture guardrail
+
+The backend ships a **startup posture guardrail** (`features/security/posture.ts`, wired in `app.ts`) that evaluates the resolved security posture **once at boot — after every feature and module has registered** — and surfaces misconfiguration you'd otherwise hit at runtime. It is the code half of this phase; the edge config above is the rest.
+
+It checks:
+
+- **Edge declaration** — at `hardened`+ in production with no `SECURITY_EDGE`, a **warning** that an edge is recommended (never fatal — the floor stands alone).
+- **Trust-proxy sanity** — `SECURITY_EDGE=cloudflare` with `TRUST_PROXY_HOPS=0` ⇒ broken IP keying.
+- **Field-encryption key readiness** — encryption on but no key / unwired KMS ⇒ runtime throw (fatal at `strict`).
+- **Auth-identity deleter** — unwired ⇒ deletion leaves the login behind.
+- **Module tier requirements** — a module declaring `minimumTier` above the active tier ⇒ error.
+- **Production hardening** — e.g. `REQUEST_TIMEOUT=0` in production.
+
+Findings are logged at their severity. **Enforcement** (halting the process on an error finding) is on by default **only at the `strict` tier in production**; override with `SECURITY_POSTURE_ENFORCE` (`true` enforces everywhere, `false` never exits — which at `strict` defeats the guard). It's exposed programmatically too:
+
+```ts
+import { evaluateStartupPosture } from '@/features/security';
+
+const report = evaluateStartupPosture(); // pure — no logging, no exit
+// report.worst: 'ok' | 'info' | 'warn' | 'error'
+// report.findings[]: { id, title, severity, detail, remediation? }
+```
+
+A separate **one-shot middleware** (`edgePostureMiddleware`) checks the *first* real inbound request for Cloudflare headers (`cf-ray` / `cf-connecting-ip`) when `SECURITY_EDGE=cloudflare` in production, and warns if they're absent — the signal that traffic is reaching the origin directly (Step 6 not done, or DNS not proxied). It's a pure pass-through otherwise.
+
+---
+
+## Per-tier edge checklist
+
+The edge is additive at every tier; what each tier **expects** scales up. The app-layer floor is identical at all tiers — this table is only the *perimeter*.
+
+| Edge control | `standard` | `hardened` (default) | `strict` |
+|--------------|:--:|:--:|:--:|
+| Proxied DNS (orange cloud) | Recommended | **Expected** | **Required** |
+| TLS Full (strict) + Always-HTTPS | Recommended | **Expected** | **Required** |
+| HSTS | Optional | Recommended | **Required** |
+| WAF managed ruleset | Optional | **Expected** | **Required** (+ OWASP) |
+| Edge rate-limiting rules | Optional | Recommended | **Required** on auth/sensitive |
+| Bot management | Optional | Recommended | **Required** |
+| Frontend CSP at edge | Recommended | **Expected** | **Required** (enforcing) |
+| Origin locked to Cloudflare | Optional | Recommended | **Required** |
+| `SECURITY_EDGE=cloudflare` | Optional | Recommended | **Required** |
+| Zero Trust on `/admin` | Optional | Optional | **Recommended** |
+| `SECURITY_POSTURE_ENFORCE` | — | Optional | **On by default** |
+
+"Required" at `strict` doesn't mean the app refuses to start without Cloudflare — the guardrail can't see Cloudflare's dashboard. It means: at `strict`, this row is part of your production go-live checklist, and the guardrail flags the app-side halves it *can* see (`SECURITY_EDGE`, trust-proxy, posture enforcement).
+
+## Verify
+
+1. **Boot logs** — `Security startup posture evaluated` with `edge: 'cloudflare'` and no `error` findings.
+2. **Origin not directly reachable (the authoritative test)** — `curl https://<your-origin-ip>/api/health` from outside should fail (refused/timeout), proving the firewall lock works. This is what actually guarantees traffic can't bypass the edge.
+3. **Edge headers (observational)** — after the first request, the guardrail notes whether Cloudflare headers were seen; if you see the *bypass warning*, recheck Steps 1 and 6. Treat header *presence* as a hint only — those headers are forgeable until Step 2 (the origin lock) passes, so don't read it as a pass on its own.
+4. **WAF** — a probe like `…/api/health?x=<script>alert(1)</script>` should be challenged/blocked at the edge.
+
+## Troubleshooting
+
+### All traffic shares one rate-limit bucket
+`TRUST_PROXY_HOPS` is `0` (or wrong) behind the edge, so `req.ip` is Cloudflare's IP. Set it to the real hop count (Cloudflare = 1). The guardrail warns about this on boot.
+
+### Redirect loop / 5xx after enabling SSL
+SSL/TLS mode is **Flexible** while the origin forces HTTPS. Switch to **Full (strict)**.
+
+### The app won't load after adding the CSP
+The policy is too strict for your build — run it as `Content-Security-Policy-Report-Only` first, read the browser console violations, and widen `connect-src` / `script-src` to your real origins before enforcing.
+
+### The bypass warning won't go away
+Traffic is still reaching the origin directly. Confirm the DNS record is **Proxied** (Step 1) and the origin firewall only admits Cloudflare IPs (Step 6).
+
+## Production considerations
+
+- **Lock the origin (Step 6) — it's the difference between a perimeter and a suggestion.** An unlocked origin IP is a full bypass of the WAF and rate limiting.
+- **Promote gradually.** Run the WAF and CSP in log/report-only first; an over-eager rule that blocks your own API is its own outage.
+- **The floor still stands alone.** If Cloudflare has an incident and you fail traffic straight to the origin, Neon RLS, Neon Auth, validation, the app rate limiter, and field encryption all still apply. The edge is additive — by design.
