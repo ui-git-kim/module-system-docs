@@ -19,7 +19,7 @@ The starter template includes shell scripts for creating new apps and keeping th
 | `npm run template:check` / `template:update` | Preview / merge upstream template updates | [update-template](#update-template) |
 | `npm run template:version:{patch,minor,major}` | Bump the template `VERSION` file + root/backend `package.json` | [Version Tracking](#version-tracking) |
 | `npm run components:sync` / `components:sync:dry` | Merge module `styleRegistry` contributions into `components.json` and reinstall shadcn components | [Sync shadcn components](#sync-shadcn-components) |
-| `npm run deps:check` / `deps:update` / `deps:update:latest` | Check or apply dependency updates across root/frontend/backend | [Dependency Updates](#dependency-updates) |
+| `npm run deps:check` / `deps:update` / `deps:update:latest` / `deps:lockfile` | Check or apply dependency updates across root/frontend/backend (cross-platform; preserves `npm link`s) | [Dependency Updates](#dependency-updates) |
 | `npm run release:{patch,minor,major}` | Bump the **app's** version (not the template's) in apps cloned from this starter | [Version Tracking](#app-version) |
 
 ---
@@ -199,6 +199,8 @@ If the update touches any `componentsJson` contributions (module-starter changes
 8. **Post-merge tasks:**
    - Checks for new schema models
    - Auto-adds missing models (e.g., AppSettings)
+   - Preserves `npm link` symlinks across `install:all` (snapshot + restore)
+   - Reconciles foundation npm scripts into your `package.json` (so new `deps:*` aliases reach older apps)
    - Provides next steps
 
 ### Configuration
@@ -347,10 +349,10 @@ An admin-UI reinstall flow (confirmation dialog, streamed progress) is [planned 
 
 ## Dependency Updates
 
-Keep the template's root, frontend and backend dependencies up to date. Three modes cover the common cases from a quick peek to a full major-version sweep.
+Keep the root, frontend and backend dependencies up to date. The updater is a cross-platform **Node** script (`scripts/update-deps.mjs`) — it runs the same on Windows, macOS and Linux with no PowerShell dependency. Four modes cover everything from a quick peek to a full major-version sweep to a `node_modules`-free lockfile refresh.
 
-<Aside type="caution">
-  **Run these in a cloned app, not in the template repo itself.** The template has no `node_modules`. After running `deps:update:latest`, test thoroughly — major version jumps can introduce breaking changes.
+<Aside type="note" title="Runs in apps AND in the template repo">
+  In a **cloned app**, use `deps:update` / `deps:update:latest` (they install into `node_modules`). In the **template repo itself** — which ships no `node_modules` — use `deps:lockfile` to refresh the lockfiles without installing. Earlier versions wired these to PowerShell and to a user-owned `package.json`, so on some host apps `npm run deps:update` did nothing; both are fixed in v1.32.0 (see [Reaching host apps](#reaching-host-apps)).
 </Aside>
 
 ### npm scripts
@@ -359,34 +361,57 @@ Keep the template's root, frontend and backend dependencies up to date. Three mo
 npm run deps:check          # Preview pending updates (no changes)
 npm run deps:update         # Safe: npm update in root/frontend/backend (respects semver ^ and ~)
 npm run deps:update:latest  # Bump everything to latest via npm-check-updates (may break)
+npm run deps:lockfile       # Regenerate lockfiles from package.json — no node_modules install
+npm run deps:relink         # Re-create npm-link symlinks from the last snapshot
 ```
 
 ### What each mode does
 
-| Mode | Respects semver? | Tool | Changes lockfiles? |
-|------|------------------|------|--------------------|
-| `deps:check` | n/a (read-only) | `npm outdated` + `npx npm-check-updates` | No |
-| `deps:update` | Yes — won't cross majors | `npm update` | Yes |
-| `deps:update:latest` | **No** — jumps to latest | `npx npm-check-updates -u` + `npm install` | Yes |
+| Mode | Respects semver? | Tool | Needs `node_modules`? | Changes lockfiles? |
+|------|------------------|------|:--:|:--:|
+| `deps:check` | n/a (read-only) | `npm outdated` + `npx npm-check-updates` | No | No |
+| `deps:update` | Yes — won't cross majors | `npm update` | Yes (skips packages without it) | Yes |
+| `deps:update:latest` | **No** — jumps to latest | `npx npm-check-updates -u` + `npm install` | Yes | Yes |
+| `deps:lockfile` | Yes | `npm install --package-lock-only` | **No** | Yes |
+
+`deps:check` is informational — it prints what's pending and always exits 0 (it's a preview, not a CI drift gate).
+
+### npm-link preservation
+
+`deps:update` and `deps:update:latest` run broad `npm install`s, which prune `npm link` symlinks to locally-developed modules. The updater **snapshots** those links first (`.module-links.json`, git-ignored) and **restores** them after the install, so your linked modules survive. `template:update` does the same around its `install:all` step. If a link is ever lost, `npm run deps:relink` restores it from the last snapshot.
 
 ### Direct usage
 
 <Tabs>
   <TabItem label="Windows">
     ```powershell
-    .\scripts\update-deps.ps1              # Safe update
-    .\scripts\update-deps.ps1 -Check       # Preview only
-    .\scripts\update-deps.ps1 -Latest      # Bump to latest (may break)
+    node scripts\update-deps.mjs              # Safe update
+    node scripts\update-deps.mjs --check       # Preview only
+    node scripts\update-deps.mjs --latest      # Bump to latest (may break)
+    node scripts\update-deps.mjs --lockfile-only  # Refresh lockfiles, no install
     ```
+
+    The legacy `.\scripts\update-deps.ps1` still works — it's now a thin shim that calls the Node script.
   </TabItem>
   <TabItem label="macOS/Linux">
     ```bash
-    ./scripts/update-deps.sh               # Safe update
-    ./scripts/update-deps.sh --check       # Preview only
-    ./scripts/update-deps.sh --latest      # Bump to latest (may break)
+    node scripts/update-deps.mjs               # Safe update
+    node scripts/update-deps.mjs --check       # Preview only
+    node scripts/update-deps.mjs --latest      # Bump to latest (may break)
+    node scripts/update-deps.mjs --lockfile-only  # Refresh lockfiles, no install
     ```
+
+    The legacy `./scripts/update-deps.sh` still works — it's now a thin shim that calls the Node script.
   </TabItem>
 </Tabs>
+
+### Reaching host apps
+
+The root `package.json` is **user-owned**, so `template:update` never overwrites it — which means `deps:*` aliases added to the template never reached apps created before they existed (`npm run deps:update` → `Missing script`). To fix that, `template:update` runs `scripts/sync-package-scripts.mjs` after merging, which ensures the foundation `deps:*` aliases exist and point at the canonical Node commands. Only those foundation keys are touched; your own scripts are left alone.
+
+<Aside type="tip">
+  If `template:update` stops on a merge conflict, the post-merge reconciliation doesn't run. After resolving the conflict, run `node scripts/sync-package-scripts.mjs` (and `npm run deps:relink` if needed) to finish.
+</Aside>
 
 ### Recommended workflow
 
@@ -523,8 +548,11 @@ Both scripts follow the same structure and can be customized.
 - scripts/
   - bump-version.sh (Version bumping)
   - bump-version.ps1 (Version bumping)
-  - update-deps.sh (Dependency updates)
-  - update-deps.ps1 (Dependency updates)
+  - update-deps.mjs (Dependency updates — cross-platform Node, canonical)
+  - update-deps.sh (Shim → update-deps.mjs)
+  - update-deps.ps1 (Shim → update-deps.mjs)
+  - link-modules.mjs (Snapshot/restore npm-link symlinks)
+  - sync-package-scripts.mjs (Reconcile foundation npm scripts into a host app)
   - sync-components.sh (styleRegistry → components.json sync + shadcn reinstall)
   - sync-components.ps1 (styleRegistry → components.json sync + shadcn reinstall)
 </FileTree>

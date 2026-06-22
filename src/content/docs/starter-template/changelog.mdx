@@ -17,6 +17,38 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v1.32.0
+
+**Deletion cascade + cross-platform dependency tooling**
+
+Two things ship together: the next security-floor phase (provider-delegated account/tenant erasure) and a rebuild of the dependency-update tooling so it actually works in host apps.
+
+### Deletion cascade (provider-API wiring)
+
+The "named bespoke = thin provider wiring" exception in the [delegation model](/starter-template/security-feature/). On account/tenant deletion, `deleteAccount()` runs every registered deletion handler in a **classification-driven, fail-safe order**, then removes the auth identity **last**, and returns a `DeletionReport` (it never throws — every outcome is captured).
+
+- **`deleteAccount(subject, opts)`** — the orchestrator. Order: capture a compliance bundle **before** any destruction → `credential` (crypto-shred) → `owned` (hard-delete; the core `User` row runs late so module child tables clear first) → `referenced` (unlink, never touch the source) → `preserved` recorded as a **deferred legal hold** → auth identity **last**, and only if no `owned`/`credential` handler failed (so a partial failure keeps the login alive for an idempotent retry). There is deliberately **no wrapping DB transaction** — the cascade spans external providers (R2/Stripe/KMS) that can't enrol in one.
+- **`securityRegistry.registerDeletionHandler({ id, moduleId, classification, order?, run })`** — modules contribute deletion units via a side-effect `security.registration.ts`. Handlers must be **idempotent** and must throw / return `{ action: 'failed' }` on non-completion.
+- **Auth-identity seam (`auth-identity.ts`)** — closes the historical gap where `deleteUser` left the **Neon Auth identity** behind. The default deleter is `unconfigured` (a visible WARN + a reported `unconfigured` status — it does *not* fake success); wire the real provider call once at bootstrap via `setAuthIdentityDeleter(createNeonAuthIdentityDeleter({ projectId, secretServerKey }))`. Mirrors the `key-provider` pattern.
+- **Compliance bundle** — the data-classification manifest + consent/decision record + legal-hold deferrals, captured before destruction (GDPR Art. 17 / Art. 30). Returned in the report for the app to persist or email.
+- **Both deletion paths wired** — self-service (`user.service.deleteUser`) and admin (`admin.service.deleteUser`) now run the same cascade. The admin path keeps its atomic last-admin guard (the row is deleted inside the Serializable transaction; the idempotent `user.account` handler then no-ops).
+- New public exports from `@/features/security`: `deleteAccount`, `buildComplianceBundle`, `registerDeletionHandler`/`getDeletionHandlers`, the `AuthIdentityDeleter` seam, and the deletion types. `deleteUser`'s return is **widened additively** (`status` + `cascade` added; existing fields kept). No new dependency (Node `crypto`/`fetch`). Non-breaking, no migration.
+
+<Aside type="caution" title="Migration note for modules">
+If a module moves its cleanup from the `user.deleted` action hook into a registered deletion handler, **remove its `user.deleted` subscriber in the same step** — otherwise the cleanup runs twice. The legacy hook is kept (it fires after the cascade) only for back-compat during migration.
+</Aside>
+
+### Cross-platform dependency tooling
+
+Fixes two real host-app problems: `npm run deps:update` did nothing (the root `package.json` is user-owned, so the `deps:*` aliases never reached older apps — and they were wired to `pwsh`, not cross-platform), and `template:update` wiped locally `npm link`-ed modules.
+
+- **`deps:*` are now Node-based + cross-platform** — `scripts/update-deps.mjs` (no PowerShell dependency). The old `update-deps.{ps1,sh}` are thin shims that delegate to it.
+- **`deps:lockfile` (new)** — `npm install --package-lock-only` across root/frontend/backend: regenerates lockfiles **without** installing `node_modules`. This is the mode for refreshing the **template repo's own** stale locks (it ships no `node_modules`).
+- **npm-link preservation** — `scripts/link-modules.mjs` snapshots `npm link` symlinks before, and restores them after, any install that prunes them. `template:update` and `deps:update`/`deps:update:latest` now keep your locally-linked modules intact. Manual re-link: `npm run deps:relink`.
+- **Foundation-script reconciliation** — `template:update` runs `scripts/sync-package-scripts.mjs`, which ensures the `deps:*` aliases exist + point at the canonical commands in the host app's `package.json` (the fix for "`Missing script: deps:update`" on older apps). Only foundation keys are touched; your own scripts are untouched.
+
+---
+
 ## v1.31.0
 
 **Field encryption (app-layer AES-256-GCM)**

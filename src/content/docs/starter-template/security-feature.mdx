@@ -121,3 +121,75 @@ const ok     = verifySecret(presented, stored);
 <Aside type="caution" title="Why app-layer, not pgcrypto">
 `pgcrypto` runs inside Postgres, so the key would travel to Neon on every query — defeating "the database can't read it." App-layer AES-256-GCM keeps the key in the app; Neon only ever sees ciphertext. The stronger **zero-knowledge** guarantee (where even the app can't decrypt — client-side E2EE) has no provider and stays on the [roadmap](/starter-template/roadmap/#security-floor-v200).
 </Aside>
+
+## Deletion cascade
+
+No provider deletes across **all** your stores, so account/tenant erasure is the second item on the [named bespoke allow-list](#who-owns-what-the-delegation-map) — a thin orchestrator that calls each provider's delete API in a safe order. Added in v1.32.0.
+
+`deleteAccount(subject, opts)` runs every registered deletion handler grouped by the **data classification** the module declared, then removes the auth identity **last**, and returns a `DeletionReport` (it never throws — every outcome is captured for the caller to persist and, if needed, retry).
+
+```typescript
+import { deleteAccount } from '@/features/security';
+
+const report = await deleteAccount(
+  { tenantId: user.id, userId: user.id, email: user.email },
+  { trigger: 'user-request', requestMetadata },
+);
+// report.status: 'completed' | 'partial' | 'failed'
+// report.authIdentity.status, report.bundle, report.results, report.totals
+```
+
+**The order is fail-safe** — if the process dies partway, the least-bad state remains, and handlers are idempotent so the cascade can retry:
+
+1. **Compliance bundle** — captured *before* any destruction (you can't export after you delete): the classification manifest + consent/decision record + legal-hold deferrals.
+2. **`credential`** → **crypto-shred** (destroy keys first; even a later failure leaves encrypted data unreadable).
+3. **`owned`** → **hard-delete** app rows. The core `User` row is a registered handler that runs *late* in this phase, so module-owned child tables clear first.
+4. **`referenced`** → **unlink** the pointer only; never touch the external source.
+5. **`preserved`** → recorded as a **deferred legal hold**, not deleted (a retention job erases it when the hold lifts — app-level).
+6. **Auth identity** → removed **last**, and only if no `owned`/`credential` handler failed (a partial failure keeps the login alive for an idempotent retry rather than orphaning data).
+
+There is deliberately **no wrapping DB transaction** — the cascade spans external providers (R2/Stripe/KMS) that can't enrol in a Postgres transaction. It's best-effort and fully reported.
+
+### Modules register deletion handlers
+
+```typescript
+// features/<module>/security.registration.ts  (side-effect import from index.ts)
+import { securityRegistry } from '@/features/security';
+import { owned } from '@/lib/owned';
+import { prisma } from '@/lib/prisma';
+
+securityRegistry.registerDeletionHandler({
+  id: 'billing.invoices',
+  moduleId: 'billing',
+  classification: 'owned',
+  description: "Hard-delete the tenant's invoices",
+  async run(ctx) {
+    const { count } = await prisma.invoice.deleteMany({ where: owned(ctx.subject.tenantId) });
+    return { action: 'hard-delete', recordsAffected: count };
+  },
+});
+```
+
+Handlers must be **idempotent** and must throw — or return `{ action: 'failed' }` — if they did not complete, since the orchestrator treats any non-failed return as success when deciding whether to remove the auth identity.
+
+### The Neon Auth identity (closing the gap)
+
+Historically `deleteUser` removed app rows but left the **Neon Auth login identity** behind. Deleting the identity is a provider action, so the feature ships a **seam**, not a hand-rolled auth store — exactly like the [key provider](#field-encryption):
+
+```typescript
+// bootstrap, e.g. backend/src/app.ts
+import { setAuthIdentityDeleter, createNeonAuthIdentityDeleter } from '@/features/security';
+
+setAuthIdentityDeleter(createNeonAuthIdentityDeleter({
+  projectId: process.env.NEON_AUTH_PROJECT_ID!,
+  secretServerKey: process.env.NEON_AUTH_SECRET_KEY!, // server-only secret
+}));
+```
+
+The **default** deleter is `unconfigured`: it does **not** fake success — it logs a WARN and the report carries `authIdentity.status: 'unconfigured'`, so the gap is visible rather than silent. App data is still erased; the identity simply remains until you wire a deleter (or remove it from the Neon dashboard).
+
+<Aside type="note" title="Both deletion paths run the cascade">
+Self-service deletion (`user.service.deleteUser`) and admin deletion (`admin.service.deleteUser`) both route through `deleteAccount`. The admin path keeps its atomic last-admin guard — the row is deleted inside the Serializable transaction, and the idempotent `user.account` handler then no-ops. The legacy `user.deleted` action hook still fires (after the cascade) for back-compat; modules migrating cleanup into a deletion handler should drop their `user.deleted` subscriber in the same step to avoid double cleanup.
+</Aside>
+
+See the [Registry Reference](/starter-template/registries/#securityregistry-backend) for the deletion-handler API and the full `DeletionReport` shape.
