@@ -19,6 +19,7 @@ Use `useBranding()` in any code that might render on a public route. Use `useApp
 The admin panel is accessible at `/admin` and is only visible to users with the `admin` role. It provides:
 
 - **App Settings** - Configure app name, logo, and display options
+- **Security** - View the live security posture and edit the non-secret, env-backed security knobs (added in v1.37.0)
 - **User Management** - View, modify roles, and delete users
 - **Navigation Management** - Customise sidebar items, sections, and user menu
 - **Header Toolbar** - Show/hide toolbar items
@@ -73,23 +74,29 @@ frontend/src/features/admin/
 ├── pages/
 │   ├── AdminDashboardPage.tsx      # Overview stats
 │   ├── AppSettingsPage.tsx         # Branding config
+│   ├── SecurityAdminPage.tsx       # Security posture + env-knob editor
 │   ├── AdminUsersPage.tsx          # User management
 │   ├── NavigationManagementPage.tsx # Nav + sections + user menu
 │   └── HeaderToolbarPage.tsx       # Toolbar overrides
 ├── hooks/
 │   ├── useAppSettings.ts           # Admin settings (for editing)
+│   ├── useSecurityAdmin.ts         # Security overview + env-update
 │   ├── useNavigationOverrides.ts   # Nav + section override management
 │   ├── useToolbarOverrides.ts      # Toolbar override management
 │   └── useAdminUsers.ts            # User management
 └── services/
-    └── admin.service.ts            # API client
+    ├── admin.service.ts            # API client
+    └── security-admin.service.ts   # Security page API client
 
 backend/src/features/admin/
 ├── index.ts                        # Exports + registrations
 ├── admin.types.ts                  # Types and Zod schemas
 ├── admin.service.ts                # Business logic
 ├── admin.routes.ts                 # Two routers: public + admin
-├── route.registration.ts           # Registers both routers
+├── security-admin.types.ts         # Editable-knob allow-list + Zod contract
+├── security-admin.service.ts       # Posture overview + .env writer
+├── security-admin.routes.ts        # Admin-only security routes
+├── route.registration.ts           # Registers all routers
 └── service.registration.ts         # Service registry
 ```
 
@@ -221,6 +228,30 @@ The backend enforces these rules:
 - Cannot remove the last admin
 - Cannot delete your own account from admin panel
 - Cannot demote yourself if you're the last admin
+
+---
+
+## Security
+
+Added in **v1.37.0**. The Security page (`/admin/security`) is a window into the [security feature](/starter-template/security-feature/): a read-only **posture dashboard** plus an editor for the non-secret, env-backed security knobs.
+
+It reads the **live resolved posture** — it does not duplicate any logic. The backend delegates to the security feature's existing exports: `evaluateStartupPosture()` (the same [startup guardrail](/getting-started/cloudflare-edge/#the-startup-posture-guardrail) findings), `securityConfig`, `getKeyProviderStatus()`, and `securityRegistry`.
+
+**What it shows (read-only):**
+
+- **Posture checks** — every finding from the startup guardrail with its severity (`ok` / `info` / `warn` / `error`) and remediation.
+- **Resolved configuration** — the active `SecurityConfig` (tier + the resolved knobs).
+- **Key provider** — whether field-encryption key custody is ready (env key present, or KMS wired).
+- **Secrets** — `SECURITY_ENCRYPTION_KEY`, the KMS / AWS credentials, the Neon Auth secret — as **set / not-set only**. Values are never read into the response or shown.
+- **Module manifests** — what each registered module declared to the security registry.
+
+**What it edits:** the **non-secret** knobs only — the tier (`SECURITY_PROFILE`), the per-knob overrides, `SECURITY_EDGE`, `SECURITY_POSTURE_ENFORCE`, trust-proxy / request-timeout / rate-limit. Each edit is written to `backend/.env` via an allow-listed, atomic upsert and is **audit-logged**.
+
+<Aside type="caution" title="Edits are restart-required and dev-first">
+Security config is resolved **once at bootstrap** (`securityConfig` is computed at import), so an edit only takes effect after the backend restarts — the UI says so. Secrets are **never** editable here (use `npm run security:setup-kms` / your env manager). In **production** the editor is **refused** unless `SECURITY_ADMIN_ALLOW_ENV_WRITE=true`, because managed-env deploys (PM2 / Docker / systemd) read real env vars, not `backend/.env`. In development it is always enabled.
+</Aside>
+
+The edit endpoint validates against a **strict allow-list** (`.strict()` Zod schema — an arbitrary env key like `DATABASE_URL` is rejected) and the free-text knobs are charset-locked so a value can never inject a second `.env` line.
 
 ---
 
@@ -396,6 +427,12 @@ The `/settings` endpoint returns **everything** the frontend needs to render the
 | `/api/v1/admin/users` | GET | List all users |
 | `/api/v1/admin/users/:id/role` | PATCH | Update user role |
 | `/api/v1/admin/users/:id` | DELETE | Delete user |
+| `/api/v1/admin/security/overview` | GET | Security posture, config, key/edge status, secret status, module manifests |
+| `/api/v1/admin/security/env` | PUT | Edit the non-secret, env-backed security knobs (allow-listed; restart required) |
+
+<Aside type="note">
+The two `/admin/security/*` endpoints are **admin-only for reads too** (not public-read like `/settings`) — the posture reveals where the app's security is weak, so it must not be exposed to non-admins. See the [Security](#security) section.
+</Aside>
 
 `/style-overrides` uses **PUT** (full replace), not PATCH — sending the entire map each time keeps persistence in sync with the in-memory `styleRegistry` state and automatically drops stale keys for entries that have been unregistered.
 
