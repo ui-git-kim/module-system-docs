@@ -17,7 +17,9 @@ The pattern is **envelope encryption**: KMS holds the root key, the app unwraps 
 ## Prerequisites
 
 - An [AWS account](https://aws.amazon.com)
-- The [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and signed in (`aws configure`)
+- Your app's dependencies installed — the setup command (Step 3) runs from the app
+
+You create the key + IAM in the AWS console (like you create a project in the Neon console); the `npm run security:setup-kms` command then prompts for the values, generates the wrapped data key, and writes everything into `.env`.
 
 ## Step 1: Create a KMS key
 
@@ -31,9 +33,9 @@ The pattern is **envelope encryption**: KMS holds the root key, the app unwraps 
 Use the **same region as your Neon database** (e.g. `ap-southeast-2`) to keep the unwrap call fast.
 :::
 
-## Step 2: Create a least-privilege IAM principal
+## Step 2: Create an IAM principal
 
-Attach this policy (scoped to **your** key ARN) to the IAM user or role your backend runs as:
+Attach this policy (scoped to **your** key ARN) to an IAM user, and create an access key for it (Console → **IAM** → Users → Security credentials → Create access key). For production, attach the policy to a **role** instead of using static keys.
 
 ```json
 {
@@ -41,7 +43,7 @@ Attach this policy (scoped to **your** key ARN) to the IAM user or role your bac
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": "kms:Decrypt",
+      "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
       "Resource": "arn:aws:kms:REGION:ACCOUNT:key/KEY_ID"
     }
   ]
@@ -49,47 +51,30 @@ Attach this policy (scoped to **your** key ARN) to the IAM user or role your bac
 ```
 
 :::tip
-That's the only **runtime** permission — decrypt, on one key. The one-time data-key generation in Step 3 uses your own admin credentials, not this principal.
+`GenerateDataKey` is used **once** at setup to mint the wrapped data key; `Decrypt` is the only permission the running app needs. For strict production you can split them — set up with a key that has both, then give the runtime role `Decrypt` only.
 :::
 
-## Step 3: Generate the wrapped data key (once)
+## Step 3: Run the setup command
+
+From your app root, run the interactive setup. It **prompts for the values above, generates the wrapped data key for you, installs the SDK, and writes everything into `backend/.env`** — no manual CLI:
 
 ```bash
-aws kms generate-data-key \
-  --key-id alias/myapp-fields \
-  --key-spec AES_256 \
-  --query CiphertextBlob --output text
+npm run security:setup-kms
 ```
 
-Copy the output — that's your **wrapped data key** (base64). The plaintext key is never written to disk; you store only this encrypted form.
+It asks for the **region**, the **KMS key id/ARN**, and your **access key + secret** (leave the credentials blank to use an IAM role / `aws configure`). It writes `SECURITY_KEY_PROVIDER=kms`, `AWS_REGION`, `SECURITY_KMS_KEY_ID`, `SECURITY_KMS_WRAPPED_DEK` (and the AWS keys if you pasted them). The plaintext data key is generated in a throwaway process and never stored.
 
-## Step 4: Configure `backend/.env`
-
-```bash
-# Switch key custody from the env key to AWS KMS
-SECURITY_KEY_PROVIDER=kms
-AWS_REGION=ap-southeast-2
-SECURITY_KMS_KEY_ID=arn:aws:kms:ap-southeast-2:123456789012:key/abcd-...
-SECURITY_KMS_WRAPPED_DEK=AQIDAHj...   # the base64 from Step 3
-
-# AWS credentials (dev). In production prefer an IAM role — no static keys.
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
-```
+:::note
+`create-app` offers this same step during cloning, so a fresh app can be set up in one pass.
+:::
 
 :::caution[Keep the secret server-side]
-`SECURITY_KMS_WRAPPED_DEK` is ciphertext (safe-ish), but `AWS_SECRET_ACCESS_KEY` is a live credential. Never commit `.env`, and prefer an IAM **role** in production so there are no static keys to leak.
+The wrapped data key is ciphertext (safe-ish), but `AWS_SECRET_ACCESS_KEY` is a live credential. Never commit `.env`, and prefer an IAM **role** in production so there are no static keys to leak.
 :::
 
-## Step 5: Install the SDK and wire the adapter
+## Step 4: Wire the adapter
 
-The AWS SDK is an **optional** dependency — install it only in apps that use KMS:
-
-```bash
-cd backend && npm install @aws-sdk/client-kms
-```
-
-Then wire the adapter once at bootstrap (`backend/src/app.ts`), before any field encryption runs:
+The setup command prints this — add it once at bootstrap (`backend/src/app.ts`), before any field encryption runs:
 
 ```ts
 import { setKeyProvider } from '@/features/security';
@@ -106,7 +91,7 @@ setKeyProvider(kms);
 await kms.getKey();
 ```
 
-## Step 6: Verify
+## Step 5: Verify
 
 Encrypt and decrypt a value round-trips through the unwrapped key, and AWS **CloudTrail** shows exactly one `Decrypt` event for the process:
 
@@ -122,8 +107,8 @@ If that prints `hello`, KMS key custody is working.
 ## Troubleshooting
 
 ### `AccessDeniedException`
-- The IAM principal lacks `kms:Decrypt`, or the policy's key ARN / region doesn't match.
-- Confirm the running role/user is the one you attached the policy to.
+- The IAM principal lacks `kms:GenerateDataKey` (setup) or `kms:Decrypt` (runtime), or the policy's key ARN / region doesn't match.
+- Confirm the credentials you entered are for the principal you attached the policy to.
 
 ### `InvalidCiphertextException`
 - The `SECURITY_KMS_WRAPPED_DEK` was generated under a **different key or region** than `SECURITY_KMS_KEY_ID` / `AWS_REGION`. Regenerate it (Step 3) against the right key.
