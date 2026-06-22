@@ -40,6 +40,10 @@ export default defineConfig({
               label: "Neon Database Setup",
               slug: "getting-started/neon-setup",
             },
+            {
+              label: "Field Encryption with AWS KMS",
+              slug: "getting-started/aws-kms-setup",
+            },
             { label: "LLM Rules", slug: "getting-started/llm-rules" },
           ],
         },

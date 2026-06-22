@@ -1,0 +1,143 @@
+---
+title: Field Encryption with AWS KMS
+description: Move field-encryption key custody into AWS KMS so the master key never lives in your app
+---
+
+This guide sets up **AWS KMS** so the master key for [field encryption](/starter-template/security-feature/#field-encryption) lives in AWS, never in your app. It's **optional** — only needed if a module uses field encryption (`hardened`+ tiers) and you want provider-held key custody instead of an env key.
+
+## What this gets you
+
+Field encryption scrambles your most sensitive columns so that a leaked database password, a Neon console session, or a stolen backup yields only ciphertext. The key that unscrambles it has to live somewhere:
+
+- **An env key** (`SECURITY_ENCRYPTION_KEY`) — works, but the key sits on your server, so the risk is yours.
+- **AWS KMS** (this guide) — the key lives in AWS, every use is logged in CloudTrail, and you can revoke it instantly. The risk moves to the provider.
+
+The pattern is **envelope encryption**: KMS holds the root key, the app unwraps a data key **once** at startup and caches it, and AES-256-GCM runs locally. KMS isn't called per field.
+
+## Prerequisites
+
+- An [AWS account](https://aws.amazon.com)
+- The [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and signed in (`aws configure`)
+
+## Step 1: Create a KMS key
+
+1. AWS Console → **KMS** → **Customer managed keys** → **Create key**
+2. Key type **Symmetric**, usage **Encrypt and decrypt**
+3. Give it an alias, e.g. `alias/myapp-fields`, and add yourself as a key administrator
+4. After creation, open the key → **Key rotation** → enable **automatic rotation** (yearly)
+5. Copy the key **ARN** — `arn:aws:kms:REGION:ACCOUNT:key/KEY_ID`
+
+:::tip
+Use the **same region as your Neon database** (e.g. `ap-southeast-2`) to keep the unwrap call fast.
+:::
+
+## Step 2: Create a least-privilege IAM principal
+
+Attach this policy (scoped to **your** key ARN) to the IAM user or role your backend runs as:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:REGION:ACCOUNT:key/KEY_ID"
+    }
+  ]
+}
+```
+
+:::tip
+That's the only **runtime** permission — decrypt, on one key. The one-time data-key generation in Step 3 uses your own admin credentials, not this principal.
+:::
+
+## Step 3: Generate the wrapped data key (once)
+
+```bash
+aws kms generate-data-key \
+  --key-id alias/myapp-fields \
+  --key-spec AES_256 \
+  --query CiphertextBlob --output text
+```
+
+Copy the output — that's your **wrapped data key** (base64). The plaintext key is never written to disk; you store only this encrypted form.
+
+## Step 4: Configure `backend/.env`
+
+```bash
+# Switch key custody from the env key to AWS KMS
+SECURITY_KEY_PROVIDER=kms
+AWS_REGION=ap-southeast-2
+SECURITY_KMS_KEY_ID=arn:aws:kms:ap-southeast-2:123456789012:key/abcd-...
+SECURITY_KMS_WRAPPED_DEK=AQIDAHj...   # the base64 from Step 3
+
+# AWS credentials (dev). In production prefer an IAM role — no static keys.
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+```
+
+:::caution[Keep the secret server-side]
+`SECURITY_KMS_WRAPPED_DEK` is ciphertext (safe-ish), but `AWS_SECRET_ACCESS_KEY` is a live credential. Never commit `.env`, and prefer an IAM **role** in production so there are no static keys to leak.
+:::
+
+## Step 5: Install the SDK and wire the adapter
+
+The AWS SDK is an **optional** dependency — install it only in apps that use KMS:
+
+```bash
+cd backend && npm install @aws-sdk/client-kms
+```
+
+Then wire the adapter once at bootstrap (`backend/src/app.ts`), before any field encryption runs:
+
+```ts
+import { setKeyProvider } from '@/features/security';
+import { createAwsKmsKeyProvider } from '@/features/security/key-providers/aws-kms';
+
+const kms = createAwsKmsKeyProvider({
+  region: process.env.AWS_REGION!,
+  keyId: process.env.SECURITY_KMS_KEY_ID!,
+  wrappedDek: process.env.SECURITY_KMS_WRAPPED_DEK!,
+});
+setKeyProvider(kms);
+
+// Optional: fail fast at startup instead of on the first encrypted field.
+await kms.getKey();
+```
+
+## Step 6: Verify
+
+Encrypt and decrypt a value round-trips through the unwrapped key, and AWS **CloudTrail** shows exactly one `Decrypt` event for the process:
+
+```ts
+import { encryptField, decryptField } from '@/features/security';
+
+const sealed = await encryptField('hello');
+console.log(await decryptField(sealed)); // 'hello'
+```
+
+If that prints `hello`, KMS key custody is working.
+
+## Troubleshooting
+
+### `AccessDeniedException`
+- The IAM principal lacks `kms:Decrypt`, or the policy's key ARN / region doesn't match.
+- Confirm the running role/user is the one you attached the policy to.
+
+### `InvalidCiphertextException`
+- The `SECURITY_KMS_WRAPPED_DEK` was generated under a **different key or region** than `SECURITY_KMS_KEY_ID` / `AWS_REGION`. Regenerate it (Step 3) against the right key.
+
+### "needs the AWS SDK. Install it..."
+- Run `cd backend && npm install @aws-sdk/client-kms`.
+
+### `wrappedDek does not look like a KMS CiphertextBlob`
+- The value isn't the base64 ciphertext from Step 3 (often a placeholder or truncated). Regenerate and paste the full `--output text` value.
+
+## Production considerations
+
+- **Use an IAM role, not static keys.** On ECS/EKS/Lambda/EC2, attach the policy to the task/instance role and drop `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` entirely.
+- **Keep rotation on.** Automatic yearly CMK rotation is transparent to envelope encryption.
+- **Audit.** Watch the `Decrypt` calls in CloudTrail.
+- **Crypto-shred.** Disabling or deleting the KMS key makes every field encrypted under this data key **permanently unreadable** — that's the global crypto-shred. Per-tenant crypto-shred (shred one tenant, not all) is the documented growth path.
+- **Managed HSM.** Step up to AWS KMS **Managed HSM** only if a compliance regime requires a dedicated, single-tenant HSM (FIPS 140-2 Level 3). Standard KMS is sufficient for most apps.

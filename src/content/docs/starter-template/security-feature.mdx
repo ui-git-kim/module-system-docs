@@ -116,7 +116,7 @@ const stored = hashSecret(apiToken);          // store this
 const ok     = verifySecret(presented, stored);
 ```
 
-**Keys (`keyProvider`):** the **`env`** adapter ships working — `SECURITY_ENCRYPTION_KEY`, base64 32 bytes (`openssl rand -base64 32`). A **`kms`** adapter is an interface: wire a managed KMS per-deployment via `setKeyProvider()` (required at `strict`, where per-tenant keys enable crypto-shred). Field encryption is off at `standard`, on at `hardened`+ (the `fieldEncryption` tier knob).
+**Keys (`keyProvider`):** the **`env`** adapter ships working — `SECURITY_ENCRYPTION_KEY`, base64 32 bytes (`openssl rand -base64 32`), with the key living in your env. For **provider-held key custody**, set `SECURITY_KEY_PROVIDER=kms` and wire the shipped **AWS KMS** reference adapter (`createAwsKmsKeyProvider`) — the master key then lives in AWS, never in your env or the database, with CloudTrail logging and instant revocation. Walkthrough: [Field encryption with AWS KMS](/getting-started/aws-kms-setup/). Field encryption is off at `standard`, on at `hardened`+ (the `fieldEncryption` tier knob).
 
 <Aside type="caution" title="Why app-layer, not pgcrypto">
 `pgcrypto` runs inside Postgres, so the key would travel to Neon on every query — defeating "the database can't read it." App-layer AES-256-GCM keeps the key in the app; Neon only ever sees ciphertext. The stronger **zero-knowledge** guarantee (where even the app can't decrypt — client-side E2EE) has no provider and stays on the [roadmap](/starter-template/roadmap/#security-floor-v200).
@@ -174,17 +174,24 @@ Handlers must be **idempotent** and must throw — or return `{ action: 'failed'
 
 ### The Neon Auth identity (closing the gap)
 
-Historically `deleteUser` removed app rows but left the **Neon Auth login identity** behind. Deleting the identity is a provider action, so the feature ships a **seam**, not a hand-rolled auth store — exactly like the [key provider](#field-encryption):
+Historically `deleteUser` removed app rows but left the **Neon Auth login identity** behind. Deleting the identity is a provider action, so the feature ships a **seam**, not a hand-rolled auth store — exactly like the [key provider](#field-encryption). Neon Auth is now powered by **Better Auth**, whose supported server-side deletion is the Neon Auth server SDK (`@neondatabase/auth`, admin `removeUser`), so the recommended path is to implement the deleter against that SDK:
 
 ```typescript
 // bootstrap, e.g. backend/src/app.ts
-import { setAuthIdentityDeleter, createNeonAuthIdentityDeleter } from '@/features/security';
+import { setAuthIdentityDeleter } from '@/features/security';
 
-setAuthIdentityDeleter(createNeonAuthIdentityDeleter({
-  projectId: process.env.NEON_AUTH_PROJECT_ID!,
-  secretServerKey: process.env.NEON_AUTH_SECRET_KEY!, // server-only secret
-}));
+setAuthIdentityDeleter({
+  name: 'neon-auth',
+  async deleteIdentity(subject) {
+    const userId = subject.userId || subject.tenantId;
+    if (!userId) return { deleted: false, detail: 'no user id' };
+    await serverAuth.api.removeUser({ body: { userId } }); // your Neon Auth server SDK
+    return { deleted: true };
+  },
+});
 ```
+
+If your provider exposes a plain REST admin endpoint instead, `createRestAuthIdentityDeleter({ buildUrl, headers })` is a thin provider-agnostic helper — you supply the URL and headers (verify them against your provider).
 
 The **default** deleter is `unconfigured`: it does **not** fake success — it logs a WARN and the report carries `authIdentity.status: 'unconfigured'`, so the gap is visible rather than silent. App data is still erased; the identity simply remains until you wire a deleter (or remove it from the Neon dashboard).
 
