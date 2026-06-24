@@ -228,38 +228,71 @@ Every frontend service must use the shared `api` client — never `fetch()` or a
 ```typescript
 // src/templates/frontend/services.ts
 export const SERVICE_TEMPLATE = `// ========================================================================
-// FILE: frontend/src/features/my-feature/services/myFeature.service.ts
+// FILE: frontend/src/features/my-feature/services/my-feature.service.ts
 // PURPOSE: API service for my-feature
+// ========================================================================
+// Every method accepts an optional AbortSignal so callers can cancel
+// in-flight requests. The hooks in ../hooks/useMyFeature.ts thread
+// TanStack Query's signal through automatically. Do NOT call this
+// service directly from components — use the hooks.
 // ========================================================================
 
 import { api } from '@/lib/api';
-import type { MyFeatureItem, CreateMyFeatureInput, UpdateMyFeatureInput } from '../types';
+import type {
+  MyFeatureItem,
+  MyFeatureListOptions,
+  MyFeatureListResponse,
+  CreateMyFeatureItemInput,
+  UpdateMyFeatureItemInput,
+} from '../types';
 
-const BASE_URL = '/api/v1/my-feature';
+interface RequestOptions {
+  signal?: AbortSignal;
+}
 
 export const myFeatureService = {
-  async getAll(): Promise<MyFeatureItem[]> {
-    const { data } = await api.get(BASE_URL);
-    return data;
+  // Cursor-paginated list — returns { items, nextCursor, hasMore }, not an array.
+  async getAll(
+    options: MyFeatureListOptions & RequestOptions = {}
+  ): Promise<MyFeatureListResponse> {
+    const { signal, limit, cursor } = options;
+    const response = await api.get<MyFeatureListResponse>('/api/v1/my-feature', {
+      params: { limit, cursor },
+      signal,
+    });
+    return response.data;
   },
 
-  async getById(id: string): Promise<MyFeatureItem> {
-    const { data } = await api.get(\`\${BASE_URL}/\${id}\`);
-    return data;
+  async getById(id: string, options: RequestOptions = {}): Promise<MyFeatureItem> {
+    const response = await api.get<MyFeatureItem>(\`/api/v1/my-feature/\${id}\`, {
+      signal: options.signal,
+    });
+    return response.data;
   },
 
-  async create(input: CreateMyFeatureInput): Promise<MyFeatureItem> {
-    const { data } = await api.post(BASE_URL, input);
-    return data;
+  async create(
+    input: CreateMyFeatureItemInput,
+    options: RequestOptions = {}
+  ): Promise<MyFeatureItem> {
+    const response = await api.post<MyFeatureItem>('/api/v1/my-feature', input, {
+      signal: options.signal,
+    });
+    return response.data;
   },
 
-  async update(id: string, input: UpdateMyFeatureInput): Promise<MyFeatureItem> {
-    const { data } = await api.patch(\`\${BASE_URL}/\${id}\`, input);
-    return data;
+  async update(
+    id: string,
+    input: UpdateMyFeatureItemInput,
+    options: RequestOptions = {}
+  ): Promise<MyFeatureItem> {
+    const response = await api.patch<MyFeatureItem>(\`/api/v1/my-feature/\${id}\`, input, {
+      signal: options.signal,
+    });
+    return response.data;
   },
 
-  async delete(id: string): Promise<void> {
-    await api.delete(\`\${BASE_URL}/\${id}\`);
+  async delete(id: string, options: RequestOptions = {}): Promise<void> {
+    await api.delete(\`/api/v1/my-feature/\${id}\`, { signal: options.signal });
   },
 };
 `;
@@ -782,56 +815,78 @@ export const SERVICE_TEMPLATE = `// ============================================
 
 import { prisma } from '../../lib/prisma.js';
 import { NotFoundError } from '../../lib/errors.js';
-import type { CreateMyFeatureInput, UpdateMyFeatureInput } from './my-feature.types.js';
-
 import { createModuleLogger } from '../../lib/logger.js';
 import { actionRegistry } from '../../config/action.registry.js';
+import type {
+  CreateMyFeatureInput,
+  UpdateMyFeatureInput,
+  MyFeatureListOptions,
+  MyFeatureListResponse,
+} from './my-feature.types.js';
 
 const log = createModuleLogger('my-feature');
 
+const DEFAULT_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 200;
+
+// List endpoints return a narrow projection — full objects only via getById.
+const LIST_SELECT = {
+  id: true, name: true, status: true, createdAt: true, updatedAt: true,
+} as const;
+
 export const myFeatureService = {
-  async getAll(userId: string) {
-    return prisma.my_feature_item.findMany({
+  // Cursor-paginated — stable under concurrent inserts; relies on the
+  // [userId, createdAt] index. Returns { items, nextCursor, hasMore }.
+  async getAll(
+    userId: string,
+    { limit = DEFAULT_PAGE_SIZE, cursor }: MyFeatureListOptions = {}
+  ): Promise<MyFeatureListResponse> {
+    const take = Math.min(Math.max(1, limit), MAX_PAGE_SIZE);
+    const rows = await prisma.my_feature_item.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
+      take: take + 1, // one extra to detect the next page
+      ...(cursor && { cursor: { id: cursor }, skip: 1 }),
+      select: LIST_SELECT,
     });
+    const hasMore = rows.length > take;
+    const items = hasMore ? rows.slice(0, take) : rows;
+    return { items, nextCursor: hasMore ? items[items.length - 1].id : null, hasMore };
   },
 
   async getById(id: string, userId: string) {
-    const item = await prisma.my_feature_item.findFirst({
-      where: { id, userId },
-    });
-    if (!item) {
-      throw new NotFoundError('Item not found');
-    }
+    const item = await prisma.my_feature_item.findFirst({ where: { id, userId } });
+    if (!item) throw new NotFoundError('Item not found');
     return item;
   },
 
   async create(userId: string, data: CreateMyFeatureInput) {
-    const item = await prisma.my_feature_item.create({
-      data: { userId, ...data },
-    });
+    // Field encryption (hardened+): seal columns declared in encryptedFields with
+    // encryptField() from '../security/index.js' before storing. See security.registration.ts.
+    const item = await prisma.my_feature_item.create({ data: { ...data, userId } });
     log.info({ userId, itemId: item.id }, 'Item created');
-    await actionRegistry.doAction('my-feature.item.created', { userId, item });
+    actionRegistry.doAction('my-feature.item.created', { userId, item }); // fire-and-forget — not awaited
     return item;
   },
 
+  // Atomic ownership check + update in a single transaction.
   async update(id: string, userId: string, data: UpdateMyFeatureInput) {
-    await this.getById(id, userId);
-    const item = await prisma.my_feature_item.update({
-      where: { id },
-      data,
+    const item = await prisma.$transaction(async (tx) => {
+      const existing = await tx.my_feature_item.findFirst({ where: { id, userId }, select: { id: true } });
+      if (!existing) throw new NotFoundError('Item not found');
+      return tx.my_feature_item.update({ where: { id }, data });
     });
-    log.info({ userId, itemId: item.id }, 'Item updated');
-    await actionRegistry.doAction('my-feature.item.updated', { userId, item });
+    log.info({ userId, itemId: id }, 'Item updated');
+    actionRegistry.doAction('my-feature.item.updated', { userId, item, changes: data });
     return item;
   },
 
+  // Single round trip — deleteMany with the compound filter is idempotent.
   async delete(id: string, userId: string) {
-    await this.getById(id, userId);
-    await prisma.my_feature_item.delete({ where: { id } });
+    const result = await prisma.my_feature_item.deleteMany({ where: { id, userId } });
+    if (result.count === 0) throw new NotFoundError('Item not found');
     log.info({ userId, itemId: id }, 'Item deleted');
-    await actionRegistry.doAction('my-feature.item.deleted', { userId, itemId: id });
+    actionRegistry.doAction('my-feature.item.deleted', { userId, itemId: id });
   },
 };
 `;
@@ -845,52 +900,60 @@ export const ROUTES_TEMPLATE = `// =============================================
 // PURPOSE: API routes for my-feature
 // ========================================================================
 
-import { Router } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { myFeatureService } from './my-feature.service.js';
 import { createModuleLogger } from '../../lib/logger.js';
 
 const router = Router();
 const log = createModuleLogger('my-feature:routes');
 
-router.get('/', async (req, res, next) => {
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const items = await myFeatureService.getAll(req.user!.id);
-    res.json(items);
+    const { id: userId } = req.user!;
+    // Pagination: ?limit=50&cursor=<lastItemId> — returns { items, nextCursor, hasMore }.
+    const limit = req.query.limit ? Number(req.query.limit) : undefined;
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+    const result = await myFeatureService.getAll(userId, { limit, cursor });
+    res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const item = await myFeatureService.getById(req.params.id, req.user!.id);
+    const { id: userId } = req.user!;
+    const item = await myFeatureService.getById(req.params.id, userId);
     res.json(item);
   } catch (error) {
     next(error);
   }
 });
 
-router.post('/', async (req, res, next) => {
+router.post('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const item = await myFeatureService.create(req.user!.id, req.body);
+    const { id: userId } = req.user!;
+    const item = await myFeatureService.create(userId, req.body);
     res.status(201).json(item);
   } catch (error) {
     next(error);
   }
 });
 
-router.patch('/:id', async (req, res, next) => {
+router.patch('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const item = await myFeatureService.update(req.params.id, req.user!.id, req.body);
+    const { id: userId } = req.user!;
+    const item = await myFeatureService.update(req.params.id, userId, req.body);
     res.json(item);
   } catch (error) {
     next(error);
   }
 });
 
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    await myFeatureService.delete(req.params.id, req.user!.id);
+    const { id: userId } = req.user!;
+    await myFeatureService.delete(req.params.id, userId);
     res.status(204).send();
   } catch (error) {
     next(error);
@@ -968,13 +1031,34 @@ export const TYPES_TEMPLATE = `// ==============================================
 // ========================================================================
 
 export interface CreateMyFeatureInput {
-  title: string;
+  name: string;
   description?: string;
 }
 
 export interface UpdateMyFeatureInput {
-  title?: string;
+  name?: string;
   description?: string;
+  status?: 'active' | 'inactive' | 'archived';
+}
+
+// List / pagination types (returned by the paginated getAll)
+export interface MyFeatureListOptions {
+  limit?: number;   // Page size — clamped to [1, 200] server-side. Default: 50
+  cursor?: string;  // ID of the last item from the previous page
+}
+
+export interface MyFeatureListItem {
+  id: string;
+  name: string;
+  status: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface MyFeatureListResponse {
+  items: MyFeatureListItem[];
+  nextCursor: string | null;
+  hasMore: boolean;
 }
 `;
 ```
@@ -989,30 +1073,41 @@ Module schemas must be **self-contained** with **no `@relation` directives**. Us
 
 ```typescript
 // src/templates/schema.ts
-export const SCHEMA_TEMPLATE = `// ========================================================================
-// FILE: backend/prisma/schema/my-feature.prisma
-// PURPOSE: Database models for my-feature
+export const SCHEMA = `
 // ========================================================================
+// My Feature Models
+// ========================================================================
+// Self-contained — NO @relation to the User model (avoids requiring changes
+// to User). Use plain foreign keys + indexes. To add referential integrity,
+// add the relation fields to your own User model.
 
 model my_feature_item {
   id          String   @id @default(cuid())
-  userId      String                          // Plain FK, NOT a @relation
-  title       String
+  userId      String
+  name        String
   description String?
+  status      String   @default("active")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  @@index([userId])
+  // Supports "items per user, newest first" without an in-memory sort.
+  @@index([userId, createdAt])
+
+  // Security integration (see security.registration.ts):
+  // - Field encryption: keep a sensitive column as String and store the
+  //   encryptField() envelope in it; declare it in encryptedFields.
+  // - Neon RLS: add tenantId String (+ @@index([tenantId])) and list it in
+  //   the manifest's ownedModels. tenantId == userId in solo mode.
 }
 
+// User settings — separate table (recommended over editing the User model).
 model my_feature_settings {
   id        String   @id @default(cuid())
-  userId    String   @unique              // One settings per user
+  userId    String   @unique          // @unique already creates the index
   enabled   Boolean  @default(true)
+  config    Json     @default("{}")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
-  @@index([userId])
 }
 `;
 ```

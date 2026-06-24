@@ -223,6 +223,10 @@ export default defineConfig({
                   label: "Developer Workflow",
                   slug: "module-starter/developer-workflow",
                 },
+                {
+                  label: "Upstream Issues",
+                  slug: "module-starter/upstream-issues",
+                },
               ],
             },
             { label: "Changelog", slug: "module-starter/changelog" },
