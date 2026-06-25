@@ -252,6 +252,7 @@ export default defineConfig({
                 { label: "Field Types", slug: "modules/structure/fields" },
                 { label: "Merge Fields & Conditions", slug: "modules/structure/merge-fields" },
                 { label: "Integration", slug: "modules/structure/integration" },
+                { label: "Public REST API", slug: "modules/structure/public-api" },
                 { label: "Registries Guide", slug: "modules/structure/registries-guide" },
                 { label: "JSON Import & Export", slug: "modules/structure/json-reference" },
                 { label: "Developer Workflow", slug: "modules/structure/developer-workflow" },
