@@ -155,6 +155,10 @@ export default defineConfig({
               label: "Developer Workflow",
               slug: "starter-template/developer-workflow",
             },
+            {
+              label: "Upstream Issues",
+              slug: "starter-template/upstream-issues",
+            },
             { label: "Changelog", slug: "starter-template/changelog" },
             { label: "Roadmap", slug: "starter-template/roadmap" },
           ],
