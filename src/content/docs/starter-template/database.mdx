@@ -125,23 +125,45 @@ The `lib/prisma.ts` file creates the Prisma client with the appropriate adapter:
 
 ```typescript
 // backend/src/lib/prisma.ts
-import { PrismaClient } from '../generated/prisma/client.js';
+import { PrismaClient, Prisma } from '../generated/prisma/client.js';
 import { PrismaNeon } from '@prisma/adapter-neon';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { neonConfig } from '@neondatabase/serverless';
 import ws from 'ws';
+import { env } from '../config/env.js';
 
-// Configure WebSockets for Node.js
-neonConfig.webSocketConstructor = ws;
+// Cache the client across hot reloads (see singleton note below)
+declare global {
+  var prisma: PrismaClient | undefined;
+}
 
-// Create adapter based on DATABASE_ADAPTER env var
-const adapter = env.DATABASE_ADAPTER === 'neon'
-  ? new PrismaNeon({ connectionString: env.DATABASE_URL })
-  : new PrismaPg({ connectionString: env.DATABASE_URL });
+// Select the adapter based on the DATABASE_ADAPTER env var
+function createAdapter() {
+  if (env.DATABASE_ADAPTER === 'neon') {
+    // Configure WebSockets for Node.js (not needed in edge runtimes)
+    neonConfig.webSocketConstructor = ws;
+    return new PrismaNeon({ connectionString: env.DATABASE_URL });
+  }
+  return new PrismaPg({ connectionString: env.DATABASE_URL });
+}
 
-// Create client with adapter
-export const prisma = new PrismaClient({ adapter });
+// Log level derived from NODE_ENV / DEBUG_PRISMA
+function getLogConfig(): Prisma.LogLevel[] {
+  if (env.NODE_ENV === 'production') return ['error'];
+  return env.DEBUG_PRISMA ? ['query', 'error', 'warn'] : ['error', 'warn'];
+}
+
+// Reuse the cached client in non-production to survive hot reloads
+export const prisma =
+  globalThis.prisma ??
+  new PrismaClient({ adapter: createAdapter(), log: getLogConfig() });
+
+if (env.NODE_ENV !== 'production') {
+  globalThis.prisma = prisma;
+}
 ```
+
+The client is a **global singleton**: `globalThis.prisma ?? new PrismaClient(...)` reuses a cached instance in non-production so repeated dev hot reloads don't each open a new client and exhaust the connection pool. It is constructed with a `log` config derived from `DEBUG_PRISMA` / `NODE_ENV`, and adapter selection lives in a `createAdapter()` helper reading `env.DATABASE_ADAPTER`.
 
 ### Using Prisma in Features
 
@@ -155,7 +177,7 @@ export async function getUser(id: string) {
 ```
 
 <Aside type="danger">
-  **Do not create separate Prisma clients.** Always import from `lib/prisma.ts` to ensure connection pooling works correctly.
+  **Do not create separate Prisma clients.** Always import from `lib/prisma.ts` to reuse the global singleton — creating extra clients (especially across hot reloads) exhausts the connection pool.
 </Aside>
 
 ---
@@ -209,12 +231,25 @@ model User {
 
 // AppSettings - singleton for global config
 model AppSettings {
-  id                  String  @id @default("default")
-  appName             String  @default("My App")
-  logoUrl             String?
-  navigationOverrides Json    @default("{}")
-  toolbarOverrides    Json    @default("{}")
-  // ...
+  id        String   @id @default("default")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Branding
+  appName         String  @default("My App")
+  logoUrl         String?
+  logoDisplayMode String  @default("logo-and-name") // "logo-only" | "logo-and-name" | "name-only"
+
+  // Navigation & features
+  showDashboardInNav   Boolean @default(true)
+  enableMarketingPages Boolean @default(false)
+
+  // JSON override columns (public schema — modules read/write these)
+  navigationOverrides Json @default("{}")
+  toolbarOverrides    Json @default("{}")
+  styleOverrides      Json @default("{}")
+  dashboardOverrides  Json @default("{}") // added v1.27.0
+  appTheme            Json?               // added v1.25.0
 }
 ```
 
@@ -390,6 +425,10 @@ const docs = await withTenantContext(req.user!.tenantId!, (tx) =>
   tx.document.findMany(), // RLS restricts rows to the caller's tenant
 );
 ```
+
+<Aside type="note" title="Deprecated: withUserContext()">
+`@/lib/owned` still exports `withUserContext(userId, fn)` — a deprecated alias from the v1.27.0 opt-in API that sets the legacy `app.user_id` session variable instead of `app.tenant_id`. Apps that adopted it keep working, but should migrate their RLS policies to `current_setting('app.tenant_id', true)` and switch to `withTenantContext()`.
+</Aside>
 
 Add the policy in a migration (per-app, since the starter ships no owned models):
 

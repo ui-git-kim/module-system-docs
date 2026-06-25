@@ -39,22 +39,26 @@ The layout is assembled in `DashboardPage.tsx`:
 ```tsx
 function DashboardPage() {
   return (
-    <AppSettingsProvider>      {/* Global app settings */}
-      <UserProfileProvider>     {/* User profile data */}
-        <SidebarProvider         {/* shadcn sidebar state */}
-          style={{
-            '--sidebar-width': '16rem',
-            '--header-height': '3rem',
-          }}
-        >
-          <AppSidebar variant="inset" />
-          <SidebarInset>
-            <SiteHeader />
-            <main className="@container/main flex-1 p-4 md:p-6">
-              <Outlet />        {/* Page content */}
-            </main>
-          </SidebarInset>
-        </SidebarProvider>
+    <AppSettingsProvider>          {/* Global app settings */}
+      <UserProfileProvider>         {/* User profile data */}
+        <BreadcrumbProvider>        {/* Dynamic breadcrumb state */}
+          <FullBleedProvider>       {/* Full-bleed page mode */}
+            <SidebarProvider         {/* shadcn sidebar state */}
+              style={{
+                '--sidebar-width': '16rem',
+                '--header-height': '3rem',
+              }}
+            >
+              <AppSidebar variant="inset" />
+              <SidebarInset>
+                <SiteHeader />
+                <main className="@container/main flex-1 p-4 md:p-6">
+                  <Outlet />        {/* Page content */}
+                </main>
+              </SidebarInset>
+            </SidebarProvider>
+          </FullBleedProvider>
+        </BreadcrumbProvider>
       </UserProfileProvider>
     </AppSettingsProvider>
   );
@@ -65,8 +69,12 @@ function DashboardPage() {
 
 Above the dashboard layout, `main.tsx` wraps the entire app in:
 
-1. `NeonAuthUIProvider` — auth context and built-in auth UI
+1. `QueryClientProvider` — the **outermost** provider, sharing a single TanStack Query cache across every feature, module, auth flow, and settings hook
 2. `TooltipProvider` — shadcn Radix tooltip context, **mounted once at the root** so any tooltip anywhere in the tree works without its own wrapper
+
+A dev-only `ReactQueryDevtools` panel is also mounted inside `QueryClientProvider` (gated behind `import.meta.env.DEV`, so it's tree-shaken out of production).
+
+There is no auth provider wrapper: `authClient` is configured with the `BetterAuthReactAdapter`, so `useSession` works anywhere in the tree without one. The previous `NeonAuthUIProvider` was removed in v1.23.0 along with the pre-built Neon UI components.
 
 Nested `TooltipProvider`s (for example the `HeaderToolbar` uses one with a custom `delayDuration={300}`) override the root provider for their subtree — this is Radix's intended behaviour. Module authors can add `<Tooltip>` anywhere without remembering to add a provider.
 
@@ -377,15 +385,27 @@ The site header provides breadcrumb navigation and an extensible toolbar.
 
 ```tsx
 // SiteHeader.tsx
-<header className="flex h-(--header-height) items-center border-b">
+<header className="flex h-(--header-height) items-center border-b transition-[width,height]">
   <div className="flex w-full items-center px-4 lg:px-6">
     {/* Left: Sidebar trigger + Breadcrumbs */}
     <div className="flex items-center gap-2">
-      <SidebarTrigger className="-ml-1" />
-      <Separator orientation="vertical" className="h-4" />
-      <Breadcrumb>
-        {/* Breadcrumb items */}
-      </Breadcrumb>
+      {/* Sidebar trigger + separator are hidden when a FullBleed
+          page sets collapsible mode */}
+      {!isFullBleedCollapsible && (
+        <>
+          <SidebarTrigger className="-ml-1" />
+          <Separator orientation="vertical" className="h-4" />
+        </>
+      )}
+
+      {/* Breadcrumb trail, or a "Dashboard" heading when there are none */}
+      {crumbs.length > 0 ? (
+        <Breadcrumb>
+          {/* Breadcrumb items */}
+        </Breadcrumb>
+      ) : (
+        <h1 className="text-base font-medium">Dashboard</h1>
+      )}
     </div>
 
     {/* Toolbar (handles center and right positioning) */}
@@ -493,9 +513,23 @@ interface BreadcrumbItem {
 | `useBreadcrumbs()` | Returns `{ dynamicBreadcrumbs, setBreadcrumbs }`. Throws if not in provider. |
 | `useBreadcrumbsOptional()` | Same but returns `undefined` if not in provider. Safe for shared components. |
 
-#### Auto-Clear on Navigation
+#### Clearing on Navigation
 
-Dynamic breadcrumbs automatically clear when the route changes, so pages don't need to manually clean up. The `BreadcrumbProvider` listens for `location.pathname` changes and resets to `null`.
+The `BreadcrumbProvider` does **not** auto-clear on route change. Instead, the component that sets dynamic breadcrumbs is responsible for clearing them via its own `useEffect` cleanup:
+
+```tsx
+useEffect(() => {
+  if (project) {
+    setBreadcrumbs([
+      { label: 'Projects', path: '/projects' },
+      { label: project.name },
+    ]);
+  }
+  return () => setBreadcrumbs(null);  // Clear on unmount
+}, [project, setBreadcrumbs]);
+```
+
+The provider clears at the component level (not on `location.pathname`) deliberately: in React a parent effect fires *after* its child effects, so a provider-level reset on route change would run after — and overwrite — the new page's `setBreadcrumbs` call.
 
 <Aside type="tip">
 Use dynamic breadcrumbs when your page title comes from loaded data (API response, database entity). Use route-based breadcrumbs for static pages with known labels.
@@ -548,22 +582,34 @@ Items can be positioned in two areas:
 
 ```tsx
 // HeaderToolbar.tsx
-<TooltipProvider>
+
+// With no items at all, render just a spacer to balance the header
+if (leftItems.length === 0 && rightItems.length === 0) {
+  return <div className="flex-1" />;
+}
+
+<TooltipProvider delayDuration={300}>
   <div className="flex-1" />           {/* Spacer */}
 
-  {/* Center items */}
-  <div className="flex items-center gap-1">
-    {leftItems.map(item => <HeaderToolbarItem key={item.id} item={item} />)}
-  </div>
+  {/* Center items — only rendered when present */}
+  {leftItems.length > 0 && (
+    <div className="flex items-center gap-2">
+      {leftItems.map(item => <HeaderToolbarItem key={item.id} item={item} />)}
+    </div>
+  )}
 
   <div className="flex-1" />           {/* Spacer */}
 
-  {/* Right items */}
-  <div className="flex items-center gap-1">
-    {rightItems.map(item => <HeaderToolbarItem key={item.id} item={item} />)}
-  </div>
+  {/* Right items — only rendered when present */}
+  {rightItems.length > 0 && (
+    <div className="flex items-center gap-2">
+      {rightItems.map(item => <HeaderToolbarItem key={item.id} item={item} />)}
+    </div>
+  )}
 </TooltipProvider>
 ```
+
+Each item group is rendered only when it has items, and the component early-returns a single `flex-1` spacer when both groups are empty.
 
 ### Item Types
 
@@ -602,9 +648,8 @@ headerToolbarRegistry.register({
   id: 'theme-toggle',
   type: 'custom',
   position: 'right',
-  order: 100,
+  order: 95, // Utility — far right
   component: ThemeToggle,
-  label: 'Toggle theme',
 });
 ```
 

@@ -34,8 +34,7 @@ frontend/src/features/dashboard/
 ├── header-toolbar.registration.ts  # Registers theme toggle
 ├── dashboard.widgets.ts            # Registers example widgets
 ├── pages/
-│   ├── DashboardPage.tsx           # Main layout (shell)
-│   └── DashboardHome.tsx           # Home page with widget grid
+│   └── DashboardPage.tsx           # Exports DashboardPage (shell layout) + DashboardContent (home widget grid)
 ├── components/
 │   ├── DashboardGrid.tsx           # Widget grid renderer
 │   ├── header/                     # Header components
@@ -83,7 +82,7 @@ dashboardRegistry.register({
 | `category` | string | No | Grouping category |
 | `canHide` | boolean | No | User can hide widget. Default: true |
 | `canResize` | boolean | No | User can resize widget. Default: false |
-| `requiredRole` | UserRole | No | Role-based visibility |
+| `minRole` | string | No | Minimum role to see widget (reserved, not yet enforced) |
 
 ### Widget Sizes
 
@@ -107,29 +106,19 @@ The grid adapts to screen size:
 
 ### Creating Widget Components
 
-Widget components receive props with their configuration and context:
+Widget components receive props with their configuration and context. Under the standard `DashboardGrid` path, `WidgetWrapper` already wraps every widget in a `<Card>` with a `<CardHeader>`/`<CardTitle>{widget.title}</CardTitle>` and `<CardContent>` — so your component renders **inner content only**, not its own Card or title:
 
 ```tsx
 import type { DashboardWidgetProps } from '@/config/dashboard.registry';
-import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 
-export function AnalyticsWidget({ widget, isCompact }: DashboardWidgetProps) {
-  return (
-    <Card className="h-full">
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-medium">{widget.title}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        {isCompact ? (
-          <CompactStats />
-        ) : (
-          <FullChart />
-        )}
-      </CardContent>
-    </Card>
-  );
+export function AnalyticsWidget({ isCompact }: DashboardWidgetProps) {
+  return isCompact ? <CompactStats /> : <FullChart />;
 }
 ```
+
+<Aside type="caution">
+  Don't wrap widget content in your own `<Card>`/`<CardTitle>` when using the default `DashboardGrid` — you'll get a doubled card and a duplicate title. The self-Card pattern is only for the [`RawWidgetWrapper`](#rawwidgetwrapper) path, which omits the default Card.
+</Aside>
 
 | Prop | Type | Description |
 |------|------|-------------|
@@ -151,7 +140,7 @@ The `order` property determines where widgets appear in the grid (lower values a
 | 51-75 | Secondary | Reports, activity feed |
 | 76-100 | Utility | Tips, quick links |
 
-Default order is **50** if not specified.
+Default order is **50** if not specified. The order default comes from the `BaseRegistry` constructor (`super('DashboardRegistry', 50)`), while the `canHide: true` / `canResize: false` defaults are applied by the `DashboardRegistry`'s own `register` override.
 
 ```tsx
 // Low order value - appears first
@@ -182,25 +171,44 @@ Users can hide widgets they don't want to see. Preferences are stored in the use
 interface WidgetVisibility {
   id: string;
   visible: boolean;
-  order?: number;  // Future: custom ordering
+  order?: number;  // Per-user order override (applied in getVisible)
+  size?: string;   // Per-user size override (validated via isValidWidgetSize)
 }
 ```
 
+Both `order` and `size` overrides are applied today by `getVisible()`: `order` controls the widget's position (falling back to the widget's registered order, then `50`), and a valid `size` replaces the widget's rendered `size`.
+
 ### Using the Hook
+
+`DashboardGrid` resolves visible widgets internally — pass it the user's preferences via `userVisibility`:
+
+```tsx
+import { DashboardGrid } from '@/features/dashboard/components/DashboardGrid';
+import { useUserProfile } from '@/features/user';
+
+function DashboardContent() {
+  const { profile } = useUserProfile();
+
+  return (
+    <DashboardGrid userVisibility={profile?.preferences?.dashboardWidgets} />
+  );
+}
+```
+
+If you need the resolved list yourself (e.g. to render widgets manually), call the hook directly:
 
 ```tsx
 import { useVisibleDashboardWidgets } from '@/config/registry.hooks';
 import { useUserProfile } from '@/features/user';
 
-function DashboardHome() {
+function MyWidgetList() {
   const { profile } = useUserProfile();
   const visibleWidgets = useVisibleDashboardWidgets(
     profile?.preferences?.dashboardWidgets
   );
 
-  return (
-    <DashboardGrid widgets={visibleWidgets} />
-  );
+  // visibleWidgets is DashboardWidget[], already filtered, sized, and sorted
+  return <>{visibleWidgets.map((w) => /* render manually */ null)}</>;
 }
 ```
 
@@ -238,6 +246,21 @@ function DashboardWidgetSettings() {
 }
 ```
 
+### Admin Overrides
+
+User preferences are not the only thing that controls visibility. An admin can **globally disable** a widget, and that override always wins — a disabled widget is hidden for everyone and **cannot** be re-enabled by a user preference.
+
+This is built on `BaseRegistry`. Admin-hidden IDs are persisted in `AppSettings` and applied once at bootstrap via `applyAdminOverrides()`:
+
+| Method | Returns |
+|--------|---------|
+| `getAll()` | Every registered widget, sorted by order — use in admin management UIs |
+| `getActive()` | Every widget **except** admin-disabled ones, sorted — the set users actually see |
+| `applyAdminOverrides(ids)` | Replaces the admin-disabled ID set (empty array clears all overrides) |
+| `isAdminHidden(id)` | Whether a single widget is globally disabled |
+
+`getVisible()` (and therefore `useVisibleDashboardWidgets`) starts from `getActive()`, so admin-disabled widgets are filtered out **before** per-user preferences are applied.
+
 ---
 
 ## DashboardGrid Component
@@ -250,7 +273,7 @@ The `DashboardGrid` component renders widgets in a responsive CSS grid. It handl
 import { DashboardGrid } from '@/features/dashboard/components/DashboardGrid';
 import { useUserProfile } from '@/features/user';
 
-function DashboardHome() {
+function DashboardContent() {
   const { profile } = useUserProfile();
 
   return (
@@ -268,6 +291,10 @@ function DashboardHome() {
 |------|------|-------------|
 | `userVisibility` | `UserWidgetPreference[]` | User's widget visibility preferences |
 | `className` | `string` | Additional classes for the grid container |
+
+<Aside type="note">
+  The prop's literal type, `UserWidgetPreference`, is a private interface inside `DashboardGrid.tsx` and cannot be imported. It is structurally compatible with the public `WidgetVisibility[]` type from `@/config/dashboard.registry` (and with the user feature's `DashboardWidgetPreference[]`), so you can pass any of those.
+</Aside>
 
 ### Grid Constants
 
@@ -343,7 +370,7 @@ function MyComponent() {
 ```tsx
 import { useVisibleDashboardWidgets } from '@/config/registry.hooks';
 
-function DashboardHome() {
+function DashboardContent() {
   const visibleWidgets = useVisibleDashboardWidgets(userPreferences);
   // Returns widgets filtered by user visibility preferences
 }
@@ -351,52 +378,68 @@ function DashboardHome() {
 
 ### Get Widgets by Category
 
+The registry provides purpose-built helpers — no need to filter `getAll()` by hand:
+
 ```tsx
 import { dashboardRegistry } from '@/config/dashboard.registry';
 
-const analyticsWidgets = dashboardRegistry
-  .getAll()
-  .filter(w => w.category === 'analytics');
+// Widgets in a single category
+const analyticsWidgets = dashboardRegistry.getByCategory('analytics');
+
+// All distinct categories that have at least one widget
+const categories = dashboardRegistry.getCategories();
 ```
 
 ---
 
 ## Example Widgets
 
-The template includes example widgets to demonstrate the pattern:
+The template includes example widgets to demonstrate the pattern. Each renders **inner content only** — the surrounding `<Card>` and title come from `WidgetWrapper` (see [Creating Widget Components](#creating-widget-components)). Only `WelcomeWidget` is registered by default (under the title **Getting Started**); `QuickStatsWidget` and `RecentActivityWidget` are provided as commented-out registrations in `dashboard.widgets.ts`.
 
 ```tsx
 // features/dashboard/components/widgets/ExampleWidgets.tsx
 
-export function WelcomeWidget({ widget }: DashboardWidgetProps) {
-  const { profile } = useUserProfile();
-
+// Renders quick links to settings pages (profile, preferences, integrations)
+export function WelcomeWidget(_props: DashboardWidgetProps) {
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Welcome back, {profile?.name || 'there'}!</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <p className="text-muted-foreground">
-          Here's what's happening today.
-        </p>
-      </CardContent>
-    </Card>
+    <div className="space-y-4">
+      <p className="text-muted-foreground">
+        Welcome to your dashboard! Here are some things to get you started:
+      </p>
+      <div className="grid gap-2">
+        <QuickLink to="/settings/personal-info" icon={Settings} label="Set up your profile" />
+        <QuickLink to="/settings/preferences" icon={Palette} label="Customise preferences" />
+        <QuickLink to="/settings/integrations" icon={Plug} label="Connect integrations" />
+      </div>
+    </div>
   );
 }
 
-export function QuickStatsWidget({ widget }: DashboardWidgetProps) {
+// 3-column stat grid (Projects / Tasks / Completed)
+export function QuickStatsWidget(_props: DashboardWidgetProps) {
+  const stats = [
+    { label: 'Projects', value: '12' },
+    { label: 'Tasks', value: '48' },
+    { label: 'Completed', value: '156' },
+  ];
+
   return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm">{widget.title}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <div className="text-2xl font-bold">1,234</div>
-        <p className="text-xs text-muted-foreground">+12% from last month</p>
-      </CardContent>
-    </Card>
+    <div className="grid grid-cols-3 gap-4">
+      {stats.map((stat) => (
+        <div key={stat.label} className="text-center">
+          <p className="text-2xl font-bold">{stat.value}</p>
+          <p className="text-xs text-muted-foreground">{stat.label}</p>
+        </div>
+      ))}
+    </div>
   );
+}
+
+// Activity feed — demonstrates the isCompact prop (shows fewer rows when compact)
+export function RecentActivityWidget({ isCompact }: DashboardWidgetProps) {
+  const activities = [/* ... */];
+  const displayCount = isCompact ? 2 : activities.length;
+  // renders activities.slice(0, displayCount)
 }
 ```
 
@@ -434,7 +477,7 @@ export function QuickStatsWidget({ widget }: DashboardWidgetProps) {
 1. Verify registration file is imported in feature's `index.ts`
 2. Check feature's `index.ts` is imported in app entry point
 3. Confirm user hasn't hidden it in preferences
-4. Check `requiredRole` matches current user's role
+4. Confirm an admin hasn't globally disabled it (see [Admin Overrides](#admin-overrides))
 
 ### Widget Wrong Size
 

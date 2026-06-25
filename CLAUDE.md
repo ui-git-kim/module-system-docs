@@ -42,6 +42,8 @@ src/content/docs/
 │   ├── index.mdx                # Introduction
 │   ├── documentation.mdx        # Documentation system
 │   ├── neon-setup.mdx           # Database setup
+│   ├── aws-kms-setup.mdx        # AWS KMS envelope-encryption setup
+│   ├── cloudflare-edge.mdx      # Cloudflare edge deployment
 │   └── llm-rules.mdx            # LLM rules (authoritative)
 ├── starter-template/            # Starter template docs
 │   ├── index.mdx
@@ -57,22 +59,75 @@ src/content/docs/
 │   ├── user-feature.mdx
 │   ├── dashboard-feature.mdx
 │   ├── admin-feature.mdx
+│   ├── security-feature.mdx
+│   ├── header-toolbar.mdx
+│   ├── breadcrumbs.mdx
+│   ├── theme.mdx
+│   ├── icon-picker.mdx
+│   ├── style-system.mdx
+│   ├── data-fetching.mdx
+│   ├── logging.mdx
+│   ├── hooks.mdx
 │   ├── updating.mdx
+│   ├── versioning.mdx
 │   ├── scripts.mdx
+│   ├── developer-workflow.mdx
 │   ├── changelog.mdx
 │   └── roadmap.mdx
 ├── module-starter/              # Module starter docs
 │   ├── index.mdx                # Overview
-│   ├── creating-modules.mdx     # Step-by-step guide
-│   ├── module-structure.mdx     # File reference
+│   ├── building-modules.mdx     # Step-by-step guide
+│   ├── file-reference.mdx       # File reference
+│   ├── create-script.mdx        # create-module script
+│   ├── database.mdx             # Module database / Prisma
+│   ├── registry-guide.mdx       # Registry usage
+│   ├── starter-integration.mdx  # Starter template integration
 │   ├── templates.mdx            # Code templates
 │   ├── lifecycle-hooks.mdx      # Filters and actions
+│   ├── cli-reference.mdx        # CLI reference
+│   ├── scaffold.mdx             # Scaffold / scaffold:update
+│   ├── versioning.mdx           # Versioning policy
+│   ├── developer-workflow.mdx   # Developer workflow
 │   ├── changelog.mdx
 │   └── roadmap.mdx
 ├── modules/                     # Individual module docs
 │   ├── index.mdx                # Catalogue
-│   ├── structure.mdx
-│   └── billing.mdx
+│   ├── roadmap.mdx
+│   ├── billing.mdx
+│   ├── structure/               # Structured-content / fields module
+│   │   ├── index.mdx
+│   │   ├── usage.mdx
+│   │   ├── fields.mdx
+│   │   ├── merge-fields.mdx
+│   │   ├── json-reference.mdx
+│   │   ├── registries-guide.mdx
+│   │   └── ...                  # configuration, integration, developer-workflow, changelog, roadmap
+│   ├── builder/                 # index, usage, configuration, integration, developer-workflow, changelog, roadmap
+│   ├── cog-ingest/              # index, usage, configuration, integration, developer-workflow, changelog, roadmap
+│   ├── pickers/                 # index, usage, configuration, integration, developer-workflow, changelog
+│   └── style/                   # index, design, roadmap
+├── colour-palette/              # Colour-palette module docs
+│   ├── index.mdx
+│   ├── colour.mdx
+│   ├── colour-semantics.mdx
+│   ├── palette.mdx
+│   ├── tonal-scale.mdx
+│   ├── harmony-map.mdx
+│   ├── gamut-mapping.mdx
+│   ├── mixing-playground.mdx
+│   ├── method-panel.mdx
+│   ├── thesaurus.mdx
+│   └── ...                      # usage, configuration, integration, developer-workflow, changelog, roadmap
+├── document-management/         # Document-management module docs
+│   ├── index.mdx
+│   ├── usage.mdx
+│   ├── configuration.mdx
+│   ├── database.mdx
+│   ├── integration.mdx
+│   ├── security.mdx
+│   ├── developer-workflow.mdx
+│   ├── changelog.mdx
+│   └── roadmap.mdx
 └── reference/                   # API reference (collapsed)
     ├── cli-commands.mdx
     ├── types.mdx
@@ -122,10 +177,12 @@ When editing documentation:
 
 | Section | Status | Description |
 |---------|--------|-------------|
-| Getting Started | ✅ Complete | Introduction, docs system, LLM rules |
-| Starter Template | ✅ Complete | Architecture, registries, features |
-| Module Starter | ✅ Complete | Creating modules, templates, hooks |
-| Modules | 🔲 Partial | Catalogue, billing module |
+| Getting Started | ✅ Complete | Introduction, docs system, Neon/AWS KMS/Cloudflare setup, LLM rules |
+| Starter Template | ✅ Complete | Architecture, configuration, registries, features (auth/user/dashboard/admin/security), theme, hooks, versioning, scripts |
+| Module Starter | ✅ Complete | Building modules, file reference, create-script, database, registry guide, scaffold, CLI reference, versioning |
+| Modules | ✅ Complete | Catalogue plus structure, builder, cog-ingest, pickers, style, billing |
+| Colour Palette | ✅ Complete | Colour module: palette, tonal scale, harmony map, gamut mapping, playground |
+| Document Management | ✅ Complete | Usage, configuration, database, security, integration |
 | Reference | 🔲 Partial | CLI, types, API reference |
 
 ## Conventions
