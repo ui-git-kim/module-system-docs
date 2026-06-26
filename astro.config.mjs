@@ -107,6 +107,10 @@ export default defineConfig({
                   label: "Security",
                   slug: "starter-template/security-feature",
                 },
+                {
+                  label: "System",
+                  slug: "starter-template/system",
+                },
               ],
             },
             {

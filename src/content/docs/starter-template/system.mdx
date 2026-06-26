@@ -1,0 +1,93 @@
+---
+title: System Page
+description: The admin System page — database health, services, and the live errors/activity console — and the audit/error sink behind it.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The **System** page (`/admin/system`) is a read-only diagnostics window into the running backend: database health, the resolved service/connection posture, and a live **errors + activity console**. It is admin-only and mirrors the [Security page](/starter-template/security-feature/) pattern.
+
+It is the first phase of bringing observability into the starter **core** — audit and error logging are a built-in feature, not a separate module. See the [roadmap entry](/starter-template/roadmap/#observability-core-system-admin-page--auditerrors) for the full design and later phases.
+
+## What it shows
+
+<Tabs>
+<TabItem label="Database">
+Connectivity plus cheap structural signals via `checkDatabaseHealth()` and a couple of best-effort queries:
+
+- Connection state + `SELECT 1` latency
+- Active adapter (`neon` / `pg`)
+- Last applied migration (from `_prisma_migrations`)
+- Row counts for the starter's own models
+</TabItem>
+<TabItem label="Services & connections">
+The startup security posture, reused — not reimplemented — from the security feature:
+
+- `evaluateStartupPosture()` findings (Neon Auth, edge, trust-proxy, hardening, …)
+- `getKeyProviderStatus()` field-encryption key readiness
+- Tier, environment, edge, and DB adapter
+</TabItem>
+<TabItem label="Console">
+The live **Errors** and **Activity** feeds from the in-memory audit sink (newest first). Manual refresh only — there is no polling, so a left-open admin tab never adds steady API load.
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Ephemeral by design">
+The console is backed by an **in-memory** sink: buffers are bounded (about 200 errors / 500 activity), per-process, and reset on restart. That is intentional for the live console. Durable history (a `PrismaAuditSink` + `AuditEvent` / `ErrorLog` models + retention) is roadmap **P2**; production observability still belongs in Sentry / a log aggregator.
+</Aside>
+
+## The audit/error sink
+
+The capture pipeline is a small, swappable sink at `@/lib/audit-sink` (backend), modelled on the key-provider pattern:
+
+```ts
+import { auditSink, setAuditSink, MemoryAuditSink } from '../../lib/audit-sink.js';
+
+// The default is an ephemeral in-memory ring buffer. Swap it for a durable or
+// compliance sink at bootstrap:
+//   setAuditSink(new MyPrismaAuditSink());
+
+auditSink.recordActivity({ hook: 'thing.happened', actorId, summary: { id } });
+const recent = auditSink.queryErrors(50); // newest first
+```
+
+| Export | Purpose |
+|--------|---------|
+| `auditSink` | Stable facade — always delegates to the active sink |
+| `MemoryAuditSink` | Default ephemeral ring-buffer implementation |
+| `setAuditSink(sink)` / `getAuditSink()` | Swap / read the active sink |
+| `AuditSink` | The interface a custom sink implements |
+
+### Capture is additive
+
+Nothing in the emitting services changed — capture is wired by listeners:
+
+- **Errors** — the global error middleware fires an `error:unhandled` action; `features/admin/audit.registration.ts` records it. Stack traces are kept server-side outside development.
+- **Activity** — the same registration subscribes to the nine lifecycle hooks the starter already emits (`user.*` / `admin.*`). Payloads are summarised and sensitive keys masked.
+
+To record your own activity from a module, add a listener to an existing hook or call the sink directly:
+
+```ts
+import { actionRegistry } from '@/config/action.registry.js';
+import { auditSink } from '@/lib/audit-sink.js';
+
+actionRegistry.addAction('billing.invoice.paid', 'audit', (ctx) => {
+  auditSink.recordActivity({ hook: 'billing.invoice.paid', summary: { invoiceId: ctx.invoiceId } });
+});
+```
+
+## API
+
+All endpoints are admin-only (reads included — diagnostics reveal where the app is weak).
+
+| Method | Path | Returns |
+|--------|------|---------|
+| `GET` | `/api/v1/admin/system/overview` | Database + services + recent errors/activity |
+| `GET` | `/api/v1/admin/system/errors?limit=` | Newest-first errors (stack redacted outside dev) |
+| `GET` | `/api/v1/admin/system/activity?limit=` | Newest-first activity events |
+
+## Security
+
+- **Admin-only reads** — the posture and error detail are recon-relevant, so reads are gated like the Security page.
+- **Redaction** — stack traces are stripped outside development; activity summaries mask sensitive keys and reduce nested objects to a shape hint.
+- The rate limiter is unchanged — the console simply makes 429s and unhandled errors **visible** instead of silent.
