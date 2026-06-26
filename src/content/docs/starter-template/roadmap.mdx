@@ -36,9 +36,38 @@ Phases (each implemented, reviewed, and stopped for sign-off before the next):
 - ⏳ **Zero-knowledge encryption — "the operator can't read the data".** No provider offers this: at-rest and field encryption still let the key-holder decrypt, and Neon Data Masking doesn't hide data from the project owner. The only mechanism is **end-to-end / client-side encryption** keyed by the user's secret, with hard tradeoffs (no server-side search/processing/AI on content; difficult key recovery). **Opt-in, per-app, designed later.** Today's baseline for the same intent is ciphertext-in-DB via app-layer field encryption (above) + access controls.
 - ⏳ **Database-per-tenant control-plane.** The provisioning (Neon API), tenant→connection routing, and fan-out-migration machinery that makes database-per-tenant operable at scale for multi-tenant apps.
 
-### Audit & Errors module (separate module)
+### Observability (core): System admin page + Audit/Errors
 
-**Priority:** High — out of starter scope; a dedicated `@unique-icon/audit-errors` module covering three streams (Errors / Activity / Access-audit) with an `auditMode` flag (`activity` vs immutable `compliance`). The starter's job is only to emit reliable lifecycle/action events (close `skipHooks` gaps) and expose the `auditEvents` registry field. Built elsewhere.
+**Priority:** High — **decision (2026-06-25): audit + error logging live in the starter core, not a separate module.** Consolidates the former *Database Health Page*, the *Audit & Errors module*, and the error-console half of *Error Pages & Offline Handling*. The seams already exist in core — 9 lifecycle action hooks (`user.*` / `admin.*`), the single error-middleware choke point, `securityRegistry.getAuditEvents()` (declaration layer, already shipped), and the `SECURITY_AUDIT_MODE` knob — so the foundation belongs here. Compliance-grade depth stays an **opt-in sink** so apps that don't need it carry no weight.
+
+**Architecture — one pipeline, swappable sink** (mirrors the `setKeyProvider` pattern):
+
+- `AuditSink` interface — `recordEvent()` / `recordError()` / `queryRecent()`, with `setAuditSink()` as the swap seam.
+- **`MemoryAuditSink`** (default, always on) — bounded ring buffers (~200 errors / ~500 activity), ephemeral, zero-config; powers the live console.
+- **`PrismaAuditSink`** (optional, `hardened`+) — `AuditEvent` / `ErrorLog` models; survives restarts, supports retention. A composite fans out to memory + DB so the live console always works.
+- **Compliance sink** (opt-in; strict / `SECURITY_AUDIT_MODE=compliance`) — immutable / hash-chained, no TTL, export hooks. The former "module", reframed as this sink.
+
+**Capture (almost entirely additive):**
+
+- **Errors** — one line in `backend/src/middleware/error.middleware.ts` after `log.error()` → `auditSink.recordError(...)`. Optional `POST /api/v1/admin/system/client-error` from a React error boundary.
+- **Activity** — a new `backend/src/features/audit/audit.registration.ts` subscribes the sink to the 9 existing hooks via `actionRegistry.addActionAsync(hook, 'audit', cb)` — no changes to the emitting services. `securityRegistry.getAuditEvents()` is the canonical filter set.
+
+**The `/admin/system` page** (mirrors the v1.37.0 Security page — `*-admin.routes/service/types` + page + `adminPagesRegistry`, admin-gated reads):
+
+- **Database** — `checkDatabaseHealth()` (connected / latency / adapter) + last migration (`_prisma_migrations`) + table row counts.
+- **Services / connections** — reuses `evaluateStartupPosture()` (the 7 startup findings) + `getKeyProviderStatus()`: Neon Auth/JWKS, KMS readiness, edge, DB adapter. A *window*, not a reimplementation.
+- **Console** — errors + activity tabs reading `auditSink.queryRecent()` via `GET /api/v1/admin/system/errors` and `.../activity`, rendered with the existing `AdminDataTable`.
+
+**Security / redaction:** all reads are **admin-only** (posture + errors expose internals). Redaction reuses `securityRegistry.getEncryptedFields()` / `getHashedSecrets()` to scrub activity `changes`; stack traces are server-side / dev only; secrets shown set-or-not. DB-backed audit is owned data → `tenantId` / RLS applies.
+
+**Phasing:**
+
+- **P1 (target v1.39.0)** — `/admin/system` page + sink abstraction + `MemoryAuditSink` + the error-middleware hook + activity listeners (**errors and activity** console) + DB / services health. No schema change — ephemeral, in-memory.
+- **P2** — `AuditEvent` / `ErrorLog` Prisma models + `PrismaAuditSink` + TTL retention driven by `SECURITY_AUDIT_MODE` (history across restarts). Schema additions auto-migrate downstream via the v1.34 field-add machinery.
+- **P3** — compliance sink (immutable / hash-chained + export); the former separate module, now a thin tier-gated swap.
+- **P4** (optional) — client-error boundary capture into the console.
+
+**Supersedes** the former separate *Audit & Errors module* and *Database Health Page* entries. The rate limiter stays unchanged — 429s become visible in the console instead of being silenced.
 
 ### Integrations / connector module (separate module)
 
@@ -94,18 +123,6 @@ Admin panel page for managing dashboard widgets:
 - Toggle widget visibility globally (hide from all users)
 - Reorder widget default positions
 - Set default visibility for new users
-
-### Database Health Page
-
-**Priority:** High
-
-Admin panel page for monitoring database health:
-
-- Connection status and pool metrics
-- Table sizes and row counts
-- Recent migration history
-- Basic query performance stats
-- Prisma connection info
 
 ### Permissions Module Integration
 
@@ -359,6 +376,7 @@ Proper error boundaries and user-facing error pages:
 - 500 / unexpected error boundary with retry action
 - React Router `errorElement` integration on protected routes
 - Offline detection banner or toast notification
+- *Note:* the React error boundary here can also report caught client errors into the admin **System** page console — see the **Observability (core)** entry above (P4).
 
 ### Deployment Guide
 
