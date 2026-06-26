@@ -32,8 +32,8 @@ The live **Errors** and **Activity** feeds from the in-memory audit sink (newest
 </TabItem>
 </Tabs>
 
-<Aside type="caution" title="Ephemeral by design">
-The console is backed by an **in-memory** sink: buffers are bounded (about 200 errors / 500 activity), per-process, and reset on restart. That is intentional for the live console. Durable history (a `PrismaAuditSink` + `AuditEvent` / `ErrorLog` models + retention) is roadmap **P2**; production observability still belongs in Sentry / a log aggregator.
+<Aside type="tip" title="In-memory by default; durable + compliance are opt-in">
+The console is backed by an **in-memory** sink by default: buffers are bounded (about 200 errors / 500 activity), per-process, and reset on restart — intentional for a zero-config live console. Set `SECURITY_AUDIT_SINK=database` (or the strict / compliance tier) to persist events durably — see [Durable & compliance storage](#durable--compliance-storage-p2p3) below. Production observability still belongs in Sentry / a log aggregator.
 </Aside>
 
 ## The audit/error sink
@@ -76,6 +76,24 @@ actionRegistry.addAction('billing.invoice.paid', 'audit', (ctx) => {
 });
 ```
 
+## Durable & compliance storage (P2/P3)
+
+By default the console is **ephemeral** (in-memory). Two opt-in env knobs upgrade it to durable storage. The sink is **best-effort**: it self-provisions its table at runtime and degrades back to memory-only on any DB error, so turning it on can never break the app.
+
+| Knob | Effect |
+|------|--------|
+| `SECURITY_AUDIT_SINK=database` | **Durable (P2).** Persists errors + activity to a self-provisioned `"AuditLog"` table while the live console still serves recent events from memory. Prunable. |
+| `SECURITY_AUDIT_MODE=compliance` (or the `strict` tier) | **Compliance (P3).** An immutable, **hash-chained**, append-only sink — never pruned. |
+| `SECURITY_AUDIT_RETENTION_DAYS=30` | Activity-row TTL in days (default 30; `0` = keep forever). Compliance rows are never pruned. |
+
+<Aside type="note" title="No schema migration required">
+The `"AuditLog"` table is created at runtime via `CREATE TABLE IF NOT EXISTS` — it is **not** a Prisma model, so there is no schema change, migration, or `create-app` / `template:update` propagation to do. The sink uses raw SQL, so the code compiles in every app whether or not durable audit is enabled. Apps that prefer Prisma-managed schema + Row-Level Security can add an equivalent model themselves.
+</Aside>
+
+**Retention & erasure.** Activity rows age out after `SECURITY_AUDIT_RETENTION_DAYS`. They are also **owned data**: the [deletion cascade](/starter-template/security-feature/) erases a tenant's activity rows on account deletion (errors from authed requests carry the tenant; unauthenticated errors are operational telemetry that age out via retention). Compliance rows are **preserved** (legal hold) — the cascade never deletes them.
+
+**Tamper-evidence (compliance).** Each compliance row stores the exact canonical serialisation it was hashed over plus `hash = SHA-256(prevHash + payload)`, chained across rows and serialised with a Postgres advisory lock. `GET /api/v1/admin/system/audit/verify` recomputes the chain from the stored payloads and reports the first break; `GET /api/v1/admin/system/audit/export` returns it for offline archival. The **History** tab on the System page surfaces durable rows and a "Verify integrity" action.
+
 ## API
 
 All endpoints are admin-only (reads included — diagnostics reveal where the app is weak).
@@ -85,6 +103,9 @@ All endpoints are admin-only (reads included — diagnostics reveal where the ap
 | `GET` | `/api/v1/admin/system/overview` | Database + services + recent errors/activity |
 | `GET` | `/api/v1/admin/system/errors?limit=` | Newest-first errors (stack redacted outside dev) |
 | `GET` | `/api/v1/admin/system/activity?limit=` | Newest-first activity events |
+| `GET` | `/api/v1/admin/system/history?kind=&limit=` | Durable DB history (P2) — empty when in-memory only |
+| `GET` | `/api/v1/admin/system/audit/verify` | Recompute the compliance hash chain (P3) |
+| `GET` | `/api/v1/admin/system/audit/export?limit=` | Export compliance rows for offline archival (P3) |
 
 ## Security
 
