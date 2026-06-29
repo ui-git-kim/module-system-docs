@@ -319,6 +319,7 @@ export default defineConfig({
                 { label: "Palette", slug: "colour-palette/palette" },
                 { label: "Method Panel", slug: "colour-palette/method-panel" },
                 { label: "Colour Semantics", slug: "colour-palette/colour-semantics" },
+                { label: "Colour Knowledge", slug: "colour-palette/colour-knowledge" },
                 { label: "Usage", slug: "colour-palette/usage" },
                 { label: "Integration", slug: "colour-palette/integration" },
                 { label: "Configuration", slug: "colour-palette/configuration" },
