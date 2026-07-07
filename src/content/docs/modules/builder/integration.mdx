@@ -93,7 +93,7 @@ declare module '../../config/service.registry.js' {
 
 Each project can vendor its own timestamped snapshot of the shadcn component sources for its chosen library + style — a lockfile for the generated UI. Different projects can therefore use different libraries (radix **or** base) and styles concurrently, and updates stay explicit and reviewable.
 
-- **Storage:** the `builder_component_set` table (one row per project) holds `library`, the combined `style` key (e.g. `radix-luma`), `syncedAt`, the `files` map (`{ componentName: rewrittenSource }`), and an optional `pending` update candidate.
+- **Storage:** the `builder_component_set` table (one row per project) holds `library`, the combined `style` key (e.g. `radix-luma`), `syncedAt`, the `files` map (`{ componentName: rewrittenSource }`), a derived `baseClasses` manifest (see [below](#base-class-manifest)), and an optional `pending` update candidate.
 - **Management UI:** the **Component Sources** panel in the project's Blocks tab drives **Sync**, **Check for updates** (diff-only), **Re-sync**, and **Update files** (promote the pending candidate). Every route is scoped by project ownership.
 - **Style source:** the library + style come from the project's config, which the [style module](/modules/style/) writes to the structure node's `theme_config` field (`{ componentLibrary, styleName, cssVars }`). The builder derives the registry key as `` `${componentLibrary}-${styleName}` `` and fetches sources from `ui.shadcn.com`.
 
@@ -104,6 +104,28 @@ When a project has a snapshot, the preview iframe compiles it at runtime and ren
 1. `IframeCanvas` forwards the snapshot to the iframe via the `foundry:component-set` message on ready and whenever it changes.
 2. `CanvasPage` compiles each source with Sucrase (`typescript` + `jsx` + `imports`, automatic JSX runtime) and executes it via `new Function` with a `require()` shim: relative imports resolve to other snapshot files (or a synthesised `./utils` `cn`), and external imports resolve from a curated `externalScope` — `react`, `radix-ui`, the `@base-ui/react/*` subpaths, `class-variance-authority`, `clsx`, `tailwind-merge`, `lucide-react`, `cmdk`, `vaul`, `react-day-picker`, `react-resizable-panels`, `input-otp`, and more.
 3. Compilation is lazy, memoised, and cycle-guarded; a source that fails to compile is skipped in isolation, so one bad component never blanks the preview. With no snapshot pinned, the preview uses the shared pristine component map.
+
+### Base-class manifest
+
+Alongside `files`, each snapshot carries a **derived** `baseClasses` manifest: the baked-in Tailwind classes each component ships, keyed by `data-slot`. It is extracted from the vendored sources (never hand-authored) and rebuilt on every sync and promote, so it always matches the pinned library + style. The [style module](/modules/style/) consumes it to run `twMerge(base, userClasses)` for its per-instance class designer and to warn on variant-group mismatches (e.g. `max-w-2xl` won't override the shipped `sm:max-w-sm` — the designer suggests `sm:max-w-2xl`).
+
+Each `data-slot` entry always has a `base` string; components built on `cva()` (Button, Badge, Toggle, Tabs, …) also carry the `variants` tables and `defaultVariants` so the consumer can merge against the *active* variant, not just the default:
+
+```jsonc
+{
+  "sheet-content": { "base": "fixed z-50 … data-[side=right]:sm:max-w-sm …" },
+  "button": {
+    "base": "inline-flex shrink-0 items-center …",
+    "variants": {
+      "variant": { "default": "bg-primary …", "destructive": "…" },
+      "size": { "default": "h-9 …", "sm": "h-8 …", "icon": "size-9" }
+    },
+    "defaultVariants": { "variant": "default", "size": "default" }
+  }
+}
+```
+
+Extraction is a dependency-free scan (no AST): it reads the first string literal(s) of the `cn(…)` on each `data-slot` element and, when that element wires up a `cva()` helper, reconstructs the base + variant tables from the `cva` definition. `data-slot` elements with no `className` (e.g. `Sheet`, `SheetTrigger`) and anything whose classes are a dynamic template literal are omitted rather than mis-parsed. The manifest rides on the per-project component-set the builder already serves (`GET /projects/:id/component-set` → `set.baseClasses`), and a snapshot synced before the manifest existed is backfilled on first read.
 
 ---
 
