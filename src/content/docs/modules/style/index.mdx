@@ -71,9 +71,64 @@ The module contributes to five registries:
 | `propertyPanelTabRegistry` *(builder)* | "Style" tab on selected builder elements (full mode only) |
 | `filterRegistry` | Filter on the builder's `builder.canvas.globalCss` hook injecting the project's generated CSS into the iframe preview (full mode only) |
 
-The module also registers a `theme_config` field on structure project nodes — a mirror of the canonical theme configuration that the builder reads when rendering a project (full mode only).
-
 The backend exposes `/api/v1/my-feature` with routes for theme CRUD, project configs, app overrides, and version history. Routes register through `routeRegistry`; the service is exposed via `serviceRegistry.register('my-feature', ...)`.
+
+---
+
+## Builder integration — the `theme_config` contract
+
+The builder renders a project's components using the project's own shadcn configuration. Rather than have the builder call the style module directly, the style module **mirrors the active configuration onto the project's structure node**, and the builder reads it from there. This keeps the two modules decoupled — the style module owns the data, the builder just reads a field.
+
+### The field
+
+The style module registers a field on the project node type through structure's `structureRegistry` (full install mode only):
+
+```typescript
+structureRegistry.register({
+  moduleId: 'style',
+  displayName: 'Style',
+  fields: [{
+    id: 'theme_config',        // NOT namespaced — the builder reads this exact id
+    nodeTypes: ['projects'],   // the project node-type slug(s)
+    order: 1000,
+    field: { type: 'hidden', label: 'Shadcn Config' },
+  }],
+});
+```
+
+Because structure stores field values in the node's `data` JSON, the value lands at **`node.data.theme_config`**. The field is `hidden` — it is system-managed, not user-edited on the Info tab.
+
+### Who writes it
+
+The style backend mirrors the full `StyleConfig` onto the node on **every change to the active project configuration** — `saveProjectConfig`, `setActiveProjectTheme`, and project-scoped `restoreVersion` — via structure's node-update API:
+
+```typescript
+await structureService.updateNode(nodeId, userId, { data: { theme_config: config } });
+```
+
+The style module's own `my_feature_theme` table remains the editor/history store; `node.data.theme_config` is the **canonical mirror everyone reads**. The write is best-effort (failure is logged, never blocks the save), so the builder should tolerate a missing field on projects that predate the style module or haven't been saved yet.
+
+### The shape the builder reads
+
+At `node.data.theme_config` the builder needs at minimum these keys (the style module mirrors the whole `StyleConfig`, so extra keys are present and can be ignored):
+
+```typescript
+{
+  componentLibrary: 'radix' | 'base',   // ← builder uses this
+  styleName: 'nova' | 'vega' | 'maia' | 'lyra' | 'mira' | 'luma' | 'sera' | 'rhea',
+  cssVars: {                            // ← builder uses this as the preview theme
+    light: { [token: string]: string },
+    dark?: { [token: string]: string },
+  },
+  // iconLibrary, radius, font, baseColor, colorPreset, chartColor, savedColors, … — ignored by the builder
+}
+```
+
+The builder derives the shadcn registry style path as **`${componentLibrary}-${styleName}`** (e.g. `radix-luma`) and fetches `ui.shadcn.com/r/styles/{that}/{component}.json`. All eight `styleName` values map 1:1 to real registry slugs for both `radix-` and `base-` — no translation table is needed. `cssVars` is applied directly as the preview theme.
+
+<Aside type="note" title="Read fallbacks">
+For resilience against older data, the builder reads `node.data.theme_config` first, then falls back to `shadcn_config` → `style_config` → the legacy `data.theme`.
+</Aside>
 
 ---
 
