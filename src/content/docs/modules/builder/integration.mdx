@@ -22,7 +22,7 @@ import { serviceRegistry } from '../../config/service.registry.js';
 const builderService = serviceRegistry.get('builder');
 
 // Now you can call any builder service method
-const blocks = await builderService.getBlocksByProject(userId, projectId);
+const blocks = await builderService.getBlocks(userId, { projectId });
 const components = await builderService.getNativeComponents();
 const config = await builderService.getConfig('sharedFields');
 ```
@@ -48,12 +48,9 @@ declare module '../../config/service.registry.js' {
 | `getNativeComponent(type)` | `NativeComponentRow \| null` | Single component by type |
 | `saveNativeComponent(input)` | `NativeComponentRow` | Create or update (upsert) |
 | `deleteNativeComponent(type)` | `boolean` | Delete by type |
-| `importNativeComponents(components)` | `{ imported, errors }` | Bulk import |
-| `importComponentsJson(jsonData)` | `{ imported, errors }` | Import from JSON format |
-| `getBlocks(userId)` | `BuilderBlock[]` | All blocks for a user |
-| `getBlocksByProject(userId, projectId)` | `BuilderBlock[]` | Project-scoped blocks |
-| `getGlobalBlocks(userId)` | `BuilderBlock[]` | Global blocks |
-| `getSystemBlocks()` | `BuilderBlock[]` | Admin-created system blocks |
+| `importNativeComponents(components)` | `{ imported, created, updated, errors }` | Bulk import |
+| `importComponentsJson(jsonData)` | `{ imported, created, updated, errors }` | Import from JSON format |
+| `getBlocks(userId, filters?)` | `BuilderBlock[]` | Blocks for a user; `filters` = `{ projectId?, collectionId?, isGlobal?, isSystem? }` — scope with `{ projectId }`, `{ isGlobal: true }`, or `{ isSystem: true }` (system blocks are visible to all users) |
 | `getBlock(userId, id)` | `BuilderBlock \| null` | Single block (own or system) |
 | `createBlock(userId, input)` | `BuilderBlock` | Create with auto-changelog |
 | `updateBlock(userId, id, input)` | `BuilderBlock \| null` | Update with changelog append |
@@ -79,13 +76,16 @@ declare module '../../config/service.registry.js' {
 | `getProjectComponentSet(projectId)` | `builder_component_set \| null` | The project's pinned component snapshot |
 | `syncProjectComponentSet(projectId, style, names?)` | `{ set, errors }` | Create/replace the project's snapshot |
 | `checkProjectComponentUpdates(projectId)` | `{ changed, added, removed, checkedAt } \| null` | Diff latest sources vs the pinned snapshot (stores the candidate as `pending`) |
-| `promoteProjectComponentUpdate(projectId)` | `builder_component_set` | Promote the pending candidate to the live snapshot |
+| `promoteProjectComponentUpdate(projectId)` | `builder_component_set \| null` | Promote the pending candidate to the live snapshot; `null` when there is no pending update |
 | `getBuilderStyle()` | `string` | Get current shadcn style |
 | `setBuilderStyle(style)` | `string` | Set shadcn style |
 | `getIconLibrary()` | `string` | Get current icon library |
 | `setIconLibrary(library)` | `string` | Set icon library |
-| `findUserByHandle(handle)` | `User \| null` | Find user by registry handle |
-| `checkHandle(handle)` | `{ available, message? }` | Check handle availability |
+| `findUserByHandle(handle)` | `{ id: string } \| null` | Find user by registry handle (returns the user id only) |
+
+<Aside type="note">
+Block scoping is done through the `getBlocks(userId, filters?)` argument, not dedicated methods. `getBlocksByProject`, `getGlobalBlocks`, `getSystemBlocks`, `getBlocksByCollection` and `checkHandle` are **frontend** API-client wrappers (`builderService` in `services/builder.service.ts`), not backend service methods — calling them on `serviceRegistry.get('builder')` would fail. Handle availability at the backend is `findUserByHandle` (surfaced to the client by the `GET /check-handle` route).
+</Aside>
 
 ---
 
@@ -94,7 +94,7 @@ declare module '../../config/service.registry.js' {
 Each project can vendor its own timestamped snapshot of the shadcn component sources for its chosen library + style — a lockfile for the generated UI. Different projects can therefore use different libraries (radix **or** base) and styles concurrently, and updates stay explicit and reviewable.
 
 - **Storage:** the `builder_component_set` table (one row per project) holds `library`, the combined `style` key (e.g. `radix-luma`), `syncedAt`, the `files` map (`{ componentName: rewrittenSource }`), a derived `baseClasses` manifest (see [below](#base-class-manifest)), and an optional `pending` update candidate.
-- **Management UI:** the **Component Sources** panel in the project's Blocks tab drives **Sync**, **Check for updates** (diff-only), **Re-sync**, and **Update files** (promote the pending candidate). Every route is scoped by project ownership.
+- **Management UI:** the **Component Sources** panel in the project's Blocks tab drives **Sync**, **Check for updates** (diff-only), **Re-sync**, and **Update files** (promote the pending candidate). Every route is scoped by project ownership. This UI is backed by an internal `useProjectComponentSet(projectId)` hook (`{ set, isLoading, sync, checkUpdates, promote, … }`); it is used within the module and is intentionally **not** part of the public frontend export surface.
 - **Style source:** the library + style come from the project's config, which the [style module](/modules/style/) writes to the structure node's `theme_config` field (`{ componentLibrary, styleName, cssVars }`). The builder derives the registry key as `` `${componentLibrary}-${styleName}` `` and fetches sources from `ui.shadcn.com`.
 
 ### Runtime rendering
@@ -296,7 +296,16 @@ interface DeletedContext {
 
 ### Hooks the Builder Fires
 
-The builder fires 8 CRUD action hooks from its backend service via `actionRegistry.doActionAll()`. Companion modules can subscribe to these hooks to react to builder lifecycle events — for example, updating analytics, triggering notifications, or syncing external systems.
+The builder fires 10 CRUD action hooks from its backend service via `actionRegistry.doActionAll()`. Companion modules can subscribe to these hooks to react to builder lifecycle events — for example, updating analytics, triggering notifications, or syncing external systems.
+
+#### Native Component Hooks
+
+These are app-wide catalogue events (the `native_component` table has no `userId`), so their context carries the component `type`, not a `userId`.
+
+| Hook | Fired When | Context |
+|------|-----------|---------|
+| `builder.component.saved` | A native component is created or updated (upsert) | `{ type, component }` |
+| `builder.component.deleted` | A native component is deleted | `{ type }` |
 
 #### Block Hooks
 
@@ -343,7 +352,18 @@ actionRegistry.addActionAsync(
 );
 ```
 
-All 8 hooks follow the same pattern — use `actionRegistry.addActionAsync()` with the hook name and a unique registration ID.
+All 10 hooks follow the same pattern — use `actionRegistry.addActionAsync()` with the hook name and a unique registration ID.
+
+---
+
+## Security Registry
+
+The builder registers with the starter's `securityRegistry` (via `security.registration.ts`) so its per-user data participates in the platform's data-classification and account-deletion flows.
+
+- **Data-classification manifest** — `securityRegistry.register()` classifies `block`, `block_category`, and `block_collection` as **`owned`** user data. `native_component` and `builder_config` are deliberately **excluded** — they are app-wide shared state, not per-user data.
+- **Account-deletion handler** — `securityRegistry.registerDeletionHandler({ id: 'builder.user-data', … })` hard-deletes the subject's blocks, categories, and collections in a single `prisma.$transaction` when their account is deleted. It is idempotent and returns `{ action: 'hard-delete', recordsAffected }`.
+
+Companion modules or operators auditing the per-user data cascade can rely on this manifest to know exactly what the builder owns and removes on deletion.
 
 ---
 
@@ -357,7 +377,7 @@ Two tabs are registered for project node detail pages:
 
 **Blocks Tab** (`builder-blocks`)
 - Shows all blocks scoped to the project
-- Provides "Open in Builder", "Duplicate", and "Delete" actions
+- Provides "Open in Builder" and "Delete" actions (duplication is available from the Blocks Library page / `POST /blocks/:id/duplicate`, not this tab)
 - Displays a badge with block count (fetched async)
 - Supports toggling global blocks visibility
 - Order: 45
@@ -646,7 +666,7 @@ Here's how a hypothetical **analytics** module might integrate with the builder:
     async function getProjectBlockMetrics(userId: string, projectId: string) {
       const builderService = serviceRegistry.get('builder');
 
-      const blocks = await builderService.getBlocksByProject(userId, projectId);
+      const blocks = await builderService.getBlocks(userId, { projectId });
       const collections = await builderService.getCollections(userId);
 
       return {
