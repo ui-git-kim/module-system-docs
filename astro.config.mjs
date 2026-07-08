@@ -272,6 +272,7 @@ export default defineConfig({
                 { label: "Configuration", slug: "modules/builder/configuration" },
                 { label: "Usage", slug: "modules/builder/usage" },
                 { label: "Integration", slug: "modules/builder/integration" },
+                { label: "JSON Import & Export", slug: "modules/builder/json-reference" },
                 { label: "Developer Workflow", slug: "modules/builder/developer-workflow" },
                 { label: "Changelog", slug: "modules/builder/changelog" },
                 { label: "Roadmap", slug: "modules/builder/roadmap" },
