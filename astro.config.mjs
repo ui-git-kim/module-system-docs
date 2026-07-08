@@ -283,6 +283,11 @@ export default defineConfig({
               items: [
                 { label: "Overview", slug: "modules/style" },
                 { label: "Design philosophy", slug: "modules/style/design" },
+                { label: "Configuration", slug: "modules/style/configuration" },
+                { label: "Usage", slug: "modules/style/usage" },
+                { label: "Integration", slug: "modules/style/integration" },
+                { label: "Developer Workflow", slug: "modules/style/developer-workflow" },
+                { label: "Changelog", slug: "modules/style/changelog" },
                 { label: "Roadmap", slug: "modules/style/roadmap" },
               ],
             },
