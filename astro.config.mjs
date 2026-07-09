@@ -45,12 +45,20 @@ export default defineConfig({
               slug: "getting-started/neon-setup",
             },
             {
+              label: "Backup & Restore",
+              slug: "getting-started/backup-restore",
+            },
+            {
               label: "Field Encryption with AWS KMS",
               slug: "getting-started/aws-kms-setup",
             },
             {
               label: "Cloudflare Edge",
               slug: "getting-started/cloudflare-edge",
+            },
+            {
+              label: "Error Tracking (Sentry)",
+              slug: "getting-started/error-tracking",
             },
             { label: "LLM Rules", slug: "getting-started/llm-rules" },
           ],

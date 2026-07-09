@@ -1,0 +1,64 @@
+---
+title: Backup & Restore
+description: Recovery runbook built on Neon instant point-in-time restore — how to restore into a branch, verify, and the retention window per tier.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Backups are **delegated to Neon**. Neon continuously retains your database's change history, so recovery is a *point-in-time restore* (PITR) rather than a separate backup job — there is nothing to schedule or store yourself. This page is the runbook: how to restore, how to verify, and how retention maps to tiers.
+
+<Aside type="note" title="What you get for free">
+Neon keeps a **history window** of every change. Within that window you can branch or restore to **any point in time** (timestamp or LSN granularity), instantly. No dumps, no cron, no backup bucket to manage.
+</Aside>
+
+## Before an incident
+
+- **Know your retention window.** History retention is configurable and **capped by plan** — roughly **1 day on Free up to 30 days** on higher tiers. Set it to match your recovery objective in the Neon console (Project → Settings → Storage / History retention). A longer window costs more storage; pick per tier.
+- **Recovery objective.** With PITR your effective RPO is ~zero (any point in the window) and RTO is minutes (restore is instant). Decide the window that covers "how long before we'd notice a bad write".
+
+## Restore procedure (non-destructive: restore into a branch)
+
+The safe pattern is to restore **into a new branch off the root**, verify it, and only then cut over — the current state is never mutated until you choose to.
+
+<Steps>
+
+1. **Pick the target time** — a timestamp (or LSN) just *before* the incident (a bad migration, a bulk delete, corruption).
+
+2. **Create a branch at that time.** In the Neon console: **Branches → Create branch → Include data up to → Time**, branching from your root/parent branch. (Or via the Neon API / CLI with the timestamp or LSN.) The branch is an isolated, writable copy of the database as it was at that instant.
+
+3. **Get the branch connection strings** — both the **pooled** (`-pooler`, for `DATABASE_URL`) and **direct** (for `DIRECT_DATABASE_URL`) URLs.
+
+4. **Verify** (see below) against the branch before touching production.
+
+5. **Cut over**, one of:
+   - **Repoint the app** — set `DATABASE_URL` / `DIRECT_DATABASE_URL` to the restored branch and redeploy. Fastest; the branch becomes the live database.
+   - **Reset the root** — use Neon's **Restore** to reset the main branch to the restored point. Neon preserves the pre-restore state as an automatic backup branch, so this is reversible.
+
+</Steps>
+
+## Verify a restore
+
+Before and after cut-over, confirm the restore is good:
+
+- **Connectivity** — hit the readiness probe against the restored target: `GET /api/health/db` returns `200`.
+- **Spot-check data** — query a few known rows (the affected table, recent `User`/`Space` rows, an owned table) and confirm the state matches the target time.
+- **Schema** — confirm the restored branch's schema matches the app. If you restored to a point *before* a migration, run `prisma migrate deploy` (or reconcile) so the schema and client agree.
+- **Row counts** — compare counts of key tables against expectations for that point in time.
+
+## Retention per tier
+
+| Tier | Typical history window | Notes |
+|------|------------------------|-------|
+| Free | ~1 day | Enough to recover from a same-day mistake. |
+| Paid (lower) | up to ~7 days | Covers a working week. |
+| Paid (higher) | up to **30 days** | Set explicitly; longer = more storage. |
+
+Check your project's actual limit in the Neon console — plans and limits evolve. Set history retention deliberately per app tier rather than accepting the default.
+
+<Aside type="caution" title="PITR vs. the right to erasure">
+A point-in-time restore can **resurrect data you legally erased.** If you restore to a time *before* an account deletion (the [deletion cascade](/starter-template/security-feature/)), the restored branch will contain that account's data again. After any restore, **re-run erasure** for accounts deleted between the restore point and now. Compliance-mode audit logs are hash-chained and stored separately, so the erasure record survives.
+</Aside>
+
+<Aside type="tip" title="Drill it">
+A backup you've never restored is a hope, not a plan. Periodically create a branch at a past time and run the verify steps — it costs minutes and proves the runbook works before you need it under pressure.
+</Aside>
