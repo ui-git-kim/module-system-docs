@@ -335,18 +335,6 @@ export default defineConfig({
               ],
             },
             {
-              label: "Pickers",
-              collapsed: true,
-              items: [
-                { label: "Overview", slug: "modules/pickers" },
-                { label: "Configuration", slug: "modules/pickers/configuration" },
-                { label: "Usage", slug: "modules/pickers/usage" },
-                { label: "Integration", slug: "modules/pickers/integration" },
-                { label: "Developer Workflow", slug: "modules/pickers/developer-workflow" },
-                { label: "Changelog", slug: "modules/pickers/changelog" },
-              ],
-            },
-            {
               label: "Document Management",
               collapsed: true,
               items: [
