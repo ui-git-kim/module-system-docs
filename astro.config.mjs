@@ -33,6 +33,10 @@ export default defineConfig({
           items: [
             { label: "Introduction", slug: "getting-started" },
             {
+              label: "Product Model",
+              slug: "getting-started/product-model",
+            },
+            {
               label: "Documentation System",
               slug: "getting-started/documentation",
             },
