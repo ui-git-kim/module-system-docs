@@ -127,6 +127,10 @@ export default defineConfig({
                   label: "Email",
                   slug: "starter-template/email-feature",
                 },
+                {
+                  label: "Jobs",
+                  slug: "starter-template/jobs-feature",
+                },
               ],
             },
             {

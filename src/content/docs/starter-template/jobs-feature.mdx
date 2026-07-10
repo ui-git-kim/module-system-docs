@@ -1,0 +1,78 @@
+---
+title: Jobs Feature
+description: The foundation-owned background-jobs seam — import-time handler registration, one enqueueJob entry point, an in-process default, and a durable pg-boss adapter path.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+The starter ships background jobs as a **foundation feature** (`backend/src/features/jobs/`, backend only — a sibling to `auth`, `user`, `admin` and [`email`](/starter-template/email-feature/), **not a module**). It is a **seam, not a job system**: a handler registry, one `enqueueJob()` entry point, an honest in-process default, and a durable adapter that is one env key away.
+
+<Aside type="tip" title="Philosophy">
+Durability, retries and scheduling are delegated to a real queue (pg-boss — Postgres-backed, so the database the app already has *is* the queue; no new infrastructure). The foundation owns the *mechanism* — register a handler, enqueue a message, drain on shutdown — while job *content* stays with the feature or module that registered the handler. Same pattern as the email and key-provider seams.
+</Aside>
+
+## How it works
+
+- **Handlers register at import time.** A feature/module ships a registration file that calls `registerJobHandler('feature.job', handler)` as a side effect of being imported. This matters: module lifecycle hooks (`onActivate`) run at *CLI* time, not server runtime — import-time registration is what exists when the runner starts.
+- **`enqueueJob(name, data, opts?)`** is the one entry point. It **never throws** — failures normalise to `{ queued: false, detail }`.
+- **The inline default is honest scaffolding.** With no runner configured, jobs execute in-process: immediately, exactly once, no persistence. A crash loses in-flight work; delayed jobs not yet started are **dropped with a warning at shutdown**. Handler failures are logged with the audit flag (`job.failed`). Good for development and light production; durability is deliberately one config change away.
+- **The runner starts after everything registers.** `app.ts` calls `startJobRunner()` once all features and modules have imported — a durable adapter then connects and subscribes one worker per registered job name.
+- **Graceful shutdown drains jobs.** SIGTERM/SIGINT now fires the **`app.shutdown` action** (the foundation's shutdown seam, bounded by `SHUTDOWN_TIMEOUT`) *before* the database disconnects; the jobs feature registers its drain there, so in-flight jobs finish their writes.
+
+## Registering a handler and enqueueing
+
+```typescript
+// features/my-feature/jobs.registration.ts (side-effect import from index.ts)
+import { registerJobHandler } from '../jobs/index.js';
+
+registerJobHandler('my-feature.export', async (data, ctx) => {
+  // job content lives HERE, with the feature — the foundation only moves messages
+});
+```
+
+```typescript
+// anywhere at runtime
+import { enqueueJob } from '../jobs/index.js';
+
+const result = await enqueueJob('my-feature.export', { userId }, { tenantId, delayMs: 5_000 });
+if (!result.queued) {
+  log.warn({ detail: result.detail }, 'Export not queued');
+}
+```
+
+Job names follow `{feature}.{job}`. Payloads must be JSON-serialisable (durable adapters round-trip them through Postgres). `EnqueueOptions` carries `delayMs`, `retryLimit` (honoured by durable adapters; the inline runner runs once) and `tenantId` (audit context for failure logs).
+
+## Enabling the durable runner (pg-boss)
+
+<Steps>
+1. `cd backend && npm install pg-boss`
+2. Set `JOBS_RUNNER=pg-boss` in `backend/.env` (the commented stub is already there). It uses `DIRECT_DATABASE_URL` (falling back to `DATABASE_URL`) and creates its own `pgboss` schema.
+3. Restart — the adapter auto-wires at bootstrap, connects at `startJobRunner()`, and subscribes one worker per registered handler. Queued jobs now survive restarts, `retryLimit` works, and graceful shutdown persists unfinished work.
+</Steps>
+
+A declared-but-broken config stays **visible**: startup logs an error, `getJobRunnerStatus()` reports `configured: true, ready: false`, and jobs run on the inline fallback in the meantime. BullMQ (Redis-backed) or any other queue can be wired the same way — implement the three-member `JobRunner` interface and call `setJobRunner(...)` at bootstrap.
+
+## The `app.shutdown` seam
+
+The foundation registers two handlers itself: `http.close` (order 5 — the HTTP server stops accepting and in-flight requests finish) and `jobs.drain` (order 10 — in-flight jobs complete, chained follow-up jobs included). A repeated SIGTERM/SIGINT skips the drain and force-exits. Any feature or module can register its own flush:
+
+```typescript
+import { actionRegistry } from '../../config/action.registry.js';
+
+actionRegistry.addActionAsync('app.shutdown', 'my-module.flush', async () => {
+  await flushBuffers(); // DB is still connected here
+}, 50);
+```
+
+The whole drain is bounded by `SHUTDOWN_TIMEOUT` (default 10s) — a hung handler delays shutdown by at most that.
+
+## What the foundation deliberately does not do
+
+- **Cron / recurring schedules** — use the runner's native scheduling through the adapter escape hatch (pg-boss has `schedule()`), or an interval that calls `enqueueJob`. A first-class scheduling seam is future roadmap territory.
+- **Retries on the inline runner** — retry semantics belong to a durable queue; faking them in-process would hide the durability gap.
+- **Concurrency caps / backpressure on the inline runner** — every enqueue starts immediately. If an HTTP-reachable path can enqueue at attacker-controlled rates, rate-limit that route (the global limiter already applies) or use the durable runner, whose worker pool bounds concurrency.
+- **A jobs dashboard** — pg-boss's tables are queryable; admin surfacing can come later.
+
+Ready-made adoption candidates already in the codebase: the deletion cascade's retry (`scheduleDeletionRetry` in its JSDoc), lifted-legal-hold erasure of `preserved` data, grace-period account deletion (`Space.deletionState`), and the audit-prune interval.
+
+The seam is stateless in the foundation — the inline runner holds jobs only in memory, and pg-boss's schema is provider-owned infrastructure — so it registers a security manifest declaring only the `job.failed` audit event, and needs no deletion handler.
