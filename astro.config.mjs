@@ -131,6 +131,10 @@ export default defineConfig({
                   label: "Jobs",
                   slug: "starter-template/jobs-feature",
                 },
+                {
+                  label: "Notifications",
+                  slug: "starter-template/notifications-feature",
+                },
               ],
             },
             {

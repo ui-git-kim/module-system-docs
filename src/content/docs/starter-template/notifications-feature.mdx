@@ -1,0 +1,85 @@
+---
+title: Notifications Feature
+description: The foundation notification transport — in-app rows + preference-gated email delivery, with a bell in the header and a notifications page. Content stays with features and modules.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The starter ships notifications as a **foundation feature** (`backend/src/features/notifications/` + `frontend/src/features/notifications/` — a sibling to `auth`, `user`, `admin`, [`email`](/starter-template/email-feature/) and [`jobs`](/starter-template/jobs-feature/), **not a module**). It is the notification **transport**: the mechanism that stores, delivers and tracks read state. Notification **content** — what to say and when — stays with the features and modules that call `notify()`, and preference **toggles** stay in the [notificationPreferencesRegistry](/starter-template/registries/#notification-preferences-registry).
+
+<Aside type="tip" title="The transport/content split">
+This mirrors Medusa's Notification infrastructure module: the foundation owns delivery (an owned `Notification` table, the email channel via the email seam, read-state APIs, the bell); modules own what notifications exist. A billing module ships `notify(...)` calls and preference toggles — never its own delivery pipeline.
+</Aside>
+
+## Sending — `notify()`
+
+One server-side entry point (there is deliberately **no HTTP send endpoint** — sending is code, not client input):
+
+```typescript
+import { notify } from '../notifications/index.js';
+
+await notify({
+  tenantId,                          // req.user.tenantId
+  category: 'emailSecurityAlerts',   // preference key gating the email channel
+  title: 'New sign-in to your account',
+  body: 'A new device signed in from Melbourne, Australia.',
+  data: { url: '/settings/security' },
+  email: true,                       // also email it (subject/text default from title/body)
+  emailDefault: true,                // treat an unset preference as opted-in for this category
+});
+```
+
+What happens:
+
+1. **In-app row, always** — a `Notification` row (owned by `tenantId`, per the [isolation convention](/starter-template/database/)), which drives the bell badge and the notifications page. Fires the `notification.created` action.
+2. **Email, when asked and allowed** — gated three ways: an email provider must be [ready](/starter-template/email-feature/), the recipient's stored preference for `category` must allow it (`emailDefault` covers the never-set case, since the backend can't see frontend registry defaults; unknown = don't email), and then the send is **enqueued as a `notifications.email` job** — durable and retried when a [queue adapter](/starter-template/jobs-feature/) is wired, immediate on the inline runner.
+3. **Never throws** — the returned `NotifyResult` reports each channel honestly (`created`, `queued` / `skipped` / `failed` with detail).
+
+`category` is the same key modules register in the `notificationPreferencesRegistry` (and the four core `email*` keys the Preferences page hardcodes) — one key drives the toggle UI and the delivery gate.
+
+## The UI surface
+
+- **Bell** — a header-toolbar item (order 60, the notifications band) with an unread indicator, registered by the frontend feature; clicking opens `/notifications`.
+- **Notifications page** — newest-first list with unread highlighting, mark-read / mark-all-read, delete, an unread-only filter and cursor-driven load-more. Structure-only styling throughout.
+- **Hooks** — `useUnreadCount()` (badge; polls gently), `useNotificationList()`, `useNotificationMutations()`. Query keys are namespaced under `['notifications', …]`.
+
+## The API
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/v1/notifications` | List (newest first; `?unread=true`, `?limit`, `?cursor`) |
+| `GET /api/v1/notifications/unread-count` | Unread total (bell badge) |
+| `PATCH /api/v1/notifications/:id/read` | Mark one read |
+| `PATCH /api/v1/notifications/read-all` | Mark all read |
+| `DELETE /api/v1/notifications/:id` | Delete one |
+
+Every query is `owned()`-scoped on the caller's `tenantId` — there is no cross-user access path.
+
+## Isolation & deletion
+
+The `Notification` model carries `tenantId` (isolation key) + `userId` (recipient) per the isolation convention, is standalone (no FK — the model auto-adds cleanly on `template:update`), and is declared in the feature's security manifest (`ownedModels: [{ model: 'Notification', ownerColumn: 'tenantId' }]`). The `notifications.account` deletion handler clears the account's rows early in the cascade (order 500).
+
+As with every owned table, RLS policies are applied per-app (the template doesn't auto-provision them — see [Database & Prisma](/starter-template/database/) for the policy template):
+
+```sql
+ALTER TABLE "Notification" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "Notification" FORCE ROW LEVEL SECURITY;
+CREATE POLICY notification_isolation ON "Notification"
+  USING ("tenantId" = current_setting('app.tenant_id', true));
+```
+
+`owned()` scoping stands as defence-in-depth either way.
+
+One durable-queue caveat: on the pg-boss runner, `notifications.email` job payloads (recipient address + message content) persist in pg-boss's own schema until its retention purges them (days, by default) — the account-deletion cascade doesn't reach into queue tables. The job handler therefore **re-checks the recipient still exists at send time** and skips (visibly) when the account is gone, so a queued email can never be delivered after deletion.
+
+## For modules
+
+1. Register preference toggles in the `notificationPreferencesRegistry` (frontend) with your module's ids.
+2. Call `notify({ tenantId, category: '<your-pref-id>', … })` from your backend feature code, passing `emailDefault` to mirror your registry `defaultValue`.
+3. Listen to `notification.created` (action) if you need side effects.
+
+## What the foundation deliberately does not do
+
+- **Realtime push** — the badge polls; WebSocket/SSE transport is roadmap territory (a future foundation seam).
+- **Notification templates/digests** — content is caller territory; digest scheduling belongs to a module on the jobs seam.
+- **Broadcast/fan-out** — one recipient per `notify()` call (solo product).
