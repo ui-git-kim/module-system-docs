@@ -22,9 +22,9 @@ export interface ModuleContract {
   description: string;
   version: string;      // semver
 
-  /** Module id → semver range. RECORDED, not yet validated —
-   *  range enforcement + install/boot ordering (topological sort)
-   *  land with the dependency-resolution effort. */
+  /** Module id → semver range. Checked as WARNINGS at install
+   *  (CLI) and at boot, which also computes a topological order
+   *  and reports cycles. Hard enforcement is a future step. */
   depends?: Record<string, string>;
 
   /** @deprecated Use `depends`. Still honoured everywhere depends is checked. */
@@ -41,7 +41,7 @@ Lifecycle hooks (`onInstall`, `onUpdate`, `onActivate`, `onDeactivate`, `onUnins
 - **Registration at import time.** An installed module's backend feature ships a generated `module.registration.ts` that registers `{ id, name, version, depends }` with the `moduleRegistry` as a side effect of being imported — exactly the `security.registration.ts` pattern. Foundation features do **not** register: they are not modules.
 - **Startup state sync.** After all features and modules have registered, `app.ts` fires `runModuleStartupTasks()` (fire-and-forget, never throws): the feature diffs the registry against the `InstalledModule` table and records each transition. This diff is the *only* way the runtime can observe CLI-side install, update and uninstall — they happen while the server is down.
 - **Audit events at each transition** (declared in the feature's security manifest): `module.installed` (new row), `module.updated` (version change), `module.missing` (a row whose code no longer registers — uninstalled?), and `module.dependencyIssue`. Each also fires on the `actionRegistry`, so other features and modules can react.
-- **Dependency check.** Every boot, each registered module's `depends` (and legacy `requiredModules`) ids are presence-checked. Unlike the CLI's install-time check this catches **uninstall drift** — a dependency removed after its dependents were installed. A dependency that is *installed but not registered* (an older-vintage module, or a frontend-only module with no backend code) is excused via a feature-folder fallback rather than warned about.
+- **Dependency check.** Every boot, each registered module's `depends` (and legacy `requiredModules`) ids are presence-checked, and — since v1.49.0 — registered dependencies are **range-checked** against the declared semver range (the contract's own `satisfiesRange`, so the CLI and the host can never disagree about what a range means) and the registry computes a **dependency-first topological order** (Kahn's algorithm), reporting cycles as readable paths (`a → b → a`). The result partitions the registered ids three ways: `order`, cycle members, and `blocked` — modules that cannot be ordered because they sit behind a cycle or on one entangled with an already-reported cycle; blocked ids get their own startup warning. Unlike the CLI's install-time check this catches **uninstall drift** — a dependency removed after its dependents were installed. A dependency that is *installed but not registered* (an older-vintage module, or a frontend-only module with no backend code) is excused via a feature-folder fallback rather than warned about; a version mismatch gets no such excusal. Everything is a **warning** — nothing hard-fails yet.
 
 ```typescript
 // generated per module: backend/src/features/my-feature/module.registration.ts
@@ -65,7 +65,7 @@ The module CLI's `enable`/`disable` commands flip a flag in `.module-state.json`
 
 ## What the foundation deliberately does not do (yet)
 
-- **Semver-range enforcement and topological install/boot ordering** — `depends` ranges are recorded so they hold retroactively once Kahn's-algorithm ordering ships ([roadmap](/starter-template/roadmap/)).
+- **Hard dependency enforcement and ordered install/boot** — ranges are checked and the topological order is computed (`moduleRegistry.computeModuleOrder()`), but mismatches and cycles only warn, and nothing consumes the order at runtime yet ([roadmap](/starter-template/roadmap/)).
 - **Runtime enable/disable** — features are wired by static imports; a dynamic mount/unmount story belongs to Admin Module Management.
 - **Owning the CLI's state files** — `.module-state.json` / `.module-manifests.json` remain CLI bookkeeping; the runtime's record is the `InstalledModule` table.
 - **A per-module migration runner** — its own roadmap effort (`_module_migrations`, expand-and-contract).
