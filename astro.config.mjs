@@ -172,6 +172,10 @@ export default defineConfig({
               slug: "starter-template/developer-workflow",
             },
             {
+              label: "Testing & CI",
+              slug: "starter-template/testing",
+            },
+            {
               label: "Upstream Issues",
               slug: "starter-template/upstream-issues",
             },
