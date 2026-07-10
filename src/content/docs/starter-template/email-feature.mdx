@@ -1,0 +1,136 @@
+---
+title: Email Feature
+description: The foundation-owned email seam — one sendEmail entry point, a console default that never fakes success, and optional provider adapters (Resend, SendGrid, SES, SMTP).
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The starter ships email as a **foundation feature** (`backend/src/features/email/`, backend only — a sibling to `auth`, `user` and `admin`, **not a module**). It is a **seam, not a mail system**: one `sendEmail()` entry point, a provider interface, a default that logs instead of sending, and four optional adapters whose SDKs are **app-installed, never template dependencies**.
+
+<Aside type="tip" title="Philosophy">
+Delivery is delegated to expert providers (Resend, SendGrid, AWS SES, or any SMTP host via Nodemailer). The foundation owns the *mechanism* — one correct wiring of "send this message" — while templates, rendering and per-feature email *content* stay with callers and modules. Same pattern as the [security feature's](/starter-template/security-feature/) key-provider and auth-identity seams.
+</Aside>
+
+<Aside type="note" title="Auth emails are not sent through this seam">
+Verification, password-reset and change-email messages are sent by **Neon Auth itself**; a custom SMTP provider for those is configured in the **Neon dashboard**, not here (see [Authentication](/starter-template/auth-feature/)). This seam serves everything else: notifications, billing receipts, and module-sent mail.
+</Aside>
+
+## How it works
+
+- **`sendEmail(message)`** is the one entry point. It resolves the active provider, applies the `email.outbound` filter, sends, fires the `email.sent` action, and **never throws** — failures normalise to `{ sent: false, detail }` so callers treat non-delivery as data.
+- **Unconfigured = visible, not silent.** With no provider wired, the **console provider** logs the envelope (body at `debug` level) and returns `sent: false` — it never fakes success. In development this doubles as a "what would have been sent" console.
+- **Adapters are optional dependencies.** Each SDK is imported dynamically via a variable specifier (the same idiom as the [AWS KMS key provider](/getting-started/aws-kms-setup/) and [Sentry](/getting-started/error-tracking/)), so the template — and any app not sending email — type-checks and builds without any mail SDK installed.
+- **Wiring is configuration, not code.** Set the `EMAIL_*` env keys and the feature auto-wires the matching adapter at startup; a bad or incomplete config logs an error and leaves the console default active — it never crashes bootstrap.
+
+## Sending email
+
+```typescript
+import { sendEmail } from '../email/index.js';
+
+const result = await sendEmail({
+  to: user.email,
+  subject: 'Your receipt',
+  text: 'Thanks! Your receipt is attached.',          // plain text — required
+  html: '<p>Thanks! Your receipt is attached.</p>',    // optional alternative
+  attachments: [{ filename: 'receipt.pdf', content: pdfBuffer, contentType: 'application/pdf' }],
+});
+
+if (!result.sent) {
+  log.warn({ detail: result.detail }, 'Receipt not delivered');
+}
+```
+
+`EmailMessage` is deliberately small: `to`, `subject`, `text`, optional `html` / `from` / `replyTo` / `attachments`. Single recipient — the product is solo, so fan-out is a caller loop, never seam surface. Attachment `content` follows the Nodemailer convention: a **string is UTF-8 text**, **binary content must be a `Buffer`** (adapters convert per provider).
+
+`EmailResult` reports `sent`, the `provider` name, the provider's `messageId` when available, and a human-readable `detail`.
+
+## Enabling a provider
+
+Set `EMAIL_PROVIDER` + `EMAIL_FROM` (plus the provider's key) in `backend/.env`, and install the matching SDK **in your app** — the stubs are already in your generated `.env`:
+
+```bash frame="none"
+# EMAIL_PROVIDER=              # resend | sendgrid | ses | smtp
+# EMAIL_FROM=                  # e.g. My App <noreply@yourdomain.com>
+```
+
+<Tabs>
+  <TabItem label="Resend">
+    <Steps>
+      1. `cd backend && npm install resend`
+      2. Set `EMAIL_PROVIDER=resend`, `EMAIL_FROM=...`, `RESEND_API_KEY=re_...`
+      3. Restart — the adapter auto-wires; the SDK loads at first send.
+    </Steps>
+  </TabItem>
+  <TabItem label="SendGrid">
+    <Steps>
+      1. `cd backend && npm install @sendgrid/mail`
+      2. Set `EMAIL_PROVIDER=sendgrid`, `EMAIL_FROM=...` (a verified sender), `SENDGRID_API_KEY=SG...`
+      3. Restart.
+    </Steps>
+  </TabItem>
+  <TabItem label="AWS SES">
+    <Steps>
+      1. `cd backend && npm install @aws-sdk/client-sesv2`
+      2. Set `EMAIL_PROVIDER=ses`, `EMAIL_FROM=...` (an SES-verified identity). Credentials + region ride the standard AWS chain (`AWS_REGION` etc.).
+      3. Restart.
+    </Steps>
+    <Aside type="caution">
+    The SES adapter sends **simple (non-attachment) email only** — SES attachments require hand-building raw MIME, which the foundation deliberately doesn't do. For attachments, use the `smtp` adapter against SES's SMTP endpoint, or Resend/SendGrid.
+    </Aside>
+  </TabItem>
+  <TabItem label="SMTP (Nodemailer)">
+    <Steps>
+      1. `cd backend && npm install nodemailer`
+      2. Set `EMAIL_PROVIDER=smtp`, `EMAIL_FROM=...`, `SMTP_URL=smtp://user:pass@host:587` (any SMTP host — a mail provider, SES's SMTP interface, or Mailpit/MailHog in dev).
+      3. Restart.
+    </Steps>
+  </TabItem>
+</Tabs>
+
+A declared-but-broken config (key missing, SDK not installed) stays **visible**: startup logs an error, `getEmailProviderStatus()` reports `configured: true, ready: false`, and sends return `sent: false` with an actionable message naming the missing piece.
+
+## Custom adapters
+
+Any provider can be wired by implementing the two-member `EmailProvider` interface and registering it once at bootstrap:
+
+```typescript
+import { setEmailProvider, type EmailProvider } from '../email/index.js';
+
+const myProvider: EmailProvider = {
+  name: 'my-provider',
+  async send(message) {
+    // one provider API call
+    return { sent: true, provider: 'my-provider', messageId: '...' };
+  },
+};
+setEmailProvider(myProvider);
+```
+
+## Hooks
+
+| Hook | Kind | Fires |
+|------|------|-------|
+| `email.outbound` | filter | Before send — transform the outgoing `EmailMessage` (e.g. append a footer) |
+| `email.sent` | action | After a successful send, with `{ message, result }` — fire-and-forget, never delays the send path |
+
+```typescript
+import { filterRegistry } from '../../config/filter.registry.js';
+
+filterRegistry.register<EmailMessage>('email.outbound', 'my-module.footer', (m) => ({
+  ...m,
+  text: `${m.text}\n\n— Sent by My App`,
+}));
+```
+
+## Enabling on an existing app
+
+Run `npm run template:update` — the merge brings the feature in, and `sync-env` appends the commented `EMAIL_*` stubs to your `backend/.env`. Fill them in and install the SDK per the tabs above.
+
+## What the foundation deliberately does not do
+
+- **Templates / rendering** — callers pass `text` (+ optional `html`); template systems are module territory (the planned Email module).
+- **Bulk / marketing send** — one message, one recipient; campaign tooling belongs with a provider.
+- **Queuing and retry** — `sendEmail` is a direct call. Durable retry arrives with the background-jobs seam (roadmap) or via your provider.
+- **Auth emails** — Neon Auth sends its own (see the note above).
+
+The seam is stateless — it stores no rows, so it registers a security manifest declaring only the `email.sent` audit event, and needs no deletion handler.

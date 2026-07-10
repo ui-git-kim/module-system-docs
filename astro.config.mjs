@@ -123,6 +123,10 @@ export default defineConfig({
                   label: "System",
                   slug: "starter-template/system",
                 },
+                {
+                  label: "Email",
+                  slug: "starter-template/email-feature",
+                },
               ],
             },
             {
