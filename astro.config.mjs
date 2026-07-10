@@ -135,6 +135,10 @@ export default defineConfig({
                   label: "Notifications",
                   slug: "starter-template/notifications-feature",
                 },
+                {
+                  label: "Modules",
+                  slug: "starter-template/modules-feature",
+                },
               ],
             },
             {

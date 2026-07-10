@@ -1,0 +1,73 @@
+---
+title: Modules Feature
+description: The module-system foundation feature — the canonical ModuleContract, the runtime module registry, InstalledModule state sync with audit events, and the dependency-check seam.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The starter ships the **module system itself** as a foundation feature (`backend/src/features/modules/`, backend only — a sibling to `auth`, `user`, [`email`](/starter-template/email-feature/), [`jobs`](/starter-template/jobs-feature/) and [`notifications`](/starter-template/notifications-feature/), **not a module**). This is where you work on *how modules work in the system*: it owns the **`ModuleContract`** (the single source of truth for "what a module is"), the runtime **`moduleRegistry`** installed modules register with, the **`InstalledModule`** state table and its startup sync, and the **dependency-check seam**.
+
+<Aside type="note" title="Two things are called 'manifest' — they stay separate">
+The **security manifest** (`ModuleSecurityManifest`) declares a feature's or module's *security surface* and keeps living in per-feature `security.registration.ts` files — foundation features use it too, without being modules. The **module contract** (`ModuleContract`) is different: it is the module system's *identity and lifecycle* contract. Different consumers, different timing; see the [Security feature](/starter-template/security-feature/).
+</Aside>
+
+## The contract — one source of truth, two repos
+
+`ModuleContract` lives canonically at `backend/src/features/modules/module-contract.ts` — a deliberately **self-contained file** (zero imports; types plus one `MODULE_CONTRACT_VERSION` const). The module starter consumes a **hash-stamped synced copy** (`src/scaffold/module-contract.ts`, refreshed by its `contract:sync` script) and extends it with its scaffold-time codegen fields to form the full `ModuleDefinition` — so "your module definition **extends** the foundation module contract". The copy propagates to every downstream module automatically on `scaffold:update` (it is scaffold infrastructure, not module-owned).
+
+```typescript
+export interface ModuleContract {
+  id: string;           // kebab-case unique id
+  name: string;
+  description: string;
+  version: string;      // semver
+
+  /** Module id → semver range. RECORDED, not yet validated —
+   *  range enforcement + install/boot ordering (topological sort)
+   *  land with the dependency-resolution effort. */
+  depends?: Record<string, string>;
+
+  /** @deprecated Use `depends`. Still honoured everywhere depends is checked. */
+  requiredModules?: string[];
+
+  lifecycle?: LifecycleHooks;   // CLI-time hooks (install/update/activate/…)
+}
+```
+
+Lifecycle hooks (`onInstall`, `onUpdate`, `onActivate`, `onDeactivate`, `onUninstall`) execute in the **module CLI's Node process** inside the host app's working directory — never in the app server. Their contexts are generic over the definition type, so scaffold-extended definitions keep typed access to their own fields inside hooks. If you change the contract, **bump `MODULE_CONTRACT_VERSION`** and re-sync the module starter — the version-bump script reminds you when the file changed since the last release.
+
+## How the runtime learns about modules
+
+- **Registration at import time.** An installed module's backend feature ships a generated `module.registration.ts` that registers `{ id, name, version, depends }` with the `moduleRegistry` as a side effect of being imported — exactly the `security.registration.ts` pattern. Foundation features do **not** register: they are not modules.
+- **Startup state sync.** After all features and modules have registered, `app.ts` fires `runModuleStartupTasks()` (fire-and-forget, never throws): the feature diffs the registry against the `InstalledModule` table and records each transition. This diff is the *only* way the runtime can observe CLI-side install, update and uninstall — they happen while the server is down.
+- **Audit events at each transition** (declared in the feature's security manifest): `module.installed` (new row), `module.updated` (version change), `module.missing` (a row whose code no longer registers — uninstalled?), and `module.dependencyIssue`. Each also fires on the `actionRegistry`, so other features and modules can react.
+- **Dependency check.** Every boot, each registered module's `depends` (and legacy `requiredModules`) ids are presence-checked. Unlike the CLI's install-time check this catches **uninstall drift** — a dependency removed after its dependents were installed. A dependency that is *installed but not registered* (an older-vintage module, or a frontend-only module with no backend code) is excused via a feature-folder fallback rather than warned about.
+
+```typescript
+// generated per module: backend/src/features/my-feature/module.registration.ts
+import { moduleRegistry } from '../modules/index.js';
+
+moduleRegistry.register({
+  id: 'my-feature',
+  name: 'My Feature',
+  version: '1.2.0',
+  depends: { 'ai-core': '^1.2.0' },
+});
+```
+
+## The `InstalledModule` table
+
+Deployment-level state — like `AppSettings`, it carries **no `tenantId`**, is not account data, and is untouched by the account-deletion cascade (modules are installed per deployment, not per space). The sync **never deletes rows**: a module whose code disappears is stamped `missingSince` (cleared if it returns), so "was installed, code now absent" stays visible for the future Admin Module Management UI. The `enabled` column is that UI's seam for *runtime* enablement.
+
+<Aside type="caution" title="Registered = installed ≠ enabled">
+The module CLI's `enable`/`disable` commands flip a flag in `.module-state.json` that the runtime cannot see — a "disabled" module's routes, navigation and registrations still execute today. Do not read `moduleRegistry.getAll()` as enablement; the `InstalledModule.enabled` column is where runtime enablement will live.
+</Aside>
+
+## What the foundation deliberately does not do (yet)
+
+- **Semver-range enforcement and topological install/boot ordering** — `depends` ranges are recorded so they hold retroactively once Kahn's-algorithm ordering ships ([roadmap](/starter-template/roadmap/)).
+- **Runtime enable/disable** — features are wired by static imports; a dynamic mount/unmount story belongs to Admin Module Management.
+- **Owning the CLI's state files** — `.module-state.json` / `.module-manifests.json` remain CLI bookkeeping; the runtime's record is the `InstalledModule` table.
+- **A per-module migration runner** — its own roadmap effort (`_module_migrations`, expand-and-contract).
+
+The feature's own security manifest declares only the four audit events above — it stores no per-account rows, so it needs no owned models, data categories or deletion handler.
