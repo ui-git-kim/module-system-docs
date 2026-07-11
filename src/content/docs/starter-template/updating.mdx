@@ -69,6 +69,7 @@ The script will:
 |--------|-------------|
 | **Merge** (recommended) | Creates a merge commit. Preserves all history. Safe. |
 | **Preview** | Shows what would change without merging. |
+| **Continue** (v1.51.0+) | Resumes the post-merge pipeline after you resolved a merge conflict by hand. See [Resuming after a conflict](#resuming-after-a-conflict--continue). |
 
 ### Manual Update
 
@@ -192,6 +193,35 @@ git commit
 git merge --abort
 ```
 
+### Resuming after a conflict (`-Continue`)
+
+<Aside type="caution" title="A plain re-run does NOT resume the update">
+When the update script hits a merge conflict it exits **before** the whole post-merge pipeline — schema auto-add, dependency install, foundation script/env/dependency reconciliation, database migration, Prisma client generation, and the shadcn component check. Once you've committed the resolution, merge-base equals the template's HEAD, so running `npm run template:update` again just prints "You're already up to date" and resumes **nothing**. This is how apps end up half-updated: code at the new version, database and dependencies at the old one.
+</Aside>
+
+After resolving the conflicts and committing, resume the pipeline with the `-Continue` flag (v1.51.0+):
+
+<Tabs>
+  <TabItem label="Windows (PowerShell)">
+    ```powershell
+    npm run template:update -- -Continue
+    ```
+  </TabItem>
+  <TabItem label="macOS/Linux">
+    ```bash
+    ./update-template.sh --continue
+    ```
+  </TabItem>
+</Tabs>
+
+Continue mode skips the merge itself (already done by hand) and runs everything that comes after it. Three behaviours differ from a normal run:
+
+- **The migration always runs.** After your resolution commit the merge-base diff is empty, so the script can't tell whether the interrupted merge carried schema changes. `prisma migrate dev` no-ops cleanly when the schema and database already agree.
+- **A merge still in progress is refused.** If `MERGE_HEAD` exists or files are still unmerged, the script tells you to finish resolving and committing first — in any mode, not just Continue.
+- **Being behind the template head is refused.** Continue expects the resolved merge commit to already be in your history. If the template has commits you haven't merged (the merge was aborted, or the template released again while you were resolving), Continue would reconcile your schema and dependencies against code that was never merged — so it refuses and points you at a normal `npm run template:update`, which merges *and* runs the pipeline.
+
+The conflict-exit message prints the exact resume command, and Continue is idempotent — re-running it heals a half-applied update at any point.
+
 ### Common Conflict Patterns
 
 **routes.tsx** - You added routes, template structure changed:
@@ -241,10 +271,11 @@ git merge --abort
 
 ### Post-merge reconciliation
 
-After `install:all`, the update script runs a few reconciliation steps so that template infrastructure added since your app was created reaches the user-owned files it lives in:
+As part of the post-merge pipeline, the update script runs a few reconciliation steps — dependency reconciliation just *before* `install:all`, the rest just after — so that template infrastructure added since your app was created reaches the user-owned files it lives in:
 
 - **Foundation npm scripts** — `node scripts/sync-package-scripts.mjs` reconciles the template's foundation scripts (`deps:check`, `deps:update`, `deps:update:latest`, `deps:lockfile`, `deps:relink`, `security:setup-kms`) into your user-owned root `package.json` and commits them automatically (`chore: sync foundation npm scripts from template`). This is why `npm run deps:update` stops reporting "Missing script" after an update — the root `package.json` is never force-synced, so these scripts can't reach an older app any other way.
 - **Foundation env keys** — `node scripts/sync-env.mjs` appends any missing foundation keys to `frontend/.env` and `backend/.env` without overwriting existing values: `VITE_SECURITY_PROFILE` (frontend) and `SECURITY_PROFILE`, `SECURITY_ENCRYPTION_KEY`, `NEON_AUTH_PROJECT_ID` / `NEON_AUTH_SECRET_KEY`, `SECURITY_KMS_*`, `SECURITY_EDGE` / `SECURITY_POSTURE_ENFORCE`, and `SECURITY_ADMIN_ALLOW_ENV_WRITE` (backend). Secrets land as commented placeholders. `.env` files are gitignored, so nothing is committed — the new keys just appear in your working tree to review and fill in.
+- **Foundation dependencies** (v1.51.0+) — `node scripts/sync-deps.mjs` runs *before* `install:all` and appends any foundation dependency your user-owned `package.json` files are missing (currently `vitest` as a devDependency in `frontend/` and `backend/`, added by template v1.43). Presence-only: a dep you already list — in either `dependencies` or `devDependencies`, at any version — is never touched; version bumping stays with `deps:update`. Additions are committed automatically (`chore: sync foundation dependencies from template`).
 - **npm-link symlinks** — the script snapshots your `npm link`-ed local modules (`node scripts/link-modules.mjs snapshot`) before `install:all` and restores them afterward (`restore`), so the broad reinstall doesn't prune your linked local modules. The manual fallback is `npm run deps:relink`.
 
 ---
@@ -267,6 +298,18 @@ git stash pop
 ### "No common ancestor"
 
 This happens on first merge if histories are unrelated. The script handles this with `--allow-unrelated-histories`.
+
+### vite.config.ts changes don't take effect
+
+If template updates to `frontend/vite.config.ts` seem to be ignored — across dev-server restarts *and* re-updates, with no error anywhere — check for a compiled copy of the config sitting next to it. Vite resolves `vite.config.js` and `vite.config.mjs` **before** `vite.config.ts`, so a stray compiled config (typically the artefact of a one-off `tsc` run over the folder) silently shadows the real one. (A `vite.config.cjs` does *not* shadow the `.ts` — Vite finds `.ts` first — but it's stale output of the same origin and worth removing too.)
+
+```bash
+rm -f frontend/vite.config.js frontend/vite.config.d.ts
+```
+
+Use `git rm` instead for any of these files git still tracks (committed before the ignore rule shipped) — a compiled artefact is often untracked *and* gitignored, where `git rm` fails with "did not match any files".
+
+Since v1.51.0 the update script detects this at the end of every completed update run **and** on the "already up to date" fast path — exactly where a diagnostic re-run lands — printing a warning that names the offending file(s) with a per-file removal command chosen by tracked-ness. It never deletes the files itself.
 
 ### Template remote missing
 
