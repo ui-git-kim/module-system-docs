@@ -1,0 +1,125 @@
+---
+title: Database Migrations
+description: Per-module SQL and TypeScript database migrations, applied at CLI time by the migration runner
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+`prisma migrate dev` handles the module's **schema** (the shape of its tables). It cannot express a **rename**, a **data backfill**, or any change that must run in a specific order relative to your code. That's what module migrations are for: ordered SQL and TypeScript steps the runner applies at CLI time, after the schema migrate and before your lifecycle hooks.
+
+<Aside type="note" title="Scaffold v1.18.0+ (contract v1.2.0)">
+The runner ships in the scaffold; the host starter (v1.52.0+) reads the resulting `_module_migrations` table to show applied/pending status on its admin Modules page. Both agree on the table shape and file ordering through the synced contract, so they can never drift.
+</Aside>
+
+## Declaring migrations
+
+Add a `migrations` array to your module definition (`src/module.ts`). Each entry is a **filename** and its **literal content** — embedded in the module like every other template, since the CLI bundle carries no loose files:
+
+```typescript
+// src/module.ts
+export const moduleDefinition: ModuleDefinition = {
+  // …
+  migrations: [
+    // Expand: add a nullable column (additive, safe to deploy ahead of code).
+    {
+      name: '1.1.0__add-status-column.sql',
+      content: `ALTER TABLE billing_subscription ADD COLUMN IF NOT EXISTS status text;`,
+    },
+    // Backfill: a programmatic TS step — receives a tagged-template SQL handle.
+    {
+      name: '1.1.0__backfill-status.ts',
+      content: [
+        'export async function up(sql) {',
+        "  await sql`UPDATE billing_subscription SET status = 'active' WHERE status IS NULL`;",
+        '}',
+      ].join('\n'),
+    },
+  ],
+};
+```
+
+### Filename convention
+
+`<version>__<slug>.<ext>` — a double underscore separates the semver from a kebab-case slug; the extension is `sql` or `ts` (case-insensitive):
+
+| Example | Version | Kind |
+|---------|---------|------|
+| `1.1.0__add-status-column.sql` | `1.1.0` | Raw SQL |
+| `1.1.0__backfill-status.ts` | `1.1.0` | TypeScript backfill |
+| `1.2.0__enforce-not-null.sql` | `1.2.0` | Raw SQL |
+
+Migrations apply in **version order, then filename order** (so a `.sql` before a `.ts` at the same version). The filename is the migration's identity — it's what the `_module_migrations` table records.
+
+### SQL vs TypeScript
+
+- **`.sql`** — the file body is run verbatim in a transaction. Use for DDL and set-based data changes.
+- **`.ts`** — exports `async up(sql)` and receives a **tagged-template SQL handle** bound to the migration's transaction. Use for backfills that need branching, batching, or values computed in JS:
+
+  ```typescript
+  export async function up(sql) {
+    // Parameterised — values are escaped, never string-concatenated.
+    await sql`UPDATE billing_subscription SET status = ${'active'} WHERE status IS NULL`;
+  }
+  ```
+
+  TS migrations are transpiled and loaded **in-process** (via esbuild) — no temp files, no separate process — so the runner keeps the transaction in hand. Keep them self-contained; a migration is not the place to import your module's services.
+
+## When it runs
+
+The runner is wired into `init` and `update`, **after** the Prisma schema migrate and **before** the lifecycle hooks:
+
+<Steps>
+1. `prisma migrate dev` applies the schema (the tables exist).
+2. **The runner materialises any newly-shipped migration files** to `backend/prisma/module-migrations/<module-id>/`, then applies the pending ones.
+3. `onInstall` / `onUpdate` run — against the fully-migrated database.
+</Steps>
+
+A migration failure **stops the run** before the hooks, so a hook never executes against a half-migrated database.
+
+You can also run migrations on their own:
+
+```bash
+npx <module> migrate-db            # apply pending
+npx <module> migrate-db --dry-run  # list pending, apply nothing
+```
+
+Use `migrate-db` to **resume** after a failure (fix the migration, re-run) or to preview what an update would apply.
+
+## How applied state is tracked
+
+The runner owns a `_module_migrations` table, created on first use via `CREATE TABLE IF NOT EXISTS` — **not** a Prisma model (it's runner plumbing, not app data; a model would cost the multi-site embedded-schema hand-sync, the same call made for the security audit table):
+
+```sql
+_module_migrations (
+  module_id  text        NOT NULL,  -- your module id
+  version    text        NOT NULL,  -- from the filename
+  name       text        NOT NULL,  -- the full filename (identity)
+  checksum   text        NOT NULL,  -- SHA-256 of the file's bytes when applied
+  applied_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (module_id, version, name)
+)
+```
+
+- **Pending** = files on disk not in the table. **Applied** = files with a row.
+- Each file applies in **its own transaction together with its bookkeeping row** — a crash can never leave a migration applied-but-unrecorded (which would re-run it) or recorded-but-unapplied.
+- The runner connects on `DIRECT_DATABASE_URL` (the non-pooled URL, preferred for DDL) from the host's `backend/.env`, falling back to `DATABASE_URL`.
+
+<Aside type="caution" title="Migrations are append-only">
+An applied migration's file is **checksummed**. If you edit a file that has already run, the next run **fails loudly** — history diverged. Never edit an applied migration; add a new one. Materialisation is append-only too: the runner writes a migration file to the host once and never overwrites it.
+</Aside>
+
+## Expand → backfill → contract
+
+Because migrations are forward-only and run in order, evolve a shipped table with the **parallel-change** pattern — spread across releases so a deploy is never mid-change:
+
+<Steps>
+1. **Expand** (`1.1.0`) — add the new column/table *additively*, keep the old. Safe to deploy before the code that uses it.
+2. **Backfill** (`1.1.0`) — copy/derive data into the new shape, in batches for large tables (a `.ts` migration).
+3. **Contract** (`1.2.0`, a *later* release) — drop the old shape / enforce `NOT NULL`, only once no running code reads the old form.
+</Steps>
+
+Never a destructive rename in one step — that breaks any instance running the previous code during the deploy.
+
+## Forward-only
+
+There are no down migrations (the same stance as `prisma migrate deploy`). To reverse a change, ship a new forward migration. The first failure stops the run and reports; already-applied migrations stay committed, and a re-run resumes from the failed one.

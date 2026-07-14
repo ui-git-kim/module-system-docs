@@ -239,6 +239,10 @@ export default defineConfig({
                   slug: "module-starter/lifecycle-hooks",
                 },
                 {
+                  label: "Database Migrations",
+                  slug: "module-starter/migrations",
+                },
+                {
                   label: "File Reference",
                   slug: "module-starter/file-reference",
                 },
