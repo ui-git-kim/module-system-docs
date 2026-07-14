@@ -297,7 +297,14 @@ export default defineConfig({
               collapsed: true,
               autogenerate: { directory: "modules/style" },
             },
-            { label: "Billing", slug: "modules/billing" },
+            {
+              label: "Billing",
+              collapsed: true,
+              items: [
+                { label: "Overview", slug: "modules/billing" },
+                { label: "Roadmap", slug: "modules/billing/roadmap" },
+              ],
+            },
             {
               label: "Cog Ingest",
               collapsed: true,
