@@ -19,9 +19,11 @@ The core principle constrains the roadmap. The database stores references, metad
 
 ## Known Issues
 
-There are no known issues at this time.
+V1 has shipped at release version `1.2.2`. The items below were surfaced while designing the upload → ingest pipeline (see **Next up**); they are gating prerequisites for that work rather than field-reported defects.
 
-V1 has shipped at release version `1.2.2`. As defects are found in connected-provider behaviour, preview rendering, or the encryption/credential path, they will be listed here with a short description and a workaround. Until then this section is intentionally empty — treat it as "nothing currently outstanding" rather than "not yet reviewed".
+- **The upload hook is synchronous, so async subscribers are silently skipped.** `documentManagementService.upload()` fires `documents.document.uploaded` via `actionRegistry.doAction` (sync), which never reaches `addActionAsync` consumers — and the payload carries only `{ userId, providerId, remotePath, fileName }` (no `mimeType`, `size`, or `contentHash`; `contentHash` is computed only on the reference/`createDocument` path). Any event-driven consumer — including the planned pipeline — cannot receive uploads until this becomes an awaited async fan-out (`doActionAll`) with an enriched payload. Severity: Medium.
+- **No default-provider fallback for a brand-new user.** `POST /upload` (`uploadToDefault`) throws *"No default storage provider is set"* when the caller has no `isDefault` provider, so a fresh user cannot upload until they add one manually. The app-wide admin default (see **Next up**) resolves this. Severity: Low.
+- **WebDAV upload does not pre-create parent folders.** Uploading into a not-yet-existing WebDAV folder via `uploadToDefault` can fail; the Local and S3 paths do not hit this. Severity: Low.
 
 <Aside type="tip" title="Where to look first when something breaks">
 Most field issues fall into one of three buckets: a provider is unreachable (check `status` and `statusMessage` on `doc_storage_provider`, then re-run `POST /providers/:id/test`), a credential failed to decrypt (`DOC_ENCRYPTION_KEY` changed or is missing), or a preview type isn't supported inline in V1 (office, archives — these intentionally show a download prompt). None of these are bugs; they are documented behaviour.
@@ -31,7 +33,51 @@ Most field issues fall into one of three buckets: a provider is unreachable (che
 
 ## Planned Improvements
 
-The planned work is grouped by horizon. **Short-term** resolves the open questions left for implementation time. **Medium-term / V2** is the content layer and companion app. **Long-term** is the broader vision once V2 is stable.
+The planned work is grouped by horizon. **Next up** is the committed near-term work — a reusable upload → ingest pipeline, an app-wide default location, and first-class local storage. **Short-term** resolves the smaller open questions left for implementation time. **Medium-term / V2** is the content layer and companion app. **Long-term** is the broader vision once V2 is stable.
+
+### Next up
+
+Four committed features, sequenced so the pipeline foundation lands first and the others build on it. All four are additive to the V1 connector model.
+
+#### 1. Reusable upload → ingest pipeline
+
+The headline. Instead of wiring Document Management directly to any one consumer, uploads flow through a **loosely-coupled event + jobs pipeline** that any module can produce into or subscribe to. The starter already ships both primitives, so no new core module is needed: `actionRegistry` gives async 1:N fan-out with per-consumer error isolation (inert when nobody subscribes), and the `features/jobs` seam (`enqueueJob` / `registerJobHandler`, durable via `pg-boss`) gives back-pressure, retries, and durability.
+
+The shape:
+
+<Steps>
+
+1. On a successful upload, Document Management emits an enriched, **awaited async** `documents.document.uploaded` event carrying a storage **reference** — `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }` — never the bytes.
+
+2. Each consumer subscribes with `actionRegistry.addActionAsync`, does near-zero work in the callback (validate + `enqueueJob`), and returns immediately.
+
+3. The heavy work runs in the consumer's own **job handler**, which pulls the bytes back on demand via the Document Management download service and processes them off the request path.
+
+</Steps>
+
+**cog-ingest is the first consumer**, wired **both** ways: an **automatic** path (subscribe to the upload event → enqueue an ingest job) and a **manual** "Ingest to Knowledge Base" action in the document browser and on Structure nodes. The whole hand-off is guarded by `serviceRegistry.getOptional('cog-ingest')`, so it is completely inert when cog-ingest is not installed.
+
+<Aside type="note" title="What cog-ingest needs (from its API)">
+cog-ingest's `ingest(userId, { sourceId, content, contentType, … })` requires a pre-existing **source** (created once per user), and only extracts text for `pdf` / `image` / `url` / `text` content types — Word/Excel/PowerPoint must be text-extracted by the caller first. Ingestion is synchronous and LLM-bound (seconds + token cost), which is exactly why it belongs in a job worker, not the upload response. Pass a reference in the event and job payload; pull bytes once, in the worker. Production deployments that enable ingestion should run `JOBS_RUNNER=pg-boss` for durability and back-pressure.
+</Aside>
+
+Prerequisites are the two upload-hook items under **Known Issues** (sync → awaited async fan-out, and computing `contentHash` on the upload stream so the event carries it).
+
+#### 2. App-wide default storage location (admin-set)
+
+Today "default" means a **per-user** `isDefault` provider, and a user with none gets a hard error on upload. This adds an **admin-set global default**: a new `defaultProviderId` column on `doc_app_settings` (mirroring the existing `allowedAdapters` admin-policy pattern), with default-provider resolution falling back to it when the caller has no `isDefault` of their own. This makes uploads work for new users out of the box and removes the *"No default storage provider is set"* dead-end. Schema addition → version bump.
+
+#### 3. First-class in-app local storage
+
+Promote `LocalAdapter` from *dev-only-by-convention* to a supported end-user option. The blockers are isolation and setup, not gating: add **per-user isolation** (auto-derive a per-user subdirectory under `DOC_LOCAL_BASE_PATH` so users can't traverse into each other's files), have `connect()` create the base directory, and add disk-quota accounting. This is the **in-app** local track; the Local Connect companion app (Medium-term, below) is the complementary **remote/desktop** track — both are being advanced together so "local storage" is covered from the app itself now and from the desktop later.
+
+<Aside type="caution" title="Isolation is the gate">
+The current `LocalAdapter` resolves every user's local provider within the same `DOC_LOCAL_BASE_PATH` unless each row sets a distinct `basePath`. Per-user subdirectory isolation is the security prerequisite before local can be offered as a multi-tenant end-user store.
+</Aside>
+
+#### 4. CrashPlan-style folder picker (selective folder inclusion)
+
+A checkbox **tree** over a connected provider's folders — tri-state checkboxes (checked / unchecked / indeterminate), expand/collapse, and Name / Size / Date columns — for choosing which folders are included (for browsing focus, sync, or auto-ingest). This is net-new UI: today's `FileBrowser` is a single-level drill-down with no checkboxes, tree, or multi-select. Build seams: extend `FileList` with a leading checkbox column and an absolute Date column, reuse the per-item toggle model from `DocumentEnginesAdminPage`, persist the selection in a new self-contained `doc_included_folder` table, and feed the existing `POST /bulk-download` `paths[]`. Distinct from Local Connect's OS-level folder chooser. Schema addition → version bump.
 
 ### Short-term
 
@@ -272,6 +318,7 @@ The module was brought in line with the current module-system standards without 
 - **File browser** — folder navigation, breadcrumbs, and switchable list/grid views (`FileBrowser`, `FileList`, `FileGrid`).
 - **File preview** — images (inline with zoom), PDF (`react-pdf`), text and code (fetched via `/download`, read as text, shown as a code block), video and audio (HTML5 players). Office and archives show a download prompt.
 - **Upload** — raw request body with `?path=` naming the destination; size enforced on the byte stream (a counting transform aborts at `DOC_MAX_UPLOAD_SIZE`), not on the spoofable `Content-Length`. Respects the per-provider read-only flag.
+- **Default provider & upload-to-default** — a user can mark one provider `isDefault` and set its `uploadPath`; `POST /upload` with no `providerId` routes to it via `uploadToDefault`. This is **per-user** today — an app-wide admin-set default is planned (see [Next up](#2-app-wide-default-storage-location-admin-set)).
 - **Download** — single file streamed with `Content-Disposition: attachment`, plus bulk zip via `POST /bulk-download`.
 - **Document references** — created on meaningful user interaction (favourite/link/tag/notes) or on cross-module request via `serviceRegistry`.
 - **Favourites, folder bookmarks, and recent-access tracking** — the recent-access log doubles as a chain-of-custody audit trail.
