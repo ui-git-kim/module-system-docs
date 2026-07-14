@@ -196,6 +196,28 @@ Add a "Mappings" tab to the Source Config Dialog for managing multiple source-to
 **Files to change:**
 - `src/templates/frontend/components.ts` — `SOURCE_CONFIG_DIALOG_TEMPLATE`
 
+### Medium-Term — Document Management upload pipeline (auto-ingest)
+
+Consume Document Management's reusable upload pipeline so files uploaded through the documents module are automatically ingested. Document Management (v1.2.3) now emits an **awaited async** `documents.document.uploaded` event carrying a storage **reference** (not bytes): `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash }`. cog-ingest is the first intended consumer.
+
+**Shape (event → job → ingest):**
+
+1. **Subscribe** to `documents.document.uploaded` with `actionRegistry.addActionAsync`. Keep the callback O(1): resolve a source id, `enqueueJob('cog-ingest.ingest-file', { ...ref, sourceId }, { tenantId: userId })`, and return. Document Management *awaits* this fan-out, so no heavy work in the callback.
+2. **Job handler** (`registerJobHandler('cog-ingest.ingest-file', …)` from the starter `features/jobs` seam) pulls the bytes on demand via the Document Management service — `serviceRegistry.getOptional('document-management')?.getDownloadStreamByPath(providerId, userId, remotePath)` — then calls `cogIngestService.ingest(userId, …)`. Running in a job keeps the synchronous, LLM-bound ingest off the upload response and gives durability/back-pressure under `JOBS_RUNNER=pg-boss`.
+3. **Source resolution:** `ingest()` requires a pre-existing user-scoped `sourceId`. Resolve one per user (create-once a `document-management` source, or a provider/folder → source mapping so different folders map to different sources). If none resolves, skip — auto-ingest is opt-in per location.
+4. **Content-type mapping** from `mimeType`: `application/pdf` → `contentType: 'pdf'` + `pdfData` (base64); `image/*` → `'image'` + `imageData` (base64) + `imageMimeType`; `text/*` / `application/json` → `'text'` + decoded string. Office formats (DOCX/XLSX/PPTX) have no runtime extractor yet — extract to text first (see **New Content Types → Document Files** below) or skip.
+5. **Guarded + inert by default:** guard the download via `serviceRegistry.getOptional('document-management')`; the whole feature is inert when Document Management is absent (nothing emits the event).
+
+**Manual counterpart:** Document Management is also adding a manual "Ingest to Knowledge Base" action (document browser + Structure node) that calls the same job path for on-demand or already-referenced files.
+
+**Files to change (cog-ingest):**
+- `src/templates/backend/registrations.ts` + `index.ts` (`INDEX_TEMPLATE`) — a new `action.registration.ts` (subscribe) and `jobs.registration.ts` (handler), imported as side-effects before the public exports.
+- A source-resolution helper, and optionally a provider/folder → source mapping.
+
+<Aside type="note">
+Depends on Document Management **≥ v1.2.3** — the producer half (the async `documents.document.uploaded` event with the enriched reference payload, plus `getDownloadStreamByPath`) shipped there. See the Document Management roadmap → *Next up → Reusable upload → ingest pipeline*. Two follow-ups remain on the **producer** side: populating `contentHash` for streamed uploads (best-effort/null today) for dedup, and the manual action.
+</Aside>
+
 ### Medium-Term — New Content Types
 
 The `allowedContentTypes` system (v1.6.0) makes it straightforward to add new content types per source. Each new type needs a backend processor, frontend input UI, and an entry in the content type enum.
