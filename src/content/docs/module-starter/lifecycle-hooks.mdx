@@ -315,8 +315,49 @@ await actionRegistry.doActionParallel('notifications.send', { notifications });
 | `doActionAsync(hook, context)` | Execute async actions sequentially |
 | `doActionAll(hook, context)` | Execute sync then async (backend) |
 | `doActionParallel(hook, context)` | Execute async in parallel (backend) |
+| `doActionWithResults(hook, context)` | Execute all and collect per-action success/error results |
 | `hasActions(hook)` | Check if actions exist |
 | `getHooks()` | Get all hook names |
+
+<Aside type="caution" title="doAction does not run async handlers">
+`doAction` executes **only** the handlers registered with `addAction`. Handlers registered with `addActionAsync` are **silently skipped** — nothing errors, they just never run. If an event may have async consumers (true for most cross-module events), emit it with `await doActionAll(...)` (sync then async, in order) or `await doActionParallel(...)` (async consumers in parallel). Firing a bare `doAction` for an event you expect other modules to consume asynchronously is a common footgun.
+</Aside>
+
+### Cross-module events (a reusable pattern)
+
+Actions aren't only for the built-in hooks — a module can **define its own hook** and use the action registry as a lightweight, decoupled event bus that *other* modules subscribe to. This is how one module lets others react to its events without either side importing the other.
+
+**Producer** — the module that owns the event emits a well-defined hook, awaited as an async fan-out, carrying a small, documented payload (a **reference**, not large blobs):
+
+```typescript
+// In the producing module's service, right after the thing happens:
+await actionRegistry.doActionParallel('documents.document.uploaded', {
+  userId, providerId, remotePath, fileName, mimeType, size, contentHash,
+});
+// Depends on no consumer. When nobody subscribes, this is a no-op.
+```
+
+**Consumer** — any other module subscribes with `addActionAsync` and keeps the callback **O(1)**: validate, then hand off to a [job](/starter-template/jobs-feature/). Do the slow or expensive work in the job handler, not in the callback — the producer *awaits* the fan-out, so a slow callback slows the producer:
+
+```typescript
+// consuming module's action.registration.ts (side-effect import from index.ts)
+actionRegistry.addActionAsync('documents.document.uploaded', 'my-feature.on-upload', async (ctx) => {
+  const c = ctx as { userId: string; providerId: string; remotePath: string };
+  await enqueueJob('my-feature.process-upload', c, { tenantId: c.userId });
+});
+```
+
+Why this shape works:
+
+- **Loose coupling.** The producer depends on nothing; the consumer depends only on the hook name and payload shape. Either module installs without the other.
+- **Error isolation.** `doActionAll` / `doActionParallel` wrap each handler in try/catch — a throwing consumer is logged, never propagated, so one bad subscriber can't break the producer or its peers.
+- **Back-pressure and durability** live in the [jobs feature](/starter-template/jobs-feature/), not the hook: the callback only enqueues; the worker does the heavy work (and, under `JOBS_RUNNER=pg-boss`, survives restarts).
+
+**Contract tips:** namespace hook names as `feature.entity.verb` (e.g. `documents.document.uploaded`); make the payload a **stable, documented reference** (ids and paths a consumer resolves on demand, not megabytes of data); and treat the payload shape like a public API — additive changes only.
+
+<Aside type="tip">
+Worked example: the Document Management **upload → ingest pipeline** uses exactly this. Document Management (the producer) fires `documents.document.uploaded`; a consumer (cog-ingest) subscribes, enqueues a job, and the job pulls the bytes back on demand and ingests them. See the [Document Management roadmap](/document-management/roadmap/) and the [cog-ingest roadmap](/modules/cog-ingest/roadmap/).
+</Aside>
 
 ---
 
