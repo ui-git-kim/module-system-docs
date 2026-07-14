@@ -1,0 +1,184 @@
+---
+title: Scientific Foundations
+description: The neuroscience and machine-learning grounding behind cognitive-db — content-addressable memory, complementary learning systems, Hebbian strengthening, spreading activation, and the biological case for never-decay.
+sidebar:
+  order: 2
+  label: "Scientific Foundations"
+---
+
+import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+cognitive-db is shaped by neuroscience and machine-learning research — but as **intellectual grounding and a research agenda**, not a checklist of shipped algorithms. This page explains the ideas that inform the engine's design so you can understand *why* it is built the way it is. It is deliberately explicit about what is a foundational principle in force today versus what is reference material for future work.
+
+<Aside type="caution" title="Grounding, not a 1:1 specification">
+The research below is the *intellectual case* for the engine's shape — it is **not** a line-by-line implementation spec. The most advanced algorithms named here (Modern Hopfield attractor retrieval, Leiden community detection, GraphSAGE, RotatE, full Elastic Weight Consolidation, PrefixSpan sequence mining) are **reference material**. The concrete, sequenced plan for turning them into features is the seven-phase **R1–R7** refinements agenda — none of which ships in v1.0.0. See the [Roadmap](/cognitive-db/roadmap/) for what is built, stubbed, and planned.
+</Aside>
+
+## The headline insight
+
+The design rests on two research findings that, taken together, make a brain-like memory layer buildable with standard tooling rather than exotic architecture.
+
+<CardGrid>
+  <Card title="Hopfield ≡ Attention" icon="random">
+    **Modern Hopfield Networks are mathematically equivalent to Transformer attention.** That means content-addressable, exponential-capacity associative memory is achievable with the same attention machinery already used everywhere — no bespoke hardware or novel model architecture required.
+  </Card>
+  <Card title="Complementary Learning Systems" icon="open-book">
+    **CLS theory** describes two cooperating memory systems: a *fast* episodic store that captures individual experiences immediately, and a *slow* semantic store that consolidates them into general knowledge over time. This maps directly onto ingest-time capture plus background consolidation.
+  </Card>
+</CardGrid>
+
+Content-addressable means you retrieve by *what something is about*, not by an exact key — the same faculty that lets a person recall a whole memory from a fragment of it. Exponential capacity means the store does not saturate as it grows. Both properties fall out of attention-style retrieval over embeddings, which is exactly what the engine already does for [semantic search](/cognitive-db/architecture/).
+
+## Complementary Learning Systems
+
+CLS is the organising metaphor for the whole pipeline. Biological memory splits the work in two, and cognitive-db mirrors the split:
+
+| Biological system | Role | cognitive-db counterpart |
+|---|---|---|
+| Hippocampus (fast) | Rapidly encodes individual episodes | **Perception at ingest** — entities, relationships, emotions, concepts and questions extracted the moment content arrives (built) |
+| Neocortex (slow) | Gradually consolidates episodes into stable, generalised knowledge | **Consolidation & pattern detection** — background passes that merge duplicates, compress versions and surface patterns (built); replay-based consolidation (planned, R4) |
+
+This is why the engine's most important principle is **build at ingest, not at retrieval**: the fast system does the expensive understanding work up front, so the slow system — and every later query — can be cheap. Consolidation then does what sleep does for a brain: it revisits recent material and integrates it with what came before.
+
+<Aside type="tip" title="Where this is already real">
+The fast/episodic half of CLS is **built** — graded perception with graceful degradation when the LLM is unavailable, immediate (Tier-1) connection discovery, and working-memory event tracking all ship in v1.0.0. The slow/semantic half is **partly built**: condensation, duplicate merging, version compression and pattern detection ship today; the neuroscience-flavoured *replay* engine (R4) is planned. See the [Roadmap](/cognitive-db/roadmap/) for the exact split.
+</Aside>
+
+## Hebbian learning — strengthen without decay
+
+> "Neurons that fire together wire together." — Donald Hebb, 1949
+
+When two nodes are co-activated — retrieved together, discussed together, or linked by new content — their connection should **strengthen**. The classic weight-update rule is:
+
+```
+Δw = η × activation_i × activation_j
+```
+
+where `η` (eta) is a learning rate and `activation_i`, `activation_j` are how strongly each node fired. In practice the update is clamped so weight never runs away past a ceiling:
+
+```typescript
+// Hebbian weight update — capped at 1.0 to prevent runaway strengthening
+// η typically 0.01–0.1
+newWeight = Math.min(1.0, weight + learningRate * coactivationStrength);
+```
+
+The critical distinction is that **this is not decay in reverse**. Strengthening raises the relevance of connections that prove useful; it never *weakens* the ones that do not. Connections that are never co-activated simply stay at baseline — they remain fully traversable and findable, they just rank lower.
+
+| Hebbian strengthening | Decay (deliberately **not** implemented) |
+|---|---|
+| Active connections get stronger | Inactive connections get weaker |
+| Baseline connections stay stable | All connections degrade over time |
+| Relevance rises with use | Relevance falls without use |
+| Old knowledge stays findable | Old knowledge becomes unfindable |
+
+<Aside type="note" title="Status">
+Hebbian connection strengthening is the **R1** refinement — the first, highest-priority item on the research agenda — but it is **planned, not built** in v1.0.0. What ships today is confidence propagation (a learning signal that adjusts connection confidence), which is a related but distinct mechanism. Treat the `Δw` rule above as design intent for R1.
+</Aside>
+
+## Spreading activation — precompute at ingest
+
+In cognitive science, **spreading activation** describes how activating one concept automatically activates related ones, fanning outward and weakening with distance. cognitive-db's rule is to *precompute* that fan-out at ingest and store it, rather than traversing the graph at query time.
+
+This is the same "build at ingest, not retrieval" principle applied to graph traversal. When a new node arrives, the engine can compute how much activation it should spread to already-connected nodes — decaying by **graph distance** (not by time), and boosting nodes reachable by multiple convergent paths — then store those weights so retrieval is a lookup, not a search.
+
+<Steps>
+
+1. A new node is ingested.
+
+2. Activation spreads outward to connected nodes, multiplied down by a decay factor per hop and cut off below a firing threshold.
+
+3. Nodes reachable via several paths get a convergence boost — many routes to the same place means stronger association.
+
+4. The resulting activation weights are stored, so a later retrieval of the source node instantly knows what else to light up.
+
+</Steps>
+
+<Aside type="note" title="Status">
+Spreading-activation precomputation is the **R2** refinement — **planned, not built**. It depends on R1 (Hebbian weights) landing first. The design intent is decay-by-distance, never decay-by-time, which keeps it consistent with the never-decay principle below.
+</Aside>
+
+## Multi-level connection extraction
+
+A pure vector database collapses "how similar are these two things?" into a single embedding-cosine number. Research suggests that is too blunt: different *kinds* of similarity should be measured separately and weighted differently, because **experiential** similarity (shared sensory, motor, or affective features) often creates stronger associations than **taxonomic** closeness.
+
+"Cat" and "dog" are taxonomically close (both animals), but "cat" and "soft" have a stronger experiential association. The design therefore extracts four levels of similarity and combines them:
+
+| Level | What it captures | Example signal |
+|---|---|---|
+| **Surface** | Lexical overlap | Shared words, phrases |
+| **Conceptual** | Semantic / embedding closeness | Cosine distance in vector space |
+| **Emotional** | Affective / valence overlap | Shared emotions, sentiment |
+| **Temporal** | Co-occurrence in time | Ingested or discussed close together |
+
+The research-informed weighting that recurs in the design puts experience ahead of raw embedding similarity:
+
+```
+connectionStrength = experiential × 0.40
+                   + semantic     × 0.30
+                   + temporal     × 0.20
+                   + taxonomic    × 0.10
+```
+
+<Aside type="tip" title="Status — partly built">
+Multi-level perception is **real** in v1.0.0: the engine already extracts entities, relationships, **emotions**, concepts and questions at graded levels, and immediate connection discovery uses semantic and temporal signals. What is **planned (R3)** is the deeper *experiential-feature* extraction (sensory / motor / affective / situational) and the exact four-way weighting above. So the "emotional" and "conceptual" levels are grounded in shipped perception; the full experiential model is roadmap.
+</Aside>
+
+## The Synaptic Homeostasis Hypothesis — the biology of never-decay
+
+Why does cognitive-db refuse to let information decay? The answer is biological. The **Synaptic Homeostasis Hypothesis** holds that sleep performs a *downscaling* of synaptic strength — it rebalances **relevance ranking** across the network, but it does not erase memories. Forgetting in a brain serves metabolic and capacity constraints that simply do not apply to a database.
+
+cognitive-db takes the useful half and drops the constraint:
+
+- **Ranking may be downscaled.** Relevance is relative; consolidation can lower how prominently something surfaces.
+- **Information is never deleted.** A decade-old note can turn out to be the single most important thing in the system. Nothing is made unfindable by the passage of time.
+
+<Aside type="caution" title="Never-decay is not never-delete">
+"Never decay" is about *not degrading relevance over time* — it is **not** a refusal to ever remove data. There is exactly one lawful exception: the **account-erasure / deletion pathway**, which is implemented. In the consuming [Cog Ingest](/modules/cog-ingest/) module this is a real, working account-erasure deletion handler that cascades through the module's per-user data. Erasure on lawful request is a distinct, deliberate pathway — not a contradiction of never-decay. See [Data Ownership & Security](/cognitive-db/security/) for how ownership-based isolation and erasure fit together.
+</Aside>
+
+## Attractor networks — converging vague cues
+
+Biological memory is an **attractor network**: a partial, noisy, or vague cue converges toward the nearest complete stored pattern. This is what lets you recall an entire memory from a fragment of it — and it is exactly what a query like *"that thing about… the project… last month"* needs.
+
+Modern Hopfield Networks implement this convergence using standard attention: an under-specified query embedding is iteratively pulled toward the most strongly matching stored patterns until it settles on one. Because Hopfield retrieval *is* attention (the headline insight above), this needs no special infrastructure — it layers on top of the embeddings the engine already stores.
+
+| Vague input | Attractor behaviour |
+|---|---|
+| "that project thing" | Converges to the most-activated project pattern |
+| "John… the one who…" | Completes to the most likely *John* entity |
+| "prepiad funral" | Converges through the typos to "prepaid funeral" |
+| "feeling anxious about money" | Converges to the financial-anxiety pattern cluster |
+
+<Aside type="note" title="Status">
+Attractor-based retrieval is the **R6** refinement — **planned, not built**. It depends on R2 (spreading activation) landing first. Today the engine's semantic search is filtered vector similarity (labelled "hybrid" but not yet a lexical blend); attractor convergence is a future enhancement on top of it.
+</Aside>
+
+## From research to plan: R1–R7
+
+Everything above is grounding. The engine's authors turned it into a concrete, sequenced set of seven **research-informed refinements**, each additive and opt-in so no phase blocks the others:
+
+| Phase | Name | Core idea drawn from above |
+|---|---|---|
+| **R1** | Hebbian Foundations | Co-activated connections strengthen; never decay |
+| **R2** | Spreading Activation | Precompute activation weights at ingest |
+| **R3** | Enhanced Perception | Experiential-feature extraction + late chunking |
+| **R4** | Consolidation Engine | Replay-based background strengthening (CLS slow system) |
+| **R5** | Temporal Patterns | Sequential pattern mining beyond co-occurrence |
+| **R6** | Attractor Retrieval | Hopfield convergence for vague queries |
+| **R7** | Importance Weighting | Fisher-information importance → Elastic Weight Consolidation |
+
+<Aside type="caution" title="None of R1–R7 ships in v1.0.0">
+The entire R1–R7 agenda is **planned**, layered on top of the built node model. Reference algorithms such as **Leiden**, **GraphSAGE**, **RotatE** and full **Elastic Weight Consolidation** are intellectual grounding for these phases, not confirmed features. For the authoritative built-versus-planned breakdown, see the [Roadmap](/cognitive-db/roadmap/); for how the grounded principles express themselves in a running system today, see [Architecture](/cognitive-db/architecture/) and the consuming [Cog Ingest module](/modules/cog-ingest/).
+</Aside>
+
+## Principles in force today
+
+Regardless of which refinements land, these foundational principles are already the law of the engine as of v1.0.0:
+
+- **Build at ingest, not at retrieval** — understanding is computed when content arrives, so queries are fast.
+- **Never decay** — relevance ranking may be downscaled; information is never deleted except through the lawful erasure pathway.
+- **Everything is a node** — content, entities, connections, patterns and ontology all live in one versioned graph.
+- **Apps own their data** — the engine references content by `sourceId` / `sourceType` and never stores the original.
+- **Generic, not app-specific** — models, keys, ontology and prompts are supplied by the consuming app via `initConfig()`.
+
+These are the through-line from neuroscience to running code — the parts of the research that are not aspirational but foundational.

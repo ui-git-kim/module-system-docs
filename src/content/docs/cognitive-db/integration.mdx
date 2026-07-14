@@ -1,0 +1,250 @@
+---
+title: Integration & Delivery
+description: How an app wires cognitive-db in via initConfig(), the sourceId/sourceType no-content-duplication contract, hybrid database mode, and how the engine is delivered — vendored into Cog Ingest or installed standalone from Git.
+sidebar:
+  order: 3
+  label: "Integration & Delivery"
+---
+
+import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+cognitive-db is a library, not a service. It runs **inside your app's process**, uses **your app's database and API keys**, and never phones home. This page covers the two things you need to know to adopt it: how an application **integrates** the engine (the `initConfig()` contract and the no-content-duplication pattern), and how the engine is **delivered** to that application (vendored into Cog Ingest, or installed standalone from Git).
+
+<Aside type="tip">
+Most developers never touch this directly. The [Cog Ingest module](/modules/cog-ingest/) bundles the engine and runs every step below for you at install time — a single `npx cognitive-ingest init`. Read this page if you are integrating the engine by hand, or want to understand what Cog Ingest does under the covers.
+</Aside>
+
+---
+
+## Part 1 — Integration
+
+### The core principle: your app owns the infrastructure
+
+cognitive-db is deliberately **generic, not app-specific**. It hardcodes no database connection, no LLM provider, no API keys, and no domain ontology. Everything it needs is supplied by the consuming app at startup through a single `initConfig()` call. The engine just orchestrates the knowledge-graph operations on top of what you give it.
+
+<CardGrid>
+  <Card title="You provide" icon="laptop">
+    Prisma client, an LLM model, embedding functions, your ontology, and prompt overrides.
+  </Card>
+  <Card title="The engine provides" icon="puzzle">
+    Perception, entity extraction, connection discovery, versioning, search, and pattern detection.
+  </Card>
+</CardGrid>
+
+### `initConfig()` — the single wiring point
+
+Call `initConfig()` once at app startup, before any engine service is used. It validates the config (via Zod) and stores it process-wide.
+
+```typescript
+import { initConfig } from 'cognitive-db';
+import { PrismaClient } from '@prisma/client';
+import { createAnthropic } from '@ai-sdk/anthropic';
+import { embed, embedBatch, embedQuery } from './lib/cognitive-db/embedding';
+
+const prisma = new PrismaClient();
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+initConfig({
+  // 1. Database — your Prisma client, your Postgres
+  database: {
+    mode: 'integrated',      // recommended (see Hybrid database mode below)
+    prisma,                  // the app's own PrismaClient instance
+    tablePrefix: 'cog_',     // default; all engine tables are cog_-prefixed
+  },
+
+  // 2. LLM — a pre-built Vercel AI SDK LanguageModel
+  llm: {
+    model: anthropic('claude-sonnet-4-20250514'),
+    temperature: 0.3,        // optional (default 0.3)
+  },
+
+  // 3. Embeddings — functions the app supplies (model name is for tracking only)
+  embedding: {
+    model: 'voyage-3',       // recorded on each node for provenance
+    dimensions: 1024,        // MUST match your vector column width
+    embed,                   // (text) => Promise<EmbeddingResult>   — required
+    embedBatch,              // optional batch variant
+    embedQuery,              // optional query-side variant
+  },
+
+  // 4. Ontology — your entity + relationship-type definitions (loaded as nodes)
+  ontology: {
+    definition: myOntology,  // OntologyDefinition; layered over the base ontology
+    autoLoad: true,          // seed concept / relationship_type nodes on init
+  },
+
+  // 5. Prompts — override any extraction prompt without touching engine code
+  prompts: {
+    contentDescription: 'Court filings, case notes, and evidence records',
+    systemContext: 'You are extracting entities for a family-law matter.',
+    customPrompts: {
+      entityExtraction: '…',       // fully overridable, per function
+      relationshipExtraction: '…',
+    },
+  },
+});
+```
+
+<Aside type="note" title="Provider config lives in your app, not the engine">
+Note that `llm.model` is a **pre-configured `LanguageModel`** — you build the provider client (`createAnthropic`, `createOpenAI`, …) and pass the model object in. Likewise `embedding.embed` is a **function you write**. The engine never sees a provider name or an API key; those stay in your app's environment. This is why the concept doc's older `{ provider, model, apiKey }` shape has been superseded — the built API takes the constructed model/functions directly, which keeps the engine provider-agnostic.
+</Aside>
+
+The keys the engine hands back through helpers (`getConfig`, `isFeatureEnabled`, `getEmbeddingDimensions`, `getPrismaClient`) are all read from this one config object. If you call a service before `initConfig()`, you get a clear `CognitiveDB: Not initialized` error.
+
+<Aside type="caution" title="Dimensions must match">
+`embedding.dimensions` must equal the width of your `vector(N)` column and your model's actual output. A mismatch fails at query time, not at config time. `voyage-3` is 1024; `text-embedding-3-small` is 1536; `text-embedding-3-large` is 3072.
+</Aside>
+
+### The no-content-duplication contract: `sourceId` + `sourceType`
+
+This is the most important integration rule. **cognitive-db never stores a copy of your original content.** It stores its *understanding* of that content — embeddings, extracted entities, discovered connections, questions — and references the original back to your own table via two fields:
+
+- `sourceId` — the primary key of the row in **your** table
+- `sourceType` — which table/kind it came from
+
+```typescript
+import { IngestService } from 'cognitive-db';
+
+const ingest = new IngestService(prisma);
+
+const result = await ingest.ingest({
+  sourceId: 'note-123',        // the id in YOUR notes table
+  sourceType: 'note',          // which of YOUR tables it came from
+  content: note.body,          // text to understand — processed, not persisted verbatim
+  userId: note.userId,         // ownership boundary (see below)
+});
+
+result.contentNode;   // the cog_node that represents this item's understanding
+result.entities;      // extracted entity nodes
+result.connections;   // connections discovered at ingest (Tier-1, immediate)
+```
+
+Your app remains the **single source of truth** for the actual content. If a note changes or is deleted, you re-ingest or purge by `sourceId` — the engine holds a derived layer keyed to your data, never a second copy of it. Every downstream consumer of the engine (Cog Ingest, and the planned Documents module) keys off `sourceId`/`sourceType` the same way.
+
+<Aside type="note" title="userId is the ownership boundary">
+`userId` on each node is how rows are isolated. The engine follows a **`tenantId === userId`** model — a solo-business design where one user *is* the tenant. There is no separate multi-tenant layer and no `tenantId` column: isolation is by **ownership** of the `userId` field. The consuming module's security layer declares `ownedModels: []` and relies on the starter's `userId`-ownership isolation, and it wires up the account-erasure deletion handler for lawful data removal. `userId` is intentionally **nullable** — system and ontology nodes are shared, not user-owned — so a null there is by design, not a gap.
+</Aside>
+
+### Hybrid database mode
+
+The engine supports two database modes. In practice, one is the path everyone uses today.
+
+| Mode | Status | How it works |
+|------|--------|--------------|
+| **`integrated`** | ✅ Primary / recommended | You pass in your app's `PrismaClient`. The `cog_*` tables live in your app's own Postgres database, alongside your own tables. One database, one migration story. |
+| **`standalone`** | ⏳ Deferred | Exists in the config schema, but still requires a Prisma client today. A true standalone mode (raw `pg`, no Prisma dependency on the consuming side) was scoped and deliberately deprioritised until a real consumer needs it. |
+
+For every real deployment, use `integrated`. The engine reads and writes through the Prisma client you supply, so it participates in your transactions and your connection pooling rather than opening its own.
+
+```typescript
+database: {
+  mode: 'integrated',
+  prisma,               // required for integrated mode
+}
+```
+
+<Aside type="caution">
+Setting `mode: 'standalone'` requires a `connectionString`, but the standalone code path still depends on Prisma. Treat standalone as **not yet available** for Prisma-free use — it is on the roadmap, not shipping.
+</Aside>
+
+### Table prefixing and avoiding migrations
+
+All engine tables are prefixed **`cog_`** (`cog_node`, `cog_working_memory_event`, `cog_processing_log`) so they never collide with your app's tables when they share a database. The prefix is configurable via `database.tablePrefix` but defaults to — and is expected to stay — `cog_`.
+
+A related design habit worth adopting: **new configuration goes into existing JSON columns wherever possible, to avoid schema migrations.** The engine's per-node `data` and `metadata` JSON fields, and the consuming module's `config` JSON on its source records, are where new options land — so shipping a new capability rarely means an `ALTER TABLE`. See the [Cog Ingest configuration page](/modules/cog-ingest/configuration/) for how the module leans on this.
+
+---
+
+## Part 2 — Delivery
+
+The engine is not published to the npm registry. It is delivered two ways, both auth-free.
+
+<CardGrid>
+  <Card title="Vendored into Cog Ingest" icon="cloud-download">
+    The normal path. The module packs and installs the engine for you — no npm account, no GitHub token.
+  </Card>
+  <Card title="Standalone from Git" icon="download">
+    For integrating the engine directly, without the module. Installs from GitHub and builds on install.
+  </Card>
+</CardGrid>
+
+### Delivery A — vendored into Cog Ingest (recommended)
+
+The [Cog Ingest module](/modules/cog-ingest/) **vendors** the engine so an app developer installs one thing and gets the whole cognitive stack. The engine version is locked to the module release, and no registry or GitHub credentials are ever needed.
+
+<Steps>
+
+1. **Pack at build.** When the module is built, its `prebuild` step runs `scripts/vendor-engine.cjs`, which does `npm pack` against the engine checkout and writes the tarball to `vendor/cognitive-db.tgz`. That tarball ships inside the module package.
+
+2. **Install via lifecycle hook.** When you run `npx cognitive-ingest init` (or `update`) in your app, the module's `onInstall` / `onUpdate` lifecycle hook installs the vendored tarball into the host backend as a portable `file:` dependency.
+
+3. **Version locked.** Because the engine came from a pinned tarball baked into that module release, the engine version is fixed to the module version — no drift, no surprise upgrades.
+
+</Steps>
+
+<Aside type="note" title="Engine development override">
+If a local `npm link cognitive-db` is present, the lifecycle hook **skips** the vendored install and leaves the symlink in place — so engine developers can iterate against a live checkout while the module still installs cleanly for everyone else.
+</Aside>
+
+### Delivery B — standalone install from Git
+
+To use the engine on its own, install it straight from GitHub. It is not on npm, but a `prepare` script builds `dist/` on install, so a Git/vendored install works without a published package.
+
+```bash
+# Install the engine directly from GitHub (builds dist/ via the prepare script)
+npm install github:ui-git-kim/cognitive-db
+```
+
+Then add the `cog_node` schema to your Prisma (copy it from the engine's `prisma/schema.prisma`), enable the pgvector extension, run your migration, and call `initConfig()` as shown in Part 1.
+
+```prisma
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector]
+}
+
+// Copy the full cog_node model (and the other cog_* models) from
+// cognitive-db/prisma/schema.prisma into your own schema.
+model cog_node {
+  id       String @id @default(uuid())
+  nodeType String
+  // …rest of the unified node model
+}
+```
+
+### Delivery C — `npm link` for engine development
+
+When developing the engine itself against a consuming app, link it locally:
+
+```bash
+# In the engine repo
+cd cognitive-db && npm link
+
+# In the consuming app
+npm link cognitive-db
+```
+
+As noted above, the Cog Ingest lifecycle hook detects this symlink and skips its vendored install, so the linked checkout wins.
+
+---
+
+## Where to go next
+
+<CardGrid>
+  <Card title="Cog Ingest — the primary consumer" icon="puzzle">
+    See the engine integrated end-to-end: admin-configurable sources, the ingest pipeline, and Structure-node mapping. Start at the [Cog Ingest overview](/modules/cog-ingest/).
+  </Card>
+  <Card title="Configuration reference" icon="setting">
+    Init prompts, environment variables, provider setup, and runtime config are on the [Cog Ingest configuration page](/modules/cog-ingest/configuration/).
+  </Card>
+</CardGrid>
+
+<Aside type="tip">
+The quickest path to a working system is not to wire `initConfig()` by hand — it is to run `npx cognitive-ingest init` and let the module collect your provider keys, add every `cog_*` table to your Prisma schema, and generate the config file for you.
+</Aside>

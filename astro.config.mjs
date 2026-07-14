@@ -339,6 +339,16 @@ export default defineConfig({
           ],
         },
         {
+          label: "Libraries",
+          items: [
+            {
+              label: "cognitive-db",
+              collapsed: true,
+              autogenerate: { directory: "cognitive-db" },
+            },
+          ],
+        },
+        {
           label: "Reference",
           collapsed: true,
           items: [

@@ -1,0 +1,179 @@
+---
+title: Providers & Infrastructure
+description: The LLM, embedding, database, and validation infrastructure cognitive-db runs on — all supplied by the consuming app, nothing hardcoded in the engine.
+sidebar:
+  order: 4
+  label: "Providers & Infrastructure"
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+cognitive-db is deliberately **infrastructure-agnostic**. It hardcodes no provider, no model, and no connection string. Everything — the language model, the embedding function, the Prisma client, the ontology, the prompts — is handed to the engine at startup through `initConfig()`. This is the *generic, not app-specific* principle in force: the engine supplies the intelligence, the consuming app owns the infrastructure.
+
+<Aside type="tip" title="Apps own the infrastructure">
+The engine never reads an environment variable, never opens a database connection, and never holds an API key. Your app constructs the LLM model, the embedding functions, and the Prisma client, then passes them in. cognitive-db just orchestrates the knowledge graph on top of them. See [Integration](/cognitive-db/integration/) for the full `initConfig()` contract.
+</Aside>
+
+For most developers this is all handled for you: the [Cog Ingest module](/modules/cog-ingest/) bundles the engine and collects provider keys through its install prompts, generating the config and embedding files automatically. This page documents what sits underneath, so you understand the choices and can override them.
+
+---
+
+## Provider & infrastructure summary
+
+| Component | Choice | Notes |
+|---|---|---|
+| **LLM provider** | Anthropic **or** OpenAI only | Accessed through the Vercel AI SDK. Local models (Ollama) are explicitly **out of scope**. |
+| **LLM model** | App-config choice (example: `claude-sonnet-4-5-20250929`) | Not hardcoded — the app passes a Vercel AI SDK `LanguageModel`. Revisit per app as models evolve. |
+| **Embedding provider** | Voyage (recommended) **or** OpenAI | App-supplied embedding functions; provider is a config choice, not baked in. |
+| **Embedding model** | `voyage-3.5` @ 1024 dimensions (recommended) | Best storage/quality trade-off (see comparison below). |
+| **Embedding dimensions** | Set at runtime via config | The vector column is created at the configured width; it is not fixed in the schema. |
+| **AI integration layer** | Vercel AI SDK (`ai`) | Provider-agnostic interface; matches the wider Standard Stack default. |
+| **Validation** | Zod | Frontend, backend, and structured LLM outputs. |
+| **Database hosting** | Neon (PostgreSQL + pgvector) | Sydney region, database branching, free tier. See [Neon setup](/getting-started/neon-setup/). |
+| **ORM** | Prisma 7 | Runtime connection strings via `datasourceUrl` — no `url` in the schema. |
+| **Auth** | App-layer concern (Neon Auth / Better Auth) | **Not** the engine's responsibility — the engine has no notion of sessions or login. |
+
+---
+
+## Language model (LLM)
+
+cognitive-db uses an LLM for perception: extracting entities, relationships, emotions, concepts, and questions from ingested content at graded levels. It reaches the model through the **Vercel AI SDK**, which gives a single provider-agnostic `LanguageModel` interface.
+
+<CardGrid>
+  <Card title="Anthropic" icon="star">
+    Construct a model with `createAnthropic` from `@ai-sdk/anthropic` and pass it in. Example config model: `claude-sonnet-4-5-20250929`.
+  </Card>
+  <Card title="OpenAI" icon="star">
+    Construct a model with `createOpenAI` from `@ai-sdk/openai`. Any chat-capable model works, e.g. `gpt-4o`.
+  </Card>
+</CardGrid>
+
+<Aside type="note" title="Local models are out of scope">
+Only Anthropic and OpenAI are supported. Ollama and other local models were explicitly removed from scope — they added complexity without a clear benefit for this use case, and the Vercel AI SDK already abstracts the two hosted providers cleanly.
+</Aside>
+
+The model is *app config*, not an engine constant. The example `claude-sonnet-4-5-20250929` reflects an evaluation of the balance between entity extraction, content understanding, and insight generation — but because the app supplies the model, changing it later is a config edit, never an engine change.
+
+```typescript
+import { createAnthropic } from '@ai-sdk/anthropic';
+
+const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// Passed to initConfig({ llm: { model } })
+const model = anthropic('claude-sonnet-4-5-20250929');
+```
+
+<Aside type="tip" title="Graceful degradation">
+Perception degrades gracefully when the LLM is unavailable — ingest still stores the content node, embeds it, and runs immediate connection discovery, so a provider outage never blocks the pipeline. See [Architecture](/cognitive-db/architecture/).
+</Aside>
+
+---
+
+## Embeddings
+
+Embeddings power semantic search and the filtered "hybrid" search over the `cog_node` graph. The engine does **not** call an embedding API itself — your app provides `embed`, and optionally `embedBatch` and `embedQuery`, functions. This keeps the choice of provider, input-type handling, and batching entirely in the app's hands.
+
+**Voyage** is the recommended provider; **OpenAI** embeddings are the supported alternative. The recommended model is **`voyage-3.5` at 1024 dimensions**.
+
+### Why voyage-3.5 @ 1024 dimensions
+
+`voyage-3.5` supports multiple output widths (2048 / 1024 / 512 / 256). 1024 dimensions was chosen over 2048 as a **storage/quality trade-off**: the larger width's marginal quality gain (roughly 1–3% on the benchmarks reviewed) did not justify doubling the size of every stored vector and the pgvector index. On the same benchmarks, `voyage-3.5` outperformed `voyage-3` by around 2.66% and OpenAI's `text-embedding-3-large` by around 8.26%.
+
+<Aside type="note" title="Dimensions are a runtime setting">
+The embedding width is set at runtime through config and must match the output of your chosen model — the engine creates the vector column at that width during database setup. It is **not** hardcoded in the Prisma schema, so switching model or width is a config-and-migrate change, not an engine change.
+</Aside>
+
+### Voyage model comparison
+
+Provided for comparison — not all are in active use:
+
+| Model | Dimensions | Price / 1M tokens | Best for |
+|---|---|---|---|
+| **voyage-3.5** | 2048 / 1024 / 512 / 256 | $0.06 | General purpose — **recommended** |
+| voyage-3.5-lite | 2048 / 1024 / 512 / 256 | $0.02 | Faster, cheaper |
+| voyage-3-large | 1024 | $0.18 | Highest accuracy |
+| voyage-code-3 | 2048 / 1024 / 512 / 256 | $0.02 | Code-specific |
+
+```typescript
+// The app supplies embedding functions; provider/model/width live here, not in the engine.
+initConfig({
+  embedding: {
+    model: 'voyage-3.5',   // recorded for tracking
+    dimensions: 1024,       // must match the model output width
+    embed,                  // (text) => Promise<EmbeddingResult>
+    embedBatch,             // optional
+    embedQuery,             // optional — Voyage uses input_type: 'query'
+  },
+});
+```
+
+---
+
+## Validation — Zod
+
+**Zod** is the validation layer across the stack — frontend forms, backend request handling, and, most importantly for the engine, **structured LLM outputs**. Perception hands the model a Zod schema and parses the response against it, so extracted entities, relationships, and concepts arrive as typed, validated objects rather than free-form text. Zod is a [peer dependency](#peer-dependencies).
+
+---
+
+## Database — Neon + Prisma 7
+
+### Neon (PostgreSQL + pgvector)
+
+The database is **Neon** — managed PostgreSQL with the **pgvector** extension for the embedding index. Neon was chosen for:
+
+- **Sydney region** availability (data residency for Australian apps).
+- **Database branching** — cheap, instant branches for dev and preview environments.
+- A usable **free tier** and integration with Neon Auth.
+
+Full setup instructions live in [Neon setup](/getting-started/neon-setup/). The pgvector extension is enabled through Prisma's `postgresqlExtensions` preview feature.
+
+### Prisma 7
+
+The engine runs on **Prisma 7** and uses your app's Prisma client (integrated mode). A defining Prisma 7 pattern here: **runtime connection strings via `datasourceUrl`** — there is no `url` in the schema's `datasource` block. The connection string is provided when the client is instantiated, which keeps secrets out of the schema and suits Neon's per-environment branch URLs.
+
+```prisma
+// The datasource declares no url — it is supplied at runtime.
+datasource db {
+  provider   = "postgresql"
+  extensions = [vector]
+}
+```
+
+```typescript
+// Connection string provided at client instantiation, not in the schema.
+const prisma = new PrismaClient({
+  datasourceUrl: process.env.DATABASE_URL,
+});
+```
+
+<Aside type="caution" title="Standalone mode still needs Prisma">
+A true standalone database mode (raw `pg`, no Prisma dependency for the consuming app) is **planned but not built** — it exists in the config shape but still requires a Prisma client today. Integrated mode, where the app passes in its own Prisma client, is the supported path. See [Architecture](/cognitive-db/architecture/).
+</Aside>
+
+---
+
+## Authentication is an app concern
+
+cognitive-db has **no authentication layer**. It knows nothing about sessions, login, or identity beyond the `userId` string an app attaches to each node. Authentication — recommended as **Neon Auth** or **Better Auth**, never self-managed JWT — is entirely the app layer's responsibility.
+
+<Aside type="note" title="userId ownership, not multi-tenant isolation">
+The engine's model is `tenantId === userId` (solo-business: one user *is* the tenant). Isolation is by **`userId` ownership** — the starter template's security foundation isolates owned rows, and the [Cog Ingest module](/modules/cog-ingest/) declares `ownedModels: []` in its `security.registration.ts` to rely on that ownership boundary, plus an account-erasure deletion handler for its per-user data. There is no separate multi-tenant layer, and no Row-Level Security to configure. `userId` is intentionally nullable so system and ontology nodes can be shared rather than owned by any one user.
+</Aside>
+
+---
+
+## Peer dependencies
+
+The engine declares three **peer dependencies**, so the consuming app controls their versions and there is only ever one copy in the tree:
+
+| Package | Version range | Role |
+|---|---|---|
+| `@prisma/client` | `^7.3.0` | The app's Prisma client, passed in via `initConfig()`. |
+| `ai` | `^6.0.39` | The Vercel AI SDK — the LLM integration layer. |
+| `zod` | `^3.25.76` | Schema validation for structured LLM outputs. |
+
+The provider SDKs themselves — `@ai-sdk/anthropic` and `@ai-sdk/openai` — ship as direct dependencies of the engine, so both providers are available regardless of which one the app configures.
+
+<Aside type="tip" title="Delivery">
+When installed through Cog Ingest, the engine is **vendored** (`vendor/cognitive-db.tgz` + a lifecycle-hook install) — no npm registry or GitHub auth, and the engine version is locked to the module release. For standalone use, `npm install github:ui-git-kim/cognitive-db` builds `dist/` on install. See [Integration & Delivery](/cognitive-db/integration/) and the [Cog Ingest integration guide](/modules/cog-ingest/integration/).
+</Aside>

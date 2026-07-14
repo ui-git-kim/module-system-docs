@@ -1,0 +1,244 @@
+---
+title: Security & Compliance
+description: The hardened security posture of cognitive-db — userId-ownership isolation, the lawful-erasure pathway, embeddings as personal data, prompt-injection surface, and third-party AI-processor disclosure
+sidebar:
+  order: 5
+  label: "Security & Compliance"
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+cognitive-db stores an unusually sensitive kind of data. It performs **psychological and emotional profiling of named individuals** — perceiving intentions, emotions, and concepts from whatever content an app sends it — and one of its primary consumers, Evidence Manager, handles **legal evidence** for family-law matters. That combination puts the engine above a "standard" posture: it is designed and built to a **hardened baseline**.
+
+This page explains how that posture is actually realised. The headline is that isolation is not a bolt-on multi-tenant layer — it is **ownership by `userId`**, inherited from the host starter's security foundation — and that "never decay" coexists with a real, lawful **right-to-erasure** pathway.
+
+<Aside type="note" title="What the engine does and does not hold">
+cognitive-db never stores your original content — only its *understanding* of it, referenced back to your own tables via `sourceId` + `sourceType` (see [apps own their data](/modules/cog-ingest/engine/)). What it *does* hold — extracted entities, emotions, concepts, questions, connections, and their embeddings — is derived personal data about a named person, and is treated as such.
+</Aside>
+
+---
+
+## The isolation model: `tenantId === userId`
+
+The engine is deliberately **single-user-per-tenant**: one user *is* the tenant. There is no team or organisation layer, and there is no separate `tenantId` column. Every module table is keyed on `userId`, and that ownership **is** the isolation boundary.
+
+<Aside type="caution" title="Do not add a multi-tenant layer">
+This is a product decision, not an oversight. The target is apps for **solo business owners**, and the whole stack is built around it. Adding multi-tenant scoping, an organisation layer, or per-request tenant-guard middleware on top of this model would be working against the design — the host starter's ownership foundation already provides the isolation these would duplicate.
+</Aside>
+
+### Isolation is inherited, not reimplemented
+
+The consuming module (Cog Ingest) does **not** roll its own row-level isolation. It declares its security surface to the host starter's security registry and lets the foundation isolate owned rows by `userId`. The manifest declares **no** RLS-managed models — `ownedModels: []` — precisely because the tables are keyed on the actor (`userId`) that the foundation already isolates by ownership:
+
+```typescript
+// backend/src/features/my-feature/security.registration.ts
+securityRegistry.register({
+  moduleId: 'my-feature',
+
+  // RLS-managed models. The isolation key is always 'tenantId'. This module's
+  // tables are keyed on userId (the actor), which the foundation already
+  // isolates by ownership, so this stays empty.
+  ownedModels: [],
+
+  // Data categories drive the deletion cascade + the compliance bundle.
+  dataCategories: [
+    { name: 'cog_ingest_sources', classification: 'owned' },
+    { name: 'cog_ingest_jobs', classification: 'owned' },
+    { name: 'cog_ingest_config', classification: 'owned' },
+    { name: 'cog_ingest_mappings', classification: 'owned' },
+    { name: 'cog_ingest_rss_entries', classification: 'owned' },
+    { name: 'cog_engine_graph', classification: 'owned' },
+  ],
+});
+```
+
+<Aside type="tip" title="Neon RLS is available as an opt-in escalation">
+PostgreSQL Row-Level Security is not part of the current design, but it is an *available* escalation path rather than a rewrite. Adding a `tenantId String` column (plus `@@index([tenantId])`) to a model and listing it in `ownedModels` opts that model into the foundation's RLS. For the solo-business model this is unnecessary — ownership isolation is sufficient — but the door is deliberately left open.
+</Aside>
+
+### Why `userId` is nullable — by design
+
+`userId` on the engine's `cog_node` (and its sibling tables) is **nullable**, and that is intentional, not a gap. Some nodes are **not owned by any one user** — the base ontology, shared system concepts, and relationship-type definitions are meant to be common infrastructure that every user's graph classifies against. A `null` `userId` marks a node as *shared/system*, distinct from a user-owned node.
+
+| `userId` value | Meaning | Isolation behaviour |
+|----------------|---------|---------------------|
+| A concrete id | A user-owned node (content, entity, connection, pattern) | Isolated to that user by ownership; never visible to another user's scoped reads |
+| `null` | Shared system/ontology node (concepts, relationship types, base ontology) | Common infrastructure; not personal data; deliberately not user-scoped |
+
+<Aside type="caution" title="This is why 'enforce non-nullable userId' is the wrong fix">
+An earlier security assessment framed nullable `userId` as a defect to be closed by making the column non-nullable. Under the `tenantId === userId` model that reading is inverted: nullability is what lets shared ontology exist without being falsely attributed to — or deleted with — a single user. Ownership-scoped reads already exclude other users' rows; the null case is the *shared* case, handled explicitly (see the erasure cascade below).
+</Aside>
+
+---
+
+## Lawful erasure vs "never decay"
+
+Two of the engine's commitments look, at first glance, contradictory:
+
+- **Never decay** — cognitive-db never reduces the accessibility of old information. A decade-old note can be the single most important thing in the graph. Consolidation may *downscale relevance ranking*, but information is never deleted to save space.
+- **Right to erasure** — privacy law obliges an app to delete a person's data on lawful request.
+
+These do not conflict, because they are about different things. "Never decay" is a statement about **relevance ranking over time** — the engine will not silently forget or bury data as it ages. Erasure is a **distinct, legally-mandated override** — an explicit, deliberate deletion of a specific subject's data, triggered by a lawful request, not by the passage of time.
+
+<Aside type="note" title="One principle is automatic; the other is a deliberate act">
+Never-decay is the engine's default behaviour on every read. Erasure is never automatic — it runs only when an account is erased, cascading through content, embeddings, versions, and derived data. Distinguishing the two is what lets both hold at once.
+</Aside>
+
+### The erasure pathway is implemented
+
+This is not a design aspiration — the deletion handler ships in the module. Cog Ingest registers an account-erasure handler that hard-deletes the subject's ingest data **and** their slice of the engine graph. Child tables keyed by `sourceId` are cleared first, then the user-owned rows; shared/system ontology (the `null`-`userId` nodes) is left intact:
+
+```typescript
+securityRegistry.registerDeletionHandler({
+  id: 'my-feature.ingest-and-engine-data',
+  moduleId: 'my-feature',
+  classification: 'owned',
+  description: "Hard-delete the subject's ingest sources, jobs, config, mappings, RSS entries and engine graph",
+  async run(ctx) {
+    const userId = ctx.subject.userId ?? ctx.subject.tenantId;
+
+    // Child tables (keyed by sourceId) are cleared BEFORE the sources themselves.
+    const sources = await prisma.cog_ingest_source.findMany({
+      where: { userId }, select: { id: true },
+    });
+    const sourceIds = sources.map((s) => s.id);
+
+    let recordsAffected = 0;
+    if (sourceIds.length > 0) {
+      recordsAffected += (await prisma.cog_ingest_rss_entry.deleteMany({ where: { sourceId: { in: sourceIds } } })).count;
+      recordsAffected += (await prisma.cog_ingest_mapping.deleteMany({ where: { sourceId: { in: sourceIds } } })).count;
+    }
+
+    recordsAffected += (await prisma.cog_ingest_source.deleteMany({ where: { userId } })).count;
+    recordsAffected += (await prisma.cog_ingest_job.deleteMany({ where: { userId } })).count;
+    recordsAffected += (await prisma.cog_ingest_config.deleteMany({ where: { userId } })).count;
+
+    // Engine tables: only the subject's rows (userId match). Shared/system
+    // ontology carries a null userId and is deliberately left untouched.
+    recordsAffected += (await prisma.cog_node.deleteMany({ where: { userId } })).count;
+    recordsAffected += (await prisma.cog_working_memory_event.deleteMany({ where: { userId } })).count;
+    recordsAffected += (await prisma.cog_processing_log.deleteMany({ where: { userId } })).count;
+
+    log.info({ audit: true, userId, recordsAffected }, 'cog-ingest data deleted (account erasure)');
+    return { action: 'hard-delete', recordsAffected };
+  },
+});
+```
+
+The cascade has three properties worth calling out:
+
+<CardGrid>
+  <Card title="Complete" icon="approve-check">
+    It reaches everything derived from the subject: the unified graph (`cog_node`, which holds nodes, connections, patterns, and their **embeddings**), working-memory events, processing logs, and every module table — not just the visible ingest records.
+  </Card>
+  <Card title="Ownership-scoped" icon="list-format">
+    Every delete filters on `userId`. Shared ontology (`null` `userId`) survives, so erasing one subject never degrades another user's classification base.
+  </Card>
+  <Card title="Idempotent & audited" icon="approve-check">
+    `deleteMany` finds zero rows on a retried cascade, so re-running is safe, and the terminal `recordsAffected` count is written to the audit log.
+  </Card>
+</CardGrid>
+
+<Aside type="note" title="Embeddings are deleted with the node">
+Because a node's embedding lives on the same `cog_node` row (a pgvector column), erasing the node erases its embedding. There is no separate vector store to sweep — which matters, because embeddings are themselves personal data (next section).
+</Aside>
+
+---
+
+## Genuine considerations to keep
+
+The reframing above closes the "multi-tenant / non-nullable `userId`" thread, but several security considerations from the original assessment remain **live and correct**. These are the ones to design around.
+
+### Embeddings are personal data
+
+An embedding is not an anonymised vector. It encodes what the model understood about a person — their psychology, emotional state, decisions, and relationships — densely enough to support semantic search and similarity. Treat embeddings with the **same sensitivity as the source understanding**, not as opaque numbers:
+
+- Include them in any data-subject export or erasure reasoning (the cascade above already deletes them with their node).
+- Do not ship embeddings to logging, analytics, or third-party sinks that would not be trusted with the underlying content.
+- Remember that similarity search over embeddings can re-identify or correlate individuals even without the original text.
+
+### Untrusted ingested content is a prompt-injection surface
+
+Everything that enters the pipeline is **untrusted input**. During the extraction stage the engine sends ingested content to an LLM to perceive entities, emotions, and concepts — so hostile content can attempt to hijack that extraction prompt (injected instructions, fake "system" directives, attempts to exfiltrate other context).
+
+<CardGrid>
+  <Card title="Where it bites" icon="warning">
+    The perception/extraction stage of ingest, where raw content is interpolated into an extraction prompt. This is the module's most exposed AI boundary.
+  </Card>
+  <Card title="Posture" icon="magnifier">
+    Treat extraction output as *claims*, not commands — the engine persists structured perception, it does not execute instructions found in content. Validate and constrain structured outputs (the engine parses LLM responses through strict schemas).
+  </Card>
+</CardGrid>
+
+<Aside type="caution" title="Design pipelines assuming the content is adversarial">
+The admin-configurable pipeline (intake → acquisition → preprocessing → extraction → actions) is where content is handled — see [Cog Ingest configuration](/modules/cog-ingest/configuration/). Context fields and prompt grounding improve accuracy, but they do not sanitise hostile content; keep extraction outputs bounded and never let perceived "instructions" drive privileged actions.
+</Aside>
+
+### Third-party AI-processor disclosure
+
+cognitive-db calls out to **LLM and embedding providers** (Anthropic/OpenAI for language, Voyage/OpenAI for embeddings) to do its perception and vectorising. In practice this means **content leaves the app and is processed by US-based providers**. Under Australian privacy law — and potentially the EU/UK GDPR depending on where a given app's users are — that is a disclosure to an overseas third-party processor and must be surfaced to users, not buried.
+
+| Data flow | Destination | Compliance angle |
+|-----------|-------------|------------------|
+| Content sent for perception | LLM provider (US) | Overseas disclosure; processor agreement; user notice |
+| Text sent for embedding | Embedding provider (US) | Same — embeddings are derived personal data |
+| Understanding + embeddings stored | Your own database (e.g. Neon) | Data residency of *derived* data (Neon offers a Sydney region) |
+
+<Aside type="note" title="A first-class disclosure decision">
+Whether and how to disclose overseas AI processing is an app-level decision that belongs in the app's privacy policy and onboarding, not something the engine can decide for you. Because the provider is app-supplied config (`initConfig()`), the app already knows exactly which processors it uses — make that a deliberate, documented data-flow disclosure.
+</Aside>
+
+### An append-only access-audit trail (roadmap)
+
+The engine already writes `cog_processing_log`, but that records **what happened during processing** — jobs, propagation, token accounting — not **who read what, when**. A distinct, **append-only read/access audit trail** is a roadmap item for stricter (evidence-grade) deployments, where chain-of-custody over *reads* matters as much as over writes.
+
+<Aside type="tip" title="Not the same as the processing log">
+Do not conflate the two. `cog_processing_log` is operational bookkeeping. A read/access audit trail — an append-only record of access events — is a separate control, currently **planned**, not shipped. Evidence-focused consumers that need read-side chain-of-custody today should layer it at the app level (Document Management, for example, keeps its own access log).
+</Aside>
+
+---
+
+## Open compliance decisions
+
+Some choices are genuinely app- and deployment-specific, and the engine deliberately does **not** hard-code them. These need a real decision per consuming app, not a default guess:
+
+<CardGrid>
+  <Card title="Retention periods" icon="setting">
+    How long derived understanding is kept absent a lawful erasure request. "Never decay" governs *ranking*, not *retention policy* — the latter is yours to set.
+  </Card>
+  <Card title="EU / UK user scope" icon="information">
+    Whether any users fall under GDPR changes disclosure, transfer, and erasure obligations for the overseas-processor data flows above.
+  </Card>
+  <Card title="Key management" icon="setting">
+    How provider API keys and any app-layer encryption keys are stored and rotated. Keys live in the app environment, never in the engine — the host starter provides envelope-encryption tooling.
+  </Card>
+</CardGrid>
+
+---
+
+## Quality: hardened by audit
+
+The hardened posture is not just architectural. cognitive-db reached its **first stable release (v1.0.0)** on 2026-07-14 only after a comprehensive multi-agent **code audit** (96 files, ~28k LOC, 83 verified findings, all remediated). Security-relevant fixes in that pass included a **SQL-injection remediation** in the search service (raw string-interpolated `WHERE` clauses — including the `userId` filter — replaced with parameterised queries) and correctness fixes to graph traversal. Auditing implemented-versus-stubbed before extending anything is a standing practice for the engine, not a one-off.
+
+<Aside type="caution" title="The search-filter fix was security-critical">
+The pre-v1.0.0 search service concatenated caller-supplied values (including `userId`) straight into SQL, which — under the ownership model — was an isolation-bypass risk, not merely an injection risk. It was fixed to use numbered placeholders. When extending search or any query surface, keep every dynamic value parameterised.
+</Aside>
+
+---
+
+## Summary
+
+| Concern | Posture |
+|---------|---------|
+| Isolation | **Ownership by `userId`** (`tenantId === userId`); inherited from the host starter's security foundation; `ownedModels: []` |
+| Multi-tenant / RLS | **Not in the design** — solo-business model; RLS is an available opt-in escalation, not a plan |
+| Nullable `userId` | **Intentional** — marks shared system/ontology nodes; not a gap |
+| Never-decay vs erasure | Reconciled — decay is about *ranking*; erasure is a **distinct lawful override** |
+| Right to erasure | **Implemented** — account-erasure deletion handler cascades through ingest data, the graph, embeddings, versions, and logs |
+| Embeddings | **Personal data** — deleted with their node; never treated as anonymised vectors |
+| Ingested content | **Prompt-injection surface** at the extraction stage — perception is claims, not commands |
+| Overseas AI processing | **Disclosure decision** under Australian (and possibly EU/UK) privacy law |
+| Read/access audit trail | **Roadmap** — distinct from `cog_processing_log` (which logs processing, not reads) |
+| Retention / EU-UK scope / key management | **Open, app-specific decisions** |
+
+For how this engine is delivered and consumed, see the [Cog Ingest module](/modules/cog-ingest/) and its [engine overview](/modules/cog-ingest/engine/); for the pipeline where untrusted content is handled, see [configuration](/modules/cog-ingest/configuration/).

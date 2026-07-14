@@ -1,0 +1,228 @@
+---
+title: Architecture
+description: The unified node model at the heart of cognitive-db — one table for content, entities, connections, patterns and ontology, with first-class versioned connections, strategic embeddings, tracked working memory and tiered discovery.
+sidebar:
+  order: 1
+  label: "Architecture"
+---
+
+import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+cognitive-db is the intelligence engine that powers the [Cog Ingest module](/modules/cog-ingest/). It gives an application a brain-like knowledge layer: it *understands* content at ingest — extracting entities, discovering connections, detecting patterns — rather than just storing and retrieving it.
+
+Everything below describes the engine as shipped in **v1.0.0** (the first stable release, 2026-07-14, cut after a full code audit). Where a capability is planned or partial rather than built, it is labelled as such.
+
+## The unified node model
+
+The single most important architectural decision is that **everything is a node**. Instead of separate tables for content, entities, connections, patterns and ontology concepts, every one of those things is a row in one table: `cog_node`.
+
+What a row *represents* is determined by its `nodeType`; whether it is an ontology definition or a concrete instance is a boolean flag, not a different table.
+
+```prisma
+// Illustrative / trimmed — see the engine schema for the full model.
+model cog_node {
+  id              String   @id @default(uuid())
+
+  // Classification — what kind of node is this?
+  nodeType        String   // 'content' | 'entity' | 'connection' | 'pattern'
+                           // | 'question' | 'concept' | 'relationship_type' ...
+  subType         String?  // Optional refinement: 'person', 'place', 'emotion' ...
+  isOntology      Boolean  @default(false)  // true = definition, false = instance
+  instanceOf      String?  // ID of the ontology concept this instantiates
+
+  // Content
+  name            String?  // Display name (entities, patterns, ...)
+  rawContent      String?  @db.Text
+  summary         String?  @db.Text
+  data            Json     @default("{}")  // Type-specific structured payload
+
+  // Connection fields — populated when nodeType = 'connection'
+  fromNodeId      String?
+  toNodeId        String?
+  connectionType  String?  // References a relationship_type ontology node
+  strength        Float?   @default(1.0)
+  bidirectional   Boolean? @default(false)
+
+  // Ontology fields — populated when isOntology = true
+  superClass      String?  // Parent concept ID (concept hierarchy → inheritance)
+  domain          String?  // Valid source concept (for relationship_type nodes)
+  range           String?  // Valid target concept (for relationship_type nodes)
+
+  // Versioning & provenance
+  version         Int      @default(1)
+  previousVersion String?
+  supersededBy    String?
+  sourceNodeId    String?  // The triggering node/input
+  sourceType      String?  // 'ingest' | 'extraction' | 'inference' | 'user' | 'merge' | 'system'
+  changeReason    String?  @db.Text
+  confidence      Float    @default(1.0)
+  status          String   @default("active")
+
+  // Strategic semantic search (pgvector)
+  embedding       Unsupported("vector(1024)")?
+  embeddingText   String?  @db.Text
+  embeddingModel  String?
+  shouldEmbed     Boolean  @default(true)
+
+  // Context validity (see below)
+  validInContexts   String[] @default([])
+  invalidInContexts String[] @default([])
+
+  // Ownership & metadata
+  userId          String?  // Ownership boundary (see "Data ownership")
+  metadata        Json?
+  createdAt       DateTime @default(now())  // Tracking only — never used for decay
+  updatedAt       DateTime @updatedAt
+}
+```
+
+<Aside type="tip" title="Why one table?">
+An entity, a detected pattern, a piece of raw content, an ontology concept and a relationship *type* are all just nodes with different `nodeType` values and a different subset of the flexible `data` JSON populated. The goal — "everything should be able to connect to everything" — becomes trivial when everything shares one shape.
+</Aside>
+
+### nodeType, subType, isOntology, instanceOf
+
+These four fields carry the whole classification scheme:
+
+| Field | Role |
+|---|---|
+| `nodeType` | Primary category — `content`, `entity`, `connection`, `pattern`, `question`, `concept`, `relationship_type` … |
+| `subType` | Optional refinement within a type — a `person` entity, a `place` entity, an `emotion` … |
+| `isOntology` | `true` marks a *definition* (a type in the schema-as-data); `false` marks a concrete *instance* |
+| `instanceOf` | On an instance node, points at the ontology `concept` node it instantiates |
+
+## Ontology as data, not code
+
+Entity types and relationship types are **not** hardcoded string unions. They are themselves nodes — `concept` nodes and `relationship_type` nodes — with `isOntology = true`. This turns the schema into data that an application can grow at runtime.
+
+<CardGrid>
+  <Card title="Inheritance via superClass" icon="list-format">
+    A `concept` node's `superClass` points at a parent concept, forming a real hierarchy. `person` can be a subclass of `agent`, which is a subclass of `entity`.
+  </Card>
+  <Card title="Constraints via domain / range" icon="approve-check">
+    A `relationship_type` node's `domain` and `range` constrain which concepts it can validly connect — e.g. `employed_by` might have domain `person`, range `organisation`.
+  </Card>
+</CardGrid>
+
+The engine ships a **base ontology** (`src/ontology/base-ontology.ts`) and the consuming application supplies its own concept and relationship types through `initConfig()`. Growing the ontology for a new domain is a configuration change, never an engine code change — this is the *generic, not app-specific* principle in force.
+
+## Connections as first-class, versioned nodes
+
+Because a connection is a node (`nodeType = 'connection'`), it is far more than an edge in a lookup table.
+
+- It carries its own `strength`, `confidence` and full version history — a connection can be strengthened, weakened or superseded over time with a recorded reason, exactly like an entity.
+- It can have **its own connections**. A connection between two nodes can be linked to the reasoning that justified it — a *meta-connection*. This is how the engine models **N-way** relationships that a rigid two-node edge table could never express (a gap explicitly called out when the old multi-table schema was retired).
+- It can have its own `embedding` and `metadata`, so connections are themselves discoverable and searchable.
+
+## Versioning & provenance
+
+Every meaningful change creates a **new version** rather than mutating a row in place. Five fields together give a complete "why did this change" trail:
+
+| Field | Meaning |
+|---|---|
+| `version` | Monotonic version number for this logical node |
+| `previousVersion` | ID of the prior version this one replaced |
+| `supersededBy` | ID of the version that replaced *this* one (forward pointer) |
+| `sourceNodeId` | The node or input that triggered this creation/change |
+| `changeReason` | Human-readable explanation of why the node exists or changed |
+
+Versioning is **atomic** — `previousVersion`/`supersededBy` form linked chains so history is never lost and the active node is always reachable. This underpins the *never-decay* principle: information is never deleted or degraded by the passage of time. Relevance *ranking* may downscale a node, but the node — and every prior version of it — remains. (The one exception is the lawful erasure pathway; see [Data ownership](#data-ownership--the-userid-boundary).)
+
+<Aside type="note" title="Two kinds of versioning — don't conflate them">
+`cog_node` versioning tracks how the engine's *understanding* of something evolved. That is distinct from *document* versioning (draft v1 → v2 → v3), which belongs to the application layer, not the engine.
+</Aside>
+
+## Embeddings: strategic, not universal
+
+Not every node is embedded. The `shouldEmbed` flag keeps the pgvector index focused on things worth searching semantically — content, entities, patterns and questions are embedded; ontology and purely structural nodes are found by *type*, not by semantics, so they are left out. This avoids diluting the vector index with schema metadata.
+
+Search built on this index is **filtered semantic search** (embeddings scoped by `nodeType`, `userId`, status and similar). It is referred to as "hybrid" search in the codebase, but note it is currently a filtered semantic search only — a lexical/keyword blend is **not yet built**.
+
+## Working memory: tracked, not owned
+
+cognitive-db does **not** own or manage the application's LLM context window — the application does. What the engine does is *track* activation, so it can learn from what actually got used and consolidate session activity back into the long-term graph.
+
+That tracking lives in `cog_working_memory_event`: rows recording which nodes were `activated` / `retrieved` / `used` / `deactivated` in a session, which nodes were `usedWith` each other, and optional `wasHelpful` feedback. Co-retrieval signals feed the learning subsystem (confidence propagation); consolidation folds session activity back into the graph. The application still decides what goes into its own prompt.
+
+## Tiered discovery
+
+Connection discovery is deliberately staged so expensive work never blocks the user. This is the *build-at-ingest-not-retrieval* principle made concrete.
+
+| Tier | Timing | Scope | Status |
+|---|---|---|---|
+| **Immediate** | ~2–3 s, synchronous | Direct, high-confidence connections for the just-ingested node (semantic + `mentions`) | **Built** |
+| **Background** | ~30 s, non-blocking | Wider connection search around the new node | **Built** |
+| **Periodic** | Batch, scheduled | Pattern detection and consolidation-style passes | **Built** |
+| **On-demand** | Query time | Anything not worth precomputing ahead of time | **Built** |
+
+<Aside type="caution" title="Tier 2 & Tier 3 discovery are currently stubs">
+Within discovery, the deeper **semantic entity-matching (Tier 2)** and **potential-contradiction (Tier 3)** passes are present as empty stubs in `discovery.service.ts` — the types and call sites exist, but they return no results yet. Tier-1 immediate discovery is fully built. Treat Tier 2/3 semantic entity-matching and contradiction discovery as roadmap, not shipped.
+</Aside>
+
+## Proactive intelligence
+
+The engine is designed to *volunteer* insight rather than wait to be queried — the *proactive over reactive* principle. In v1.0.0 the built proactive surface includes:
+
+- **Gap and question detection** — orphaned entities, abandoned threads, unanswered questions (`src/intelligence/gap.detector.ts`, `src/proactive/`).
+- **Some contradiction detection** — surfacing tensions between things already ingested (`src/proactive/contradiction.detector.ts`). Note this is distinct from the stubbed *discovery-tier* contradiction pass above.
+- **Question resolution and surprise detection** — noticing when new content answers an earlier open question, or is unexpectedly novel.
+- **Pattern detection** — preference, behavioural and temporal patterns across everything ingested.
+
+Deeper temporal/sequential pattern mining and the neuroscience-informed refinements (Hebbian weighting, spreading activation, replay-based consolidation, attractor retrieval) are on the **roadmap (R1–R7)** and are not built.
+
+## Data ownership — the `userId` boundary
+
+cognitive-db follows a **solo-business model**: one user *is* the tenant (`tenantId === userId`). There is no separate organisation or teams layer and no multi-tenant scoping column.
+
+<Aside type="note" title="Isolation is by ownership, not a multi-tenant layer">
+Rows are isolated by **`userId` ownership**, enforced by the starter template's security foundation. The consuming Cog Ingest module declares `ownedModels: []` in its `security.registration.ts` and relies on that ownership isolation — it does **not** add its own multi-tenant scoping.
+
+`userId` is intentionally **nullable**: system and ontology nodes (the base ontology, shared concepts) are not owned by any one user. That is by design, not a gap.
+
+The lawful **deletion / erasure pathway is implemented** — the module's account-erasure deletion handler cascades through a user's owned nodes, embeddings, versions and derived data. This is the deliberate, legally-mandated override of *never-decay*, not a contradiction of it.
+</Aside>
+
+## Data ownership contract
+
+cognitive-db never stores an application's original content — the *apps-own-their-data* principle. It stores its *understanding*, referenced back to the application's own table via `sourceId` + `sourceType`. Provider models, API keys, ontology and prompts are all supplied by the application through `initConfig()`; nothing is hardcoded. See the [Cog Ingest module](/modules/cog-ingest/) for how a real consumer wires this up.
+
+## Subsystem map
+
+The engine's `src/` is organised by capability. Each subsystem is a focused service module; the flags below reflect the v1.0.0 audit.
+
+| Subsystem (`src/…`) | Responsibility | Status |
+|---|---|---|
+| `core/` | Node model, repository, mapper, embedding service | Built |
+| `ingest/` | The ingest entry point that orchestrates the pipeline | Built |
+| `perception/` | LLM extraction of entities, relationships, emotions, concepts, questions (graded levels; graceful degradation when the LLM is unavailable) | Built |
+| `ontology/` | Base ontology, concept/relationship-type management, `superClass`/`domain`/`range` | Built |
+| `graph/` | Connections, filtered semantic ("hybrid") search, traversal | Built |
+| `discovery/` | Tiered connection discovery | Tier 1 built; Tier 2 & 3 stubbed |
+| `versioning/` | Atomic version chains, entity matching & dedup | Built (single-ingest dedup; cross-item batch dedup not built) |
+| `learning/` | Confidence propagation and updates (learning from use) | Built |
+| `working-memory/` | Activation tracking + consolidation back into the graph | Built |
+| `patterns/` | Preference / behavioural / temporal pattern detection & confirmation | Built |
+| `proactive/` | Gap/question detection, some contradiction detection, surprise, question resolution | Built |
+| `intelligence/` | Gap detector, temporal service, trend detection | Built |
+| `condensation/` | Merge duplicates, version compression, archival, summarisation | Built (`undoMerge` replay is status-only) |
+| `algorithms/` | Centrality, community detection, pathfinding, similarity | Built |
+| `resources/` | Token/metrics accounting, budgets | Built (budget **persistence** is in-process only) |
+| `degradation/` | Graceful degradation & auto-level selection under limits | Built |
+| `batch/` | Batch processing + scheduler | Built |
+| `providers/` | Pluggable LLM & embedding providers (Vercel AI SDK) | Built |
+| `config/` | `initConfig()` — models, keys, ontology, prompts | Built |
+
+<Aside type="caution" title="Known partials at v1.0.0">
+Beyond the Tier 2/3 discovery stubs: **budget persistence** is in-process only (not durably stored); **`undoMerge`** flips connection status but does not replay the merge; **cross-item batch entity dedup** runs within a single ingest, not across a batch. The **R1–R7** neuroscience refinements, true **standalone DB mode** (the engine still needs Prisma), the `contexts` parameter on ingest with Structure materialised-path propagation, and most advanced "Phase F" intelligence are **planned, not built**.
+</Aside>
+
+## Where to go next
+
+<CardGrid>
+  <Card title="Cog Ingest module" icon="puzzle">
+    The primary consumer — it vendors this engine and exposes admin-configurable ingest sources and pipelines. See [/modules/cog-ingest/](/modules/cog-ingest/).
+  </Card>
+  <Card title="Foundational principles" icon="star">
+    build-at-ingest-not-retrieval, never-decay, everything-is-a-node, apps-own-their-data, generic-not-app-specific, and `tenantId === userId` — the invariants every subsystem upholds.
+  </Card>
+</CardGrid>
