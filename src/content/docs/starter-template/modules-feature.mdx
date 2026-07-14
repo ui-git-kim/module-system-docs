@@ -34,7 +34,7 @@ export interface ModuleContract {
 }
 ```
 
-Lifecycle hooks (`onInstall`, `onUpdate`, `onActivate`, `onDeactivate`, `onUninstall`) execute in the **module CLI's Node process** inside the host app's working directory — never in the app server. Their contexts are generic over the definition type, so scaffold-extended definitions keep typed access to their own fields inside hooks. If you change the contract, **bump `MODULE_CONTRACT_VERSION`** and re-sync the module starter — the version-bump script reminds you when the file changed since the last release.
+Lifecycle hooks (`onInstall`, `onUpdate`, `onActivate`, `onDeactivate`, `onUninstall`) execute in the **module CLI's Node process** inside the host app's working directory — never in the app server. Their contexts are generic over the definition type, so scaffold-extended definitions keep typed access to their own fields inside hooks. If you change the contract, **bump `MODULE_CONTRACT_VERSION`** and re-sync the module starter — the version-bump script reminds you when the file changed since the last release. The contract also carries the shared **semver range** semantics (v1.1.0) and the **module-migration** table shape + filename parse/order (v1.2.0, see [Module migrations](#module-migrations-contract-v120)), so the CLI and the host never disagree about a range's meaning or a migration's identity.
 
 ## How the runtime learns about modules
 
@@ -63,15 +63,21 @@ Deployment-level state — like `AppSettings`, it carries **no `tenantId`**, is 
 The module CLI's `enable`/`disable` commands flip a flag in `.module-state.json` that the runtime cannot see — a "disabled" module's routes, navigation and registrations still execute today. Do not read `moduleRegistry.getAll()` as enablement; the `InstalledModule.enabled` column is where runtime enablement will live.
 </Aside>
 
+## Module migrations (contract v1.2.0)
+
+A module can ship ordered migration files (`src/templates/migrations/<version>__<slug>.{sql,ts}`); its CLI copies them into the host at `backend/prisma/module-migrations/<module-id>/` and — the module starter's job — **applies** the pending ones at `npx <module> update`, recording each in a runner-owned `_module_migrations` table. That table is deliberately **not** a Prisma model (it is runner plumbing, not app data; a model would cost the multi-site embedded-schema hand-sync — the same call made for the security `AuditLog` table), so both the runner and the host reach it through raw SQL.
+
+The **starter's** share is read-only. Contract v1.2.0 adds the shared surface both sides agree on — the table name/DDL/row shape (`MODULE_MIGRATIONS_TABLE`, `MODULE_MIGRATIONS_DDL`, `ModuleMigrationRecord`) and the `<version>__<slug>.{sql,ts}` filename parse + ordering (`parseMigrationFilename`, `compareMigrations`) — so the CLI's applied order and the host's displayed order can never drift. `getModuleMigrationStatuses()` diffs the on-disk files against the `_module_migrations` rows per registered module and reports applied/pending counts (never-throwing; disk-only when the table can't be read). The host **never applies** a migration — that stays a CLI operation.
+
 ## The admin Modules page
 
-`/admin/modules` (v1.50.0, `adminPagesRegistry` order 16, between Security and System) is a **read-only** window over all of the above: registered modules merged with the `InstalledModule` rows (flagging `missingSince` and recorded-but-not-registered states), dependency issues with their excusal flags, cycle paths, and the computed order. The backend surface is one admin-gated endpoint (`GET /api/v1/admin/modules/overview`) served by the side-effect-free `getModulesOverview()` — unlike the startup check it never logs or fires actions. Install, update, uninstall and enable stay CLI operations until the Admin Module Management trust boundary (executing module code from the UI) is decided — see the [roadmap](/starter-template/roadmap/).
+`/admin/modules` (v1.50.0, `adminPagesRegistry` order 16, between Security and System) is a **read-only** window over all of the above: registered modules merged with the `InstalledModule` rows (flagging `missingSince` and recorded-but-not-registered states), dependency issues with their excusal flags, cycle paths, the computed order, and — since v1.52.0 — a **Migrations** section showing each module's applied/pending counts with the pending filenames. The backend surface is one admin-gated endpoint (`GET /api/v1/admin/modules/overview`) served by the side-effect-free `getModulesOverview()` — unlike the startup check it never logs or fires actions. Install, update, uninstall and enable stay CLI operations until the Admin Module Management trust boundary (executing module code from the UI) is decided — see the [roadmap](/starter-template/roadmap/).
 
 ## What the foundation deliberately does not do (yet)
 
 - **Hard dependency enforcement and ordered install/boot** — ranges are checked and the topological order is computed (`moduleRegistry.computeModuleOrder()`), but mismatches and cycles only warn, and nothing consumes the order at runtime yet ([roadmap](/starter-template/roadmap/)).
 - **Module management from the UI** — the admin page is read-only; install/update/uninstall/enable from the browser means executing module code, and that trust boundary is deliberately undecided. Runtime enable/disable also needs a dynamic mount/unmount story (features are wired by static imports).
 - **Owning the CLI's state files** — `.module-state.json` / `.module-manifests.json` remain CLI bookkeeping; the runtime's record is the `InstalledModule` table.
-- **A per-module migration runner** — its own roadmap effort (`_module_migrations`, expand-and-contract).
+- **Applying module migrations** — the starter reads migration status (above); the **runner** that applies them lives in the module CLI (module starter), since migrations run at CLI time against `DIRECT_DATABASE_URL`, never at server boot.
 
 The feature's own security manifest declares only the four audit events above — it stores no per-account rows, so it needs no owned models, data categories or deletion handler.
