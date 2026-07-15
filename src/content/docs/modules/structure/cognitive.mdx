@@ -1,0 +1,276 @@
+---
+title: Cognitive Foundations
+description: Storage foundations for cognitive modules — opt-in pgvector embeddings and semantic search, connection provenance and promotion, and node-type proposals
+sidebar:
+  order: 6.5
+  label: "Cognitive Foundations"
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Structure v1.16.0 ships the **storage foundations for cognitive modules** (cog-ingest and the cognitive-db v2 engine). The division of responsibility is deliberate: **Structure owns storage and lifecycle** — the embedding column, vector search, connection provenance and pending state, node-type proposal rows — while **the engine owns generation and intelligence** — it produces the embeddings, discovers the connections, and proposes the types. Structure never calls an LLM or an embedder.
+
+Everything on this page is additive. Connection provenance, node-type proposals, and the `cognitiveIngest` feature flag are always present; embeddings are **opt-in at install**.
+
+<Aside type="note">
+No cognitive module is required. These foundations are inert until something drives them — pending connections and proposals only exist if a caller creates them, and the embeddings service is only generated when you opt in.
+</Aside>
+
+## Opt-in embeddings
+
+### Install prompts
+
+| Prompt | Type | Default | Notes |
+|--------|------|---------|-------|
+| `enableEmbeddings` | confirm | `false` | Requires a pgvector-capable Postgres (Neon ships it) |
+| `embeddingDimensions` | select: `1024`, `512`, `1536`, `3072` | `1024` | Asked only when embeddings are enabled; baked into the column type |
+
+### What gets added
+
+When embeddings are enabled, the install adds:
+
+- **Schema columns** on `structure_node`: `embedding vector(<dimensions>)`, `embeddingText` (the exact text that was embedded — kept for re-embed and staleness checks), and `embeddingModel` (`NULL` marks a node as *needs embedding*).
+- **Module migration** `1.16.0__cognitive-foundations.sql` — Structure's first module migration. Its statements are idempotent, exception-safe `DO` blocks that can never fail an install (privilege problems degrade to `NOTICE`s): `CREATE EXTENSION IF NOT EXISTS vector` (only when the extension is available), then a partial HNSW index `structure_nodes_embedding_hnsw_idx` (`vector_cosine_ops`, `WHERE embedding IS NOT NULL`).
+- **Install heal** in `onInstall`/`onUpdate` — the pgvector extension must exist *before* Prisma can apply the migration that adds the `vector` column, and a failed attempt leaves a P3009 migration lock. The heal runs the extension setup directly, resolves any failed migration, re-applies, and re-runs the index setup. Every step is idempotent.
+
+### The `structureEmbeddings` service
+
+The service is generated only on embeddings-enabled installs and registered in the `serviceRegistry` as **`structureEmbeddings`**. It is an **in-process API only — there are no HTTP routes** for embeddings or search. This is deliberate: frontends have no embedder, so every caller must supply vectors (the engine embeds text, Structure stores and searches).
+
+```typescript
+interface StructureEmbeddingsService {
+  /** Vector dimension of the embedding column (install-time constant) */
+  dimensions: number;
+
+  /** Idempotent extension/index provisioning (memoised; also runs lazily before writes and searches) */
+  ensureInfrastructure(): Promise<void>;
+
+  /** Store a node's embedding (the engine's write path) */
+  setNodeEmbedding(
+    nodeId: string,
+    userId: string,
+    embedding: number[],
+    embeddingText: string,
+    embeddingModel: string
+  ): Promise<void>;
+
+  /** Clear a node's embedding — flips it back into the needs-embedding set */
+  clearNodeEmbedding(nodeId: string, userId: string): Promise<void>;
+
+  /** Backfill query: active nodes not yet embedded, oldest first */
+  listNodesNeedingEmbedding(
+    userId: string,
+    options?: { nodeTypes?: string[]; limit?: number }
+  ): Promise<StructureNode[]>;
+
+  /** Semantic search by query vector (the caller embeds the query text) */
+  semanticSearchNodes(
+    userId: string,
+    queryEmbedding: number[],
+    options?: SemanticSearchOptions
+  ): Promise<SemanticSearchResult[]>;
+
+  /** Nodes similar to an existing node — the stored vector never leaves the database */
+  findSimilarNodes(
+    nodeId: string,
+    userId: string,
+    options?: FindSimilarOptions
+  ): Promise<SemanticSearchResult[]>;
+}
+
+interface SemanticSearchOptions {
+  topK?: number;        // default 20, max 200
+  minScore?: number;    // default 0.5; score = 1 - cosine distance
+  nodeTypes?: string[]; // filter by node type slugs
+  status?: string[];    // default ['active']
+}
+
+interface FindSimilarOptions extends SemanticSearchOptions {
+  excludeSelf?: boolean; // default true
+}
+
+interface SemanticSearchResult {
+  node: StructureNode; // the vector column is never returned
+  score: number;       // 1 - cosine distance (higher is better)
+  distance: number;    // raw cosine distance (lower is better)
+}
+```
+
+Method semantics:
+
+- **`setNodeEmbedding`** validates the vector dimension and that every value is finite, writes via a parameterised raw `UPDATE`, throws `NotFoundError` when the node doesn't exist, and fires `structure.node.embeddingUpdated`.
+- **`clearNodeEmbedding`** nulls all three columns and fires the same hook with `embeddingModel: null`.
+- **`listNodesNeedingEmbedding`** returns active nodes with `embeddingModel IS NULL`, oldest first (`limit` defaults to 100, max 500). When `nodeTypes` is omitted, it resolves the node types whose `features.cognitiveIngest.enabled` is `true` — see [features.cognitiveIngest](#featurescognitiveingest).
+- **`semanticSearchNodes`** requires `userId` scoping, uses the cosine operator (`<=>`), over-fetches 2× `topK` and tunes `hnsw.ef_search` per query (shared-table recall), then converts distance to score and applies `minScore`.
+- **`findSimilarNodes`** joins target against source inside the database, so the stored vector is never round-tripped. Throws `NotFoundError` if the node doesn't exist; returns `[]` if it has no embedding yet.
+
+### Discovery
+
+Callers should probe the capability rather than hard-import the service — the file only exists on embeddings-enabled installs:
+
+```typescript
+// Always available, even without embeddings
+const caps = await structureService.getCognitiveCapabilities();
+// → { embeddings: { enabled: boolean, dimensions: number | null } }
+
+// Type-safe access on embeddings-enabled installs
+import { serviceRegistry } from '../../config/service.registry.js';
+
+const embeddings = serviceRegistry.getOptional('structureEmbeddings');
+if (embeddings) {
+  const results = await embeddings.semanticSearchNodes(userId, queryVector, { topK: 10 });
+}
+```
+
+### Opting in later
+
+An install that answered *No* can opt in afterwards: set `enableEmbeddings: true` in `.module-state.json`, then run `npx structure update` (regenerates the schema and the embeddings-gated files; the runtime `ensureInfrastructure` pass creates the extension and index) — or `npx structure init --force` for the full heal.
+
+<Aside type="caution">
+**Dimensions are baked in.** `embeddingDimensions` is fixed at install into the column type and the service constant. Changing it later is a manual migration — alter the column type and re-embed every node. Pick the dimension your embedding model produces before enabling.
+</Aside>
+
+## Connection provenance & promotion
+
+### Origin
+
+`createConnection` accepts an options argument:
+
+```typescript
+await structureService.createConnection(userId, fromNodeId, toNodeId, connectionType, data, metadata, {
+  origin: 'discovered', // provenance tag, default 'explicit'
+  status: 'pending',    // 'active' (default) | 'pending'
+});
+```
+
+`origin` is an **open vocabulary** (lowercase kebab-case, max 50 chars) stamped into the connection's `data.origin`. Well-known values:
+
+| Origin | Meaning |
+|--------|---------|
+| `explicit` | User-created (the default) |
+| `discovered` | Engine-suggested |
+| `active` | Working-memory active set |
+
+Legacy rows without a stamp read back as `explicit`. Because the stamp lives in `data`, **`origin` is a reserved connection field id** — `createConnectionType` and `updateConnectionType` reject a custom field with id `origin` (the provenance stamp would clobber its value).
+
+### Pending lifecycle & promotion
+
+A connection created with `status: 'pending'` is **not live**: it fires `structure.connection.proposed` (not `created`), and counting constraints (`isUnique`, `maxConnections`) ignore it — they only ever look at active rows. All other creation-time validation still runs.
+
+`promoteConnection(id, userId)` takes a pending connection live. It first verifies **both endpoints are still active**, then **re-validates `isUnique` and `maxConnections` against the active set** — the world may have changed since the pending row was created. On success it fires `structure.connection.created` and `structure.connection.promoted`. On violation it throws `BadRequestError` with a machine-readable prefix; the row stays pending and no hook fires — the caller decides whether to `deleteConnection` it.
+
+| Error prefix | Meaning |
+|--------------|---------|
+| `endpoint-not-active:` | One or both connected nodes no longer exist |
+| `duplicate-active-connection:` | An active connection of this type already exists between these nodes (`isUnique`) |
+| `max-connections-reached:` | The from-node is at the type's `maxConnections` |
+
+### Cascade behaviour
+
+- **`deleteNode`** sweeps a node's connections including **pending** ones — a pending discovered connection cannot outlive its endpoints.
+- **`restoreNode`** restores the connections its own delete cascade soft-deleted, provided the other endpoint is live — a delete → restore round trip no longer silently hides connections.
+
+### Reading connections
+
+<Aside type="caution" title="Behaviour change in v1.16.0">
+`getNodeConnections` previously returned connections of **all** statuses (including archived). It now returns **active only by default** — pass `status: ['active', 'pending']` to include unpromoted connections. `getNodeContext` inherits the new default.
+</Aside>
+
+`listConnections(userId, { status?, origin?, connectionType?, page?, limit? })` lists connections account-wide and returns the same paginated envelope as `listNodes`: `{ connections, total, page, limit, totalPages }`.
+
+New and extended endpoints (internal API, session-authed, relative to `/api/v1/structure`):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/connections` | Now accepts `origin` and `status` in the body |
+| `GET` | `/connections?status=active,pending&origin=discovered&connectionType=&page=&limit=` | List connections with provenance filters (paginated) |
+| `POST` | `/connections/:id/promote` | Promote a pending connection to active |
+| `GET` | `/nodes/:id/connections?status=&origin=` | Node connections; `status` comma-separated, default `active` |
+
+## Node-type proposals
+
+A cognitive module that keeps meeting an entity with no matching node type can **propose** one instead of creating it. Proposing is deliberately **non-admin** (it's the low-privilege path); reviewing is admin-only.
+
+<Steps>
+
+1. **Propose.** The module calls `POST /types/proposals` (or `structureService.proposeNodeType`). The proposal is stored as a `structure_node_type` row with `proposalStatus: 'pending'` and `isEnabled: false`, owned by the user, with `moduleId` set to the proposer.
+
+2. **Review.** An admin lists pending proposals (`GET /types/proposals`) and approves or rejects each one.
+
+3. **Go live (or vanish).** Approval clears `proposalStatus` and enables the type — it is live immediately. Rejection **deletes the row**.
+
+</Steps>
+
+```typescript
+await structureService.proposeNodeType(userId, config, {
+  proposedBy: 'cog-ingest',                                   // module id, kebab-case (required)
+  reason: 'Recurring "court hearing" entities have no type',  // shown to the reviewing admin
+  sourceContext: { jobId },                                   // arbitrary provenance
+});
+```
+
+Semantics:
+
+- **Slug holding.** A pending proposal holds its slug — `proposeNodeType` raises distinct duplicate errors for a clash with a live type versus a pending proposal, and `createNodeType` cannot claim the slug either.
+- **Invariant: pending proposals are invisible everywhere else.** Every other node-type query filters `proposalStatus: null` — `listNodeTypes`, `getNodeType`, `updateNodeType`, `deleteNodeType`, JSON import (merge matching and replace-mode deletion both leave proposals alone), and the node create/update type lookups. A proposal cannot affect any behaviour until approved.
+- **`approveNodeTypeProposal(slug, userId, { scope? })`** — `scope: 'user'` (default) keeps the type owned by the proposing user; `scope: 'system'` promotes it to a shared system type (`userId: null`). Both scopes re-check the slug against **live** types first — one can appear between propose and approve (e.g. via JSON import). Fires `structure.nodeType.proposalApproved` **and** `structure.nodeType.created` — the type goes live now.
+- **`rejectNodeTypeProposal(slug, userId)`** — deletes the row, freeing the slug. The full proposed config rides on the `structure.nodeType.proposalRejected` hook, because "don't re-propose" memory belongs to the proposing module, not Structure.
+- **`listNodeTypeProposals(userId)`** — pending proposals, oldest first, as `NodeTypeProposal` (the config subset plus `proposalMeta`: `{ proposedBy, reason?, sourceContext?, proposedAt }`).
+
+Proposal endpoints (declared before `/types/:slug` so `proposals` is never matched as a slug):
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/types/proposals` | session | Propose a node type (body: node-type config + required `proposal.proposedBy`) |
+| `GET` | `/types/proposals` | admin | List pending proposals |
+| `POST` | `/types/proposals/:slug/approve` | admin | Approve; body `{ scope?: 'user' \| 'system' }` |
+| `POST` | `/types/proposals/:slug/reject` | admin | Reject (deletes the proposal); returns `204` |
+
+## features.cognitiveIngest
+
+`NodeTypeFeatures` gains `cognitiveIngest?: { enabled?: boolean }` (mirroring `publicApi`). It marks a node type as **participating in cognitive processing** — the flag that tells cognitive modules which types to embed and ingest against.
+
+```typescript
+features: {
+  cognitiveIngest: { enabled: true },
+}
+```
+
+Admins toggle it per type as **Cognitive Processing** on the node-type *Properties* tab. Inside Structure it drives one thing today: `listNodesNeedingEmbedding` resolves its default `nodeTypes` from types with the flag enabled. Cognitive modules read it for their own type selection.
+
+## New action hooks
+
+Six hooks join the [Structure action hooks](/modules/structure/integration/#reacting-to-structure-events-action-hooks):
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.connection.proposed` | `{ userId, connection }` | A connection is created with status `pending` |
+| `structure.connection.promoted` | `{ userId, connection }` | A pending connection is promoted to active |
+| `structure.node.embeddingUpdated` | `{ userId, nodeId, embeddingModel }` | An embedding is set — or cleared (`embeddingModel: null`) |
+| `structure.nodeType.proposed` | `{ userId, proposal }` | A node type is proposed |
+| `structure.nodeType.proposalApproved` | `{ userId, nodeType, scope }` | A proposal is approved (the type is live) |
+| `structure.nodeType.proposalRejected` | `{ userId, slug, config, meta }` | A proposal is rejected — carries the full proposed config |
+
+<Aside type="note" title="Amended semantics: created means went live">
+`structure.connection.created` and `structure.nodeType.created` now mean **"went live"** — they fire when something is created directly as active, *or* at promotion/approval. Listeners never hear `created` for a pending row, so existing listeners keep working unchanged.
+</Aside>
+
+## Notes & troubleshooting
+
+- **Init/update now needs a reachable database.** v1.16.0 ships Structure's first module migration, so `npx structure init` and `npx structure update` must be able to connect via `backend/.env` (`DIRECT_DATABASE_URL` or `DATABASE_URL`). Previously the schema step was file-only.
+- **Declare pgvector in the datasource** (recommended once embeddings are enabled) so future `prisma migrate dev` shadow databases include the extension — otherwise `migrate dev` fails with **P3006** after the vector migration exists:
+
+  ```prisma
+  generator client {
+    // ...existing config
+    previewFeatures = ["postgresqlExtensions"]
+  }
+
+  datasource db {
+    // ...existing config
+    extensions = [pgvector(map: "vector")]
+  }
+  ```
+
+- **Windows line endings.** Module migration files are checksummed byte-exact. Keep `backend/prisma/module-migrations/**` as LF — add `backend/prisma/module-migrations/** text eol=lf` to `.gitattributes` — or updates fail with a "history diverged" error after Git normalises them to CRLF.
+- **Runtime self-repair.** `ensureInfrastructure()` runs lazily (memoised) before every embedding write and search, re-creating the extension and indexes if missing. It repairs states the install ordering can't reach — such as flipping `enableEmbeddings` on without a version change — and each statement is individually guarded, so a permissions problem logs a warning instead of crashing the request.

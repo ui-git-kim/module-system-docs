@@ -6,8 +6,8 @@ sidebar:
   label: "v2 RFC (Structure-native)"
 ---
 
-> **Status:** Draft / Proposed · **Date:** 2026-07-15 · **Supersedes:** the v1 "engine owns `cog_node`" model
-> This is a design map to redline, not an implementation. Nothing here is built yet.
+> **Status:** Accepted — Phase 1 shipped (Structure v1.16.0, 2026-07-15) · **Date:** 2026-07-15 · **Supersedes:** the v1 "engine owns `cog_node`" model
+> This is a design map to redline, not an implementation. Phases 2–5 are not yet built.
 
 ## 1. Motivation
 
@@ -124,7 +124,7 @@ Working memory is user-facing (Structure holds it) but *composed* by many source
 
 ## 9. Phased migration
 
-1. **Foundations** — Structure: `cognitiveIngest` flag, opt-in embedding column + index, connection `origin`/`status`, node-type proposal/approval API, semantic-search entrypoint. (Additive, ships first, harmless when unused.)
+1. **Foundations** — Structure: `cognitiveIngest` flag, opt-in embedding column + index, connection `origin`/`status`, node-type proposal/approval API, semantic-search entrypoint. (Additive, ships first, harmless when unused.) ✅ **Shipped in [Structure v1.16.0](/modules/structure/cognitive/).**
 2. **Engine core** — retarget storage: records + ontology reads + embeddings + dedup against Structure; stand up `cog_intelligence_*`. Behind a flag alongside v1 if practical.
 3. **cog-ingest rewire** — pipeline writes Structure nodes; make the mapping real; slim `cog_ingest_job`; content-as-field.
 4. **Intelligence** — patterns/questions/insights as nodes; discovered-connection promotion; provenance/working-memory.
@@ -168,10 +168,12 @@ The design is settled enough to start; this section orients a fresh session.
 **Read first:** §4 (the six settled decisions) and §5 (the concern-by-concern migration) — those are the contract. `tenantId === userId` throughout (no multi-tenant).
 
 **Order of work (additive-first, so v1 keeps running):**
-1. **Phase 1 — Structure foundations** (§9.1, all additive): `features.cognitiveIngest` flag; opt-in embedding column + HNSW index; connection `origin`/`status`; node-type proposal/approval API; a semantic-search entrypoint.
+1. **Phase 1 — Structure foundations** (§9.1, all additive): `features.cognitiveIngest` flag; opt-in embedding column + HNSW index; connection `origin`/`status`; node-type proposal/approval API; a semantic-search entrypoint. ✅ **Shipped in [Structure v1.16.0](/modules/structure/cognitive/).**
 2. **Working-memory node type + hook surface** (§7) — also additive; cog-ingest registers the `working-memory` type and the `cog-ingest.working-memory.*` hooks.
 3. **Engine core retarget** (§6 + §9.2) — the large, breaking v2 work (records/ontology/embeddings/dedup → Structure; stand up `cog_intelligence_*`). Flag-guard alongside v1.
 4. **cog-ingest rewire** (§9.3) — pipeline writes Structure nodes; make `cog_ingest_mapping` real; slim `cog_ingest_job`; content-as-field.
 5. **Intelligence + retire v1** (§9.4–9.5) — patterns/questions as nodes; discovered-connection promotion; delete `cog_node`; cut **v2.0.0**.
 
 **Also true:** cognitive-db is currently **v1.0.0** (audited, all 84 findings fixed) and vendored into cog-ingest **v1.11.10**. Nothing here is in production, so breaking changes are fine.
+
+**Phase 1 outcome:** everything landed as specified (the §4 decisions are intact), with two deviations from the original sketch. The `data->>'origin'` expression index was dropped — Prisma's JSON path filter emits a different expression, so the index could never be used; revisit when the review UI's query shape settles. And the embeddings code ships as a separate when-gated service file registered as `structureEmbeddings` (not inline flags in existing files), so flipping the opt-in later regenerates cleanly. See [Cognitive foundations](/modules/structure/cognitive/) for the shipped surface.

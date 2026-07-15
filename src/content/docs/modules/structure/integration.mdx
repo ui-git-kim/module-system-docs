@@ -27,7 +27,7 @@ Structure exposes **10 module-specific registries**. 8 are content registries (`
 
 ### 2. React to Node Events (Backend Action Hooks)
 
-When nodes are created, updated, deleted, moved, archived, published, duplicated, or when workflow states change, Structure fires **27 action hooks**. Your module listens to these events and reacts: clean up tasks when a project is deleted, generate an invoice when a client is archived, send a notification when a node is moved. This is the primary mechanism for **cross-module coordination**.
+When nodes are created, updated, deleted, moved, archived, published, duplicated, or when workflow states change, Structure fires **33 action hooks**. Your module listens to these events and reacts: clean up tasks when a project is deleted, generate an invoice when a client is archived, send a notification when a node is moved. This is the primary mechanism for **cross-module coordination**.
 
 ### 3. Transform Node Data (Backend Filter Hooks)
 
@@ -43,7 +43,7 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 
 <CardGrid>
   <Card title="React to Events" icon="rocket">
-    Hook into 27 lifecycle events — run logic when nodes are created, updated, deleted, moved, archived, published, duplicated, or connected.
+    Hook into 33 lifecycle events — run logic when nodes are created, updated, deleted, moved, archived, published, duplicated, or connected.
   </Card>
   <Card title="Add Tabs & Widgets" icon="list-format">
     Add tabs to node detail pages, widgets to the Overview tab, and sections to the sidebar.
@@ -73,6 +73,7 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 | Reference nodes (NodeSelector) | ✅ | — | Component import |
 | Customise UI labels per type | ✅ | — | `getLabel()` utility |
 | Access Structure data at runtime | — | ✅ | `serviceRegistry.get('structure')` |
+| Semantic search / embeddings (opt-in) | — | ✅ | `serviceRegistry.get('structureEmbeddings')` |
 | Transform Structure data (filters) | — | ✅ | `filterRegistry` |
 | React to Structure events (actions) | — | ✅ | `actionRegistry` |
 
@@ -712,7 +713,7 @@ actionRegistry.addActionAsync(
 );
 ```
 
-**Available Structure action hooks (27 total):**
+**Available Structure action hooks (33 total):**
 
 | Hook | Context | Fires when |
 |------|---------|------------|
@@ -729,10 +730,16 @@ actionRegistry.addActionAsync(
 | `structure.node.duplicated` | `{ userId, sourceNodeId, newNode, includeChildren }` | A node is duplicated |
 | `structure.node.reordered` | `{ userId, parentId, nodeIds }` | Nodes are reordered within a parent |
 | `structure.node.metadataUpdated` | `{ userId, nodeId, moduleId }` | Namespaced metadata is written |
+| `structure.node.embeddingUpdated` | `{ userId, nodeId, embeddingModel }` | A node's embedding is stored or cleared (`embeddingModel` is `null` on clear) |
 | `structure.nodes.bulkCreated` | `{ userId, count, nodeTypes, nodeIds }` | Multiple nodes are created in one bulk operation |
-| `structure.connection.created` | `{ userId, connection }` | A connection is created |
+| `structure.connection.created` | `{ userId, connection }` | A connection goes live — created with status `active`, or promoted from pending |
+| `structure.connection.proposed` | `{ userId, connection }` | A connection is created with status `pending` (awaiting promotion) |
+| `structure.connection.promoted` | `{ userId, connection }` | A pending connection is promoted to active (fires after `created`) |
 | `structure.connection.deleted` | `{ userId, connectionId }` | A connection is deleted |
-| `structure.nodeType.created` | `{ userId, nodeType }` | A node type is created |
+| `structure.nodeType.created` | `{ userId, nodeType }` | A node type goes live — created directly, or a proposal is approved |
+| `structure.nodeType.proposed` | `{ userId, proposal }` | A node type proposal is created (awaiting admin approval) |
+| `structure.nodeType.proposalApproved` | `{ userId, nodeType, scope }` | A proposal is approved (fires alongside `structure.nodeType.created`) |
+| `structure.nodeType.proposalRejected` | `{ userId, slug, config, meta }` | A proposal is rejected — the row is deleted; the full proposed config rides on the payload |
 | `structure.nodeType.updated` | `{ userId, slug, changes }` | A node type is updated |
 | `structure.nodeType.deleted` | `{ userId, slug }` | A node type is deleted |
 | `structure.nodeType.imported` | `{ userId, stats, mode }` | Node types are imported (merge or replace) |
@@ -818,6 +825,47 @@ export const tasksService = {
 <Aside type="caution" title="Never import across module boundaries">
 Do NOT import directly from `../../features/structure/structure.service.js`. Always use `serviceRegistry.get('structure')` to access other modules' services. This maintains module isolation and allows the system to detect missing dependencies.
 </Aside>
+
+### Connection Lifecycle Methods (v1.16.0+)
+
+Connections carry provenance (`origin`) and lifecycle (`status`). Your module can create a connection as a `pending` proposal — it stays invisible to normal queries until it's promoted to active. All methods are available via `serviceRegistry.get('structure')`:
+
+| Method | Description |
+|--------|-------------|
+| `createConnection(userId, fromNodeId, toNodeId, connectionType, data?, metadata?, options?)` | `options` is `{ origin?, status? }`. `origin` is a lowercase-kebab provenance tag stamped into `data.origin` (default `'explicit'`; other well-known values: `'discovered'`, `'active'`). `status` is `'active'` (default, goes live immediately) or `'pending'` (fires `structure.connection.proposed` instead of `created`) |
+| `promoteConnection(id, userId)` | Promotes a pending connection to active. Re-validates that both endpoints are still active and re-checks the connection type's `isUnique`/`maxConnections` rules against the active set (`BadRequest` with machine-readable prefixes `duplicate-active-connection:`, `max-connections-reached:`, `endpoint-not-active:`). Fires `structure.connection.created` then `structure.connection.promoted` |
+| `getNodeConnections(nodeId, userId, options?)` | `options` is `{ status?: string[], origin?: string }`. Returns **active connections only by default** (previously all statuses) — pass `status: ['active', 'pending']` to include proposals |
+| `listConnections(userId, query?)` | Paginated listing across all nodes: `{ status?, origin?, connectionType?, page?, limit? }` → `{ connections, total, page, limit, totalPages }` |
+
+The `NodeConnection` wire type now includes `status` and `origin` (legacy rows report `origin: 'explicit'`). Note that `origin` is a reserved connection field id — connection types can't define a custom field with that id.
+
+### Node Type Proposals (v1.16.0+)
+
+Instead of creating node types directly, your module can propose them for admin approval. A pending proposal reserves its slug but stays disabled and invisible to every other node-type query until approved:
+
+| Method | Description |
+|--------|-------------|
+| `proposeNodeType(userId, config, { proposedBy, reason?, sourceContext? })` | Creates a pending, disabled node type from a standard `NodeTypeConfig`; `proposedBy` (your module id) becomes the `moduleId` fallback. Fires `structure.nodeType.proposed` |
+| `listNodeTypeProposals(userId)` | Returns pending proposals, oldest first |
+| `approveNodeTypeProposal(slug, userId, { scope? })` | Makes the proposal a live, enabled type. `scope: 'user'` (default) keeps it owned by the user; `'system'` promotes it to a shared system type. Fires `structure.nodeType.proposalApproved` and `structure.nodeType.created` — the type goes live at approval |
+| `rejectNodeTypeProposal(slug, userId)` | Deletes the proposal row (freeing the slug). Fires `structure.nodeType.proposalRejected` with the full proposed config — listen for it if your module should remember not to re-propose |
+
+### Cognitive Integration (v1.16.0+)
+
+Structure ships opt-in cognitive foundations: pgvector node embeddings with a semantic search service, and a `features.cognitiveIngest` flag on node types. Because embeddings are an install-time opt-in, probe availability with `structureService.getCognitiveCapabilities()` — it returns `{ embeddings: { enabled, dimensions } }` without hard imports:
+
+```typescript
+const structureService = serviceRegistry.get('structure');
+const caps = await structureService.getCognitiveCapabilities();
+
+if (caps.embeddings.enabled) {
+  // Generated only on embeddings-enabled installs — a separate service
+  const embeddings = serviceRegistry.get('structureEmbeddings');
+  const results = await embeddings.semanticSearchNodes(userId, queryEmbedding, { topK: 20 });
+}
+```
+
+The `structureEmbeddings` service (registered only when the app opted into embeddings) provides `setNodeEmbedding`, `clearNodeEmbedding`, `listNodesNeedingEmbedding`, `semanticSearchNodes`, and `findSimilarNodes`. It is an in-process API only — there are no HTTP routes for embeddings or search. See the [Cognitive guide](/modules/structure/cognitive/) for full signatures, the `features.cognitiveIngest` flag, and install/opt-in details.
 
 ### Registering Node Types from Your Module
 
@@ -1050,6 +1098,7 @@ Use this checklist when building a module that integrates with Structure:
 ## Next Steps
 
 - [Registries Guide](/modules/structure/registries-guide/) — Comprehensive reference for all 10 registries, module fields, and hooks
+- [Cognitive](/modules/structure/cognitive/) — Embeddings, semantic search, connection promotion, and node type proposals
 - [JSON Import & Export](/modules/structure/json-reference/) — Import and export Structure configurations
 - [Usage](/modules/structure/usage/) — Admin page, components, and hooks reference
 - [Configuration](/modules/structure/configuration/) — Database schema and API endpoints

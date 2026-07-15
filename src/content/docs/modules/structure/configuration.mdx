@@ -55,6 +55,17 @@ The main entity your users work with.
 | `enableFolders` | Yes | Allow folders within nodes for organisation |
 | `enableTags` | Yes | Allow tags for categorisation |
 
+### Cognitive Foundations (Optional)
+
+Opt-in vector embedding support for semantic search. Requires a Postgres database with the pgvector extension available (Neon ships it). See [Cognitive Foundations](/modules/structure/cognitive/) for the full feature.
+
+| Prompt | Default | Condition | Description |
+|--------|---------|-----------|-------------|
+| `enableEmbeddings` | No | — | Add embedding columns to `structure_node` and generate the semantic search service |
+| `embeddingDimensions` | 1024 | enableEmbeddings=true | Embedding vector dimensions — 1024, 512, 1536, or 3072 |
+
+To opt in later, set `enableEmbeddings: true` in `.module-state.json` and run `npx structure update` (or `npx structure init --force` for a full heal). Changing dimensions after installation requires a manual migration.
+
 ---
 
 ## Post-Installation
@@ -160,6 +171,9 @@ The universal entity table — every node is stored here.
 | `publishedSlug` | String? | Public URL slug |
 | `settings` | JSON | Node-specific settings |
 | `metadata` | JSON | Module extensibility data |
+| `embedding` | vector? | Embedding vector (opt-in — only when embeddings enabled) |
+| `embeddingText` | String? | Exact text that was embedded, used for staleness checks (opt-in — only when embeddings enabled) |
+| `embeddingModel` | String? | Model that produced the embedding; `null` means the node needs embedding (opt-in — only when embeddings enabled) |
 | `createdAt` | DateTime | Creation timestamp |
 | `updatedAt` | DateTime | Last update timestamp |
 
@@ -200,6 +214,10 @@ Configuration for each node type.
 | `isSystem` | Boolean | Protected from user editing |
 | `isEnabled` | Boolean | Whether the type is active |
 | `sortOrder` | Int | Display order |
+| `proposalStatus` | String? | `null` = live type; `pending` = awaiting admin approval |
+| `proposalMeta` | JSON | Proposal metadata (proposing module, reason, source context) |
+
+An `@@index([proposalStatus])` supports the admin proposal queue. See [Cognitive Foundations](/modules/structure/cognitive/) for the proposal workflow.
 
 ### structure_template
 
@@ -373,8 +391,14 @@ interface NodeTypeFeatures {
   publishing?: boolean;      // Enable draft/published workflow
   manualSort?: boolean;      // Allow drag-and-drop reordering
   workflowStates?: boolean;  // Enable workflow state machine (populate workflowConfig)
+  // Expose entries of this type via the public REST API
+  publicApi?: { enabled?: boolean };
+  // Opt entries of this type into cognitive processing (embeddings, ingest)
+  cognitiveIngest?: { enabled?: boolean };
 }
 ```
+
+`cognitiveIngest` appears as the "Cognitive Processing" toggle on the node type Properties tab and controls which types the embeddings service targets by default — see [Cognitive Foundations](/modules/structure/cognitive/).
 
 ### Navigation
 
@@ -585,9 +609,13 @@ All endpoints are prefixed with `/api/v1/structure`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/nodes/:id/connections` | Get connections for a node |
-| POST | `/connections` | Create a connection |
+| GET | `/nodes/:id/connections` | Get connections for a node (`?status=`, `?origin=` filters; active-only by default) |
+| GET | `/connections` | List connections with pagination (`?status=`, `?origin=`, `?connectionType=`, `?page=`, `?limit=`) |
+| POST | `/connections` | Create a connection (optional `origin` and `status` body fields) |
+| POST | `/connections/:id/promote` | Promote a pending connection to active |
 | DELETE | `/connections/:id` | Remove a connection |
+
+Connection `origin`/`status` semantics, pending connections, and promotion are covered in [Cognitive Foundations](/modules/structure/cognitive/).
 
 ### Tree
 
@@ -607,6 +635,17 @@ All endpoints are prefixed with `/api/v1/structure`.
 | DELETE | `/types/:slug` | Delete type (admin only, fails if nodes exist) |
 | GET | `/types/export` | Export all types + connection types as JSON (admin only) |
 | POST | `/types/import` | Import types from JSON — `merge` or `replace` mode (admin only) |
+
+### Node Type Proposals
+
+Modules can propose new node types for admin approval — see [Cognitive Foundations](/modules/structure/cognitive/) for the workflow.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/types/proposals` | Propose a node type (any authenticated user) |
+| GET | `/types/proposals` | List pending proposals (admin only) |
+| POST | `/types/proposals/:slug/approve` | Approve a proposal — body `scope` of `user` (default) or `system` (admin only) |
+| POST | `/types/proposals/:slug/reject` | Reject and delete a proposal, freeing the slug (admin only, returns 204) |
 
 ### Connection Types
 
@@ -713,9 +752,11 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 | `updateNodeSchema` | PATCH `/nodes/:id` | All fields optional, max lengths |
 | `moveNodeSchema` | POST `/nodes/:id/move` | `newParentId` required (nullable) |
 | `reorderNodesSchema` | POST `/reorder` | `nodeIds` array required (min 1) |
-| `createConnectionSchema` | POST `/connections` | `fromNodeId`, `toNodeId`, `connectionType` required |
+| `createConnectionSchema` | POST `/connections` | `fromNodeId`, `toNodeId`, `connectionType` required; optional `origin` (lowercase-kebab) and `status` (`active` or `pending`) |
 | `createNodeTypeSchema` | POST `/types` | `slug` regex validated, `name`/`namePlural` required |
 | `updateNodeTypeSchema` | PATCH `/types/:slug` | All fields optional |
+| `proposeNodeTypeSchema` | POST `/types/proposals` | Everything in `createNodeTypeSchema`, plus required `proposal.proposedBy` (kebab-case) |
+| `approveNodeTypeProposalSchema` | POST `/types/proposals/:slug/approve` | Optional `scope` — `user` (default) or `system` |
 | `createTemplateSchema` | POST `/templates` | `name`, `type` required, `slug` regex validated |
 | `updateTemplateSchema` | PATCH `/templates/:id` | All fields optional |
 
@@ -734,6 +775,10 @@ Complete list of subcommands exposed by `npx structure <command>`.
 | `disable` | `--force` | Temporarily disable without removing files |
 | `enable` | `--force` | Re-enable a disabled module |
 | `info` | — | Print module name, version, features, and available commands |
+
+<Aside type="caution" title="Module migrations need a reachable database">
+Structure ships module SQL migrations (the first is `1.16.0__cognitive-foundations.sql`). Both `init` and `update` apply them, so they need a reachable database — set `DIRECT_DATABASE_URL` (or `DATABASE_URL`) in `backend/.env` before running either command.
+</Aside>
 
 ### Updating
 
@@ -761,6 +806,7 @@ This removes generated files and the schema block. You will need to manually cle
 ## Next Steps
 
 - [Usage](/modules/structure/usage/) — Admin page, pages, components, and hooks
+- [Cognitive Foundations](/modules/structure/cognitive/) — Embeddings, semantic search, connection provenance, and node type proposals
 - [Field Types Reference](/modules/structure/fields/) — All 22 built-in field types with configuration and examples
 - [Merge Fields & Conditional Logic](/modules/structure/merge-fields/) — Auto-compute field values and control visibility
 - [Integration](/modules/structure/integration/) — How other modules extend Structure
