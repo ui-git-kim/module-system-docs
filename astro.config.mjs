@@ -300,10 +300,7 @@ export default defineConfig({
             {
               label: "Billing",
               collapsed: true,
-              items: [
-                { label: "Overview", slug: "modules/billing" },
-                { label: "Roadmap", slug: "modules/billing/roadmap" },
-              ],
+              autogenerate: { directory: "modules/billing" },
             },
             {
               label: "Cog Ingest",

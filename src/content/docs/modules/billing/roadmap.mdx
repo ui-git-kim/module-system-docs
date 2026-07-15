@@ -1,77 +1,130 @@
 ---
 title: Roadmap
-description: Planned features, improvements, and known issues for the Billing module
-lastUpdated: 2026-07-14
+description: Known issues, planned improvements, and completed work for the Billing module
+lastUpdated: 2026-07-15
+sidebar:
+  order: 6
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-This page tracks planned work, known issues, and completed milestones for the Billing module.
+This page tracks known issues, planned work, and completed milestones for the Billing module. Each item carries enough context to be picked up as a standalone work item.
 
-<Aside type="note">
-This roadmap reflects current plans and may change based on feedback and requirements from other modules.
-</Aside>
-
----
-
-## Standards alignment audit — 2026-07-14
-
-A full standards audit of the generated templates was run against module-starter scaffold **v1.18.0** (contract v1.2.0) and host starter **v1.52.1**. The module is already modern in its infrastructure: it ships the runtime module registration (`module.registration.ts`, starter v1.48+) correctly, the scaffold updater and `docs/` submodule are in place, `shadcnComponents` is complete, all templates carry the `FILE`/`PURPOSE` banner, backend imports use `.js` extensions, the schema is self-contained (`userId String`, no `@relation`), and the frontend uses the shared `@/lib/api` client. The gaps below were found during that audit.
-
-<Aside type="caution">
-The `module.registration.ts` runtime registration was verified byte-for-byte against the canonical scaffold template and is **correct** — no action needed there.
+<Aside type="note" title="Where the 2026-07-14 audit went">
+A full standards audit ran on 2026-07-14 against scaffold v1.18.0/v1.18.1 and host v1.52.1. Nearly all of its findings were resolved the same day by the v1.3.0 tenant-keyed redesign and the v1.4.x releases — those items now live under [Completed](#completed). Only the still-open remainder is listed under Known Issues.
 </Aside>
 
 ---
 
 ## Known Issues
 
-Issues discovered but not yet resolved.
+### Webhook signature verification depends on host raw-body support
 
-| Issue | Severity | Where | Notes |
-|-------|----------|-------|-------|
-| No `security.registration.ts` / deletion handler | High | The module stores per-user financial data (`Subscription` keyed by `userId`, plus Stripe customer/subscription ids) but registers no security manifest or account-deletion handler | On host account deletion / GDPR erasure the `Subscription` row (userId → Stripe customer mapping) is orphaned. Needs a `SECURITY_REGISTRATION` template deleting `Subscription` rows by `userId`, wired into `module.ts` + the backend `INDEX_TEMPLATE` |
-| Frontend uses manual `useState`/`useEffect` fetching, not TanStack Query | High | `useSubscription`, `useEntitlements`, `SeatManagement`, `UsageDisplay`, `BillingSettingsPage` all fetch into component-local state | Current rule mandates TanStack Query with namespaced keys (`['billing', …]`). No request de-dup, shared cache, or invalidation today; multiple consumers fire duplicate requests |
-| `console.*` used in backend templates | Medium | 11 `console.log`/`error`/`warn` calls in `src/templates/backend/index.ts`; zero `createModuleLogger` | Rule: no `console.*` in backend — use `createModuleLogger('billing')` from `../../lib/logger.js`, log-object-first, `audit: true` on security ops |
-| Forbidden Tailwind utilities in generated components | Medium | ~13 clusters across `SubscriptionStatus`, `TrialCountdown`, `DunningBanner`, `TrialExpiringAlert`, `UsageDisplay`, `PromoCodeInput`, `SeatManagement`, `BillingSettingsPage` | Colour literals (`text-green-600`, `bg-red-50`, amber/blue) break theming; typography scale (`text-sm`) and `font-*` weights are design-system decisions. Migrate to semantic tokens (`text-muted-foreground`, `text-destructive`, `bg-muted`) and drop typography/weight classes |
-| Stripe webhook returns HTTP 200 on internal processing failure | Medium | `stripeWebhookHandler` catch block returns `{ received: true }` with 200 even when a DB write threw | Stripe treats any 2xx as acknowledged, so transient failures (DB down, timeout) are never retried → subscription-state drift. Return 5xx for transient/processing errors |
-| `status as any` casts in the webhook upsert | Medium | `syncSubscriptionFromWebhook` casts the mapped status `as any` in both create and update branches | A wrong status string compiles silently against the Prisma enum. Type `statusMap` to the generated `SubscriptionStatus` enum (from `@prisma/client`) instead of `as any` |
-| Model/enum use generic PascalCase names | Medium | `model Subscription` / `enum SubscriptionStatus` have no module prefix; convention is snake_case, module-prefixed (`billing_subscription`) | Merged into the host's shared `schema.prisma`, an unprefixed `Subscription` risks collision. Rename to `billing_subscription` with `@@map("Subscription")` to preserve existing data + update `modelNames`. Breaking migration — weigh against installed apps |
-| `SeatManagement` conflicts with the product vision | Medium | Module ships seat-based billing UI + detection, but the [Module Roadmap](/modules/roadmap/) states the system is single-tenant with **no per-seat billing** ("permanently out of scope") | Design-alignment question: keep seat support as an opt-in for non-standard hosts, or retire it. Needs a product decision before further seat work |
-| `navigation.registration.ts` is an orphan placeholder | Low | Generated from `NAVIGATION_REGISTRATION` (comment-only, no registration call) and never imported by the frontend `INDEX_TEMPLATE` | Billing is surfaced via the settings-page replacement; delete the entry + export |
-| 13 unused "placeholder" template exports | Low | `PLACEHOLDER EXPORTS` block in `frontend/index.ts` — none referenced by `module.ts` | Dead code; several would emit banner-less files if ever wired. Delete the block |
-| `serviceRegistry` version hardcoded to `'1.0.0'` | Low | `SERVICE_REGISTRATION` passes a static version while the module is at 1.2.1 | Use `version: '{{moduleVersion}}'` (the pattern `MODULE_REGISTRATION` already uses) so it stays in sync |
-| Redundant `@@index` on unique columns | Low | `@@index([userId])` / `@@index([stripeCustomerId])` duplicate the single-column `@unique` backing indexes | Remove both; `@unique` already indexes them |
-| American spelling in user-facing text | Low | A few strings/comments in `frontend/index.ts` + one backend comment | Australian spelling required in prose/user-facing text |
-| Stale version + install docs | Low | `CLAUDE.md` Module Overview says v1.2.0 (actual 1.2.1); this docs page's Overview describes a manual `cp -r` install rather than the CLI `npx billing init` flow | Refresh both |
+- **Description:** Stripe signature verification needs the raw request body. The handler reads `req.rawBody`, which the host must populate via an `express.json({ verify })` callback; the fallback to `req.body` fails verification safely (rejects) rather than accepting unsigned payloads. On a host without the verify callback, **all webhook deliveries fail signature verification** and subscription state never syncs.
+- **Where:** `backend/src/features/billing/webhooks/stripe.webhook.ts` (reads `rawBody`), `webhook.registration.ts` (documents the requirement); the fix belongs in the host's `app.ts` body-parser setup.
+- **Severity:** High — **current starter versions do not provide the verify callback** (the upstream issue is still open, confirmed against host v1.52.1/v1.53.0 during the v1.4.0 end-to-end test), so webhook sync fails on an unmodified host until the workaround is applied or the starter fix ships.
+- **Workaround:** In the host: `express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } })`. Logged as an open upstream starter issue — "No way to verify inbound third-party webhook signatures (e.g. Stripe HMAC-SHA256)" on the [Starter Template → Upstream Issues](/starter-template/upstream-issues/) page. Billing is forward-compatible: either proposed host fix enables verification with no module change.
+
+### Webhook-sync end-to-end verification blocked; v1.4.1/v1.4.2 not re-run
+
+- **Description:** A v1.4.0 end-to-end test **was** run on the `veradai` app (host v1.52.1 → v1.53.0) — it surfaced the two upstream starter issues logged on 2026-07-14 (raw-body/webhook verification, and `template:update` not propagating sub-package `type-check` scripts). What remains: the **webhook sync leg cannot pass end-to-end** until the host raw-body issue above is fixed (the handler rejects unverifiable deliveries by design), and the v1.4.1/v1.4.2 type-cleanliness fixes landed after that run and haven't been re-verified in the host.
+- **Where:** The whole generated output; re-run in a current starter app once the raw-body fix ships (or with the manual `verify` callback applied).
+- **Severity:** Medium
+- **Workaround:** Apply the raw-body workaround from the issue above to test webhook sync locally; the rest of the module (checkout, portal, entitlements, admin page) is verifiable today.
+
+### Module repo `CLAUDE.md` is stale
+
+- **Description:** The module's own `CLAUDE.md` still describes v1.2.0: seat-based/metered billing endpoints (`/seats`, `/usage`), billing-model detection, `VITE_STRIPE_*` env vars, and the removed `@/features/user/components/settings/SettingsComponents` import path. Anyone (or any agent) reading it gets pre-redesign facts.
+- **Where:** `CLAUDE.md` (module repo root, Module Overview section).
+- **Severity:** Medium (misleads future development sessions; generated code is unaffected)
+- **Workaround:** Treat `src/module.ts` and `src/templates/**` as the source of truth; this docs site is current.
+
+### Prisma models use generic PascalCase names
+
+- **Description:** `model Subscription` / `model BillingSettings` / `enum SubscriptionStatus` carry no module prefix. Convention for module schemas is snake_case, module-prefixed (`billing_subscription`) to avoid collisions in the host's shared `schema.prisma`. Renaming is a breaking migration for installed apps — it should ride the scaffold's `migrations` array (expand → backfill → contract) with `@@map` to preserve data.
+- **Where:** `src/templates/schema.ts`; `schema.modelNames` in `src/module.ts`; every `prisma.subscription.*` / `prisma.billingSettings.*` call in the backend templates.
+- **Severity:** Low (advisory — no collision reported; cost of fixing is high)
+- **Workaround:** None required; avoid installing another module that defines a `Subscription` model.
+
+### Webhook event dedupe is per-process
+
+- **Description:** Duplicate Stripe deliveries are deduplicated via an in-memory set of the last 1,000 event IDs. Multiple backend instances (or a restart mid-delivery) can process the same event twice. The sync operations are upserts and status transitions, so double-processing is mostly harmless, but it is not guaranteed side-effect-free forever.
+- **Where:** `backend/src/features/billing/webhooks/stripe.webhook.ts` (`processedEvents`).
+- **Severity:** Low (single-instance deployments are the norm for this product)
+- **Workaround:** Run a single backend instance, or back the dedupe with a durable store (see Planned).
 
 ---
 
 ## Planned Improvements
 
-### Short-term (Next Version)
+### Short-term (next version)
 
-**Scaffold currency — v1.17.0 → v1.18.0**
-- Merge the scaffold update (clean merge; shared history) to pick up contract **v1.2.0**, the per-module DB migration runner (`src/scaffold/migrations.ts`), and the `migrate-db` CLI command.
-- *Context:* `npm run scaffold:update` — infrastructure-only merge; `src/templates/**` and `src/module.ts` stay module-owned.
+**Refresh the module repo `CLAUDE.md`**
+- Rewrite the Module Overview section to match v1.4.x: tenant-keyed `Subscription` + `BillingSettings`, no seats/metered, admin page config, current endpoint table, env vars down to `STRIPE_SECRET_KEY` (+ optional local `STRIPE_WEBHOOK_SECRET`), settings-blocks import path.
+- *Context:* clears the "stale CLAUDE.md" known issue; pure documentation, no version bump needed for docs but the CLAUDE.md lives in the module repo so bump patch if templates are touched at the same time.
 
-**Security registration + deletion handler**
-- Ship `security.registration.ts` declaring the `Subscription` data manifest and an idempotent account-deletion handler (`prisma.subscription.deleteMany({ where: { userId } })`).
-- *Context:* mirror the scaffold's `SECURITY_REGISTRATION` template; wire into `module.ts` `backend.templates` and the backend `INDEX_TEMPLATE` side-effect imports.
+**Complete the end-to-end host verification**
+- Re-run the full pass in a current starter app at v1.4.2: install, `prisma migrate dev`, type-check both sides (confirms the v1.4.1/v1.4.2 fixes), boot, complete a test-card checkout with `stripe listen`, verify webhook sync and the dunning/recovery transitions (needs the raw-body `verify` callback in the host — see Known Issues), exercise `/admin/billing` (Stripe config save, webhook connect refusal on localhost, entitlement config save).
+- *Context:* the v1.4.0 pass on `veradai` surfaced the two upstream issues; this item closes the loop once the host raw-body fix (or workaround) is in place. Record the result on this page.
 
-**TanStack Query migration**
-- Move reads to `useQuery` and writes to `useMutation` with namespaced keys via `createModuleQueryKeys('billing')`; invalidate on success instead of manual `refetch()`.
+### Medium-term (upcoming)
 
-**Structure-only styling pass**
-- Replace colour literals with semantic tokens and remove typography-scale / font-weight utilities across the eight affected components.
+**Action hooks on subscription transitions**
+- Fire `actionRegistry` hooks from the webhook sync — e.g. `billing.subscription.updated { tenantId, previousStatus, status, planId }`, `billing.payment.failed { tenantId }`, `billing.subscription.canceled { tenantId }` — so other modules can react to plan changes without polling `getSubscription`.
+- *Context:* the Integration page currently documents "no action hooks"; update it when this lands. Follow the cog-ingest hook-naming pattern (`module.noun.verb`), fire **after** the DB upsert commits, and use `addActionAsync` semantics.
 
-### Medium-term (Upcoming)
+**Durable webhook event dedupe**
+- Replace the in-memory `processedEvents` set with a small `billing_webhook_event` table (event ID + processed timestamp, pruned by age), making processing idempotent across instances and restarts.
+- *Context:* clears the per-process dedupe known issue; keep the "mark handled only after success" ordering so Stripe retries still work.
 
-**Opt-in `migrations` field**
-- Adopt the v1.18.0 `migrations` array (STEP 4b) when a schema change needs expand → backfill → contract (e.g. the `billing_subscription` rename). Not needed for a purely additive change (`prisma migrate dev` handles those).
+**Full-erasure owner flow**
+- `billingService.deleteStripeCustomerForTenant(tenantId)` exists but nothing calls it. Add a deliberate, confirmed owner action (likely on `/admin/billing` in a danger section) that deletes the Stripe Customer — removing invoices from Stripe — for "delete everything" requests, distinct from the default deletion path that retains tax records.
+- *Context:* two-mode deletion is the agreed design: default = cancel + retain records ('preserved'); full erasure = explicit second action.
 
-**Lifecycle hooks**
-- Consider `onUninstall` to offer a data export and optionally cancel live Stripe subscriptions / clean up external resources.
+**`onUninstall` lifecycle hook**
+- Offer a data export and optionally cancel the live Stripe subscription when the module is uninstalled from an app, so an uninstall can't silently leave a paying subscription running.
+- *Context:* scaffold `lifecycle.onUninstall` is available; mirror the deletion handler's cancel logic.
 
-**Webhook robustness**
-- Distinguish permanent vs transient webhook failures so Stripe retries transient errors; add structured audit logging on subscription-state transitions.
+**Adopt the `migrations` array for any breaking schema change**
+- If the model-prefix rename (or the next re-key) goes ahead, ship it via the scaffold v1.18 per-module migration runner (`npx billing migrate-db`) with expand → backfill → contract steps rather than asking apps to hand-migrate.
+
+### Long-term / Ideas
+
+**Multi-member tenancy readiness**
+- Billing is already keyed on `tenantId`, so when the host resolves shared tenants (an invited member/VA on the same account), members inherit the owner's plan with no schema change. Remaining work is UX: the member read-only state exists on `/settings/billing`; extend the same "managed by owner" treatment anywhere else billing surfaces.
+- *Context:* do **not** build tenancy into billing itself — the host owns membership resolution.
+
+**Dashboard widget**
+- A small plan/trial-status widget via `dashboardRegistry` (plan name, status badge, trial days remaining, past-due warning). Deliberately not shipped yet; the hooks make it trivial for apps to build their own.
+
+**Usage-based pricing, if it ever returns**
+- Metered billing was retired in v1.3.0 and remains out of scope. If usage pricing is ever revisited, build on Stripe's current Billing Meters APIs (the legacy usage-record APIs the old implementation used are deprecated) — treat the old code as unrecoverable prior art.
+
+---
+
+## Completed
+
+Most recent first. Items moved here from the sections above as they ship.
+
+| Item | Version | Date |
+|------|---------|------|
+| Docs overhaul — full page set (overview, configuration, usage, integration, developer workflow, changelog, roadmap) replacing the stale v1.2.0-era overview | docs | 2026-07-15 |
+| Backend templates import Prisma types from `lib/prisma`, not `@prisma/client` (host uses the `prisma-client` generator) | v1.4.2 | 2026-07-14 |
+| Generated code type-clean against React 19 + current Stripe/Prisma SDKs | v1.4.1 | 2026-07-14 |
+| Admin-automated webhook setup — endpoint created from `/admin/billing`, signing secret stored encrypted (AES-256-GCM), DB-first/env-fallback resolution, `STRIPE_WEBHOOK_SECRET` now optional (local dev only) | v1.4.0 | 2026-07-14 |
+| Non-secret Stripe config (publishable key, pricing table ID, product ID) moved from `VITE_*` env vars to the admin page + `GET /config` | v1.4.0 | 2026-07-14 |
+| Stripe API version drift tolerated — `current_period_end` read from the subscription item first (`2025-03-31.basil` moved it) with subscription fallback | v1.4.0 | 2026-07-14 |
+| Tenant-keyed redesign — `Subscription` re-keyed to `tenantId @unique` (userId kept as actor); subscription owned by the account | v1.3.0 | 2026-07-14 |
+| Security registration — ownership manifest + account-deletion handler (order 500): cancels the live Stripe subscription, hard-deletes local rows, retains Stripe Customer + invoices; `deleteStripeCustomerForTenant` for full erasure | v1.3.0 | 2026-07-14 |
+| Seat-based and metered billing retired (`SeatManagement`, `UsageDisplay`, `/seats`, `/usage`, billing-model detection removed) | v1.3.0 | 2026-07-14 |
+| Admin page (`/admin/billing`) with owner-configurable entitlements (`BillingSettings.entitlements`) merged under Stripe product metadata at runtime | v1.3.0 | 2026-07-14 |
+| Admin/member route split — writes `requireAdmin`, reads member-level for feature gating; member read-only view on the settings page | v1.3.0 | 2026-07-14 |
+| TanStack Query migration — `useQuery`/`useMutation` with `createModuleQueryKeys('billing')` keys throughout | v1.3.0 | 2026-07-14 |
+| Structured logging — `createModuleLogger` throughout (`'billing'`, `'billing-webhook'`, `'billing-security'`), `audit: true` on financial mutations (was 11 `console.*` calls) | v1.3.0 | 2026-07-14 |
+| Structure-only styling pass — semantic tokens, no colour literals / typography scale / font weights | v1.3.0 | 2026-07-14 |
+| Webhook returns 5xx on processing failure so Stripe retries; in-memory event dedupe; `invoice.paid` recovers `PAST_DUE` → `ACTIVE` | v1.3.0 | 2026-07-14 |
+| Typed Stripe→Prisma status map (removed `status as any` casts) | v1.3.0 | 2026-07-14 |
+| Settings page imports fixed to `@/components/settings-blocks` (module previously failed to compile against host v1.52.1) | v1.3.0 | 2026-07-14 |
+| Housekeeping — orphan `navigation.registration` and 13 unused placeholder exports removed; `serviceRegistry` version now `{{moduleVersion}}`; redundant `@@index` removed; Australian spelling in user-facing text | v1.3.0 | 2026-07-14 |
+| Scaffold merged v1.17.0 → v1.18.1 (contract v1.2.0, per-module DB migration runner, `migrate-db` command) | — | 2026-07-14 |
+| Runtime module registration with the host module registry (starter v1.48+, silent no-op on older hosts) | v1.2.1 | 2026-07-11 |

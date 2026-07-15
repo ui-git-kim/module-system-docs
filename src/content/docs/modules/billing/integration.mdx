@@ -1,0 +1,483 @@
+---
+title: Integration
+description: How other modules gate features on the plan, register entitlements, and call the billing service
+lastUpdated: 2026-07-15
+sidebar:
+  order: 3
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+Billing exists so **other modules can gate features on the tenant's plan**. This page is the definitive guide for module developers: the entitlements system, the service registry, the security manifest, and every registration Billing makes — with full interfaces.
+
+---
+
+## Integration Points at a Glance
+
+<CardGrid>
+  <Card title="Register Entitlements" icon="approve-check">
+    Define the limits your module cares about in the entitlements registry — Billing resolves the effective limit from the plan at runtime.
+  </Card>
+  <Card title="Check Limits" icon="seti:lock">
+    Gate UI with `useEntitlements`, gate backend writes with `billingService.checkEntitlement`.
+  </Card>
+  <Card title="Call the Service" icon="puzzle">
+    `serviceRegistry.get('billing')` gives backend modules typed access to subscription state and Stripe operations.
+  </Card>
+  <Card title="React to Status" icon="information">
+    Read `useSubscription` computed flags (`isActive`, `needsPayment`) to adapt your module's UI.
+  </Card>
+</CardGrid>
+
+| Integration | Frontend | Backend | Mechanism |
+|-------------|----------|---------|-----------|
+| Register a plan limit | ✅ | ✅ | `entitlementsRegistry.register(...)` (each side has its own registry) |
+| Check a limit | ✅ | ✅ | `useEntitlements()` / `billingService.checkEntitlement()` |
+| Read subscription state | ✅ | ✅ | `useSubscription()` / `serviceRegistry.get('billing').getSubscription()` |
+| Access the billing service | — | ✅ | `serviceRegistry.get('billing')` |
+| Use billing types | ✅ | ✅ | Import from `@/features/billing` / `../billing/index.js` |
+| Action hooks | — | — | **None registered** — see [below](#action-and-filter-hooks) |
+| Filter hooks | — | — | **None registered** — see [below](#action-and-filter-hooks) |
+| Dashboard widgets | — | — | **None registered** — use the hooks in your own widget |
+
+### Declaring the Dependency
+
+If your module requires Billing at runtime, declare it in your `module.ts`:
+
+```typescript
+export const moduleDefinition: ModuleDefinition = {
+  id: 'my-feature',
+  depends: { billing: '*' },   // module id → semver range, e.g. '^1.4.0'
+  // ...
+};
+```
+
+Init and the host boot check verify the dependency is installed and its version satisfies the range. The legacy `requiredModules: ['billing']` form is deprecated but still honoured. Keep the coupling **runtime-only** — never add database foreign keys to Billing's tables.
+
+---
+
+## The Entitlements System
+
+Entitlements are numeric plan limits (e.g. "Pro allows 25 projects"). The effective limit for a key is resolved in this order (later wins):
+
+1. **Your registered `defaultLimit`** — the free/no-subscription fallback, supplied when you check
+2. **Owner-configured options** — enabled entries from `/admin/billing` (stored in `BillingSettings.entitlements`)
+3. **Stripe product metadata** — `max_*` / `limit_*` keys on the active plan's product (authoritative for the plan)
+
+Entitlements are evaluated **per tenant**, so every member of the account inherits the owner's plan limits.
+
+### Step 1 — Register Your Entitlement (frontend)
+
+```typescript
+// frontend/src/features/my-feature/registrations/entitlements.registration.ts
+import { entitlementsRegistry } from '@/features/billing';
+import { myFeatureService } from '../services/my-feature.service';
+
+entitlementsRegistry.register({
+  key: 'max_projects',        // matches the Stripe metadata key
+  label: 'Projects',
+  defaultLimit: 3,            // free-tier fallback
+  feature: 'my-feature',
+  getUsage: async () => {
+    const stats = await myFeatureService.getStats();
+    return stats.projectCount;
+  },
+});
+```
+
+The `getUsage` function is what lets `useEntitlements().canUse('max_projects')` work **without** the caller passing usage — Billing asks your module how much is used.
+
+### Step 2 — Register on the Backend (optional)
+
+The backend registry mirrors the frontend one (minus `getUsage`) and exists so backend code can resolve default limits:
+
+```typescript
+// backend/src/features/my-feature/entitlements.registration.ts
+import { entitlementsRegistry } from '../billing/index.js';
+
+entitlementsRegistry.register({
+  key: 'max_projects',
+  label: 'Projects',
+  defaultLimit: 3,
+  feature: 'my-feature',
+});
+```
+
+### Step 3 — Gate the UI
+
+```tsx
+import { useEntitlements } from '@/features/billing';
+
+function NewProjectButton({ projectCount }: { projectCount: number }) {
+  const { checkLimit } = useEntitlements();
+  const [check, setCheck] = useState<EntitlementCheck | null>(null);
+
+  useEffect(() => {
+    void checkLimit('max_projects', projectCount).then(setCheck);
+  }, [checkLimit, projectCount]);
+
+  if (check && !check.allowed) {
+    return <UpgradePrompt used={check.used} limit={check.limit} />;
+  }
+  return <Button onClick={createProject}>New project</Button>;
+}
+```
+
+### Step 4 — Enforce on the Backend
+
+UI gating is advisory — the server is the enforcement point:
+
+```typescript
+// backend/src/features/my-feature/my-feature.routes.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+
+router.post('/projects', async (req, res, next) => {
+  try {
+    const tenantId = req.user!.tenantId ?? req.user!.id;
+    const billing = serviceRegistry.get('billing');
+
+    const currentCount = await myFeatureService.countProjects(tenantId);
+    const check = await billing.checkEntitlement(tenantId, 'max_projects', currentCount, 3);
+
+    if (!check.allowed) {
+      return res.status(403).json({
+        error: `Project limit reached (${check.used}/${check.limit}). Upgrade your plan.`,
+      });
+    }
+
+    const project = await myFeatureService.createProject(tenantId, req.body);
+    res.status(201).json(project);
+  } catch (error) {
+    next(error);
+  }
+});
+```
+
+### Entitlements Registry API
+
+Both registries are plain in-process registries populated by side-effect imports. Registering the same key twice overwrites (last registration wins; the backend logs a warning).
+
+**Frontend** (`import { entitlementsRegistry } from '@/features/billing'`):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `register` | `(definition: EntitlementDefinition) => void` | Register a limit definition (with optional `getUsage`) |
+| `get` | `(key: string) => EntitlementDefinition \| undefined` | Look up a definition |
+| `getDefaultLimit` | `(key: string) => number` | Default limit for a key (0 if unregistered) |
+| `getAll` | `() => EntitlementDefinition[]` | All registered definitions |
+| `getByFeature` | `(feature: string) => EntitlementDefinition[]` | Definitions owned by one module |
+| `has` | `(key: string) => boolean` | Whether a key is registered |
+| `getUsage` | `(key: string) => Promise<number>` | Run the registered usage getter (0 if none) |
+
+**Backend** (`import { entitlementsRegistry } from '../billing/index.js'`): same API **without** `getUsage`, and `EntitlementDefinition` has no `getUsage` field.
+
+### Entitlement Interfaces
+
+```typescript
+// Frontend definition (backend omits getUsage)
+interface EntitlementDefinition {
+  key: string;                       // matches Stripe metadata, e.g. 'max_projects'
+  label: string;                     // human-readable, shown in admin UI
+  defaultLimit: number;              // fallback when no subscription exists
+  feature: string;                   // owning module id
+  getUsage?: () => Promise<number>;  // current usage (frontend only)
+}
+
+interface EntitlementCheck {
+  key: string;
+  limit: number;        // effective limit for the current plan
+  used: number;
+  remaining: number;
+  allowed: boolean;     // used < limit
+  percentUsed: number;  // 0–100
+}
+
+interface EntitlementConfigEntry {
+  key: string;
+  label: string;
+  defaultLimit: number;
+  enabled: boolean;
+}
+type EntitlementConfig = Record<string, EntitlementConfigEntry>;
+```
+
+<Aside type="tip" title="Metadata naming">
+Only Stripe product metadata keys starting with `max_` or `limit_` are read (values parsed as integers). Pick one key per limit and use it identically in Stripe metadata, your registrations, and your checks.
+</Aside>
+
+---
+
+## Service Registry
+
+### Registration
+
+```typescript
+// Registered as (with type augmentation for type-safe get):
+serviceRegistry.register('billing', billingService, {
+  feature: 'billing',
+  description: 'Stripe subscription billing logic',
+  version: '<module version>',
+});
+
+declare module '../../config/service.registry.js' {
+  interface ServiceTypes {
+    billing: typeof billingService;
+  }
+}
+```
+
+### Accessing the Service
+
+```typescript
+import { serviceRegistry } from '../../config/service.registry.js';
+
+const billing = serviceRegistry.get('billing');
+const subscription = await billing.getSubscription(tenantId);
+
+if (subscription.status !== 'active' && subscription.status !== 'trialing') {
+  // tenant has no live plan
+}
+```
+
+### Service Methods
+
+Every method is tenant-scoped — pass the tenant ID (`req.user.tenantId ?? req.user.id`), never a raw user-supplied value.
+
+**Subscription and Stripe sessions:**
+
+| Method | Parameters | Returns | Description |
+|--------|-----------|---------|-------------|
+| `getSubscription(tenantId)` | `string` | `SubscriptionResponse` | Status + plan details (plan fetched from Stripe, 5-min cache) |
+| `getOrCreateStripeCustomer(tenantId, email)` | `string, string` | `string` | Existing or new Stripe customer ID (stamps `tenantId` in customer metadata) |
+| `createCheckoutSession(tenantId, email, priceId)` | `string, string, string` | `string` (URL) | Checkout session with automatic tax; `client_reference_id = tenantId` |
+| `createPortalSession(tenantId)` | `string` | `string` (URL) | Customer Portal session (throws `NotFoundError` without a customer) |
+| `getPlanDetails(productId, priceId)` | `string, string` | `SubscriptionPlan` | Product + price from Stripe, cached 5 minutes |
+| `getPaymentMethod(tenantId)` | `string` | `PaymentMethodResponse \| null` | Default card on file |
+| `getInvoices(tenantId, limit?)` | `string, number` | `InvoicesListResponse` | Invoice history with `hasMore` |
+
+**Entitlements:**
+
+| Method | Parameters | Returns | Description |
+|--------|-----------|---------|-------------|
+| `getPlanLimits(tenantId)` | `string` | `{ limits, planName, status }` | Effective limits — admin config overlaid by Stripe metadata |
+| `checkEntitlement(tenantId, key, currentUsage, defaultLimit)` | `string, string, number, number` | `EntitlementCheck` | The enforcement primitive |
+| `getEntitlementConfig(tenantId)` | `string` | `EntitlementConfig` | Owner-configured options |
+| `setEntitlementConfig(tenantId, config)` | `string, EntitlementConfig` | `EntitlementConfig` | Replace the options (audit-logged) |
+
+**Stripe config and webhook (admin plumbing):**
+
+| Method | Parameters | Returns | Description |
+|--------|-----------|---------|-------------|
+| `getStripeConfig(tenantId)` | `string` | `StripeConfig` | Owner-managed non-secret settings |
+| `setStripeConfig(tenantId, config)` | `string, StripeConfig` | `StripeConfig` | Save settings (audit-logged) |
+| `resolveWebhookSecret()` | — | `string \| null` | Signing secret, DB-first (decrypted) then env |
+| `connectWebhook(tenantId, publicUrl)` | `string, string` | `{ endpointId, connected }` | Create the Stripe endpoint + store the secret encrypted |
+| `getConnectionStatus(tenantId)` | `string` | `{ webhookConnected, endpointId, source, suggestedUrl }` | Whether/where a signing secret exists (never returns the secret). The named `WebhookConnectionStatus` type exists frontend-side only |
+
+**Webhook sync (called by the webhook handler — rarely needed directly):**
+
+| Method | Parameters | Returns | Description |
+|--------|-----------|---------|-------------|
+| `syncSubscriptionFromWebhook(stripeSubscription, stripeCustomerId, tenantId?)` | `Stripe.Subscription, string, string?` | `void` | Upsert local state; resolves the tenant from the arg, an existing row, or customer metadata |
+| `handleSubscriptionDeleted(stripeSubscriptionId)` | `string` | `void` | Mark `CANCELED` |
+| `handlePaymentFailed(stripeCustomerId)` | `string` | `void` | Mark `PAST_DUE` |
+| `handlePaymentSucceeded(stripeCustomerId)` | `string` | `void` | Recover `PAST_DUE` → `ACTIVE` only |
+
+**Lifecycle (account deletion):**
+
+| Method | Parameters | Returns | Description |
+|--------|-----------|---------|-------------|
+| `cancelStripeSubscriptionForTenant(tenantId)` | `string` | `void` | Cancel the live subscription; **retains** the Stripe Customer + invoices. Idempotent. |
+| `deleteStripeCustomerForTenant(tenantId)` | `string` | `void` | **Full erasure** — deletes the Stripe Customer (cascades to subscriptions, removes invoices from Stripe). A separate, deliberate action; not part of the standard deletion cascade. Idempotent. |
+
+---
+
+## Action and Filter Hooks
+
+Billing currently registers **no action hooks and no filter hooks** — there is nothing to list in either registry. If your module needs to react to subscription changes today, poll `getSubscription`/`getPlanLimits` from the service registry, or key off the subscription status when handling your own requests.
+
+<Aside type="note" title="Planned">
+Action hooks on subscription-state transitions (e.g. `billing.subscription.updated`, `billing.payment.failed` fired from the webhook sync) are on the [Roadmap](/modules/billing/roadmap/) so modules can react to plan changes without polling. If you need this, add your use case to the roadmap item.
+</Aside>
+
+## Dashboard Widgets
+
+Billing registers **no dashboard widgets**. To surface billing state on the dashboard, register your own widget and use the hooks:
+
+```tsx
+import { useSubscription } from '@/features/billing';
+
+export function PlanWidget() {
+  const { subscription, isTrial } = useSubscription();
+  return (
+    <div>
+      <p>{subscription?.plan?.name ?? 'No plan'}</p>
+      {isTrial && <p>{subscription?.daysRemaining} trial days left</p>}
+    </div>
+  );
+}
+```
+
+---
+
+## Security Registry
+
+Billing declares its data surface and participates in the host's account-deletion cascade. Other modules don't call this — but if your module stores billing-adjacent data, mirror the pattern.
+
+### Manifest
+
+```typescript
+securityRegistry.register({
+  moduleId: 'billing',
+  ownedModels: [
+    { model: 'Subscription', ownerColumn: 'tenantId' },
+    { model: 'BillingSettings', ownerColumn: 'tenantId' },
+  ],
+  encryptedFields: [
+    { model: 'BillingSettings', field: 'stripeWebhookSecretEnc' },
+  ],
+  dataCategories: [
+    { name: 'subscription', classification: 'owned' },
+    { name: 'billing_settings', classification: 'owned' },
+    { name: 'stripe_customer_records', classification: 'preserved' },
+  ],
+  credentialTypes: ['stripe'],
+  auditEvents: [
+    'billing.subscription.created',
+    'billing.subscription.updated',
+    'billing.subscription.canceled',
+  ],
+});
+```
+
+### Deletion Handler
+
+| Property | Value |
+|----------|-------|
+| ID | `billing.subscription` |
+| Classification | `owned` |
+| Order | `500` — feature rows clear before the core account handlers (900+) |
+| Behaviour | Cancels the live Stripe subscription (so an ex-customer is never billed again), then hard-deletes the `Subscription` and `BillingSettings` rows |
+| Retained | The Stripe **Customer and invoices** stay on Stripe (`preserved` category) for tax/accounting |
+| Full erasure | `billingService.deleteStripeCustomerForTenant(tenantId)` — a separate, explicit owner action |
+
+If your module's deletion handler depends on billing state (e.g. it needs to know the plan before rows disappear), give it an order **below 500**.
+
+---
+
+## Other Registrations (IDs to avoid colliding with)
+
+| Registry | ID | Details |
+|----------|----|---------|
+| `settingsPagesRegistry` | `billing` | `BillingSettingsPage`, order 50, `isReplacement: true` — replaces the starter's placeholder Billing page |
+| `adminPagesRegistry` | `billing` | `BillingAdminPage`, order 30, `/admin/billing` |
+| `routeRegistry` | path `/billing` | Feature `billing`, versions `['v1']`, `requiresAuth: true` |
+| `routeRegistry` (public) | `POST /api/v1/billing/webhook` | Raw-body Stripe webhook |
+| `serviceRegistry` | `billing` | `billingService` |
+| `moduleRegistry` | `billing` | Runtime registration `{ id, name, version, depends }` (starter v1.48+; silent no-op on older hosts) |
+
+## Public Types
+
+Each barrel exports its billing types for other modules. The sets differ slightly: `WebhookConnectionStatus` is **frontend-only**; `CreateCheckoutInput` and `CheckEntitlementInput` are **backend-only**; and the frontend `EntitlementDefinition` has the extra optional `getUsage` field.
+
+```typescript
+// Frontend
+import type {
+  SubscriptionResponse, SubscriptionStatus, SubscriptionPlan,
+  EntitlementDefinition, EntitlementCheck, PlanLimits, EntitlementsResponse,
+  EntitlementConfig, EntitlementConfigEntry,
+  PaymentMethodResponse, InvoiceResponse, InvoicesListResponse,
+  StripeConfig, StripePublicConfig, WebhookConnectionStatus,
+} from '@/features/billing';
+
+// Backend
+import type {
+  SubscriptionResponse, SubscriptionStatus, SubscriptionPlan,
+  EntitlementDefinition, EntitlementCheck, PlanLimits, EntitlementsResponse,
+  EntitlementConfig, EntitlementConfigEntry,
+  PaymentMethodResponse, InvoiceResponse, InvoicesListResponse,
+  StripeConfig, StripePublicConfig,
+  CreateCheckoutInput, CheckEntitlementInput,   // backend-only inputs
+} from '../billing/index.js';
+```
+
+---
+
+## End-to-End Example: a "Projects" Module
+
+A hypothetical Projects module that limits how many projects each plan allows:
+
+**1. Frontend entitlement registration** (side-effect import in the Projects barrel):
+
+```typescript
+// frontend/src/features/projects/registrations/entitlements.registration.ts
+import { entitlementsRegistry } from '@/features/billing';
+import { projectsService } from '../services/projects.service';
+
+entitlementsRegistry.register({
+  key: 'max_projects',
+  label: 'Projects',
+  defaultLimit: 3,
+  feature: 'projects',
+  getUsage: async () => (await projectsService.list()).length,
+});
+```
+
+**2. Gate the create button:**
+
+```tsx
+// frontend/src/features/projects/components/CreateProjectButton.tsx
+import { useEntitlements } from '@/features/billing';
+
+export function CreateProjectButton({ onCreate }: { onCreate: () => void }) {
+  const { canUse } = useEntitlements();
+
+  const handleClick = async () => {
+    if (await canUse('max_projects')) {
+      onCreate();                       // usage comes from the registered getUsage
+    } else {
+      window.location.href = '/settings/billing';   // send them to upgrade
+    }
+  };
+
+  return <Button onClick={handleClick}>New project</Button>;
+}
+```
+
+**3. Enforce server-side and register the backend default:**
+
+```typescript
+// backend/src/features/projects/entitlements.registration.ts
+import { entitlementsRegistry } from '../billing/index.js';
+entitlementsRegistry.register({ key: 'max_projects', label: 'Projects', defaultLimit: 3, feature: 'projects' });
+```
+
+```typescript
+// backend/src/features/projects/projects.routes.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+import { entitlementsRegistry } from '../billing/index.js';
+
+router.post('/', async (req, res, next) => {
+  try {
+    const tenantId = req.user!.tenantId ?? req.user!.id;
+    const billing = serviceRegistry.get('billing');
+
+    const used = await projectsService.count(tenantId);
+    const check = await billing.checkEntitlement(
+      tenantId, 'max_projects', used,
+      entitlementsRegistry.getDefaultLimit('max_projects'),
+    );
+    if (!check.allowed) {
+      return res.status(403).json({ error: `Plan limit reached (${check.limit} projects).` });
+    }
+
+    res.status(201).json(await projectsService.create(tenantId, req.body));
+  } catch (error) {
+    next(error);
+  }
+});
+```
+
+**4. Set the plan limits in Stripe** — on the Pro product: `max_projects: 25`; on Starter: `max_projects: 10`. Free/no-subscription tenants fall back to the registered `defaultLimit` of 3 (or whatever the owner configures on `/admin/billing`).
+
+That's the whole loop: register → gate → enforce → configure in Stripe. No database coupling, no billing internals imported beyond the barrels.

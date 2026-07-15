@@ -1,0 +1,351 @@
+---
+title: Developer Workflow
+description: How to develop, test, version, and maintain the Billing module
+lastUpdated: 2026-07-15
+sidebar:
+  order: 4
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This page covers working **on** the Billing module itself — the repo layout, the edit/build/test loop, versioning, scaffold updates, common scenarios, and the documentation workflow. If you just want to *use* Billing in an app, see [Usage](/modules/billing/usage/).
+
+---
+
+## Setup
+
+### Clone and Install
+
+```bash
+git clone <billing-repo-url>
+cd billing
+npm install
+```
+
+### Build
+
+```bash
+npm run build        # One-time build (tsup → dist/)
+npm run dev          # Watch mode
+npm run type-check   # TypeScript check without emitting
+```
+
+### Link for Local Testing
+
+```bash
+npm link             # Makes the `billing` CLI available globally
+```
+
+### Where Things Live
+
+| Location | What It Is | Edit? |
+|----------|-----------|-------|
+| `src/module.ts` | Module definition — templates map, schema models, env vars, features | ✅ |
+| `src/templates/frontend/index.ts` | **All** frontend templates in one file (~2,000 lines of template-string constants) | ✅ |
+| `src/templates/backend/index.ts` | **All** backend templates in one file | ✅ |
+| `src/templates/schema.ts` | Prisma schema (`Subscription`, `BillingSettings`, `SubscriptionStatus`) | ✅ |
+| `src/scaffold/**`, `src/cli.ts` | Shared scaffold infrastructure | ❌ — updated via `scaffold:update`; report bugs upstream |
+| `docs/` | Git submodule → the shared documentation site | ✅ (own push flow) |
+
+<Aside type="note" title="Monolithic template files">
+Unlike some modules that split templates into `pages.ts` / `routes.ts` etc., Billing keeps one `index.ts` per side. Each exported constant (e.g. `SERVICE_TEMPLATE`, `WEBHOOK_TEMPLATE`) is one generated file; `src/module.ts` maps constants to output paths.
+</Aside>
+
+---
+
+## Development Loop
+
+```
+Edit templates → npm run build → test in an app → version bump → commit → push
+```
+
+### 1. Edit Templates
+
+Templates are template-string constants. Two escaping rules matter constantly:
+
+- Backticks inside a template → `` \` ``
+- Runtime template expressions → `\${variable}` (unescaped `${}` is evaluated at build time — the `check:templates` guard from scaffold v1.15 catches these)
+
+### 2. Build
+
+```bash
+npm run build
+```
+
+### 3. Test in a Starter App
+
+In a starter template app (with the module linked):
+
+```bash
+npx billing init               # Fresh install
+npx billing init --force       # Overwrite existing files
+npx billing update             # Apply template changes to an existing install
+npx billing update --dry-run   # Preview what would change
+npx billing update --force     # Update even with conflicts
+npx billing info               # Show the module's own metadata and version
+```
+
+Full CLI (from the scaffold):
+
+| Command | Purpose |
+|---------|---------|
+| `npx billing init` | Install into the current app (writes files, schema, env vars, manifest) |
+| `npx billing update` | Update generated files to the latest templates (version-header + hash detection) |
+| `npx billing update-schema` | *(Deprecated)* Update only the Prisma schema — schema updates now run as part of `update` |
+| `npx billing migrate` | Add version headers to files generated before header tracking |
+| `npx billing migrate-db` | Run the module's DB migrations (scaffold v1.18+) |
+| `npx billing uninstall` | Remove files, registrations, and schema (manifest-driven) |
+| `npx billing disable` / `enable` | Toggle the module off/on without uninstalling |
+| `npx billing info` | Show the module's own metadata (name, version, description, features) |
+
+After an install, verify in the app:
+
+```bash
+cd backend && npx prisma migrate dev --name add-billing && npm run type-check
+cd ../frontend && npm run type-check
+```
+
+Then boot the app and walk the flow: admin page config → pricing table renders → test-card checkout → webhook sync (`stripe listen` locally) → settings page shows the plan.
+
+### 4. Version Bump
+
+**Bump after any change to `src/templates/**` or `src/module.ts`** — see [Version Management](#version-management).
+
+### 5. Commit and Push
+
+Commit directly to `main` — this is an upstream repo; downstream apps pull from `main`.
+
+---
+
+## Version Management
+
+### When to Bump
+
+The update system detects template changes by **content hash** — every generated file's header stores a hash of the raw template, and `npx billing update` rewrites the file whenever the current template's hash differs. A rebuild alone (`npm run build`) is therefore enough for edits to be picked up. Bump anyway: the version header stamps which release generated each file, `{{moduleVersion}}` substitutions (e.g. in `service.registration.ts`) only refresh against the current `module.ts` version, and the `onUpdate` lifecycle hook runs only when the installed version is older than the module version.
+
+| Changed | Bump? |
+|---------|-------|
+| `src/templates/**` | ✅ Always |
+| `src/module.ts` | ✅ Always |
+| `CLAUDE.md`, `README.md` | ❌ No |
+| `docs/**` | ❌ No — push the docs submodule instead |
+| `src/scaffold/**` (via scaffold update) | ❌ The scaffold has its own `VERSION` file |
+
+### Commands
+
+| Command | Use For |
+|---------|---------|
+| `npm run version:patch` | Bug fixes, template corrections |
+| `npm run version:minor` | New features, new templates, new endpoints |
+| `npm run version:major` | Breaking changes needing app migration |
+| `npm run release:patch` / `minor` / `major` | Same, plus a `vX.Y.Z` git tag |
+
+Each updates `package.json` **and** the `version` field in `src/module.ts` (they must match — the CLI reads `module.ts`), then commits. After a release:
+
+```bash
+git push && git push --tags
+```
+
+### Why It Matters
+
+1. **Version headers** — every generated file carries `// @generated-by: billing vX.Y.Z | hash: ...`. The update command uses this to know which template version produced the file.
+2. **Lifecycle + reporting** — `update` compares installed vs available version to report the upgrade (`Version: X → Y`) and to decide whether to run the `onUpdate` hook; file change detection itself is hash-based and version-independent.
+3. **No user-modification detection on tracked files** — the header hash fingerprints the *template*, not your edits. When the template changes upstream, `update` rewrites any file carrying a version header, and hand edits to it are lost. Only files *missing* a version header are flagged ("may have user modifications") and prompted individually (`--force` approves them all). To keep a customised copy of a generated file, move it out of the tracked path and strip its `@generated-by` header.
+4. **Service registry** — `service.registration.ts` stamps `version: '{{moduleVersion}}'`, substituted at generation time.
+
+---
+
+## Scaffold Updates
+
+The CLI/init/update infrastructure comes from the **module starter** and is pulled in by git merge from the `scaffold-upstream` remote.
+
+```bash
+npm run scaffold:check    # Preview available scaffold changes
+npm run scaffold:update   # Merge them
+```
+
+### What Gets Updated vs Not
+
+| Updated | Not Updated |
+|---------|-------------|
+| `src/scaffold/**` (init, update, migrations, types, utils) | `src/templates/**` — your templates |
+| `src/cli.ts` | `src/module.ts` — your config |
+| `scripts/**` (version bump, runners) | `package.json` name/description/bin |
+| CLAUDE.md scaffold sections (between markers) | Module-specific CLAUDE.md sections |
+| `tsup.config.ts`, `tsconfig.json`, `VERSION` | Your customisations |
+
+### Handling Merge Conflicts
+
+Lessons from Billing's v1.17.0 → v1.18.1 scaffold merge:
+
+1. **`src/scaffold/**` conflicts** — take the upstream side; these files are not module-owned.
+2. **`docs` gitlink conflict** — the submodule pointer can conflict; resolve by keeping your current docs commit (`git add docs` at the pointer you want).
+3. **`package-lock.json`** — don't hand-merge; delete and regenerate with `npm install`.
+4. **`src/module.ts`** — keep **ours** (the scaffold only touches it in genuinely breaking contract changes; read the scaffold changelog if it conflicts).
+5. New scaffold dependencies may be required — v1.18 needed `postgres` installed for the DTS build to pass.
+6. Finish with `npm run build && npm run type-check` before committing the merge.
+
+---
+
+## Common Development Scenarios
+
+### Adding a New Frontend Component/Page
+
+1. Add a new exported constant in `src/templates/frontend/index.ts` with the standard header:
+   ```typescript
+   export const MY_COMPONENT = `// ========================================================================
+   // FILE: frontend/src/features/billing/components/MyComponent.tsx
+   // PURPOSE: One-line description
+   // ========================================================================
+   // ... component code (structure-only styling, semantic tokens)
+   `;
+   ```
+2. Map it in `src/module.ts` under `frontend.templates`:
+   ```typescript
+   'components/MyComponent.tsx': frontend.MY_COMPONENT,
+   ```
+3. Export it from the generated barrel by adding a line to `INDEX_TEMPLATE`.
+4. If it uses a new shadcn component, add it to `frontend.shadcnComponents`.
+5. Styling rules: layout utilities and semantic tokens only — no colour literals, no typography scale, no font weights.
+
+### Adding a New Backend Endpoint
+
+1. Add the route handler inside `ROUTES_TEMPLATE` in `src/templates/backend/index.ts` — resolve the tenant with `req.user!.tenantId ?? req.user!.id` and choose `requireAdmin` vs member access deliberately.
+2. Add the service method to `SERVICE_TEMPLATE` (log with `createModuleLogger('billing')`, `audit: true` for money/config mutations).
+3. Add request/response types to `TYPES_TEMPLATE` (backend) and the frontend `TYPES_TEMPLATE` + `SERVICE_TEMPLATE` so the frontend client stays in sync.
+4. All relative imports need `.js` extensions.
+
+### Adding a New Database Table
+
+1. Add the model to `src/templates/schema.ts` — self-contained rules apply:
+   - `tenantId String` plain column (no `@relation`), `@unique` if one row per tenant
+   - No edits to the `User` model
+   - Skip `@@index` on columns that are already `@unique`
+2. Add the model name to `schema.modelNames` in `src/module.ts`.
+3. For a **breaking** schema change (rename/re-key), add an entry to the module `migrations` array (scaffold v1.18+) with expand → backfill → contract steps; additive changes just need `prisma migrate dev` in the app.
+
+### Adding a New Registry Registration
+
+1. Create the registration template (see `SECURITY_REGISTRATION` or `ADMIN_PAGE_REGISTRATION` as models).
+2. Frontend core-registry registrations go in `frontend.registrations` in `module.ts` (typed entries like `{ type: 'settingsPage', path, content }`); backend ones and module-owned registries are plain `templates` entries.
+3. Add the side-effect import to the relevant `INDEX_TEMPLATE` — registrations that aren't imported never run.
+
+### Adding an Environment Variable
+
+1. Declare it in `module.ts` under `envVariables.backend` (or `.frontend`, which auto-prefixes `VITE_`):
+   ```typescript
+   { name: 'MY_KEY', description: 'Shown during init', required: false, secret: true }
+   ```
+2. Read it in templates via `process.env.MY_KEY`.
+3. Prefer the Billing pattern: secrets in env, everything else in `BillingSettings` managed from the admin page.
+
+### Adding an Init Prompt
+
+Billing currently has `prompts: []`. To add one:
+
+```typescript
+prompts: [
+  {
+    id: 'currencyDefault',
+    type: 'select',
+    question: 'Default display currency?',
+    options: [
+      { value: 'aud', label: 'AUD' },
+      { value: 'usd', label: 'USD' },
+    ],
+    default: 'aud',
+  },
+],
+```
+
+Use it in templates as `{{currencyDefault}}` (with `{{currencyDefault|aud}}` fallback syntax), or in `envVariables` `when` callbacks.
+
+### Module Dependencies
+
+Billing has none, but if a future feature needs another module:
+
+```typescript
+depends: { structure: '*' },   // module id → semver range, e.g. '^1.0.0'
+```
+
+Init and the host boot check then verify the dependency is installed and its version satisfies the range. The legacy `requiredModules: ['structure']` form is deprecated (module contract v1.2.0) but still honoured. Keep it runtime-only — no cross-module foreign keys.
+
+### Lifecycle Hooks
+
+Not currently used. Available on the module definition:
+
+```typescript
+lifecycle: {
+  onInstall: async (context) => { /* after files are generated */ },
+  onUpdate: async (context) => { /* after update applies */ },
+  onUninstall: async (context) => { /* during uninstall — e.g. offer data export */ },
+},
+```
+
+An `onUninstall` hook that offers to cancel live Stripe subscriptions is on the [Roadmap](/modules/billing/roadmap/).
+
+---
+
+## Debugging and Troubleshooting
+
+### Inspect Generated Output
+
+After `npx billing init` in a test app, check:
+
+- `frontend/src/features/billing/` and `backend/src/features/billing/` — generated files, version headers present
+- `backend/prisma/schema.prisma` (or the module's `.prisma` file in multi-file setups) — models added
+- `.module-manifests.json` — install manifest used by uninstall/update
+
+### Common Template Mistakes
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `my-feature` appears literally in generated code | Placeholder case variant mismatch | Use the exact variants: `my-feature`, `myFeature`, `MyFeature`, `my_feature` |
+| Syntax error at build time in `templates/*.ts` | Unescaped backtick in a template | Escape as `` \` `` |
+| `${...}` already evaluated in generated file | Unescaped template expression | Escape as `\${...}`; run the template guard |
+| `Cannot find module './billing.service'` at runtime | Missing `.js` extension in a backend import | Add `.js` to every relative backend import |
+| Generated file missing | Constant not mapped in `module.ts` | Add it to `frontend.templates` / `backend.templates` |
+
+### Update Not Detecting Changes
+
+1. **Rebuilt?** `npm run build` after any template edit — detection hashes the built template, so a stale build means no change is seen.
+2. **Link stale?** Re-run `npm link` in the module repo.
+3. **Version bumped?** Not required for detection, but needed for `{{moduleVersion}}` stamps and the `onUpdate` hook — `npm run version:patch`, then rebuild.
+4. **Check both sides:** `npx billing update --dry-run` reports the installed vs available version (`Version: 1.4.1 → 1.4.2`); `npx billing info` only shows the module's own version.
+5. **Hand-edited a generated file?** `update` cannot detect edits to files that carry a version header — it overwrites them whenever the template hash changes. Files *without* a header are listed under "files without version tracking" and prompted one by one (`--force` updates them all). Use `--dry-run` to preview which files will be rewritten, and move customised code out of the module's generated paths before updating.
+
+### Billing-Specific Verification
+
+After changes to the Stripe surface, verify against a real Stripe test account:
+
+- `stripe listen --forward-to localhost:3100/api/v1/billing/webhook` and complete a test checkout — confirm the `Subscription` row upserts and status transitions land
+- `stripe trigger invoice.payment_failed` — `DunningBanner` appears; `stripe trigger invoice.paid` (or pay the invoice) — status recovers to active
+- Type-check against the host: the templates are kept type-clean against React 19 and current `stripe`/Prisma versions — regressions here were the subject of v1.4.1/v1.4.2
+
+---
+
+## Documentation Workflow
+
+Docs live in the `docs/` git submodule (the shared Starlight site) and deploy automatically via GitHub Actions on push.
+
+### Editing and Pushing
+
+```bash
+# 1. Edit files under docs/src/content/docs/modules/billing/
+cd docs
+git add .
+git commit -m "Docs: describe the change"
+git push
+cd ..
+
+# 2. Update the submodule pointer in this repo
+git add docs
+git commit -m "docs: update docs submodule"
+git push
+```
+
+### Adding a New Docs Page
+
+1. Create the `.mdx` under `docs/src/content/docs/modules/billing/` with `title`, `description`, and `sidebar.order` frontmatter.
+2. The Billing sidebar group autogenerates from that directory (`docs/astro.config.mjs`) — frontmatter order controls position; no config edit needed for new pages in the same folder.
+3. Push with the flow above.

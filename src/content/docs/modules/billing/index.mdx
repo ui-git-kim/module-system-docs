@@ -1,107 +1,154 @@
 ---
-title: Billing Module
-description: Stripe integration for subscriptions and payments
+title: Billing
+description: Stripe subscription billing — pricing table checkout, customer portal, webhook sync, entitlements, and an owner admin page
+lastUpdated: 2026-07-15
+sidebar:
+  order: 0
+  label: "Overview"
 ---
 
-import { Steps } from '@astrojs/starlight/components';
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
-## Overview
+The **Billing** module adds Stripe subscription billing to a starter template app. It uses Stripe's native UI wherever possible — the Pricing Table for plan selection and checkout, the Customer Portal for payment methods, invoices, and cancellations — and only builds what Stripe doesn't provide: subscription state sync, trial alerts, plan-based entitlements, and an owner admin page.
 
-The Billing module provides Stripe integration for:
-- Subscription plans and checkout
-- Customer portal for self-service
-- Webhook handling for sync
-- Usage tracking support
+The module is designed for a **solo SaaS where the user is the tenant**. Everything is keyed on `tenantId` (the host isolation key), so a subscription belongs to the account, not an individual login. There is deliberately no per-seat or metered billing — one owner, one subscription, one plan.
 
----
+<Aside type="tip" title="Stripe is the source of truth">
+Plan names, prices, and limits all come from Stripe at runtime. Nothing is hardcoded — you change plans in the Stripe Dashboard and the app follows.
+</Aside>
 
-## Requirements
+## Quick Install
 
-- Starter template v1.2.0+
-- Stripe account with API keys
-- Stripe CLI for local webhooks
-
----
-
-## Installation
-
-<Steps>
-1. **Copy module files**
-   ```bash
-   cp -r billing-module/frontend/src/features/billing frontend/src/features/
-   cp -r billing-module/backend/src/features/billing backend/src/features/
-   ```
-
-2. **Add Prisma schema**
-
-   Add `Subscription` model to `schema.prisma`
-
-3. **Run migration**
-   ```bash
-   cd backend && npx prisma migrate dev --name add-billing
-   ```
-
-4. **Import modules**
-   ```typescript
-   // frontend/main.tsx
-   import '@/features/billing';
-
-   // backend/app.ts
-   import './features/billing/index.js';
-   ```
-
-5. **Configure environment**
-   ```env
-   STRIPE_SECRET_KEY=sk_test_...
-   STRIPE_WEBHOOK_SECRET=whsec_...
-   STRIPE_PRICE_ID_BASIC=price_...
-   STRIPE_PRICE_ID_PRO=price_...
-   ```
-
-6. **Set up webhooks**
-   ```bash
-   stripe listen --forward-to localhost:3100/api/v1/billing/webhook
-   ```
-</Steps>
-
----
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/billing/checkout` | POST | Create checkout session |
-| `/billing/subscription` | GET | Get subscription status |
-| `/billing/portal` | POST | Create portal session |
-| `/billing/webhook` | POST | Stripe webhook handler |
-
----
-
-## Frontend Usage
-
-```typescript
-import { useBilling } from '@/features/billing';
-
-function BillingPage() {
-  const { subscription, createCheckout, openPortal } = useBilling();
-
-  return (
-    <div>
-      {subscription ? (
-        <Button onClick={openPortal}>Manage</Button>
-      ) : (
-        <Button onClick={() => createCheckout('price_xxx')}>
-          Subscribe
-        </Button>
-      )}
-    </div>
-  );
-}
+```bash
+npx billing init
 ```
+
+The CLI generates the frontend feature (`frontend/src/features/billing/`), the backend feature (`backend/src/features/billing/`), adds the Prisma models, installs the `stripe` npm dependency, and prompts for your Stripe secret key.
+
+---
+
+## Key Features
+
+<CardGrid>
+  <Card title="Stripe-Native Checkout" icon="rocket">
+    Plan selection through the embedded Stripe Pricing Table, checkout through Stripe Checkout with automatic tax, and self-service management through the Customer Portal.
+  </Card>
+  <Card title="Webhook Sync" icon="random">
+    A signature-verified webhook keeps the local subscription state in sync with Stripe — trials, upgrades, cancellations, failed and recovered payments.
+  </Card>
+  <Card title="Entitlements" icon="approve-check">
+    Plan-based feature limits merged from owner-configured defaults and Stripe product metadata. Other modules register the limits they care about and check them with one hook call.
+  </Card>
+  <Card title="Owner Admin Page" icon="setting">
+    `/admin/billing` handles the non-secret Stripe config, one-click webhook setup (signing secret stored encrypted), and the entitlement options — no `.env` edits or restarts.
+  </Card>
+</CardGrid>
+
+### Full Feature List
+
+- Stripe subscription management keyed on the tenant (one subscription per account)
+- Stripe Pricing Table integration for plan selection and checkout
+- Stripe Customer Portal for payment methods, invoices, and cancellation
+- Checkout sessions with automatic tax
+- Webhook handler with signature verification, idempotent processing, and retry-safe error handling
+- Self-service billing settings page (`/settings/billing`) with plan card, payment method, and invoice history
+- Owner admin page (`/admin/billing`) for Stripe config, webhook setup, and entitlements
+- Admin-automated webhook creation — signing secret stored encrypted (AES-256-GCM), resolved DB-first with env fallback
+- Entitlements system: owner-configured defaults merged with Stripe product metadata (`max_*` / `limit_*` keys)
+- `useSubscription` and `useEntitlements` TanStack Query hooks
+- Trial countdown and trial-expiring alert components
+- Dunning banner for failed payments
+- Promo code input component for custom checkout flows
+- Security manifest + account-deletion handler — cancels the live Stripe subscription and hard-deletes local rows, while retaining the Stripe Customer and invoices for tax records
+- Runtime module registration with the host module registry (starter v1.48+)
+
+---
+
+## Architecture
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                           Frontend                             │
+│                                                                │
+│  /settings/billing ─┐                                          │
+│  /admin/billing ────┼──► billingService ──► /api/v1/billing/*  │
+│  Components/Hooks ──┘      (@/lib/api)            │            │
+│                                                   ▼            │
+│                                          Backend Routes        │
+│                                     (requireAuth/requireAdmin) │
+│                                                   │            │
+│                                                   ▼            │
+│                                          billing.service       │
+│                                            │           │       │
+│                                            ▼           ▼       │
+│                                       Stripe API    Prisma     │
+│                                            ▲     (Subscription,│
+│                                            │     BillingSettings)
+│                                            │           ▲       │
+│   Stripe ── webhook ──► POST /api/v1/billing/webhook ──┘       │
+│            (signature-verified, raw body)                      │
+└────────────────────────────────────────────────────────────────┘
+```
+
+The module integrates with the host entirely through registries — no core files are modified:
+
+| Registry | What Billing registers |
+|----------|------------------------|
+| `settingsPagesRegistry` | `BillingSettingsPage` replaces the placeholder Billing settings page (`/settings/billing`) |
+| `adminPagesRegistry` | `BillingAdminPage` at `/admin/billing` |
+| `routeRegistry` | Authenticated routes under `/api/v1/billing` plus the public webhook endpoint |
+| `serviceRegistry` | `billingService` for other backend modules (`serviceRegistry.get('billing')`) |
+| `securityRegistry` | Data-ownership manifest and the account-deletion handler |
+| `moduleRegistry` | Runtime module registration (id, name, version) on starter v1.48+ |
+
+Billing also **owns a registry**: the `entitlementsRegistry` (frontend and backend), which other modules use to define plan limits. See [Integration](/modules/billing/integration/).
+
+---
+
+## Prerequisites
+
+| Requirement | Details |
+|-------------|---------|
+| **Starter template host** | v1.52.1 or later (settings-blocks components, admin pages registry, security registry) |
+| **Stripe account** | With at least one product and recurring price — [dashboard.stripe.com](https://dashboard.stripe.com) |
+| **`STRIPE_SECRET_KEY`** | The only required environment variable (entered during init) |
+| **`SECURITY_ENCRYPTION_KEY`** | Host field encryption — required for the admin webhook setup (the signing secret is stored encrypted) |
+| **Stripe CLI** | Local development only — forwards webhooks to localhost |
+| **Other modules** | None — Billing has no `requiredModules` |
+
+<Aside type="note">
+There are **no frontend environment variables**. The publishable key, pricing table ID, and product ID are all managed by the owner on `/admin/billing` and stored in the database. See [Configuration](/modules/billing/configuration/).
+</Aside>
+
+---
+
+## What Gets Installed
+
+Running `npx billing init` generates:
+
+**Frontend** (in `frontend/src/features/billing/`):
+- 2 pages — `BillingSettingsPage` (settings replacement), `BillingAdminPage` (admin)
+- 7 components — subscription status, trial countdown, pricing table, manage button, dunning banner, trial-expiring alert, promo code input
+- 2 hooks — `useSubscription`, `useEntitlements`
+- 1 service — `billingService` API client
+- 1 registry — `entitlementsRegistry`
+- 2 registrations — settings page, admin page
+
+**Backend** (in `backend/src/features/billing/`):
+- Routes, service, types, webhook handler
+- 1 registry — `entitlementsRegistry`
+- 5 registrations — route, service, webhook, security (deletion handler), module
+
+**Database** — 2 Prisma models (`Subscription`, `BillingSettings`) and the `SubscriptionStatus` enum. Self-contained: no `@relation` directives, no edits to the `User` model.
+
+**Dependencies** — `stripe` (backend); shadcn components `card`, `button`, `badge`, `alert`, `input`, `switch`.
 
 ---
 
 ## Next Steps
 
-- [Module Catalogue](/modules/) - Other modules
-- [Module Structure](/modules/structure/) - Standards
+- [Configuration](/modules/billing/configuration/) — environment variables, Stripe Dashboard setup, webhook connection
+- [Usage](/modules/billing/usage/) — pages, components, hooks, and API endpoints
+- [Integration](/modules/billing/integration/) — how other modules gate features on the plan
+- [Developer Workflow](/modules/billing/developer-workflow/) — working on the module itself
+- [Module Catalogue](/modules/) — other available modules; [Module Structure](/modules/structure/) for module standards

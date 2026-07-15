@@ -1,0 +1,505 @@
+---
+title: Usage
+description: How to use the Billing module — pages, components, hooks, and the full API reference
+lastUpdated: 2026-07-15
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+This page covers everything you use after installation: the two pages, the seven components, the two hooks, the frontend API service, and the backend endpoints.
+
+---
+
+## Pages
+
+### Billing Settings — `/settings/billing`
+
+`BillingSettingsPage` replaces the starter's placeholder Billing settings page (registered via `settingsPagesRegistry` with `isReplacement: true`, order 50). It renders inside the settings layout and adapts to the viewer:
+
+**Owner (admin) view:**
+- Checkout confirmation alerts — reads `?success=true` / `?canceled=true` query params (set by the checkout return URLs) and clears them after 5 seconds
+- Trial countdown (when trialing)
+- Current plan card with status, price, and a "Change plan" / "Choose a plan" action
+- Payment method card with a "Manage" button that opens the Stripe Customer Portal
+- Billing history table (last 10 invoices) with per-invoice "Download PDF" and "View invoice" actions
+- Embedded Stripe Pricing Table for choosing or changing plans
+
+**Member (non-admin) view:**
+- Trial countdown and the plan card only, with a note: "Your plan is managed by the account owner."
+
+### Billing Admin — `/admin/billing`
+
+`BillingAdminPage` (registered via `adminPagesRegistry`, order 30, admin-gated by the host's admin layout) is the owner's configuration surface:
+
+- **Billing status** — read-only current plan and status
+- **Stripe configuration** — product ID, publishable key, pricing table ID
+- **Webhook** — connection status, public URL field, one-click "Set up webhook"
+- **Plan entitlements** — add/edit/remove entitlement options (key, label, limit, enabled)
+
+All writes go through admin-only endpoints that enforce `requireAdmin` server-side — the page gating is a convenience, not the security boundary. See [Configuration](/modules/billing/configuration/#admin-page-settings) for what each setting does.
+
+---
+
+## Components
+
+All components are exported from the feature barrel:
+
+```typescript
+import {
+  SubscriptionStatus,
+  TrialCountdown,
+  StripePricingTable,
+  ManageSubscriptionButton,
+  DunningBanner,
+  TrialExpiringAlert,
+  PromoCodeInput,
+} from '@/features/billing';
+```
+
+| Component | Purpose | Fetches Own Data? |
+|-----------|---------|-------------------|
+| `SubscriptionStatus` | Card showing the current plan, status badge, price, and renewal/trial dates | No — pass `subscription` |
+| `TrialCountdown` | Alert showing days remaining in the trial (urgent styling at ≤ 3 days) | No — pass `subscription` |
+| `StripePricingTable` | Embeds Stripe's Pricing Table web component; loads config from the backend | Yes |
+| `ManageSubscriptionButton` | Opens the Stripe Customer Portal | Yes (on click) |
+| `DunningBanner` | Full-width banner when payment has failed, with an "Update payment" portal link | Yes |
+| `TrialExpiringAlert` | Banner when the trial is within a threshold of ending | Yes |
+| `PromoCodeInput` | Promo code entry for custom checkout flows | No |
+
+### SubscriptionStatus
+
+```tsx
+const { subscription } = useSubscription();
+{subscription && <SubscriptionStatus subscription={subscription} />}
+```
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `subscription` | `SubscriptionResponse` | required | Subscription state from `useSubscription` |
+
+Renders a status badge (Trial, Active, Cancelled, Payment Failed, Paused, Incomplete, or No Subscription), the plan price (`en-AU` currency formatting), and the contextual date line — trial end, renewal date, or "Access until" when cancelling at period end.
+
+### TrialCountdown
+
+```tsx
+{subscription && <TrialCountdown subscription={subscription} />}
+```
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `subscription` | `SubscriptionResponse` | required | Subscription state |
+
+Returns `null` unless the status is `trialing` with a known `daysRemaining`. Switches to the destructive alert variant when 3 days or fewer remain.
+
+### StripePricingTable
+
+```tsx
+const { data: session } = useSession();
+<StripePricingTable email={session?.user?.email} userId={session?.user?.id} />
+```
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `email` | `string` | — | Pre-fills the checkout email (`customer-email`) |
+| `userId` | `string` | — | Set as `client-reference-id` so the webhook can link the checkout to the tenant |
+
+Injects the `https://js.stripe.com/v3/pricing-table.js` script once, then renders the `<stripe-pricing-table>` web component using the publishable key and pricing table ID from `GET /api/v1/billing/config`. Shows a placeholder while loading, and a "not configured" notice until the admin page has both values.
+
+<Aside type="caution" title="Always pass userId">
+`client-reference-id` is how `checkout.session.completed` resolves which tenant subscribed. Without it, the webhook falls back to matching an existing Stripe customer or the `tenantId` stamped in customer metadata — fine for renewals, but first-time checkouts should always carry it.
+</Aside>
+
+### ManageSubscriptionButton
+
+```tsx
+<ManageSubscriptionButton />
+```
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `disabled` | `boolean` | — | Disable the button |
+
+Creates a Customer Portal session on click and redirects to it. Shows an inline error message if the portal call fails.
+
+### DunningBanner
+
+Add once to your app layout — it renders nothing unless the subscription is `past_due`:
+
+```tsx
+import { DunningBanner } from '@/features/billing';
+
+// In your layout
+<DunningBanner />
+```
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `dismissible` | `boolean` | `true` | Show a dismiss button (reappears on page reload) |
+
+Includes an "Update payment" button that opens the Customer Portal.
+
+### TrialExpiringAlert
+
+```tsx
+<TrialExpiringAlert thresholdDays={3} />
+```
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `thresholdDays` | `number` | `3` | Show when the trial has this many days or fewer remaining |
+| `dismissible` | `boolean` | `true` | Dismissal persists in `sessionStorage` |
+| `onUpgrade` | `() => void` | — | Custom upgrade handler; defaults to navigating to `/settings/billing` |
+
+### PromoCodeInput
+
+The Stripe Pricing Table supports promo codes natively — this component is for **custom checkout flows** or showing an applied discount.
+
+```tsx
+<PromoCodeInput onCodeApplied={(code) => setPromoCode(code)} />
+```
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `onCodeApplied` | `(code: string) => void` | — | Called when a code is applied |
+| `validateCode` | `(code: string) => Promise<AppliedPromo>` | — | Async validator; should throw on invalid codes. Without it, any code is accepted (real validation happens at checkout) |
+| `appliedPromo` | `AppliedPromo \| null` | — | Controlled mode — show an already-applied promo |
+| `onRemove` | `() => void` | — | Called when the applied promo is removed |
+| `placeholder` | `string` | `'Enter promo code'` | Input placeholder |
+
+`AppliedPromo` is `{ code: string; percentOff?: number; amountOff?: number; currency?: string }`.
+
+---
+
+## Hooks
+
+Both hooks use TanStack Query with keys namespaced via `createModuleQueryKeys('billing')`, so requests dedupe and cache app-wide.
+
+### useSubscription
+
+```typescript
+import { useSubscription } from '@/features/billing';
+
+const {
+  subscription,      // SubscriptionResponse | null
+  isLoading,
+  error,             // Error | null
+  refetch,
+  isActive,          // status is 'active' or 'trialing'
+  isTrial,           // status is 'trialing'
+  needsPayment,      // status is 'past_due' or 'incomplete'
+  isCanceled,        // status is 'canceled'
+  hasSubscription,   // a subscription row exists
+} = useSubscription();
+```
+
+| Return | Type | Description |
+|--------|------|-------------|
+| `subscription` | `SubscriptionResponse \| null` | Status, plan details, trial/period dates, `daysRemaining` |
+| `isLoading` | `boolean` | Query in flight |
+| `error` | `Error \| null` | Query error |
+| `refetch` | `() => void` | Refetch from the server |
+| `isActive` | `boolean` | `active` or `trialing` — the usual "paid features on" check |
+| `isTrial` | `boolean` | Currently trialing |
+| `needsPayment` | `boolean` | `past_due` or `incomplete` |
+| `isCanceled` | `boolean` | Cancelled |
+| `hasSubscription` | `boolean` | Any subscription exists (status non-null) |
+
+Typical gating:
+
+```tsx
+function PremiumFeature() {
+  const { isActive, isLoading } = useSubscription();
+
+  if (isLoading) return <Skeleton />;
+  if (!isActive) return <UpgradePrompt />;
+
+  return <TheFeature />;
+}
+```
+
+### useEntitlements
+
+```typescript
+import { useEntitlements } from '@/features/billing';
+
+const {
+  limits,        // Record<string, number> — effective plan limits
+  planName,      // string | null
+  isLoading,
+  error,
+  checkLimit,    // (key, currentUsage?) => Promise<EntitlementCheck>
+  canUse,        // (key, currentUsage?) => Promise<boolean>
+  getRemaining,  // (key, currentUsage?) => Promise<number>
+  refetch,
+} = useEntitlements();
+```
+
+| Return | Type | Description |
+|--------|------|-------------|
+| `limits` | `PlanLimits` | All effective limits — admin config merged with Stripe product metadata |
+| `planName` | `string \| null` | Current plan name from Stripe |
+| `isLoading` | `boolean` | Limits query in flight |
+| `error` | `Error \| null` | Query error |
+| `checkLimit` | `(key: string, currentUsage?: number) => Promise<EntitlementCheck>` | Full check — limit, used, remaining, allowed, percentUsed |
+| `canUse` | `(key: string, currentUsage?: number) => Promise<boolean>` | Quick boolean check |
+| `getRemaining` | `(key: string, currentUsage?: number) => Promise<number>` | Remaining capacity |
+| `refetch` | `() => void` | Refetch limits |
+
+If you omit `currentUsage`, the hook asks the `entitlementsRegistry` for the registered `getUsage()` function of that key (returns 0 if none). Once limits are cached, checks are computed locally without a server round-trip.
+
+```tsx
+const { canUse } = useEntitlements();
+
+async function handleCreateProject() {
+  if (!(await canUse('max_projects', projects.length))) {
+    toast.error('Project limit reached — upgrade your plan.');
+    return;
+  }
+  await createProject();
+}
+```
+
+See [Integration](/modules/billing/integration/#the-entitlements-system) for registering your own entitlement keys.
+
+---
+
+## Frontend API Service
+
+`billingService` (in `services/billing.service.ts`) wraps every endpoint. Use the hooks where one exists; use the service directly for one-shot actions like opening the portal.
+
+| Method | Returns | Endpoint |
+|--------|---------|----------|
+| `getSubscription()` | `SubscriptionResponse` | `GET /subscription` |
+| `createPortalSession()` | `PortalResponse` | `POST /portal` |
+| `createCheckoutSession(priceId)` | `CheckoutResponse` | `POST /checkout` |
+| `getPaymentMethod()` | `PaymentMethodResponse \| null` | `GET /payment-method` |
+| `getInvoices(limit = 10)` | `InvoicesListResponse` | `GET /invoices` |
+| `getEntitlements()` | `EntitlementsResponse` | `GET /entitlements` |
+| `checkEntitlement(key, currentUsage, defaultLimit = 0)` | `EntitlementCheck` | `POST /entitlements/check` |
+| `getStripeConfig()` | `StripePublicConfig` | `GET /config` |
+| `getEntitlementConfig()` | `EntitlementConfig` | `GET /admin/entitlements-config` |
+| `setEntitlementConfig(config)` | `EntitlementConfig` | `PUT /admin/entitlements-config` |
+| `getAdminStripeConfig()` | `StripeConfig` | `GET /admin/stripe-config` |
+| `setAdminStripeConfig(config)` | `StripeConfig` | `PUT /admin/stripe-config` |
+| `getConnectionStatus()` | `WebhookConnectionStatus` | `GET /admin/connection-status` |
+| `connectWebhook(publicUrl)` | `{ endpointId, connected }` | `POST /admin/connect-webhook` |
+
+---
+
+## API Endpoints
+
+All routes are registered under `/api/v1/billing`. **Member** routes need any authenticated user; **Owner** routes additionally enforce `requireAdmin`. The tenant is resolved server-side as `req.user.tenantId ?? req.user.id` — endpoints never accept a tenant ID from the client.
+
+| Method | Path | Access | Purpose |
+|--------|------|--------|---------|
+| GET | `/subscription` | Member | Subscription status with plan details |
+| POST | `/checkout` | Owner | Create a Stripe Checkout session |
+| POST | `/portal` | Owner | Create a Customer Portal session |
+| GET | `/payment-method` | Member | Default payment method on file |
+| GET | `/invoices` | Member | Invoice history |
+| GET | `/entitlements` | Member | Effective plan limits |
+| POST | `/entitlements/check` | Member | Check one entitlement against usage |
+| GET | `/config` | Member | Non-secret Stripe config for the pricing table |
+| GET | `/admin/entitlements-config` | Owner | Read the entitlement options |
+| PUT | `/admin/entitlements-config` | Owner | Replace the entitlement options |
+| GET | `/admin/stripe-config` | Owner | Read the Stripe config (incl. product ID) |
+| PUT | `/admin/stripe-config` | Owner | Save the Stripe config |
+| GET | `/admin/connection-status` | Owner | Webhook connection status |
+| POST | `/admin/connect-webhook` | Owner | Create the Stripe webhook endpoint |
+| POST | `/webhook` | Public | Stripe webhook receiver (signature-verified) |
+
+<Aside type="note">
+Reads are member-level deliberately: any member of the tenant can see the plan and check entitlements so features can gate correctly, but only the owner can spend money or change configuration.
+</Aside>
+
+### Request/Response Examples
+
+<Tabs>
+<TabItem label="GET /subscription">
+
+```json
+// 200 OK
+{
+  "status": "trialing",
+  "plan": {
+    "id": "prod_ABC123",
+    "name": "Pro",
+    "priceId": "price_XYZ789",
+    "amount": 2900,
+    "currency": "aud",
+    "interval": "month"
+  },
+  "trialEndsAt": "2026-07-28T00:00:00.000Z",
+  "currentPeriodEnd": "2026-08-14T00:00:00.000Z",
+  "cancelAtPeriodEnd": false,
+  "daysRemaining": 13
+}
+```
+
+With no subscription, every field is `null`/`false` (`status: null`, `plan: null`, …). `amount` is in cents. `daysRemaining` counts down to the trial end while trialing, otherwise to the period end.
+
+</TabItem>
+<TabItem label="POST /checkout">
+
+```json
+// Request
+{ "priceId": "price_XYZ789" }
+
+// 200 OK
+{ "checkoutUrl": "https://checkout.stripe.com/c/pay/cs_test_..." }
+
+// 400 — missing priceId
+{ "error": "priceId is required" }
+```
+
+Redirect the browser to `checkoutUrl`. Stripe returns to `/settings/billing?success=true` or `?canceled=true`.
+
+</TabItem>
+<TabItem label="POST /portal">
+
+```json
+// 200 OK
+{ "portalUrl": "https://billing.stripe.com/p/session/..." }
+
+// 404 — no Stripe customer yet
+{ "error": "No billing account found" }
+```
+
+Portal URLs are temporary — generate a fresh one for every click, never store them.
+
+</TabItem>
+<TabItem label="GET /entitlements">
+
+```json
+// 200 OK
+{
+  "limits": {
+    "max_projects": 25,
+    "max_team_members": 5,
+    "limit_api_calls": 10000
+  },
+  "planName": "Pro",
+  "status": "active"
+}
+```
+
+`limits` is the merge of the owner's enabled entitlement options and the active plan's `max_*`/`limit_*` Stripe product metadata (metadata wins).
+
+</TabItem>
+<TabItem label="POST /entitlements/check">
+
+```json
+// Request
+{ "key": "max_projects", "currentUsage": 8, "defaultLimit": 3 }
+
+// 200 OK
+{
+  "key": "max_projects",
+  "limit": 25,
+  "used": 8,
+  "remaining": 17,
+  "allowed": true,
+  "percentUsed": 32
+}
+```
+
+`defaultLimit` applies when neither the admin config nor the plan metadata defines the key.
+
+</TabItem>
+<TabItem label="GET /invoices">
+
+```json
+// GET /api/v1/billing/invoices?limit=10   (limit capped at 100)
+// 200 OK
+{
+  "invoices": [
+    {
+      "id": "in_1ABC...",
+      "number": "INV-0042",
+      "status": "paid",
+      "amount": 2900,
+      "currency": "aud",
+      "periodStart": "2026-06-14T00:00:00.000Z",
+      "periodEnd": "2026-07-14T00:00:00.000Z",
+      "pdfUrl": "https://pay.stripe.com/invoice/.../pdf",
+      "hostedUrl": "https://invoice.stripe.com/i/...",
+      "createdAt": "2026-06-14T00:00:00.000Z"
+    }
+  ],
+  "hasMore": false
+}
+```
+
+</TabItem>
+<TabItem label="Admin endpoints">
+
+```json
+// GET /admin/connection-status → 200 OK
+{
+  "webhookConnected": true,
+  "endpointId": "we_1ABC...",
+  "source": "db",              // "db" | "env" | "none"
+  "suggestedUrl": "https://app.example.com"
+}
+
+// POST /admin/connect-webhook
+// Request
+{ "publicUrl": "https://app.example.com" }
+// 200 OK
+{ "endpointId": "we_1ABC...", "connected": true }
+// 400 — localhost, bad key, or encryption unavailable
+{ "error": "Stripe cannot reach localhost. For local development use the Stripe CLI and set STRIPE_WEBHOOK_SECRET." }
+
+// PUT /admin/entitlements-config
+// Request
+{
+  "config": {
+    "max_projects": { "key": "max_projects", "label": "Projects", "defaultLimit": 3, "enabled": true }
+  }
+}
+// 200 OK — echoes { "config": ... }
+
+// PUT /admin/stripe-config
+// Request
+{ "config": { "productId": "prod_...", "publishableKey": "pk_...", "pricingTableId": "prctbl_..." } }
+// 200 OK — echoes { "config": ... }
+```
+
+</TabItem>
+</Tabs>
+
+---
+
+## Exported Types
+
+The frontend barrel re-exports every type (`export type * from './types'`):
+
+`SubscriptionStatus`, `SubscriptionPlan`, `SubscriptionResponse`, `PortalResponse`, `CheckoutResponse`, `PaymentMethodResponse`, `InvoiceResponse`, `InvoicesListResponse`, `EntitlementDefinition`, `EntitlementCheck`, `PlanLimits`, `EntitlementsResponse`, `EntitlementConfigEntry`, `EntitlementConfig`, `StripeConfig`, `StripePublicConfig`, `WebhookConnectionStatus`
+
+The backend barrel does the same from `billing.types.js` (adding `CreateCheckoutInput` and `CheckEntitlementInput`, but **without** `WebhookConnectionStatus`, which is frontend-only). Key shapes:
+
+```typescript
+type SubscriptionStatus =
+  | 'trialing' | 'active' | 'canceled'
+  | 'past_due' | 'paused' | 'incomplete';
+
+interface SubscriptionResponse {
+  status: SubscriptionStatus | null;
+  plan: SubscriptionPlan | null;       // { id, name, priceId, amount, currency, interval }
+  trialEndsAt: string | null;
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  daysRemaining: number | null;
+}
+
+interface EntitlementCheck {
+  key: string;
+  limit: number;
+  used: number;
+  remaining: number;
+  allowed: boolean;
+  percentUsed: number;                  // 0–100
+}
+```

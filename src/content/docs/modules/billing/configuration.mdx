@@ -1,0 +1,191 @@
+---
+title: Configuration
+description: Environment variables, Stripe Dashboard setup, admin-page settings, and webhook connection for the Billing module
+lastUpdated: 2026-07-15
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Billing keeps secrets in server environment variables and everything else in the database, managed from the `/admin/billing` page. This page covers all of it: env vars, the Stripe Dashboard prerequisites, the admin-page settings, and the webhook connection.
+
+---
+
+## Environment Variables
+
+### Module Variables (collected during init)
+
+| Variable | Required | Secret | Description |
+|----------|----------|--------|-------------|
+| `STRIPE_SECRET_KEY` | ✅ Yes | ✅ | Stripe secret key (`sk_test_...` / `sk_live_...`) from [dashboard.stripe.com/apikeys](https://dashboard.stripe.com/apikeys). The only variable Billing requires. |
+| `STRIPE_WEBHOOK_SECRET` | ❌ No | ✅ | Webhook signing secret (`whsec_...`) for **local development only** (Stripe CLI). Deployed apps connect the webhook from `/admin/billing` instead — the stored secret takes precedence over this variable. |
+
+### Host Variables Billing Reads
+
+These are provided by the starter template, not by Billing's init:
+
+| Variable | Used For | Fallback |
+|----------|----------|----------|
+| `FRONTEND_URL` | Checkout success/cancel URLs and the Customer Portal return URL (`{FRONTEND_URL}/settings/billing`) | `http://localhost:5173` |
+| `SECURITY_ENCRYPTION_KEY` | Field encryption for the stored webhook signing secret (AES-256-GCM via the host's `encryptField`). Required for the admin "Set up webhook" flow. | None — webhook connect fails with a clear error if absent |
+| `BILLING_PUBLIC_URL` / `PUBLIC_BACKEND_URL` | Pre-fills the "Public backend URL" field on the admin webhook panel | Empty field (owner types the URL) |
+
+<Aside type="note" title="No frontend environment variables">
+Earlier versions used `VITE_STRIPE_PUBLISHABLE_KEY` and `VITE_STRIPE_PRICING_TABLE_ID`. Since v1.4.0 these are **owner-managed settings** on `/admin/billing`, stored in `BillingSettings` and served to the pricing table via `GET /api/v1/billing/config`. Nothing Stripe-related goes in the frontend `.env`.
+</Aside>
+
+### Init Prompts
+
+Billing asks **no interactive prompts** during `npx billing init` (`prompts: []` in `module.ts`). The only inputs are the environment variables above.
+
+---
+
+## Stripe Dashboard Setup
+
+Before the module can sell anything, set up your Stripe account:
+
+<Steps>
+1. **Create a product and recurring price**
+
+   In [Products](https://dashboard.stripe.com/products), create each plan as a product with a recurring price. Add a free-trial period on the price if you want trials — `TrialCountdown` and `TrialExpiringAlert` pick it up automatically.
+
+2. **Add entitlement metadata to each product** (optional)
+
+   On the product, add metadata keys starting with `max_` or `limit_`:
+
+   ```
+   max_projects: 25
+   max_team_members: 5
+   limit_api_calls: 10000
+   ```
+
+   These become the plan's limits at runtime and override the owner-configured defaults. See [Entitlements](#entitlement-options).
+
+3. **Create a Pricing Table**
+
+   Under [Pricing tables](https://dashboard.stripe.com/pricing-tables), build a table with your prices. Copy the pricing table ID (`prctbl_...`) — you'll paste it into the admin page. Enable promotion codes on the table if you use them.
+
+4. **Enable the Customer Portal**
+
+   Under [Settings → Billing → Customer portal](https://dashboard.stripe.com/settings/billing/portal), activate the portal and choose what customers can do (update payment method, view invoices, cancel).
+
+5. **Enable automatic tax** (recommended)
+
+   Checkout sessions are created with `automatic_tax: { enabled: true }` and `customer_update: { address: 'auto' }`, so returning customers keep their address current. Configure tax in [Settings → Tax](https://dashboard.stripe.com/settings/tax).
+</Steps>
+
+---
+
+## Admin Page Settings
+
+Everything below lives on `/admin/billing` (owner only) and is stored per tenant in the `BillingSettings` table.
+
+### Stripe Configuration (non-secret)
+
+| Setting | Stored As | Purpose |
+|---------|-----------|---------|
+| Product ID (optional) | `BillingSettings.stripeProductId` | Scope the module to one product on a shared Stripe account |
+| Publishable key | `BillingSettings.stripePublishableKey` | Rendered by the embedded pricing table (`pk_...` — public by design) |
+| Pricing table ID | `BillingSettings.stripePricingTableId` | Which Stripe Pricing Table to embed (`prctbl_...`) |
+
+The frontend fetches the publishable key and pricing table ID from `GET /api/v1/billing/config`; until both are set, `StripePricingTable` renders a "not configured" placeholder instead of the table.
+
+### Webhook Connection
+
+The **Set up webhook** button automates the whole webhook flow:
+
+1. Validates the `STRIPE_SECRET_KEY` against the Stripe API before changing anything.
+2. Deletes any existing Stripe webhook endpoint with the same URL (Stripe only returns the signing secret at creation time, so it recreates to get a storable secret).
+3. Creates the endpoint at `{publicUrl}/api/v1/billing/webhook`, subscribed to the events the module handles.
+4. Encrypts the signing secret with the host's field encryption (`SECURITY_ENCRYPTION_KEY`) and stores it in `BillingSettings.stripeWebhookSecretEnc` — never plaintext, never in `.env`.
+
+The webhook handler resolves the signing secret **DB-first, env-fallback**: an admin-connected secret wins; `STRIPE_WEBHOOK_SECRET` covers local development.
+
+<Aside type="caution" title="Deployed URLs only">
+The connect flow refuses `localhost` / `127.0.0.1` — Stripe cannot reach your machine. For local development use the Stripe CLI (below). If field encryption isn't available, the flow rolls back the endpoint it created and reports the error rather than leaving a half-configured webhook.
+</Aside>
+
+The **connection status** panel shows whether a secret is available and from where: `db` (admin-connected), `env` (`STRIPE_WEBHOOK_SECRET`), or `none`.
+
+### Entitlement Options
+
+The **Plan entitlements** section lets the owner define limit options without touching Stripe:
+
+| Field | Meaning |
+|-------|---------|
+| Key | Metadata-style key, e.g. `max_projects` |
+| Label | Human-readable name shown in the admin UI |
+| Limit | Default numeric limit |
+| Enabled | Toggle an option on/off without deleting it |
+
+Stored as JSON in `BillingSettings.entitlements`. At runtime, `GET /api/v1/billing/entitlements` merges these **under** the active plan's Stripe product metadata — Stripe metadata wins for the plan; the admin values act as configurable defaults. See [Integration → Entitlements](/modules/billing/integration/#the-entitlements-system) for the full merge order.
+
+---
+
+## Webhook Events
+
+The handler processes these events. The admin connect flow subscribes the endpoint to this list, except `invoice.payment_succeeded` — the handler accepts it defensively (Stripe CLI forwarding, manually created endpoints), but the connect flow subscribes to `invoice.paid` only, which covers the same payments:
+
+| Event | Effect |
+|-------|--------|
+| `checkout.session.completed` | Fetches the subscription and upserts the local row (resolves the tenant from `client_reference_id`) |
+| `customer.subscription.created` | Syncs subscription state to the database |
+| `customer.subscription.updated` | Syncs subscription state (plan changes, cancellation flags, period end) |
+| `customer.subscription.deleted` | Marks the local subscription `CANCELED` |
+| `invoice.payment_failed` | Marks the subscription `PAST_DUE` (drives the `DunningBanner`) |
+| `invoice.paid` / `invoice.payment_succeeded` | Recovers `PAST_DUE` back to `ACTIVE` (never overrides trialing/cancelled states) |
+| `customer.subscription.trial_will_end` | Acknowledged only — trial alerts are driven by `trialEndsAt` in the frontend |
+
+Processing is **idempotent** (recently-processed event IDs are deduplicated in memory) and **retry-safe**: internal failures return HTTP 5xx so Stripe retries; the event is only marked handled after successful processing.
+
+<Aside type="caution" title="Raw body requirement — host support is an open upstream issue">
+Stripe signature verification needs the **raw request body**, but the starter's global `express.json()` consumes it before route handlers run and currently exposes no raw-body hook — logged as an open, high-severity item on the [Starter Template → Upstream Issues](/starter-template/upstream-issues/) page ("No way to verify inbound third-party webhook signatures"). Until the starter ships the fix, add the verify callback yourself in `backend/src/app.ts`:
+
+```typescript
+app.use(express.json({
+  limit: '10mb',
+  verify: (req, _res, buf) => { (req as { rawBody?: Buffer }).rawBody = buf; },
+}));
+```
+
+The handler reads `req.rawBody` and falls back to `req.body` — without the raw body it **rejects every delivery** (fails safely rather than accepting unsigned payloads), so subscription state will not sync until the callback is in place.
+</Aside>
+
+---
+
+## Local Development
+
+Stripe can't reach `localhost`, so use the Stripe CLI to forward events:
+
+```bash
+stripe listen --forward-to localhost:3100/api/v1/billing/webhook
+```
+
+The CLI prints a signing secret — put it in the backend `.env`:
+
+```env
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...   # from `stripe listen`
+```
+
+Use [Stripe test cards](https://docs.stripe.com/testing) (e.g. `4242 4242 4242 4242`) to exercise checkout, and `stripe trigger invoice.payment_failed` to test the dunning flow.
+
+---
+
+## Internal Constants
+
+Behaviour baked into the templates (change requires editing the module templates — see [Developer Workflow](/modules/billing/developer-workflow/)):
+
+| Constant | Value | Where |
+|----------|-------|-------|
+| Stripe API version | `2024-12-18.acacia` (pinned, cast to the SDK's expected literal) | `billing.service.ts`, `stripe.webhook.ts` |
+| Plan details cache TTL | 5 minutes (in-memory, per product+price) | `billing.service.ts` |
+| Webhook dedupe window | Last 1,000 event IDs (in-memory, per process) | `stripe.webhook.ts` |
+| Invoice list cap | `limit` query param capped at 100 | `billing.routes.ts` |
+| Checkout success URL | `{FRONTEND_URL}/settings/billing?success=true` | `billing.service.ts` |
+| Checkout cancel URL | `{FRONTEND_URL}/settings/billing?canceled=true` | `billing.service.ts` |
+
+<Aside type="tip" title="API version drift">
+Webhook payloads arrive in your **Stripe account's** API version, not the pinned one. Stripe moved `current_period_end` from the subscription to the subscription item in `2025-03-31.basil`, so the sync logic reads the item first and falls back to the subscription — both payload shapes work.
+</Aside>
