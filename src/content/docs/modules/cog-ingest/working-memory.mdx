@@ -1,0 +1,318 @@
+---
+title: Working Memory
+description: The shared working-memory surface — a Structure-backed active set and notes that any module contributes to and reacts to via hooks
+lastUpdated: 2026-07-15
+sidebar:
+  order: 3.5
+  label: "Working Memory"
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Working memory is the cross-module answer to **"what is the user working on right now?"** — the nodes currently in focus (the *active set*), the user's recent thought process (*notes*), and the context a chat or LLM call draws on. Cog Ingest v1.12.0 ships it as a shared surface (cognitive-db v2 RFC §7): one node type, two filter hooks, five action hooks, and an orchestrating service.
+
+## Division of Responsibility
+
+| Owner | Responsibility |
+|-------|----------------|
+| **Structure** | Stores the state — the `working-memory` node, its origin-`active` connections, and `data.notes`. Working memory adds no tables. |
+| **Cog Ingest** | Owns the node type, the hook surface, and the orchestrating `workingMemory` service. It orchestrates and never stores records. |
+| **Any module** | Contributes items via the `assemble` filter, shapes context via the `context` filter, reacts via the action hooks. |
+| **The engine** (Phase 3) | Plugs in as a contributor like any other module — token-aware trimming in the `context` filter, consolidation from `updated` events. |
+
+<Aside type="note">
+Backend-only in v1.12.0 — there are no HTTP routes and no dedicated frontend UI. Working-memory nodes render through the generic Structure node UI; presentation is a Phase 4 concern.
+</Aside>
+
+---
+
+## The Node Type
+
+The `working-memory` Structure node type is seeded as a **shared row** (`userId: null`) — at backend boot (non-fatal) and again lazily on first working-memory use, so a host that imports features in the wrong order heals itself. The seed is guarded by an existence check: it never re-imports over an existing type, so admin customisations survive restarts.
+
+| Property | Value |
+|----------|-------|
+| Slug | `working-memory` |
+| Name | Working Memory |
+| Icon | `BrainCircuit` |
+| `moduleId` | `cog-ingest` |
+| `isSystem` | `true` |
+| Fields | One `notes` textarea — "Recent Thought Process" |
+| Navigation | Hidden — `mainNav` disabled, `sidebarNav` style `none` |
+| `rules` | `{}` — any parent, enabling session linkage |
+| `features` | `{}` — deliberately **not** `cognitiveIngest`; working-memory nodes are module infrastructure, not ingest content |
+| `sortOrder` | 90 |
+
+### What lives on the node
+
+- **Active set** — outbound connections with `connectionType: 'working-memory'` and `origin: 'active'` (Structure v1.16.0 [connection provenance](/modules/structure/cognitive/#connection-provenance--promotion)).
+- **Notes** — `data.notes`, the recent-thought-process text.
+- **Scope discriminator** — `data.scope: 'user' | 'session'`, plus `data.sessionNodeId` on session-scoped nodes, so every node is self-describing.
+- **Metadata** — `metadata['cog-ingest'] = { lastActiveAt, itemCount }`. The namespace is replaced atomically on every write, so the object is always complete.
+
+### Granularity
+
+| Scope | Node shape | Lookup |
+|-------|-----------|--------|
+| Rolling per-user | One root node per user (`data.scope: 'user'`) | `parentId: 'null'` string sentinel — JS `null`/`undefined` would mean "no parent filter" and match session nodes too |
+| Per-session | One child node under each session/chat node (`data.scope: 'session'`, `parentId` = the session node) | `parentId: sessionNodeId` |
+
+Session linkage is **`parentId`-only**. The RFC's alternative session-link *connection* is deferred: Structure's service layer does not enforce hierarchy rules (`allowedChildren` is frontend-only), so a fallback connection could only mask real errors.
+
+---
+
+## Active-Set Connections
+
+Each item of the working set is a connection from the working-memory node to the node in focus:
+
+| Property | Value |
+|----------|-------|
+| `connectionType` | `working-memory` — untyped (no connection-type row is seeded; Structure has no shared-row API for connection types), so type validation is skipped by design |
+| `origin` | `active` |
+| Direction | **Outbound only** — every read, diff, and delete filters `fromNodeId === workingMemoryId`, so inbound origin-`active` edges created by other modules are never touched |
+| `data` | `{ label?, source?, weight?, pinned }` |
+
+**Pinned semantics:** pinned edges persist across assembles until an explicit `removeItem`. Only `addItem` can pin — assemble-created edges are **never** pinned, even when a contributor sets `pinned: true`. A contributor that could pin its own items would make them permanent and reintroduce the monotonic-growth ratchet the rebuild semantics exist to prevent.
+
+---
+
+## Hook Reference
+
+All hooks live under `cog-ingest.working-memory.*`. The names are exported as the `WORKING_MEMORY_HOOKS` constant:
+
+```typescript
+import { WORKING_MEMORY_HOOKS } from '../cog-ingest/cog-ingest.working-memory.js';
+```
+
+### Filter Hooks
+
+Filters are how modules **contribute**. Both receive the same context and run via `filterRegistry.applyAll()` (sync and async filters, in order). Cog Ingest registers identity defaults at order 10 as discoverability anchors — register your filters after (e.g. 50).
+
+| Hook | Value Type | Context | Purpose |
+|------|-----------|---------|---------|
+| `cog-ingest.working-memory.assemble` | `WorkingMemoryItem[]` | `{ userId, sessionNodeId?, workingMemoryId }` | Contribute the items relevant *now* — the working set is rebuilt from the filter's output |
+| `cog-ingest.working-memory.context` | `WorkingMemoryContext` | `{ userId, sessionNodeId?, workingMemoryId }` | Add, trim, or rank the context for a chat/LLM call |
+
+<Aside type="caution" title="The assemble contract: rebuild, not append">
+`assemble` runs with **rebuild semantics** — contribute your current items *every time* the filter runs. Items you stop contributing drop out of the working set; pinned items persist. This is a deliberate hardening of the RFC's append-over-seed flow: append-only assembly is a ratchet where nothing can ever leave focus.
+</Aside>
+
+<Aside type="tip" title="maxTokens is advisory">
+`WorkingMemoryContext.maxTokens` is a hint, not a limit. Cog Ingest never trims — token-aware filters (typically the engine, Phase 3) own trimming. Later filters see earlier filters' output.
+</Aside>
+
+### Action Hooks
+
+Actions are how modules **react**. All five fire via `actionRegistry.doActionAll()` through a catch-guarded fire-and-forget dispatch, so async listeners run and a failing listener cannot break the chat hot path.
+
+| Hook | Fired When | Context Shape |
+|------|-----------|---------------|
+| `cog-ingest.working-memory.updated` | The working memory changes in any way | `{ userId, workingMemoryId, change }` |
+| `cog-ingest.working-memory.item.added` | A node enters the active set | `{ userId, workingMemoryId, item }` |
+| `cog-ingest.working-memory.item.removed` | A node leaves the active set | `{ userId, workingMemoryId, item }` |
+| `cog-ingest.working-memory.session.started` | `startSession` ensures the per-session node | `{ userId, workingMemoryId, sessionNodeId }` |
+| `cog-ingest.working-memory.session.ended` | `endSession` archives the per-session node | `{ userId, workingMemoryId, sessionNodeId }` |
+
+<Aside type="note" title="Two updated events per flow — filter by change.type">
+One full assemble → getContext flow fires `updated` **twice**: once with `change.type: 'assemble'` (what changed in the active set) and once with `change.type: 'context'` (a usage summary of what went into the assembled context). Listeners must branch on `change.type` rather than treating every `updated` as the same event.
+</Aside>
+
+### Context Type Details
+
+```typescript
+// Context passed to both filter hooks
+interface WorkingMemoryFilterContext {
+  userId: string;
+  sessionNodeId?: string;   // set for per-session working memory
+  workingMemoryId: string;  // the working-memory node id
+}
+
+// cog-ingest.working-memory.updated
+interface WorkingMemoryUpdatedContext {
+  userId: string;
+  workingMemoryId: string;
+  change: WorkingMemoryChange;
+}
+
+// cog-ingest.working-memory.item.added / .item.removed
+interface WorkingMemoryItemEventContext {
+  userId: string;
+  workingMemoryId: string;
+  item: WorkingMemoryItem;
+}
+
+// cog-ingest.working-memory.session.started / .session.ended
+interface WorkingMemorySessionEventContext {
+  userId: string;
+  workingMemoryId: string;
+  sessionNodeId: string;
+}
+```
+
+The value shapes are frozen contracts exported from `cog-ingest.types.ts`:
+
+```typescript
+/** One entry of the working set — a reference to a Structure node in focus. */
+interface WorkingMemoryItem {
+  nodeId: string;    // Structure node id the item points at
+  label?: string;    // display label (defaults to the node's name)
+  source?: string;   // contributing module id (e.g. 'tasks', 'cog-ingest', 'manual')
+  weight?: number;   // optional 0..1 relevance hint — weighted items first (desc), unweighted last
+  pinned?: boolean;  // pinned items persist across assembles until removeItem
+}
+
+interface WorkingMemoryContextSection {
+  id: string;
+  title?: string;
+  content: string;
+  tokens?: number;   // estimated token count (advisory)
+}
+
+/** The value shape of the context filter — what a chat/LLM call draws on. */
+interface WorkingMemoryContext {
+  workingMemoryId: string;
+  notes: string | null;  // the node's data.notes; null when empty
+  items: WorkingMemoryItem[];
+  sections: WorkingMemoryContextSection[];
+  maxTokens?: number;    // ADVISORY — token-aware filters own trimming
+}
+
+/** Payload of the updated action — modules filter by type. */
+interface WorkingMemoryChange {
+  type: 'assemble' | 'context' | 'item-added' | 'item-removed' | 'notes';
+  added?: string[];      // nodeIds added (assemble / item-added)
+  removed?: string[];    // nodeIds removed (assemble / item-removed)
+  itemCount?: number;
+  itemIds?: string[];    // type 'context': the item nodeIds in the assembled context
+  sections?: Array<{ id: string; tokens?: number }>;  // type 'context': usage summary
+  maxTokens?: number;
+}
+```
+
+### Registering a Contribution
+
+```typescript
+// backend/src/features/my-tasks/filter.registration.ts
+import { filterRegistry } from '../../config/filter.registry.js';
+import { WORKING_MEMORY_HOOKS } from '../cog-ingest/cog-ingest.working-memory.js';
+import type { WorkingMemoryItem } from '../cog-ingest/cog-ingest.types.js';
+
+// Contribute the user's in-progress tasks to the working set.
+// REBUILD semantics: return your CURRENT items every run — a task that is
+// no longer in progress simply stops being contributed and drops out.
+filterRegistry.registerAsync(
+  WORKING_MEMORY_HOOKS.assemble,
+  'my-tasks-contribute-active',
+  async (items: WorkingMemoryItem[], context) => {
+    const active = await getInProgressTasks(context.userId);
+    return [
+      ...items,
+      ...active.map((task) => ({
+        nodeId: task.structureNodeId,
+        label: task.title,
+        source: 'my-tasks',
+        weight: 0.6,
+      })),
+    ];
+  },
+  50  // after cog-ingest's identity default at order 10
+);
+```
+
+### Reacting to Changes
+
+```typescript
+// backend/src/features/my-analysis/action.registration.ts
+import { actionRegistry } from '../../config/action.registry.js';
+import { WORKING_MEMORY_HOOKS } from '../cog-ingest/cog-ingest.working-memory.js';
+
+actionRegistry.addActionAsync(
+  WORKING_MEMORY_HOOKS.updated,
+  'my-analysis-track-focus',
+  async (context) => {
+    const { userId, workingMemoryId, change } = context;
+
+    // One flow fires TWO updated events — branch on change.type
+    if (change.type === 'context') {
+      // Usage summary: what actually went into the assembled context
+      await recordContextUsage(userId, change.itemIds, change.sections);
+    } else if (change.type === 'assemble') {
+      await recordFocusShift(userId, change.added, change.removed);
+    }
+  },
+  50
+);
+```
+
+<Aside type="caution" title="Use addActionAsync for async work">
+Working-memory actions dispatch via `doActionAll`, which awaits async listeners — but only handlers registered with `addActionAsync` may return promises. The `addAction` variant is synchronous only.
+</Aside>
+
+---
+
+## Service API
+
+The service is namespaced under the Cog Ingest service registration:
+
+```typescript
+import { serviceRegistry } from '../../config/service.registry.js';
+
+const wm = serviceRegistry.get('cog-ingest').workingMemory;
+
+// Rebuild the working set, then build context for an LLM call
+await wm.assemble(userId, { sessionNodeId });
+const context = await wm.getContext(userId, { sessionNodeId, maxTokens: 4000 });
+```
+
+All methods take an optional `{ sessionNodeId? }` — omit it for the rolling per-user working memory, pass it for per-session scope.
+
+| Method | Parameters | Returns | Description |
+|--------|-----------|---------|-------------|
+| `ensureNode(userId, options?)` | `string, { sessionNodeId? }` | `WorkingMemoryNodeRef` | Find-or-restore-or-create the working-memory node |
+| `get(userId, options?)` | `string, { sessionNodeId? }` | `WorkingMemorySnapshot` | The node + its active set (`{ node, items }`, weight-ordered) |
+| `assemble(userId, options?)` | `string, { sessionNodeId?, seed?, reflect? }` | `{ node, items, added, removed }` | Rebuild the working set through the `assemble` filter |
+| `getContext(userId, options?)` | `string, { sessionNodeId?, maxTokens? }` | `WorkingMemoryContext` | Build the chat/LLM context through the `context` filter |
+| `addItem(userId, item, options?)` | `string, WorkingMemoryItem, { sessionNodeId?, pin? }` | `WorkingMemorySnapshot` | Pin a node into the working set (`pin` defaults to `true`) |
+| `removeItem(userId, nodeId, options?)` | `string, string, { sessionNodeId? }` | `WorkingMemorySnapshot` | Drop a node from the working set, pinned or not |
+| `setNotes(userId, notes, options?)` | `string, string, { sessionNodeId? }` | `WorkingMemoryNodeRef` | Update the recent-thought-process notes (`data.notes`) |
+| `startSession(userId, sessionNodeId)` | `string, string` | `WorkingMemoryNodeRef` | Ensure (or restore) the per-session node + fire `session.started` |
+| `endSession(userId, sessionNodeId)` | `string, string` | `void` | Sweep active-set edges, archive the node + fire `session.ended` |
+| `hooks` | — | `WORKING_MEMORY_HOOKS` | The hook-name map, for convenience |
+
+Method semantics:
+
+- **`ensureNode`** restores an archived (or cascade-deleted) node before creating — a re-opened session would otherwise violate the `[userId, parentId, name]` unique constraint. A failed create re-finds once (create-race tolerance).
+- **`assemble`** seeds with the currently pinned items plus `options.seed`, runs the `assemble` filter, dedupes by `nodeId` (first occurrence wins — pinned items are seeded first; the working-memory node itself is excluded), then reflects the diff onto origin-`active` edges with per-item error tolerance. `reflect: false` runs the filter without touching edges. The returned `items`, `itemCount`, and node metadata reflect what actually landed — failed edge creations are excluded.
+- **`getContext`** builds the base context (notes + weight-ordered items), runs the `context` filter, and fires `updated` (`type: 'context'`) with the usage summary before returning.
+- **`addItem`** is idempotent: adding an already-present unpinned item pin-upgrades the existing edge in place (no `item.added` fires — the item was already in the set). Manual adds default `source: 'manual'`.
+- **`removeItem`** is idempotent — a no-op when the node isn't in the set.
+- **`setNotes`** merges into `data`, so other `data` keys (`scope`, `sessionNodeId`) are untouched.
+
+---
+
+## The Flow
+
+The full flow at the seam of a chat or LLM call:
+
+<Steps>
+
+1. **Assemble.** Call `assemble(userId, { sessionNodeId })`. Pinned items + any seed run through the `assemble` filter; every module contributes its current items; the result is reflected onto the node as origin-`active` connections. `item.added` / `item.removed` fire per change, then one `updated` with `change.type: 'assemble'`.
+
+2. **Reflect.** The active set on the Structure node now *is* the working set — visible to anything that reads the node's connections.
+
+3. **Get context.** Call `getContext(userId, { sessionNodeId, maxTokens })`. The base context (notes + weight-ordered items) runs through the `context` filter, where modules add sections, re-rank, or trim. A second `updated` fires with `change.type: 'context'` carrying the usage summary (`itemIds`, `sections`, `maxTokens`).
+
+4. **Consume.** Feed the returned `WorkingMemoryContext` to the chat/LLM call. Listeners on `updated` (the engine, Phase 3) consolidate from the two change payloads.
+
+</Steps>
+
+---
+
+## Requirements & Notes
+
+- **Structure v1.16.0 or later, runtime-gated.** The service probes for the v1.16 cognitive-foundations surface (`getCognitiveCapabilities`) and throws `structure-version: working memory requires the structure module v1.16.0 or later` on older hosts — on those, the `origin` option would be silently ignored and active-set queries would return untagged garbage. The module declares `depends: { structure: '>=1.16.0' }`.
+- **Sessions are `parentId`-linked only.** The per-session working-memory node is a child of the session node — there is no session-link connection (see [Granularity](#granularity)).
+- **`endSession` sweeps before archiving.** `archiveNode` does not cascade to connections, so `endSession` deletes the ephemeral active-set edges first — otherwise stale origin-`active` edges would pollute every content node's connection list — then archives the node. A re-opened session finds and restores the archived node via `ensureNode`.
+- **Deleted-session recovery.** Deleting a session node cascades its working-memory child to status `deleted`, and restoring the session does **not** restore children. `ensureNode`'s restore ladder therefore covers `deleted` as well as `archived` — the dead row is found and restored instead of colliding with the `[userId, parentId, name]` unique constraint.
+- **No connection-type row.** Active-set edges are untyped `working-memory` connections — Structure has no shared-row API for connection types, and untyped connections skip type validation by design.
+- **Not an ingest target.** The `working-memory` type is hidden from Cog Ingest's own Structure Type select in the source configuration dialog — it is module infrastructure, not content.

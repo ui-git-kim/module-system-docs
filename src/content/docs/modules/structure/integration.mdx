@@ -869,57 +869,72 @@ The `structureEmbeddings` service (registered only when the app opted into embed
 
 ### Registering Node Types from Your Module
 
-If your module introduces its own node type (e.g., a "Task Board" type), register it during backend initialisation. The service methods all take a `userId` as their first argument — pass the same system user ID you use for other system-level seeding in your app.
+If your module introduces its own node type (e.g., a "Task Board" type), seed it during backend initialisation — your module's init function, not per-user request hooks. Two rules make the seed correct:
+
+1. **Seed via `importNodeTypes`, not `createNodeType`.** `createNodeType(userId, config)` pins the new row to the `userId` you pass, making the type invisible to every other user. `importNodeTypes` is the only service path that creates **shared rows** (`userId: null`) that every user can see.
+2. **Guard with an existence check.** The guard is load-bearing: merge-mode import *updates* existing slugs, so an unguarded import would re-clobber admin customisations on every boot.
+
+The actor string passed to both calls is only a visibility filter and audit label — any value sees shared rows, and nothing from it is written onto the row. A module-scoped label like `'tasks-init'` keeps the audit trail readable.
 
 ```typescript
 // backend/src/features/tasks/tasks.init.ts
 import { serviceRegistry } from '../../config/service.registry.js';
-import { SYSTEM_USER_ID } from '../../config/system.js';  // your app's system user ID
+
+const TASK_BOARD_TYPE = {
+  slug: 'task-board',
+  name: 'Task Board',
+  namePlural: 'Task Boards',
+  icon: 'Kanban',
+  moduleId: 'tasks',
+  rules: {
+    isRoot: false,
+    allowedParents: ['project'],
+    allowedChildren: [],
+  },
+  features: {
+    favorites: true,
+    archiving: true,
+  },
+  fields: [],
+  navigation: {
+    mainNav: { enabled: false },
+    sidebarNav: { style: 'none' },
+    pageNav: {
+      style: 'tabs',
+      builtInTabs: {
+        overview: false,
+        info: true,
+        settings: true,
+      },
+      defaultTab: 'info',
+    },
+    listPage: { defaultView: 'grid' },
+  },
+  isSystem: true,
+  isEnabled: true,
+  sortOrder: 40,
+};
 
 export async function initTasks(): Promise<void> {
   const structureService = serviceRegistry.get('structure');
 
-  // Register a module-specific node type (tagged with moduleId: 'tasks')
-  const existingTypes = await structureService.listNodeTypes(SYSTEM_USER_ID, true);
-  const hasTaskBoard = existingTypes.some(t => t.slug === 'task-board');
+  // Existence check — load-bearing. Merge-mode import UPDATES existing
+  // slugs, so re-running it unguarded would clobber admin customisations
+  // on every boot.
+  const existingTypes = await structureService.listNodeTypes('tasks-init', true);
+  if (existingTypes.some(t => t.slug === 'task-board')) return;
 
-  if (!hasTaskBoard) {
-    await structureService.createNodeType(SYSTEM_USER_ID, {
-      slug: 'task-board',
-      name: 'Task Board',
-      namePlural: 'Task Boards',
-      icon: 'Kanban',
-      moduleId: 'tasks',
-      rules: {
-        isRoot: false,
-        allowedParents: ['project'],
-        allowedChildren: [],
-      },
-      features: {
-        favorites: true,
-        archiving: true,
-      },
-      fields: [],
-      navigation: {
-        mainNav: { enabled: false },
-        sidebarNav: { style: 'none' },
-        pageNav: {
-          style: 'tabs',
-          builtInTabs: {
-            overview: false,
-            info: true,
-            settings: true,
-          },
-          defaultTab: 'info',
-        },
-        listPage: { defaultView: 'grid' },
-      },
-      isSystem: true,
-      sortOrder: 40,
-    });
-  }
+  // importNodeTypes is the only service path that creates shared
+  // (userId: null) rows visible to every user.
+  await structureService.importNodeTypes('tasks-init', { nodeTypes: [TASK_BOARD_TYPE] }, 'merge');
 }
 ```
+
+<Aside type="caution" title="Don't seed shared types with createNodeType">
+`createNodeType(userId, config)` writes the `userId` onto the row (and validates it against a real user), so the type exists for that one user only. It's the right call for user-initiated type creation — never for module seeding.
+</Aside>
+
+For a live example, the Cog Ingest module seeds its shared `working-memory` node type at backend boot with exactly this guard-then-import pattern — see the [Cog Ingest integration guide](/modules/cog-ingest/integration/).
 
 <Aside type="note" title="moduleId matters">
 Always set `moduleId` to your module's ID when creating node types. This lets the system know which module owns the type, and enables cleanup on module uninstall. Default node types seeded by Structure itself set `moduleId: 'structure'`.
