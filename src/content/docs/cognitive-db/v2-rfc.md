@@ -49,6 +49,7 @@ Nothing is in production, so this is the moment to do it properly.
 | v1 concern (in `cog_node`) | v2 home |
 |---|---|
 | Ontology concepts / relationship types | `structure_node_type` / `structure_connection_type` (system-level = null `userId`) |
+| Concept hierarchy (the engine's single-parent `superClass` on concepts) | `structure_node_type.superClasses` — a multiple-inheritance *is-a* DAG with field/feature inheritance (Structure v1.18.0; see [Type Hierarchy](/modules/structure/type-hierarchy/)) |
 | Content nodes (`rawContent`) | `structure_node` of the source type, text in a **field** |
 | Entity nodes | `structure_node` (typed) |
 | Connections (edges) | `structure_node` connection-nodes, `data.origin` = explicit \| discovered, `status` = active \| pending |

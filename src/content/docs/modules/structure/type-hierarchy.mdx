@@ -1,0 +1,236 @@
+---
+title: Type Hierarchy
+description: is-a inheritance between node types — declaring superclasses, field and feature inheritance, subtype subsumption in connections, and the hierarchy query API
+sidebar:
+  order: 1.5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Structure v1.18.0 ships **Type Hierarchy** — *is-a* inheritance between node types. A node type can declare one or more parent types via `superClasses`, inherit their fields and features, and stand in for them wherever a connection type or query names the parent. The running example throughout this page is a legal app where **court-order is-a legal-document AND is-a event, and both are is-a entity** — a "cites" connection type that allows `legal-document` sources accepts a `court-order` node without being told about it.
+
+Everything on this page is additive: a type with no `superClasses` behaves exactly as before, and existing API responses only gain new keys.
+
+## What it is
+
+Type Hierarchy is a relationship **between node types**, not between nodes. `court-order` *is a kind of* `legal-document`, so every court-order node carries the fields a legal-document defines and is accepted wherever a legal-document is allowed.
+
+<Aside type="caution" title="Not the containment hierarchy">
+Structure already has a "hierarchy" — the **containment** rules (`rules.allowedParents`, `rules.allowedChildren`, `parentId`, the tree) documented on the [Configuration](/modules/structure/configuration/) page and edited on the same admin Hierarchy tab. Containment says *where a node can nest* ("a Matter lives inside a Client"). Type inheritance says *what a type is* ("a court-order is a legal-document"). The two are independent: declaring `superClasses` does not change where nodes can nest, and containment rules are **not** inherited from parent types.
+</Aside>
+
+Key properties:
+
+- **Multiple inheritance.** A type may declare several parents (`court-order` is both a `legal-document` and an `event`).
+- **The type graph is a DAG.** Diamonds are fine (`legal-document` and `event` can both inherit from `entity`); cycles are rejected at write time.
+- **Parents are slugs.** `superClasses` is a `string[]` of parent type slugs, stored on `structure_node_type` (JSON column, default `[]`).
+- **Disabled types are legal parents.** A disabled ancestor still contributes its inherited fields and features — disabling a base type does not strip config from its subtypes.
+
+## Declaring parents
+
+### Admin UI
+
+In **Admin > App Structure**, the node type's **Hierarchy** tab gains a **Type Inheritance (is-a)** picker. Select one or more parent types; the picker is cycle-guarded, so types that would create an inheritance cycle are not offered. Once parents are set, the **Fields** tab shows inherited fields read-only, each labelled with the ancestor type it comes from.
+
+### JSON / API
+
+`NodeTypeConfig` gains `superClasses?: string[]` — declaration works anywhere a node type config does: `POST /types`, `PATCH /types/:slug`, [JSON import](/modules/structure/json-reference/), proposals, and `createNodeType`/`updateNodeType` on the service.
+
+```json
+{
+  "slug": "court-order",
+  "name": "Court Order",
+  "namePlural": "Court Orders",
+  "superClasses": ["legal-document", "event"]
+}
+```
+
+with the parents themselves declaring:
+
+```json
+{ "slug": "legal-document", "superClasses": ["entity"] }
+{ "slug": "event",          "superClasses": ["entity"] }
+```
+
+Declaration **order matters** — it drives the resolution order below, so put the most defining parent first.
+
+## What inherits
+
+Only two parts of a type's configuration flow down the hierarchy:
+
+| Config | Inherited | Semantics |
+|--------|-----------|-----------|
+| `fields` | Yes | Own fields first, then inherited fields in [resolution order](#resolution-order). Shadowed by field `id` — an own field wins over any ancestor's field with the same id, and a nearer ancestor wins over a farther one. Inherited entries carry `inheritedFrom: '<ancestor-slug>'` in resolved output |
+| `features` | Yes | Per-key **nearest-wins**. Each feature key resolves independently to the nearest type in the resolution order that defines it — starting with the type itself |
+
+<Aside type="tip" title="An own feature key always wins — even a falsy one">
+Nearest-wins means a type's **own** value for a feature key beats every ancestor, including when that value is falsy. Setting `cognitiveIngest: { enabled: false }` on `court-order` opts it **out** of a `cognitiveIngest: { enabled: true }` inherited from `entity`. Omitting the key inherits; setting it — to anything — overrides.
+</Aside>
+
+Everything else is deliberately **not** inherited in v1:
+
+| Not inherited | Why it stays per-type |
+|---------------|----------------------|
+| `rules` (containment) | Where nodes nest is a per-type decision — see the Aside above |
+| `workflowConfig` | State machines rarely transfer wholesale between types |
+| `contextHints` / `contextConfig` | AI context assembly is tuned per type |
+| `navigation` | Sidebar/tab layout is presentation, not identity |
+| Templates (`cardTemplateId` etc.) | Rendering is assigned per type |
+| `integrations` | Module tab/widget visibility is a per-type admin decision |
+| `permissions` | Access overrides must stay explicit |
+| `builtInFieldConfig`, `conditionalColor` | Bound to the type's own field set |
+| `icon` / `color` | Visual identity is per type |
+
+One consumer of feature inheritance ships in the box: `listNodesNeedingEmbedding` in the [Cognitive Foundations](/modules/structure/cognitive/) service resolves its default type selection **hierarchy-aware** — a subtype of a [`cognitiveIngest`](/modules/structure/cognitive/#featurescognitiveingest)-enabled type is selected without restating the flag. The candidate set is still enabled (live) types only; a disabled ancestor contributes the inherited flag but is not itself a candidate.
+
+## Resolution order
+
+Ancestors are linearised **BFS nearest-first**: the type's declared parents in declaration order, then *their* parents, level by level — deduplicated keeping the first occurrence. For the diamond:
+
+```
+            entity
+           /      \
+  legal-document   event
+           \      /
+         court-order        superClasses: ["legal-document", "event"]
+```
+
+the linearisation of `court-order` is:
+
+```
+['legal-document', 'event', 'entity']
+```
+
+`entity` appears once (first occurrence kept), *after* both direct parents — nearer ancestors always beat farther ones, and among equally-near ancestors declaration order decides.
+
+**Worked example.** Suppose the types define these fields:
+
+| Type | Own fields |
+|------|-----------|
+| `court-order` | `order-number` |
+| `legal-document` | `jurisdiction`, `filing-date` |
+| `event` | `occurred-at`, `jurisdiction` |
+| `entity` | `notes` |
+
+The resolved fields for `court-order` are, in order:
+
+| Field id | Source |
+|----------|--------|
+| `order-number` | own |
+| `jurisdiction` | `inheritedFrom: 'legal-document'` |
+| `filing-date` | `inheritedFrom: 'legal-document'` |
+| `occurred-at` | `inheritedFrom: 'event'` |
+| `notes` | `inheritedFrom: 'entity'` |
+
+`event`'s `jurisdiction` is shadowed because `legal-document` comes first in the linearisation. Had `court-order` defined its own `jurisdiction`, that would shadow both.
+
+## Connections and subsumption
+
+Connection type allowlists (`fromTypes` / `toTypes` on `structure_connection_type`) are now **subsumption-aware**: a listed type admits all of its subtypes.
+
+```typescript
+// Connection type "cites" with fromTypes: ['legal-document']
+await structureService.createConnection(userId, courtOrderNodeId, statuteNodeId, 'cites');
+// accepted — court-order is-a legal-document
+```
+
+The full matching rules for `createConnection`:
+
+| Allowlist entry | Matches |
+|-----------------|---------|
+| `'legal-document'` | `legal-document` nodes **and** nodes of any subtype (`court-order`, …) |
+| `'*'` | Any node type |
+| `[]` (empty list) | Any node type (unchanged) |
+
+<Aside type="note" title="The `*` wildcard now works">
+`'*'` was previously documented but dead — a literal `'*'` entry matched nothing, so it **blocked every connection** of that type. From v1.18.0 it matches any type, as documented. If you had worked around this by emptying the list, both spellings now behave the same.
+</Aside>
+
+`promoteConnection` is unchanged: it re-checks endpoints and cardinality but does **not** re-check types — type validation happens once, at creation.
+
+## Querying the hierarchy
+
+### Resolved config on `/types` (v1.18.0+)
+
+`GET /types` and `GET /types/:slug` responses carry two additive keys per type:
+
+- `superClasses` — the raw declared parents (`string[]`)
+- `resolved` — the computed view: `{ fields, features, ancestors }`
+  - `resolved.fields` — own + inherited fields in resolution order; inherited entries carry `inheritedFrom`
+  - `resolved.features` — the per-key nearest-wins merge
+  - `resolved.ancestors` — the full linearisation, nearest-first
+
+**`resolved` is read-only.** Write paths strip it from incoming bodies, and any field entry carrying `inheritedFrom` is stripped server-side before persisting — so round-tripping a fetched config through `PATCH /types/:slug` cannot accidentally persist inherited fields as own fields.
+
+### `includeSubtypes` on node listing (v1.18.0+)
+
+`listNodes` gains an `includeSubtypes` option that expands the `type`/`types` filter to each named type plus all of its transitive subtypes:
+
+| Surface | Usage |
+|---------|-------|
+| REST | `GET /nodes?type=legal-document&includeSubtypes=true` |
+| Service | `structureService.listNodes(userId, { type: 'legal-document', includeSubtypes: true })` |
+| Frontend client | `structureApi.listNodes({ type: 'legal-document', includeSubtypes: true })` |
+
+### Service methods (v1.18.0+)
+
+Four new methods on `serviceRegistry.get('structure')` — see [Integration](/modules/structure/integration/) for the service-registry pattern:
+
+```typescript
+const structureService = serviceRegistry.get('structure');
+
+await structureService.getTypeAncestors('court-order', userId);
+// → ['legal-document', 'event', 'entity']   (nearest-first)
+
+await structureService.getTypeDescendants('legal-document', userId);
+// → ['court-order']                         (self not included)
+
+await structureService.isSubtypeOf('court-order', 'legal-document', userId);
+// → true
+await structureService.isSubtypeOf('court-order', 'court-order', userId);
+// → true                                    (reflexive)
+
+await structureService.expandTypeSlugs(['legal-document', 'event'], userId);
+// → ['legal-document', 'court-order', 'event']   (self + descendants, deduped)
+```
+
+| Method | Returns |
+|--------|---------|
+| `getTypeAncestors(slug, userId)` | `string[]` — the linearisation, nearest-first |
+| `getTypeDescendants(slug, userId)` | `string[]` — all transitive subtypes; self not included |
+| `isSubtypeOf(subSlug, superSlug, userId)` | `boolean` — reflexive (`X` is a subtype of `X`) |
+| `expandTypeSlugs(slugs, userId)` | `string[]` — self + descendants for each slug, deduped |
+
+For code running inside the Structure feature itself, `structure.service.ts` also exports in-process helpers that operate on a pre-loaded graph — `loadTypeGraph`, `computeTypeAncestors`, `computeTypeDescendants`, `expandTypeSlugsInGraph`, `isSubtypeInGraph`, `resolveTypeInGraph`, `parseSuperClasses`, and `validateSuperClasses`, plus the `TypeGraph`/`TypeGraphEntry` types — useful when you need many hierarchy checks without re-querying per call.
+
+## Validation rules
+
+`superClasses` is validated on **every write path** — create, update, import, propose, and approve:
+
+| Rule | Behaviour |
+|------|-----------|
+| Parents must exist | Every declared parent must be a **live** type. Pending proposals cannot be parents |
+| No self-inheritance | A type cannot list its own slug |
+| No cycles | The type graph must stay a DAG — a parent chain that leads back to the type is rejected |
+| No redundant parents | When **declaring** parents (create, propose, or changing a type's parents), a declared parent that is already an ancestor of another declared parent is rejected (declaring `['court-order-parent', 'entity']` when `court-order-parent` already inherits from `entity` is an error) — this keeps declaration order meaningful. Redundancy that arises *later* through edits to other types is tolerated: saves that don't change the type's parents, imports, and proposal approvals do not re-reject it |
+| Max 10 parents | Per type; transitive ancestors are unlimited |
+| Duplicates deduped | Repeated slugs are silently deduplicated, keeping the first occurrence |
+
+Around the write paths themselves:
+
+- **Delete guard.** `deleteNodeType` is blocked while any live type lists the slug in its `superClasses` — the error names the referencing types. Detach the children first.
+- **Import is transactional.** [JSON import](/modules/structure/json-reference/) validates the *final* set of types: unknown parents, cycles, or survivors orphaned by a replace-mode deletion roll the **whole import** back.
+- **Proposals.** `proposeNodeType` accepts `superClasses`; they are validated at propose time **and re-validated at approval** (existence and cycles — the type graph may have changed in between; later-arising redundancy does not block approval).
+
+<Aside type="caution" title="Importing a pre-v1.18 export resets superClasses">
+Import uses whole-row semantics: each imported type replaces the stored row in full. An export taken before v1.18.0 has no `superClasses` key, so importing it writes `superClasses: []` — wiping any parents declared since. Re-export after upgrading before using import as a backup.
+</Aside>
+
+## Limitations
+
+Deliberate v1 scope — expect some of these to lift in later releases:
+
+- **Only fields and features inherit.** Containment rules, workflow, navigation, templates, context config, integrations, permissions, and visual identity stay per-type (see [What inherits](#what-inherits)).
+- **Inherited fields are not selectable in configuration pickers.** Card `showFields`, table columns, and filterable-field pickers in the admin UI only offer the type's own fields. Inherited fields still render on forms and detail views; they just can't be referenced from those pickers yet.
+- **`publicApi` is not hierarchy-aware.** A subtype of a publicly-exposed type is **not** automatically exposed on the public REST API — each type must opt in explicitly. This is a security decision, not an oversight: widening public exposure should never happen implicitly.
+- **Concurrency.** Two concurrent type edits could in theory race a cycle past validation. Traversal is cycle-safe (it terminates and dedupes), so the failure mode is a rejected-on-next-edit graph rather than a hang — accepted for the solo-admin model.
