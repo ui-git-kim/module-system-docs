@@ -122,6 +122,33 @@ const ok     = verifySecret(presented, stored);
 `pgcrypto` runs inside Postgres, so the key would travel to Neon on every query — defeating "the database can't read it." App-layer AES-256-GCM keeps the key in the app; Neon only ever sees ciphertext. The stronger **zero-knowledge** guarantee (where even the app can't decrypt — client-side E2EE) has no provider and stays on the [roadmap](/starter-template/roadmap/#security-floor-v200).
 </Aside>
 
+## Webhook signature verification
+
+Third-party webhooks (Stripe, GitHub, ...) authenticate with an **HMAC over the raw request bytes** — not a session. Added in v1.54.0, the starter provides the full host-level chain so modules never hand-roll it:
+
+- **`req.rawBody`** — the global JSON parser captures the exact raw bytes on every parsed request (a `verify` hook; a reference, not a copy). A re-serialised `req.body` is *not* byte-identical and will fail verification, so always verify against `req.rawBody`.
+- **`verifyTimestampedWebhookSignature({ payload, header, secret, toleranceSeconds? })`** — the Stripe-style `t=...,v1=...` scheme: HMAC-SHA256 over `` `${t}.${rawBody}` `` with a **replay window** (default 300&nbsp;s), rotation candidates accepted, constant-time comparison.
+- **`verifyWebhookSignature({ payload, signature, secret, prefix? })`** — the plain scheme (header = HMAC of body, e.g. GitHub's `X-Hub-Signature-256` with `prefix: 'sha256='`).
+- **`computeHmac` / `timingSafeEqualStrings`** — the underlying keyed-MAC primitives for anything bespoke.
+
+```ts
+import { verifyTimestampedWebhookSignature } from '@/features/security';
+
+const result = verifyTimestampedWebhookSignature({
+  payload: req.rawBody,
+  header: req.headers['stripe-signature'] as string,
+  secret: env.STRIPE_WEBHOOK_SECRET,
+});
+if (!result.valid) {
+  req.log.warn({ reason: result.reason }, 'Webhook signature rejected');
+  return res.status(400).json({ error: 'Invalid signature' });
+}
+```
+
+<Aside type="caution" title="Webhooks need the CORS carve-out in production">
+Webhook deliveries are server-to-server and carry **no `Origin` header**, which production CORS rejects by default. Register the webhook route with `allowNoOrigin: true` (route registry) so signed deliveries reach the handler — the HMAC, not the Origin, authenticates the caller. See [Route Registry](/starter-template/registries/#route-registry).
+</Aside>
+
 ## Deletion cascade
 
 No provider deletes across **all** your stores, so account/tenant erasure is the second item on the [named bespoke allow-list](#who-owns-what-the-delegation-map) — a thin orchestrator that calls each provider's delete API in a safe order. Added in v1.32.0.

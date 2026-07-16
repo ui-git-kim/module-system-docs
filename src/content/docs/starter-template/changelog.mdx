@@ -17,6 +17,53 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v1.54.0
+
+**Upstream-issues batch — all six open downstream reports fixed**
+
+One release closes every open entry on the [upstream issues](/starter-template/upstream-issues/) page: reports from the **structure**, **document-management** and **billing** modules, fixed at the source so the whole fleet inherits them on the next `template:update`. Minor bump: new public exports and registry surface (webhook verification, `allowNoOrigin`) ride along with the fixes.
+
+**1. Query retry policy — no retries on 4xx client errors** *(structure)*
+
+The shared `QueryClient` retried every failed query once, including `429 Too Many Requests` — so when the API rate limiter started shedding load, every module's bootstrap queries immediately re-sent, amplifying the storm. `frontend/src/lib/query-client.ts` replaces the numeric `retry: 1` with a predicate: **4xx client errors never retry** (the request is unauthorised, invalid, missing, or rate-limited — a retry cannot succeed); network errors, 5xx, and `408 Request Timeout` keep the single retry with the default backoff. Mutations were already `retry: 0`; per-hook overrides still win. Deterministic 4xx failures now surface immediately instead of after a ~1s silent retry — if a query relied on that retry to paper over a session-bootstrap 401 race, gate it with `enabled` instead.
+
+**2. `@types/express-serve-static-core` pinned to 5.0.x** *(document-management)*
+
+The newly published 5.1.x widened `ParamsDictionary` values from `string` to `string | string[]` (modelling Express 5 wildcard `*name` params), failing `npm run type-check` on every clean install in each handler that destructures `req.params` — in the template and in every module. Runtime is unaffected (named `:param` segments are always strings). `backend/package.json` gains an `overrides` block pinning `~5.0.0` (resolves 5.0.7, still satisfying `@types/express`'s `^5.0.0`), and the backend lockfile is regenerated. **Existing apps** receive the pin on `template:update`: `sync-deps.mjs` now reconciles a foundation **overrides** manifest alongside foundation dependencies — presence-only (an override you already declare for the same package is never touched), running before `install:all` so the pinned version installs in the same pass. The pin is a **hold, not the destination** — the eventual migration is per-route param generics, tracked on the [roadmap](/starter-template/roadmap/); if you retype your own handlers sooner, delete the override and it won't come back.
+
+**3. Action registry — async handlers no longer silently dropped** *(document-management)*
+
+`doAction` ran only sync-registered handlers and **silently ignored** everything registered with `addActionAsync` — so a module's async subscriber on ~10 core hooks (`user.roleUpdated`, `user.profileUpdated`, `user.preferencesUpdated`, the five `admin.*Updated` hooks, `error:unhandled`, and frontend `theme.changed`) simply never fired. Both registries (backend + frontend) now:
+
+- emit a **once-per-hook dev-mode warning** when `doAction` (or `doActionAsync`) would skip handlers sitting in the other pool — the silent drop is gone (production stays silent);
+- route `doActionAll` through private execution loops, so it can never double-fire and never warns spuriously.
+
+The core emission sites now actually run async handlers: admin mutations (`admin.settingsUpdated`, `navigationUpdated`, `toolbarUpdated`, `styleOverridesUpdated`, `dashboardOverridesUpdated`) and both `user.roleUpdated` emissions use **`await doActionAll`** (read-after-write consistency before the admin UI refetches; handler errors are caught inside the dispatcher and can never fail the request); the hot paths `user.profileUpdated` / `user.preferencesUpdated`, `error:unhandled`, and frontend `theme.changed` use **`void doActionParallel`** (fire-and-forget — sync handlers still run inline). **Behaviour note:** async handlers that were dead code until now START FIRING after update — verify yours are idempotent; a slow awaited handler adds latency to admin mutations, so keep those fast. Dispatcher-set consolidation is deliberately deferred to the [roadmap](/starter-template/roadmap/). See [Hooks](/starter-template/hooks/).
+
+**4. `_module_migrations` read no longer logs a spurious `prisma:error`** *(document-management)*
+
+Until a module runs its first `migrate-db` migration the bookkeeping table doesn't exist, and the admin Modules read failed with `42P01` — handled correctly, but Prisma printed the failed query at error level *before* the catch could downgrade it (an alarming red line on every `/admin/modules` load). `readAppliedMigrations()` now probes existence first with `to_regclass()` (returns NULL, never raises) and skips the SELECT when absent. Same UI semantics; zero noise.
+
+**5. Sub-package foundation scripts now propagate on `template:update`** *(billing)*
+
+`sync-package-scripts.mjs` reconciled only the root `package.json`, so apps created before v1.38/v1.43 came out of an update with a CI workflow calling `type-check`/`test` scripts their user-owned `frontend`/`backend` `package.json` never received ("Missing script: type-check", red CI). The reconciler now manages per-target manifests: root (previous set plus the `type-check`/`type-check:frontend`/`type-check:backend` wrappers, absent from pre-v1.38 apps), `frontend` (`type-check`, `test`, `test:watch`) and `backend` (`type-check`, `pretest`, `test`, `test:watch`); `update-template.{ps1,sh}` stage and commit all three files — per-file, so a layout missing a sub-package file can't silently abort the whole staging. Managed keys are **forced to the canonical command** (CI depends on their exact behaviour) — deliberately different from `sync-deps`' presence-only rule, because dependency *versions* are user-owned while foundation script *commands* are template-owned. Your own scripts are never touched; a customised managed key (e.g. a hand-edited `test`) will be reset to canonical on update.
+
+**6. Webhook signature verification infrastructure** *(billing, High)*
+
+Public webhook endpoints were unverifiable — the global JSON parser discarded the raw request bytes, no keyed-MAC primitive existed, and (discovered during the fix) **production CORS rejected all no-Origin server-to-server requests**, so webhook deliveries could never reach a handler in production at all:
+
+- **`req.rawBody`** — `express.json` now captures the exact raw bytes via a `verify` hook (`middleware/raw-body.middleware.ts`); a reference, not a copy, bounded by the existing 10&nbsp;mb limit.
+- **Security feature**: new `computeHmac` / `timingSafeEqualStrings` primitives (`crypto.ts`) and `verifyWebhookSignature` / `verifyTimestampedWebhookSignature` helpers (`webhooks.ts`) — the Stripe-style `t=...,v1=...` scheme with a replay window (default 300&nbsp;s, rotation candidates accepted) and the plain GitHub-style scheme (`prefix: 'sha256='`); constant-time comparisons, `node:crypto` only. See [Webhook signature verification](/starter-template/security-feature/#webhook-signature-verification).
+- **Route registry**: `allowNoOrigin?: boolean` on `RouteConfig`/`PublicRouteConfig` + `routeRegistry.allowsNoOrigin(path)`; the CORS layer (now the options-delegate form) admits production no-Origin requests **only** for opted-in routes. Flag it exclusively on endpoints authenticated by other means (webhook HMAC) or safe probes.
+- **Health endpoints** opt in: production no-Origin monitor probes of `/api/health` and `/api/health/db` previously got CORS-rejected 5xx — they now return real status. Retrain any monitor that was trained on the failure.
+- **Module note**: signature *verification* needs no module changes (billing already reads `req.rawBody`), but production *delivery* needs one registration line in the module — `allowNoOrigin: true` on the webhook's `registerPublic` call.
+
+**Also:** two latent frontend type errors fixed (`settings-blocks/Table.tsx` unused import; `AdminComponents.tsx` React 19 portal cast) — restores a clean frontend `type-check` under current `@types/react`.
+
+**Propagation caveat (one-update lag):** an app's update run executes its *locally checked-out* `update-template` script, so apps whose script predates v1.51.0 (`sync-deps`) or this release (widened `sync-package-scripts`) won't have the pin/scripts fully applied+committed on their first update — run `node scripts/sync-deps.mjs && node scripts/sync-package-scripts.mjs` manually, or update twice.
+
+---
+
 ## v1.53.0
 
 **Vite config shadow — now auto-healed before dev/build**
