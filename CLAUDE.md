@@ -65,6 +65,7 @@ src/content/docs/
 │   ├── theme.mdx
 │   ├── icon-picker.mdx
 │   ├── style-system.mdx
+│   ├── shadcn-components.mdx     # shadcn component catalogue (verified list + links)
 │   ├── data-fetching.mdx
 │   ├── logging.mdx
 │   ├── hooks.mdx

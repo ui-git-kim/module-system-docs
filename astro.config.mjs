@@ -167,6 +167,10 @@ export default defineConfig({
               slug: "starter-template/style-system",
             },
             {
+              label: "shadcn Component Catalogue",
+              slug: "starter-template/shadcn-components",
+            },
+            {
               label: "Data Fetching",
               slug: "starter-template/data-fetching",
             },
