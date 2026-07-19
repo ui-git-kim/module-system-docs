@@ -715,6 +715,48 @@ Adopting TanStack Query as the [standard data fetching layer](/starter-template/
 
 ---
 
+## Known Issues — 2026-07-19 meta-audit
+
+A four-dimension health check (standards, production readiness, performance, security) across every backend + frontend subsystem — a 15-subsystem parallel audit with each critical/moderate finding adversarially verified. **No critical findings**; the application-layer trust boundary holds. 13 moderate + ~30 minor items, deduped against the audits above (the `matchMedia` listener is already tracked; two candidates — email CRLF injection and the export "processing" strand — were refuted on verification). File:line anchored.
+
+<Aside type="tip">
+Nothing here is an exploitable cross-user leak or data-loss bug. The three security-relevant moderates — the public DB-health error leak, JWT audience validation, and the export-throttle bypass — are the priorities.
+</Aside>
+
+### Moderate
+
+**Security**
+
+- **Public DB-health error leak** — `backend/src/lib/prisma.ts:169`. `checkDatabaseHealth()` returns the raw driver `error.message` with no `NODE_ENV` guard, and it is mounted on the unauthenticated `GET /api/v1/health/db`. On a DB failure in production, Neon/Postgres strings (hostnames, `password authentication failed…`) reach unauthenticated callers — the v1.27.0 generic-error fix only covers the throwing path, which this swallows. Fix: generic string in prod, log the detail server-side. (CWE-209)
+- **JWT audience/issuer not validated** — `backend/src/middleware/auth.middleware.ts:83`. `jwtVerify(token, JWKS)` passes no options, so `aud`/`iss` are unchecked (jose validates only signature + `exp`/`nbf`); the comment on line 82 wrongly claims issuer is validated. JWKS binding preserves the primary boundary, but a token minted by the same Neon Auth instance for another audience authenticates here. Fix: pass `{ issuer, audience }` (derive from `NEON_AUTH_URL`), correct the comment. (RFC 8725)
+- **Export-throttle bypass** — `backend/src/features/user/user.service.ts:357`. The 1/hour export clock is stored in `User.preferences._lastExportAt`, which the user can overwrite via `PATCH /api/user/preferences` because `UpdatePreferencesSchema` uses `.passthrough()`. Backdating it defeats the throttle. Fix: store outside user-writable prefs + strip `_`-prefixed keys in the schema (the check is also non-atomic — see minors).
+
+**Production**
+
+- **No axios timeout** — `frontend/src/lib/api.ts:18`. The shared client uses `timeout: 0`, so a hung/slow backend leaves TanStack Query `pending` forever (permanent spinner, no error path) across every downstream app. Fix: `timeout: 30000`.
+- **`template:check` can publish unpushed commits** — `update-template.ps1:305` / `update-template.sh:347`. The self-update block commits the refreshed script and runs a bare `git push` **before** the Preview gate, so a read-only `template:check` (whenever the script changed upstream) publishes all of the user's unpushed local commits. Fix: skip self-update in preview; push only the self-update commit.
+- **Unbounded logo upload on public branding** — `frontend/src/features/admin/pages/AppSettingsPage.tsx:70`. Reads the file to a base64 data URI with no size/type check, persisted to `AppSettings.logoUrl` and served on the **public** `/api/v1/branding` (5 MB PNG → ~6.7 MB on every unauthenticated first paint). Fix: cap size + MIME; also bound `logoUrl` in `admin.types.ts:140`.
+- **Header toolbar `update()` is a silent no-op** — `frontend/src/config/header-toolbar.registry.ts:204`. Re-registers without `allowReplace`, so the base guard drops it; `headerToolbarRegistry.update('notifications', { badge: 5 })` never applies. Fix: `{ allowReplace: true, silent: true }`.
+- **Frozen search input** — `frontend/src/features/dashboard/components/header/HeaderToolbarItem.tsx:75`. `SearchInput`'s uncontrolled fallback is dead, so a `type:'search'` toolbar item registered without a `searchValue` resolver never displays typed characters. Fix: proper controlled/uncontrolled handling.
+- **Notifications page hides fetch errors** — `frontend/src/features/notifications/pages/NotificationsPage.tsx:100`. No `isError` branch, so a failed list fetch renders "No notifications yet." Fix: render `ErrorAlert` before the empty state (every other list page does).
+- **`userService.updateRole` missing last-admin guard** — `backend/src/features/user/user.service.ts:195`. The public service-registry setter lacks the Serializable last-admin guard that `adminService.updateUserRole` has; latent (no caller today) but a module could demote the sole admin and lock everyone out. Fix: add the guard or delegate.
+- **Unbounded audit-chain verify** — `backend/src/features/admin/audit-sql-sink.ts:458`. `verifyAuditChain()` loads every (never-pruned) compliance row into memory in one query → heap spike/OOM on multi-year compliance logs. Fix: keyset-cursor batching.
+
+**Standards**
+
+- **Profile server-state off-convention** — `frontend/src/features/user/hooks/useUserProfile.tsx:75`. Fetches via `useState`/`useEffect` instead of TanStack Query (no namespaced key, no cache, downstream can't `invalidateQueries(['user'])`); the reference implementation is `AppSettingsContext`. Same anti-pattern in `SecurityPage` (`auth.listSessions`/`listAccounts`) and `useAppSettings`. Fix: back with `useQuery`.
+
+### Minor
+
+Verification downgraded five original moderates to minor: rate-limiter ordering (`app.ts:201`), posture encryptedFields-vs-tier advisory (`posture.ts:194`), pino `redact` (`logger.ts:28` — no live leak in the template), `resetThemeVariables` wiping all inline styles (`theme.ts:95`), and post-login return-to (`AuthProtectedRoute.tsx:48`). Plus the unverified minors:
+
+- **Security** — webhook empty-secret fails *open* (`security/webhooks.ts:89`); export check TOCTOU (`user.service.ts:361`); raw error message persisted to the immutable compliance log (`audit-sql-sink.ts:233`); recipient email PII logged (`email.service.ts:68`); `logoUrl` schema unbounded/unvalidated (`admin.types.ts:140`); forgot-password error path enables account enumeration (`ForgotPasswordPage.tsx:83`).
+- **Production** — email no retry/backoff (`email.service.ts:58`); inline job runner unbounded concurrency (`jobs.runner.ts:42`); pg-boss retries with no backoff (`runners/pg-boss.ts:184`); dashboard has no per-widget error boundary (`DashboardGrid.tsx:113`); reset-password timer not cleared on unmount (`ResetPasswordPage.tsx:95`); display-name allows empty save (`PersonalInformationPage.tsx:143`); audit export capped at 10k with no paging (`audit-sql-sink.ts:483`); `create-app.ps1` npm-install exit unchecked (:687); `create-app.sh` `sed` name-rewrite unescaped (:429).
+- **Performance** — audit `SELECT *` pulls the unused `payload` column (`audit-sql-sink.ts:419`); `BrandingContext` (`:176`) and `useUserProfile` (`:124`) values not memoised; `SecurityPage` effect depends on the whole session object (`:1077`); IconPicker renders ~1600 nodes with no virtualization/debounce (`IconPicker.tsx:45`).
+- **Standards** — notifications `:id` routes skip zod param validation (`notifications.routes.ts:71`); raw `process.env` reads bypass validated env (`security/key-providers/auto-wire.ts:32`, `action.registry.ts:263`); `bump-version.sh` doesn't sync `package.json` versions like the `.ps1` (:74); `useAppSettings` is off-convention and not `@deprecated` (:27).
+
+---
+
 ## Known Documentation Issues
 
 <Aside type="tip" title="✅ Resolved 2026-06-25 — accuracy audit of 2026-06-24 (against v1.37.0)">
