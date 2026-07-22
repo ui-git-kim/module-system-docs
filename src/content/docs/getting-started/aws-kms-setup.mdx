@@ -12,7 +12,7 @@ Field encryption scrambles your most sensitive columns so that a leaked database
 - **An env key** (`SECURITY_ENCRYPTION_KEY`) — works, but the key sits on your server, so the risk is yours.
 - **AWS KMS** (this guide) — the key lives in AWS, every use is logged in CloudTrail, and you can revoke it instantly. The risk moves to the provider.
 
-The pattern is **envelope encryption**: KMS holds the root key, the app unwraps a data key **once** at startup and caches it, and AES-256-GCM runs locally. KMS isn't called per field.
+The pattern is **envelope encryption**: KMS holds the root key, the app unwraps a data key **once per process** (on first use, then cached) and AES-256-GCM runs locally. KMS isn't called per field. (Per-tenant mode adds one KMS call per tenant key, not per field.)
 
 ## Prerequisites
 
@@ -64,7 +64,7 @@ The **Secret access key** is displayed once and grants KMS access — never comm
 :::
 
 :::tip
-`GenerateDataKey` is used **once** at setup to mint the wrapped data key; `Decrypt` is all the running app needs. For strict production, attach the policy to an IAM **role** instead of using static keys, and narrow the runtime to `Decrypt` only.
+`GenerateDataKey` is used **once** at setup to mint the wrapped data key; in the default single-key mode, `Decrypt` is all the running app needs. For strict production, attach the policy to an IAM **role** instead of using static keys — and narrow the runtime to `Decrypt` only **unless** you enable `SECURITY_KMS_PER_TENANT=true`, whose per-tenant mode mints a data key per tenant **at runtime** and therefore needs `kms:GenerateDataKey` kept in the policy (see [Production considerations](#production-considerations)).
 :::
 
 ## Step 3: Run the setup command
@@ -111,17 +111,20 @@ If that prints `hello`, KMS key custody is working.
 ## Troubleshooting
 
 ### `AccessDeniedException`
-- The IAM principal lacks `kms:GenerateDataKey` (setup) or `kms:Decrypt` (runtime), or the policy's key ARN / region doesn't match.
+- The IAM principal lacks `kms:GenerateDataKey` (setup — and runtime too in per-tenant mode) or `kms:Decrypt` (runtime), or the policy's key ARN / region doesn't match.
 - Confirm the credentials you entered are for the principal you attached the policy to.
 
 ### `InvalidCiphertextException`
 - The `SECURITY_KMS_WRAPPED_DEK` was generated under a **different key or region** than `SECURITY_KMS_KEY_ID` / `AWS_REGION`. Regenerate it (Step 3) against the right key.
 
-### "needs the AWS SDK. Install it..."
-- Run `cd backend && npm install @aws-sdk/client-kms`.
+### "The AWS SDK is not installed" / "needs the AWS SDK"
+- Run `cd backend && npm install @aws-sdk/client-kms` and restart. With `SECURITY_KEY_PROVIDER=kms` declared, a missing SDK is caught **at startup** (v1.64.0) and the app **fails closed** — key operations refuse to run rather than silently falling back to the env key.
+
+### "FAILING CLOSED (no env-key fallback)" on boot
+- `SECURITY_KEY_PROVIDER=kms` is declared but the `SECURITY_KMS_*` env is incomplete or malformed. Re-run `npm run security:setup-kms`. **Only if this deployment has never encrypted anything under KMS** may you instead set `SECURITY_KEY_PROVIDER=env` (and remove `SECURITY_KMS_PER_TENANT`) — with KMS-encrypted data present, switching splits the database across two key families that can't decrypt each other.
 
 ### `wrappedDek does not look like a KMS CiphertextBlob`
-- The value isn't the base64 ciphertext from Step 3 (often a placeholder or truncated). Regenerate and paste the full `--output text` value.
+- The value isn't the base64 ciphertext the setup wrote (often a placeholder, or truncated by a hand edit). Re-run `npm run security:setup-kms` (Step 3) to regenerate and re-inject it against the right key.
 
 ## Production considerations
 
@@ -129,5 +132,5 @@ If that prints `hello`, KMS key custody is working.
 - **Keep rotation on.** Automatic yearly CMK rotation is transparent to envelope encryption.
 - **Audit.** Watch the `Decrypt` calls in CloudTrail.
 - **Crypto-shred.** Disabling or deleting the KMS key makes every field encrypted under this data key **permanently unreadable** — that's the global crypto-shred.
-- **Per-tenant mode (v1.64.0, high-assurance apps).** Set `SECURITY_KMS_PER_TENANT=true` in `backend/.env` and each tenant gets a **dedicated KMS data key** (minted with `kms:GenerateDataKey` on first use, stored KMS-wrapped in the self-provisioned `TenantKey` table — ciphertext only). This enables **per-tenant crypto-shred**: the deletion cascade destroys one tenant's key first, making *their* data permanently unreadable independent of everyone else. Two operational notes: (1) **decide before the app encrypts anything** — the mode is part of the stored-ciphertext contract, flipping it later means re-encrypting; (2) the backend principal needs `kms:GenerateDataKey` **at runtime** (not just at setup), so keep it in the IAM policy alongside `kms:Decrypt`.
+- **Per-tenant mode (v1.64.0, high-assurance apps).** Set `SECURITY_KMS_PER_TENANT=true` in `backend/.env` and each tenant gets a **dedicated KMS data key** (minted with `kms:GenerateDataKey` on first use, stored KMS-wrapped in the self-provisioned `TenantKey` table — ciphertext only). This enables **per-tenant crypto-shred**: the deletion cascade destroys one tenant's key first, making *their* data permanently unreadable independent of everyone else. A shred takes effect immediately in the process that runs it; other running instances stop serving the key within about **60 seconds** (or immediately on restart/cache miss). Two operational notes: (1) **decide before the app encrypts anything** — the mode is part of the stored-ciphertext contract, flipping it later means re-encrypting. The provider records the mode in the `TenantKey` table (both modes; a single-key deployment creates the table with just the marker row) and refuses key operations against a table marked for the other mode, so a flip **fails fast with an explicit error** in either direction instead of corrupting or splitting your ciphertext; (2) the backend principal needs `kms:GenerateDataKey` **at runtime** (not just at setup), so keep it in the IAM policy alongside `kms:Decrypt`.
 - **Managed HSM.** Step up to AWS KMS **Managed HSM** only if a compliance regime requires a dedicated, single-tenant HSM (FIPS 140-2 Level 3). Standard KMS is sufficient for most apps.
