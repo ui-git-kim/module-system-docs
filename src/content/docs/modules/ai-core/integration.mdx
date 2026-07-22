@@ -1,0 +1,246 @@
+---
+title: Integration
+description: The consumer contract, content from outside, feedback, retrieval, and what AI Core does not own
+lastUpdated: 2026-07-22
+sidebar:
+  order: 3
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+This page defines how other modules integrate with AI Core under the redesign: the contract every consumer codes against, how content that arrives from outside the app is handled, how operations report what they could not do, how retrieval grounds an operation, and — just as importantly — the boundary of what AI Core does not own.
+
+<Aside type="caution" title="Design stage — not yet built">
+This page describes the AI Core redesign (design complete, July 2026). Implementation has not started; the currently installable module ships an earlier, superseded surface. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+</Aside>
+
+---
+
+## Integration at a Glance
+
+<CardGrid>
+  <Card title="The consumer contract" icon="puzzle">
+    Zero-config, degrade-don't-fail, and one line of public surface: name a job, never a model.
+  </Card>
+  <Card title="Content from outside" icon="warning">
+    External material is labelled, marked, and structurally separated — with an honest account of what that does and does not guarantee.
+  </Card>
+  <Card title="Feedback" icon="comment">
+    Every operation returns a structured account of what it could not do, on the same return as the result.
+  </Card>
+  <Card title="Retrieval" icon="magnifier">
+    AI Core owns the act of going and finding — configured per operation, reporting what it did not find.
+  </Card>
+</CardGrid>
+
+| Integration concern | Mechanism |
+|---------------------|-----------|
+| Reach AI Core | `serviceRegistry.getOptional('ai-core')` |
+| Run a job | `aiCore.run(operationName, input)` — see [Usage](/modules/ai-core/usage/) |
+| Supply context | A context segment on the call, or per-operation retrieval ([Configuration](/modules/ai-core/configuration/)) |
+| Handle shortfalls | The structured `feedback` field on every return |
+| Declare content origin | Origin and verification state on every segment |
+| Extend the libraries | Consumers register their own operations, prompts, and disciplines |
+
+---
+
+## The Consumer Contract
+
+The whole public surface is one line:
+
+```ts
+const result = await aiCore.run('extract-entities', input);
+```
+
+**A consumer names a job. It never names a model.** Everything in the [Configuration](/modules/ai-core/configuration/) layer — models as records, operations as compositions, frameworks as per-model structure — exists so that line stays true. The admin changes which model does which job without a deploy, and no consumer knows.
+
+### Zero-config
+
+AI Core works with nothing but an API key. A `--no-interactive` install produces something that runs. Batteries — seeded voices, generic disciplines, the review queue — are records from the first moment, editable and resettable.
+
+> **Ships-with is not hardcoded.**
+
+### Degrade, don't fail
+
+Consumers reach AI Core through `serviceRegistry.getOptional()`, never `serviceRegistry.get()`:
+
+```ts
+const aiCore = serviceRegistry.getOptional('ai-core');
+if (aiCore) {
+  const { result, feedback } = await aiCore.run('summarise-thread', input);
+} else {
+  // Non-AI path — the feature still works, without the AI-assisted parts
+}
+```
+
+An app with no AI Core installed still runs its non-AI paths. **AI Core absent is a smaller app, not a broken one.**
+
+### Never leak the provider SDK
+
+Consumers see AI Core's surface and never `@anthropic-ai/sdk` — or any other provider package. Swapping providers must not touch consumer code. The transport SDK is confined to a single adapter layer inside AI Core itself; the exit test and its rationale live in the [Developer Workflow](/modules/ai-core/developer-workflow/).
+
+### The context slot
+
+The context slot is the consumer's, unless retrieval fills it. A consumer that already knows exactly which content is relevant passes it as a context segment. A consumer that does not configures the operation to go and find it — see [Retrieval](#retrieval) below. Either way, the slot is filled deliberately, never both ways at once by accident.
+
+### Consumers own their domain
+
+Their operations, their prompts, their disciplines, their pipelines, their UI. AI Core holds what every operation shares; the consumer holds what only it has. Nothing in AI Core knows what any app does — consumers name jobs, AI Core runs them.
+
+### The foundation depends on nothing
+
+AI Core's `depends` list is empty. It is the foundation of the AI stack, and **nothing may make AI Core depend on a consumer**. The one place this bites in practice is billing: billing integration is a callback — AI Core owns its usage counter and hands billing `getCurrentUsage` — never a dependency in either direction. See the [Developer Workflow](/modules/ai-core/developer-workflow/) for the ledger and usage design.
+
+---
+
+## Content From Outside
+
+A year of someone's text messages, a PDF filed by an opposing party, a scraped page — this is **material to work on, not direction to follow**. But it arrives as text, in the same window as the instructions, and it may contain sentences shaped like commands.
+
+Start from what is actually true: **the prompt is one piece of text.** There is no partition. Nothing structurally prevents a model from reading retrieved content as direction. Every defence below **lowers the odds** — none of them enforces anything on the input side, and this is unsolved industry-wide. AI Core manages the risk and says so; it must never claim to have removed it.
+
+What the framework provides is **labelling**: it places external material in its own position, wraps it, and the instruction section states how it is to be treated — examined, not obeyed. That is a sentence inside the prompt, not a property of the container. Two things make it work as often as it does, and neither is a guarantee:
+
+- **Model training.** Some models are trained to privilege instructions over quoted content. Free where it exists; not something to rely on across providers.
+- **The labelling itself.** Under our control, weaker, and defeatable by content written to defeat it.
+
+The part that actually holds is on the [output side](#the-output-side-is-the-only-part-that-holds) — schema validation and constrained reach do not depend on the model cooperating.
+
+### Provenance travels with the segment
+
+Every segment declares its **origin** — authored, user-supplied, or ingested from a third party — and its **verification state**.
+
+**The consumer assigns it; AI Core honours it.** Only the consumer knows where content came from. AI Core does not guess, and does not treat an undeclared segment as authored.
+
+Organising content does not change what it is. Material is usually structured *by* an AI Core operation rather than before reaching one, and once structured it looks native — a tidy record in the graph. But the text inside that record is still text someone else wrote, and every later operation that retrieves it puts that text back in a context window.
+
+> **The exposure does not end at ingestion; it recurs on every operation that reads the content.** This is why the defence lives at assembly rather than in a cleaning step.
+
+Because of that, origin and verification state are **part of what an operation returns**, not just inputs it consumed. Whether they persist alongside the stored result is the consumer's decision — but they should.
+
+### Verification does not change how content is handled
+
+A segment's verification state comes from a source-verification guardrail — a check on the extraction that produced it, and a quality concern that arises with no adversary at all (see [Usage](/modules/ai-core/usage/) for guardrails).
+
+It changes nothing here. **A verified message and an unverified one are labelled and placed identically**, because verification establishes that the content is genuine, not that its text is safe to follow. Someone's real words can still read as a command. Provenance and injection risk are orthogonal: establishing that a message is genuine says nothing about whether its text will be read as an instruction, and the reverse.
+
+### Instruction-like content is flagged once, at rest
+
+Content that will be retrieved into prompts repeatedly is scanned **once**, when it is stored, rather than on every retrieval. The result travels with the record, alongside origin and verification state.
+
+**Name it for the observable, not the inference.** Record that a span *reads as an instruction* — not that it *is an attack*. The same observation is a threat in one app and an exhibit in another; AI Core reports what was seen and lets the consumer decide which.
+
+Three rules make the flag useful rather than dangerous:
+
+1. **It never gates the defences.** Every external segment is labelled and placed the same way regardless of what the scan said. If a low score bought lighter handling, the one span the detector missed would be the one that arrived unlabelled.
+2. **It is informative when high and meaningless when low.** Detection is evadable — intent spread across innocuous fragments reads as clean. A high value tells you something real; a low value tells you nothing. Present it that way, or a field reading `0.02` will be misread as a clearance.
+3. **It never filters.** Flagged content is not dropped, hidden, downweighted in retrieval, or quietly skipped. In some domains the most instruction-like material is the most important material — coercive, directive language is exactly what such a scan fires on, and exactly what a case may turn on. If anything, a flag should make content **more** visible to the person, not less.
+
+**The scanner version is recorded with the result.** Detectors improve; a stored score without its provenance is a stale judgement that looks current. Versioning it makes rescanning a decision rather than a discovery.
+
+### External spans are marked, not merely delimited
+
+Because origin is declared on every segment, the assembler always knows which spans came from outside — **you cannot defend content you cannot identify.**
+
+Wrapping external content in delimiters is not a defence — the content can close the delimiter. What measurably helps is **interleaving control markers through the external span** and instructing the model that everything so marked is data to be examined, never instructions to be followed. Published results put attack success reduction from above 50% to low single digits, with minimal task-quality cost. Probabilistic, not absolute. AI Core treats it as baseline hygiene, applied by default.
+
+### Separation is structural, not remembered
+
+External content carries its own segment type. The framework gives that type its own position and orders its framing segment ahead of it — the framing that says *what follows is material to examine, not direction to follow* is itself an authored, versioned library segment. Neither depends on an operation author doing the right thing: a typed segment is placed and framed the same way every time, on every model.
+
+That is what type-based assembly buys. It does not make the separation enforceable — see the top of this section — but it does make it **consistent**, which removes the failure where one operation forgets.
+
+### The output side is the only part that holds
+
+Everything above lowers the odds. This part does not depend on the model cooperating, and it is where the damage is actually contained — a successful injection is only harmful if it can *act*.
+
+- **Every output is schema-validated.** Free-form output from an operation processing external content is a defect.
+- **Operations declare what they may reach.** An operation processing external content should not also hold the ability to change external state. Where both are needed, they are two operations with a human or a check between them.
+
+This is the separation principle in its purest form: **prose asks; code holds.**
+
+### Who owns what
+
+| Defence | Owner |
+|---------|-------|
+| Origin and verification state on segments | AI Core |
+| Marking and structural separation | AI Core |
+| Schema validation | AI Core |
+| Injection-detection hooks | AI Core |
+| Capability gating on tool use | The consuming pipeline |
+| Splitting operations so external input and privileged action never share one call | The consuming pipeline |
+| Human verification of anything consequential | The consuming pipeline |
+
+### What does not work
+
+Instructions in the prompt telling the model to ignore injected instructions. Delimiters alone. Detection classifiers as a sole gate — they are evadable, and useful only as one layer among several.
+
+---
+
+## Feedback
+
+**Feedback is a structured field on the operation's return.** Not an event. Not a registry. Not a routing config. The consumer called the operation and is holding the answer:
+
+```ts
+{
+  result: { … },
+  feedback: {
+    reason, missing, confidence, threshold, coverage, ref
+  }
+}
+```
+
+**It is structured, never prose.** The consumer writes the words — it knows whether it is rendering an inline question, a flag on a document, or a queue row at 2am. AI Core shipping copy for a component it has never seen is exactly the opinion it must not have.
+
+**One event, many renderings** — the same relationship a prompt has to a framework. Something structured comes out of the middle; the edges decide how it looks:
+
+- Someone to ask → *"which document has the filing date?"*
+- Nobody to ask → a row: *claim resolved to no source · confidence 0.4 · below threshold*
+
+**The only thing the batch/interactive difference decides is whether the consumer can ask right now.** Voice applies either way. Disciplines apply either way. The brake matters *more* when nobody is watching the output — the failure this whole module exists to prevent is not that the AI was wrong, but that **the AI was wrong and looked right**.
+
+### The review queue battery
+
+AI Core ships a review queue as a battery, the way it seeds voices — a table and a component a consumer can use or ignore. It is not a mechanism, not a destination, not routing. Just something in the box, editable like every other ships-with record.
+
+---
+
+## Retrieval
+
+**If AI is doing the retrieving, AI Core owns the mechanism.** Semantic retrieval is an AI operation like any other — it uses a model, it can be wrong, it must report what it did.
+
+> **AI Core retrieves. Structure stores.**
+
+AI Core never owns the data, the graph, or the columns; it reaches them through Structure's service. It owns *the act of going and finding*.
+
+### Configured per operation, through the grounding dials
+
+An operation that needs context declares it. The grounding dials — retrieval breadth, reranking, abstention threshold — resolve how much is fetched, in what order, and what happens when nothing good comes back. Dials and presets are covered in [Configuration](/modules/ai-core/configuration/).
+
+### Retrieval reports what it didn't find
+
+This is the surface where the transparency rule bites hardest. An empty or weak retrieval that is silently treated as "no relevant context" produces a confident answer over nothing — which is indistinguishable, to the reader, from a confident answer over everything. Retrieval returns what it found **and the shape of what it missed**, and that reaches the caller as [feedback](#feedback).
+
+### Consumers may fill the slot themselves
+
+Retrieval is a capability, not a mandate. A consumer that already knows exactly which content is relevant passes it as a context segment and skips retrieval entirely. AI Core provides **guidelines** for filling that slot well — guidance, not enforcement, because the context slot belongs to the consumer.
+
+---
+
+## What AI Core Does Not Own
+
+| Thing | Owner |
+|-------|-------|
+| Chunking | cog-ingest / document-management |
+| Content acquisition — files, URLs, PDFs, images | cog-ingest / document-management |
+| Storage, the graph, vector columns | Structure |
+| What to save, pattern detection | cog-db-engine |
+| Pipeline configuration | cog-ingest |
+| Conversations, messages, memory, personas | chat |
+| Domain content — any app's operations, prompts, disciplines | that app |
+| Metering | nobody — AI Core counts, billing asks |
+| Making the database unreadable to its owner | the starter template's security layer, not AI Core |
+
+**[Cog Ingest](/modules/cog-ingest/) is a consumer.** It manages cog-db-engine. Its pipeline steps call AI Core operations. That is the entire relationship. AI Core has no view on cog-db-engine and must not acquire one.
+
+The rule underneath the whole table: AI Core holds what every operation shares; the consumer holds what only it has. For what AI Core *does* hold — models, prompts, disciplines, dials, operations, flows — start at the [module overview](/modules/ai-core/) and [Configuration](/modules/ai-core/configuration/).

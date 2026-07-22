@@ -302,6 +302,11 @@ export default defineConfig({
               autogenerate: { directory: "modules/style" },
             },
             {
+              label: "AI Core",
+              collapsed: true,
+              autogenerate: { directory: "modules/ai-core" },
+            },
+            {
               label: "Billing",
               collapsed: true,
               autogenerate: { directory: "modules/billing" },

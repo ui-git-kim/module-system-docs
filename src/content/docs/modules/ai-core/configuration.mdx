@@ -1,0 +1,220 @@
+---
+title: Configuration
+description: Models as records, provider terms, dials and presets, and the AI Core admin
+lastUpdated: 2026-07-22
+sidebar:
+  order: 1
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+Configuration in AI Core is records, not files. Models, provider terms, dials and presets all live in admin-managed tables; environment variables hold provider API keys and nothing else. This page covers each configuration surface and the admin page that manages them.
+
+<Aside type="caution" title="Design stage — not yet built">
+This page describes the AI Core redesign (design complete, July 2026). Implementation has not started; the currently installable module ships an earlier, superseded surface. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+</Aside>
+
+Every built-in is a record: seeded at install, editable, resettable — like a theme shipping a default palette. You can change every colour; you just don't start from white.
+
+> **Ships-with is not hardcoded.**
+
+---
+
+## Models
+
+A model is a record. The admin manages them; **no model string ever appears in code**. Consumers name jobs, never models — see [Usage](/modules/ai-core/usage/) for how operations resolve to models, and [Integration](/modules/ai-core/integration/) for the consumer contract.
+
+Each model record holds:
+
+| Field | Purpose |
+|-------|---------|
+| Provider and model id | Which provider, which exact model |
+| Display name | What the admin and users see |
+| Prompt framework | Model-specific prompt structure — order and wrapping syntax for this model family |
+| Framework override | One hand-written field, used when the assembled framework isn't right for this model. **The only override in the module.** |
+| Capabilities | Fetched from the provider, cached, with a logged fallback when the fetch fails |
+| Knowledge cutoff | Feeds the date context segment at prompt assembly |
+| Parameter rules | What this model accepts and rejects |
+| Dimensions | Embedding models only |
+| Enabled / user-selectable | Whether the model is active, and whether users may ever choose it |
+
+**Providers:** Anthropic, OpenAI, Google, Voyage, Black Forest Labs, Replicate. All are lazy-initialised — a provider is available when its key is present, and absent otherwise. No configuration step, no registration.
+
+**Secrets live in environment variables. Everything else lives in the table.** Keys are the only thing env holds — see [Environment Variables](#environment-variables) below.
+
+### Capabilities are fetched, never assumed
+
+Provider APIs differ — some return full metadata, some return IDs only. When a fetch fails, AI Core falls back and logs it. A stale capability that nobody knows is stale is a lie about what the model can do — the failure the module exists to prevent is not that the AI was wrong, but that **the AI was wrong and looked right**, and that rule applies to the module's own metadata too.
+
+### Parameter rules are the model's problem, not the consumer's
+
+Models reject parameters other models require. AI Core knows; consumers never find out. The rules live on the model record, and AI Core validates against them before anything is sent.
+
+### Pin exact versions, never aliases
+
+A model record names a specific snapshot. An alias means the provider can change the model underneath you with no deploy, no notice and no record — behaviour changed and nothing said so, which is the module's core failure in its purest form.
+
+### A model version change is a migration, not an edit
+
+Changing the version on a model record gets a pinned evaluation set run before and after, and a rollback path. The ledger records which exact version produced every result, so a past output can always be explained.
+
+---
+
+## Embedding Models
+
+Embedding models are models. No separate subsystem — an embedding model sits in the same table with the same fields, plus a dimensions value. An embed operation simply carries no prompt, no dials and no disciplines: text in, vectors out. It is the thinnest operation in the system.
+
+### The Structure dimension gate
+
+Structure bakes the vector dimension into its column at install, **before AI Core exists**. AI Core probes for it:
+
+```ts
+structureService.getCognitiveCapabilities();
+// → { embeddings: { enabled, dimensions } }
+```
+
+and offers only embedding models producing that width. Deployments differ — 1024, 1536, 2048 and 3072 are all in the field. A dimension mismatch is silent corruption, so this is a **hard gate, not a warning**: a model of the wrong width is not selectable for an embed operation, full stop.
+
+### Coverage reporting
+
+Over-length input reports coverage. AI Core does not silently truncate — it says what the vector covers (*"indexed to page 4 of 62"*), and the caller decides what to do about it. Truncating a long document is sometimes correct engineering; truncating it silently never is.
+
+---
+
+## Provider Terms & Content Handling
+
+A hard architectural rule:
+
+> **No sensitive content reaches a model endpoint that is not under zero-retention terms.**
+
+This rule belongs to AI Core because AI Core owns the only code in the system that talks to a provider. No consumer can enforce it, because no consumer knows which endpoint its operation resolved to. **If AI Core doesn't gate it, nothing does.**
+
+### Two terms, recorded separately
+
+Two distinct things, usually sold together:
+
+<CardGrid>
+  <Card title="Zero retention" icon="seti:lock">
+    The request and response are not stored after they are served.
+  </Card>
+  <Card title="No training" icon="seti:shell">
+    The content is not used to train the provider's models.
+  </Card>
+</CardGrid>
+
+Both are contractual states of *your account with that provider*, per endpoint or tier. Unlike capabilities, they are not API properties and **cannot be fetched** — so they are admin-entered, dated, and reviewable. Record them per provider *and per model*, because they differ within a provider.
+
+### What zero retention actually buys
+
+Zero retention is not absolute, and neither the design nor the UI pretends it is:
+
+- Providers retain limited safety-classifier or abuse-monitoring data even under zero-retention terms.
+- Some frontier model tiers are carved out of zero retention entirely.
+- A retention promise does not survive a court order compelling preservation.
+
+The content still leaves the building and is cleartext at the provider. Zero retention makes it **transient and contractually un-retained** — which is usually what a legal client is actually asking about. It does not make the provider unable to read it. The UI must not imply otherwise; the module's honesty rule applies to its claims about itself.
+
+**Australian processing is available** for the main model providers via regional endpoints, and is preferred where the content is Australian legal material.
+
+<Aside type="note" title="Image and video providers">
+Black Forest Labs and Replicate have materially weaker data-handling terms than the model providers. The design flags this as an open item to confirm before any sensitive content is routed to them — the likely answer is that it never is.
+</Aside>
+
+### The sensitivity gate
+
+An operation declares the sensitivity of the content it handles. The app sets the floor; **operations may tighten it and never relax it** — the same additive-only rule as the authority levels on disciplines.
+
+**Resolution refuses.** If no model under acceptable terms can do the job, the operation **fails loudly and says why**. It does not quietly fall back to a compliant-looking alternative, and it does not silently do nothing. A silent downgrade here is the module's core failure with legal consequences attached.
+
+Nothing about this gate belongs in a prompt. It is a resolution-time code gate — the more absolute the rule, the further its enforcement sits from the document. **Prose asks; code holds.**
+
+### What it constrains elsewhere
+
+The sensitivity flag reaches beyond resolution:
+
+| Surface | Constraint |
+|---------|-----------|
+| Semantic cache | Sensitive content is not cached, or is cached only where terms permit |
+| Ledger | Records cost, tokens and outcome for sensitive operations — **never content** |
+| Logs | Carry no prompt or response content for sensitive operations. Not at debug level, not in error paths |
+
+AI Core's obligation, stated exactly: **don't be the new hole.** It is not the app's security boundary. It must not be the gap in one.
+
+---
+
+## Dials & Presets
+
+AI Core ships dials, not opinions. The admin combines and names them.
+
+### Execution dials
+
+| Dial | What it sets |
+|------|-------------|
+| **Effort** | How hard the model thinks |
+| **Output richness** | How much it writes |
+| **Verification passes** | `0` do it · `1` do it and check it · `2` do it, check it, repair it |
+
+### Grounding dials
+
+| Dial | What it sets |
+|------|-------------|
+| **Retrieval breadth** | How widely retrieval reaches |
+| **Reranking** | On or off |
+| **Abstention threshold** | The groundedness score below which the operation abstains rather than answers |
+
+### The rules
+
+- **Multi-step is not a dial.** A flow has however many steps it has. No switch turns a one-call operation into a five-stage pipeline.
+- **Dials promise work, not speed.** Deep on a one-call operation is still one call. The UI says so.
+- **A preset sets every dial.** Each operation uses the ones that apply and ignores the rest without erroring — an embed operation has nothing for the grounding dials to configure, and that is fine.
+- **Verification must check against something external** — retrieval, a tool, a deterministic check, a second model with independent context. A model re-reading its own answer with no new information does not beat a good first prompt. *"Have another look" is not verification.*
+
+### Presets
+
+Presets are admin-named dial combinations — *"Court-ready"*, *"Quick scan"*. **AI Core ships none by name; the app owner names them.** What counts as court-ready is an opinion, and opinions belong to the app, not the module.
+
+---
+
+## The Admin
+
+**One page, tabbed.** Not a page per concern.
+
+| Tab | What it manages |
+|-----|----------------|
+| **Models** | The catalogue: capabilities, frameworks, which models are enabled |
+| **Operations** | The composer: model, dials, disciplines, prompt, schema |
+| **Prompts** | Segments: voices, methods, sections |
+| **Dials & presets** | Compose dial combinations and name them |
+| **Disciplines** | Authored records *(shape open)* |
+| **Flows** | Operations in order |
+| **Usage** | The ledger, costs, estimates |
+
+Two rules govern the whole page:
+
+- **Cost belongs in help text, not just numbers.** An app owner turning up verification passes sees what it costs before they save.
+- **Every value shows where it came from** — a shipped default or someone's deliberate choice. This is the module's transparency rule applied to its own config.
+
+What the admin composes here is what consumers run by name — see [Usage](/modules/ai-core/usage/) for operations and flows in practice, and [Developer Workflow](/modules/ai-core/developer-workflow/) for how the records are seeded and migrated.
+
+---
+
+## Environment Variables
+
+**Keys are the only thing env holds.** Provider API keys, nothing else — every other value on this page lives in admin-managed tables.
+
+A provider is available when its key is present. Providers are lazy-initialised, so there is no enable step and no configuration file entry: set the key, and the provider's models can be enabled in the admin.
+
+| Provider | Key present enables |
+|----------|--------------------|
+| Anthropic | Claude models |
+| OpenAI | GPT models, OpenAI embeddings |
+| Google | Gemini models |
+| Voyage | Voyage embeddings |
+| Black Forest Labs | Image generation |
+| Replicate | Hosted model inference |
+
+Exact variable names follow each provider SDK's convention and are settled at implementation; the contract is only that **the key's presence makes the provider available**.
+
+<Aside type="note" title="Models are never in env">
+Model selection is an architecture decision, not a secret. Model assignments live in the model and operation records, managed through the admin — never in `.env` and never in a config file. Swapping every model in the app is one admin change, with nothing to redeploy.
+</Aside>
