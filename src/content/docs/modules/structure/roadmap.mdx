@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features and future direction for the Structure module
-lastUpdated: 2026-07-19
+lastUpdated: 2026-07-22
 sidebar:
   order: 11
 ---
@@ -178,6 +178,40 @@ Improvements to make Structure easier and more powerful for other modules to int
 
 ## Known Issues
 
+### 2026-07-22 meta audit — nine criticals: install blockers, an IDOR, and a data-loss guard
+
+**Priority:** Critical — fix before any new production install (batches A–C)
+
+A four-dimension meta audit (standards / production readiness / performance / security) of v1.18.1 ran 2026-07-20 → 2026-07-22 with adversarial verification: 171 confirmed findings from 312 raw candidates, every finding surviving a three-lens refute-by-default review. The full register (issue / fix / evidence per item) is maintained in the module workspace audit artefact; this page records the actionable groupings. The nine criticals:
+
+**Security and data integrity**
+
+- **Cross-user connection read (IDOR).** `createNode` writes client-supplied `fromNodeId`/`toNodeId` with no ownership check (`backend/index.ts` ~L2431); `getNodeConnections` / `listConnections` then hydrate `include: { fromNode, toNode }` with no `userId` predicate (~L4155 / ~L4203), so a connection pointed at another user's node id returns that user's full node row — name, description, and the entire `data` blob. Fix at the write side (verify both FKs resolve to caller-owned rows) and scope the relation includes.
+- **Deletion handlers can wipe entire tables.** Every erasure handler derives `const userId = ctx.subject.userId ?? ctx.subject.tenantId` then calls `deleteMany({ where: { userId } })` (`backend/registrations.ts` ~L83 onward). If both fields are absent, Prisma treats `undefined` as *omit the filter* — the handler deletes **every row for every user**. Reachable only via a host contract violation, but the blast radius is unrecoverable and the guard is one line per handler.
+- **`bulkCreateNodes` reports partial success from an aborted transaction** (`backend/index.ts` ~L2994). Per-row errors are caught *inside* an interactive transaction Prisma has already rolled back, so rows reported "created" were never committed.
+- **`NodeForm` never resets between opens** (`frontend/components.ts` ~L616). The router reuses a single `:nodeType` route, so navigating `/clients` → `/projects` keeps the stale form state and submits `nodeType: 'clients'` — a Project is persisted as a Client, with the previous entry's values pre-filled.
+
+**Install blockers — generated code fails to compile or build on a current host**
+
+- Zero-argument `useRef<T>()` ×3 (`pages.ts` ~L58 / ~L481, `components.ts` ~L865) — the zero-arg overload was removed in `@types/react` 19.
+- `.filter(Boolean)` does not narrow (`components.ts` ~L117) — strict type-check failure; needs a type-guard predicate.
+- `handleExport` passes `{ includeDisabled: true }` where `listConnectionTypes(includeDisabled?: boolean)` is declared (`pages.ts` ~L1716) — type error (works at runtime only because an object is truthy).
+- `typeof formData.fields[0]` (`pages.ts` ~L4030) — `formData` is `Partial<NodeTypeConfig>`, so this resolves as `(NodeTypeField[] | undefined)[0]` → TS2339, confirmed by compiler repro. Use `NonNullable<typeof formData.fields>[number]`.
+- **`@dnd-kit/{core,sortable,utilities}` imported but undeclared** (`pages.ts` ~L1429–1437 vs `module.ts` `frontend.dependencies`, which lists only `react-hook-form`) — a fresh `npx structure init` does not build. Near-term fix: declare the three packages in `module.ts`. Direction decided 2026-07-22: drag-and-drop dependencies move **into the starter template** as base dependencies (tracked on the [starter roadmap](/starter-template/roadmap/)); the module declaration then remains as a harmless redundancy for older hosts.
+
+### 2026-07-22 meta audit — moderate findings (53)
+
+**Priority:** High–Medium (batches D–G)
+
+Grouped by fix area, with representative sites:
+
+- **Backend ownership and input validation (Security).** `getNode` / `listNodes` `children` includes carry no `userId` predicate; `duplicateNode` trusts `targetParentId` unverified; `bulkCreateNodes` repeats the unvalidated FK write; the public API route omits `allowNoOrigin` so production CORS rejects every headless API client (`backend/index.ts` ~L67); `dataFilters` numeric operators coerce unvalidated values into raw SQL and crash the request (~L2158); `importNodeTypes` creates imported types as shared `userId: null` rows; field-level `editableBy` and node-type `permissions` are enforced only in the browser — no server-side counterpart.
+- **Contract and dead wiring (Production).** `labels` is accepted, typed, and exported but never persisted or read back; `createNode` silently drops the `settings` field its own schema accepts; `StructureRegistry.getFieldsForNodeType` is never called, so module-registered fields never render; frontend lifecycle hooks are declared but never invoked (a delete veto is ignored); the Structure settings page saves preferences nothing reads; `NodeForm` omits `allData`, so conditional visibility and computed fields are dead in create/edit; `syncFromDatabase` wipes module-registered node types with no re-application path.
+- **Frontend error surfaces (Production).** `useConnectionTypeMutations`, `useApiKeyMutations`, and `useTemplateMutations` have no `onError` — a failed key revoke reads as success; the list filter dropdown renders a `SelectItem` with an empty `value` (hard render crash); the node-type config page renders a false 404 during load; the admin page has no error state (a failed load renders "No types yet"); config import double-submits and swallows per-item failures; the connection-type form submits with no required-field validation; the published-slug input fires a PATCH per keystroke.
+- **Data integrity (Production).** Node slug uniqueness is never pre-checked, so `P2002` surfaces as an unhandled error; `addField` mints duplicate field ids after any deletion; `getNextSortOrder` runs on the global Prisma client from inside transactions; `@@unique([userId, parentId, name])` is NULL-asymmetric with no conflict handling; card/header delete fires with no confirmation.
+- **Performance (backend).** `updateDescendantPaths` issues one UPDATE per descendant on every move; `duplicateNode` runs a SELECT per descendant; `getNodeConnections` is unbounded and hydrates both full endpoint rows per connection; `bulkCreateNodes` can issue ~1,500 sequential round trips inside one default-timeout transaction; `listPage.defaultView` is silently ignored (lazy initial state races the config load).
+- **Secrets and keys (Security).** The `secret` field type stores credentials in plaintext while the masked UI implies protection — move to the starter's `encryptField`, with a data migration for existing values; the `url` field renders an unvalidated `href` (`javascript:` XSS, reachable via public-API writes); the admin UI cannot set a key expiry, so every issued key is perpetual; the plaintext API key is retained in the TanStack mutation cache after the create dialog closes.
+
 ### Several built-in field types render as plain text
 
 **Priority:** Medium
@@ -201,6 +235,19 @@ The `field-group` field renderer emits two **over-escaped** template expressions
 ---
 
 ## Planned Improvements
+
+### 2026-07-22 meta audit — minor sweep (109)
+
+**Priority:** Low (batch H, plus opportunistic fixes alongside the critical/moderate batches)
+
+Minor findings from the same audit, grouped by theme. None is ship-blocking; each is a real polish or consistency gap confirmed by adversarial review.
+
+- **Registry hygiene.** `NodeFieldRegistration.order` defaults to 1000 and a filter registration uses order 10 — both off the unified 0–100 scale; the admin drag-reorder writes old-style 10/20/30 sort orders; all eight `createRegistryHook` subscriptions are dead (consumer hooks read registries non-reactively); the `'dashboard'` widget location is never bridged to the host `dashboardRegistry`.
+- **Schema and index cleanup.** `@@index([publishedSlug])` duplicates the `@unique`; `@@index([userId])` and `@@index([parentId])` are redundant leftmost prefixes; the two main list endpoints' ORDER BY has no serving index; materialised-path `LIKE` prefix queries cannot use the path indexes on default-collation Postgres; `embeddingModel` is filtered but unindexed; the 3072-dimension embeddings option exceeds pgvector's 2000-dim HNSW limit, so the index silently never builds.
+- **Rule 7 / rule 8 residue.** `text-white` in ColorPicker; a raw `<table>` in Registry Overview; clickable `<div>` tree rows with a hand-rolled chevron `<button>`; a bare `<h1>` in NodeDetailHeader instead of `PageHeader`; `hsl(var(--muted))` inline fallback that is invalid against Tailwind v4 shadcn tokens.
+- **Read-path consistency.** `getNodeType` drops `builtInFieldConfig` / `conditionalColor` / `permissions` that `listNodeTypes` and the frontend type both include; `listNodes` validates then silently ignores `includeChildrenDepth` / `includePath` / `includeConnectionCounts`; `restoreNode` does not restore the descendants `deleteNode` cascaded.
+- **Frontend polish.** Copy-confirmation timer never cleared on unmount; IconPicker enumerates the entire lucide-react namespace per instance with undebounced search (and its search matches zero results — lucide exports are not functions); NodeSelector's memo is defeated by a default-parameter array; `resolveTemplateAsync` awaits node fetches sequentially; spelling drift in both directions (`showFavouritesInSidebar` as a persisted key; American spelling in `module.ts` user-facing prose).
+- **Backend polish.** `listNodes` awaits `count` and `findMany` sequentially; every public-API request writes `lastUsedAt` (throttle it); `reorderNodes` accepts an unbounded `nodeIds` batch (`.max()` missing, unlike its `.max(500)` sibling); `getSettings` writes on a read path.
 
 ### Structure-only styling compliance sweep (v1.15.2 standards-alignment audit)
 
