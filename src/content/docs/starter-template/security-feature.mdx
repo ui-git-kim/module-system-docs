@@ -101,9 +101,11 @@ Cross-user isolation is **enforced by Neon**, not by hand-rolled checks: **Neon 
 
 ## Field encryption
 
-Modules declare `encryptedFields` / `hashedSecrets` in their manifest and call the foundation primitive — they never hand-roll crypto. Added in v1.31.0.
+Modules declare `encryptedFields` / `hashedSecrets` in their manifest and call the foundation primitive — they never hand-roll crypto. Added in v1.31.0; per-tenant keys + audited access in v1.64.0.
 
 - **`encryptField(plaintext, { tenantId? })` / `decryptField(envelope, { tenantId? })`** — **AES-256-GCM** via Node's `crypto` (OpenSSL): a fresh random IV per call and the GCM auth tag verified on decrypt (tamper → throws). The **key comes from env/KMS and is never sent to the database**, so Neon only ever holds ciphertext (a dump / console / leaked connection string is useless).
+- **Per-tenant keys (v1.64.0):** passing a `tenantId` now encrypts under a key **distinct to that tenant** — there is no bulk decrypt, and reading a tenant's content is a deliberate, single-tenant act. The envelope records this (`v2:` prefix; decrypt requires the same `tenantId`). `v1:` envelopes (no tenant / pre-v1.64.0) always use the app-global master key and stay readable forever. Every adapter derives per-tenant subkeys via **HKDF-SHA256**; the AWS KMS adapter's **per-tenant mode** (below) upgrades this to dedicated per-tenant data keys with true crypto-shred.
+- **`auditedDecrypt(envelope, { actorId, tenantId, resource, purpose? })` (v1.64.0)** — the **provable-access layer**: decrypts *and* fires the `security.dataAccessed` hook (captured by the audit sink; immutably, under the compliance sink). The payload's **`crossTenant`** flag (actor ≠ data owner) is the event the trail exists to prove **absent** — *"did the operator ever read tenant X's content?"* becomes answerable from an append-only log. Failures fire too (an attempted read of shredded/tampered ciphertext is audit-worthy). Use it for user content that must be provably access-controlled; plain `decryptField` remains for hot-path bulk reads.
 - **`hashSecret(token)` / `verifySecret(token, hash)`** — SHA-256 + constant-time compare, for **high-entropy tokens / license keys** (not passwords — those are Neon Auth's).
 
 ```typescript
@@ -117,6 +119,14 @@ const ok     = verifySecret(presented, stored);
 ```
 
 **Keys (`keyProvider`):** the **`env`** adapter ships working — `SECURITY_ENCRYPTION_KEY`, base64 32 bytes (`openssl rand -base64 32`), with the key living in your env. For **provider-held key custody**, run `npm run security:setup-kms` — it provisions the wrapped key and sets `SECURITY_KEY_PROVIDER=kms` + the `SECURITY_KMS_*` env, and the feature **auto-wires** the shipped **AWS KMS** adapter from that env (no `app.ts` edit, survives `template:update`). The master key then lives in AWS, never in your env or the database, with CloudTrail logging and instant revocation. Walkthrough: [Field encryption with AWS KMS](/getting-started/aws-kms-setup/). Field encryption is off at `standard`, on at `hardened`+ (the `fieldEncryption` tier knob).
+
+**Per-tenant mode (`SECURITY_KMS_PER_TENANT=true`, v1.64.0 — high-assurance apps):** with the KMS provider, each tenant gets a **dedicated KMS-generated data key**, stored KMS-wrapped in the self-provisioned `TenantKey` table (ciphertext only — the plaintext key never touches the database; the table is raw-SQL/zero-propagation like `AuditLog`, declared external in `prisma.config.ts`). This buys **true per-tenant crypto-shred**: shredding upserts a permanent tombstone barrier (blocking even a racing first-use mint) and makes *that* tenant's ciphertext unreadable, provably independent of every other tenant. The deletion cascade does this automatically — a `credential`-phase handler shreds the tenant's key **first**, so even a later cascade failure leaves their encrypted content beyond recovery. Key operations **fail closed** (a key/table/KMS error throws; a shredded tenant is refused loudly; a declared-but-unwired KMS registers a fail-closed sentinel rather than silently switching key roots).
+
+**Honest shred propagation bound:** the shred takes effect *immediately* in the process that runs it; other running instances hold a bounded plaintext-key cache that re-validates the tombstone within **60 seconds** (one PK `SELECT`; no KMS call) — and on any cache miss or restart, immediately. The deletion report states this bound. For same-key transplant resistance, bind an **`aad`** context (e.g. `case:${'{id}'}.notes`) at encrypt time — v2 envelopes fold it into the GCM tag, so ciphertext moved between rows/columns fails to decrypt.
+
+<Aside type="danger" title="The key mode is part of the stored-ciphertext contract">
+HKDF-derived subkeys (default) and per-tenant data keys (`SECURITY_KMS_PER_TENANT=true`) are **different keys**. Decide the mode **before the app encrypts anything** — flipping it later makes existing `v2:` ciphertext undecryptable without re-encryption. Same for the master key itself: with field encryption in use, `SECURITY_ENCRYPTION_KEY` / the KMS key becomes **load-bearing** — losing it loses the data. That is the property, not a bug.
+</Aside>
 
 <Aside type="caution" title="Why app-layer, not pgcrypto">
 `pgcrypto` runs inside Postgres, so the key would travel to Neon on every query — defeating "the database can't read it." App-layer AES-256-GCM keeps the key in the app; Neon only ever sees ciphertext.
