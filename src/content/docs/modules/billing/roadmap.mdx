@@ -18,65 +18,16 @@ A full standards audit ran on 2026-07-14 against scaffold v1.18.0/v1.18.1 and ho
 
 ## Known Issues
 
-<Aside type="caution" title="2026-07-23 meta-audit">
-A four-dimension audit (standards / production / performance / security) of the generated code ran on 2026-07-23 against module v1.4.3 and host v1.54.0. It confirmed **21 findings** via adversarial verification — after merging one duplicate pair (the two admin Save buttons share a root cause), **20 distinct issues: 1 critical, 6 moderate, 13 minor**. The critical + moderate items are listed below; the minor items are grouped under [Planned Improvements → Meta-audit polish](#meta-audit-polish-2026-07-23). None are shipping blockers **except** the cross-tenant subscription binding issue, which should be fixed before any real-money deployment.
+<Aside type="tip" title="2026-07-23 meta-audit — all 20 findings fixed in v1.5.0">
+A four-dimension audit (standards / production / performance / security) of the generated code ran on 2026-07-23 against module v1.4.3 and host v1.54.0. It confirmed **21 findings** via adversarial verification — **20 distinct issues** after merging one duplicate pair (1 critical, 6 moderate, 13 minor). All were fixed in **v1.5.0** (see [Completed](#completed)), including the critical cross-tenant subscription-binding hole (`client-reference-id` is now HMAC-signed and verified in the webhook). The code fixes pass the module's wrapper checks and a full generated-code TS/TSX parse; **end-to-end host verification is still pending** — see the item below.
 </Aside>
 
-### Cross-tenant subscription binding via client-controlled `client_reference_id`
+### End-to-end host verification pending (now covers the v1.5.0 changes)
 
-- **Description:** `StripePricingTable` renders `client-reference-id={userId}` as a plain DOM attribute on the native `<stripe-pricing-table>` element — any authenticated user can edit it in devtools before checking out. `syncSubscriptionFromWebhook` then trusts `session.client_reference_id` as the **first-priority** tenant key (`let resolvedTenantId = tenantId;`; the existing-row and customer-metadata fallbacks only run when it is absent) and upserts `where: { tenantId: resolvedTenantId }` with the paying session's `stripeCustomerId`. A user who knows a victim's `tenantId` (in the solo product `tenantId === userId`) can complete a checkout (free if a trial plan exists) whose signed `checkout.session.completed` event carries the victim's id, overwriting the **victim's** `Subscription` row with the attacker's Stripe customer. Downstream `/portal`, `/payment-method`, `/invoices` and account-deletion all resolve the customer from that row, so this is a bidirectional billing-data exposure and a subscription-hijack write primitive. The Stripe HMAC does not defend against it — the hostile value rides inside a legitimately-signed event.
-- **Where:** `src/templates/frontend/index.ts` (`StripePricingTable`, `client-reference-id={userId}`); `src/templates/backend/index.ts` `syncSubscriptionFromWebhook` (tenant-resolution order) and the `checkout.session.completed` handler (passes `client_reference_id` through unvalidated).
-- **Severity:** **Critical** (cross-tenant isolation break / IDOR-class). Likelihood is bounded — needs the victim's cuid-form id and a completed checkout, so it is targeted, not mass — but the consequence (destroying/hijacking any tenant's subscription) makes it fix-before-ship.
-- **Fix:** Invert the trust order in `syncSubscriptionFromWebhook` — resolve from an existing row for `stripeCustomerId`, then `customer.metadata.tenantId`, and only fall back to `client_reference_id` last; refuse to rebind a tenant whose existing row points at a different `stripeCustomerId`. Robust remedy: stop passing the raw `userId` — issue a short-lived HMAC-signed reference token from a member endpoint (signed with `SECURITY_ENCRYPTION_KEY`), use it as `client-reference-id`, and verify it in the webhook before use (a first-time subscriber has no existing row and the pricing-table customer carries no `tenantId` metadata, so the reference cannot simply be dropped).
-
-### Read paths have no Stripe error handling or stale-on-error fallback
-
-- **Description:** `getPlanDetails()` (awaited unguarded by `getSubscription()`) and `getPlanLimits()` call Stripe with no try/catch. During any Stripe outage or transient 429/5xx, `GET /subscription` and `GET /entitlements` — member reads whose core data already lives in the DB — fail completely instead of degrading, and the 5-minute `planCache` is discarded the moment it expires rather than served stale-on-error. Worse, the raw `StripeError` carries a `statusCode`, and the host error middleware does `err.statusCode || 500`, so a Stripe 401 (rotated/bad secret key) surfaces to the browser as HTTP 401 and a 404/429 as 404/429 — Stripe failures are indistinguishable from client validation failures. (The host's api interceptor does not force-logout on 401, and production messages are genericised, so no internals leak — but the misleading status remains.)
-- **Where:** `src/templates/backend/index.ts` — `getPlanDetails` (~line 527), `getSubscription` (~line 427), `getPlanLimits` (~line 811).
-- **Severity:** Moderate.
-- **Fix:** Wrap the Stripe calls in try/catch; on failure serve the cached plan even past TTL (add a cache to `getPlanLimits` — see the entitlements caching item), else translate the Stripe error into a 502/503 `AppError` rather than propagating Stripe's own `statusCode`. `getSubscription` should still return DB-backed status/dates when plan enrichment is unavailable.
-
-### Out-of-order webhook delivery can overwrite newer subscription state
-
-- **Description:** `syncSubscriptionFromWebhook` unconditionally upserts the event's subscription snapshot. Stripe does not guarantee delivery order (and the handler returns 5xx without recording the event id on failure, so retries arrive later). A delayed `customer.subscription.created` (TRIALING, earlier period-end) processed after `customer.subscription.updated` (ACTIVE, later period-end) reverts `status`/`currentPeriodEnd`/`cancelAtPeriodEnd` to stale values until the next event re-syncs. This drives entitlement resolution and the dunning/settings UI. Distinct from the per-process dedupe item (that covers exact-duplicate ids, not ordering).
-- **Where:** `src/templates/backend/index.ts` — `syncSubscriptionFromWebhook` upsert (~line 609) and the webhook handler (passes `event.data.object` directly).
-- **Severity:** Moderate (self-heals on the next event; no permanent corruption).
-- **Fix:** Thread the Stripe event `created` timestamp into the sync and make the update monotonic — persist a `lastEventAt` marker and guard the update (`updateMany` on `tenantId` AND `lastEventAt < incoming`), or at minimum ignore `customer.subscription.created` when a newer row already exists.
-
-### Admin save buttons can wipe stored config on a slow/errored load
-
-- **Description:** On `BillingAdminPage`, `entries` and `stripeCfg` initialise empty and populate only from their queries' data, but both Save buttons ("Save Stripe config", "Save entitlements") are gated solely on the mutation's `isPending` — never on the backing query's `isSuccess` — and none of the four load queries render an error state. Because both PUT endpoints full-replace, a Save clicked while `configQuery`/`stripeConfigQuery` is still loading or has transiently errored (the form then looks identical to "nothing configured yet") silently wipes the tenant's entitlement options or Stripe config — the latter breaks the pricing table served to every member.
-- **Where:** `src/templates/frontend/index.ts` — `BillingAdminPage` handlers/buttons (~lines 1862, 1930); backend full-replace upsert in `setEntitlementConfig`/stripe-config PUT.
-- **Severity:** Moderate (requires a transient load failure/race plus an admin clicking Save on a misleadingly-empty form; recoverable by re-entry).
-- **Fix:** Gate each Save on its source query — `disabled={mutation.isPending || !sourceQuery.isSuccess}` — and render explicit error/retry states for `configQuery`/`stripeConfigQuery` instead of empty editable forms.
-
-### Post-checkout success alert races the webhook
-
-- **Description:** After the hosted Pricing Table redirects to `/settings/billing?success=true`, the page shows a green "Payment successful! Your subscription is now active." but nothing invalidates or polls the subscription query. The `checkout.session.completed` webhook that writes the row races the redirect and often has not landed, so the "now active" alert can render directly above a "No active plan" card until a manual refresh.
-- **Where:** `src/templates/frontend/index.ts` — `BillingSettingsPage` success branch (~line 1417); the only `success` effect is a 5s param-clear.
-- **Severity:** Moderate (every checkout is exposed; self-heals on refresh; no data impact).
-- **Fix:** On `checkoutSuccess`, invalidate the `billing` query keys and briefly poll (`refetchInterval` until status is active/trialing, with a cap), and/or soften the copy to "Payment received — your subscription will activate shortly" until the query confirms.
-
-### Entitlements resolution hits Stripe live on every check (no product cache)
-
-- **Description:** The module has a 5-minute `planCache`, but only `getPlanDetails()` consults it. `getPlanLimits()` — which backs `GET /entitlements`, `POST /entitlements/check`, and the backend `checkEntitlement()` other modules call per-request — calls `products.retrieve()` unconditionally, so every entitlement check is a live Stripe round-trip (~200–500 ms) with rate-limit exposure scaling linearly with active users and with any module gating actions on `checkEntitlement`.
-- **Where:** `src/templates/backend/index.ts` — `getPlanLimits` (~line 811); existing `planCache` (~line 373) consulted only by `getPlanDetails`.
-- **Severity:** Moderate (performance; no correctness impact).
-- **Fix:** Add a small product-level cache (name + `max_*`/`limit_*` metadata) keyed by `productId` with the same 5-minute TTL and have `getPlanLimits()` read through it. (Pairs with the stale-on-error item above.)
-
-### Stripe SDK dependency is unpinned (`@latest` at install)
-
-- **Description:** `backend.dependencies` declares the SDK as a bare `'stripe'`; the scaffold installer appends `@latest`, so `npx billing init` installs whatever major is current. The `apiVersion` cast neutralises the most common cross-major type break, but a future SDK major can still drift method signatures the generated service/webhook rely on, and installs are non-reproducible across dates.
-- **Where:** `src/module.ts` (`backend.dependencies: ['stripe']`, ~line 145).
-- **Severity:** Moderate (install/build-time drift; not an end-user issue).
-- **Fix:** Pin a compatible major range (e.g. `'stripe@^18.0.0'`) — the scaffold leaves entries containing `@` untouched.
-
-### Webhook-sync end-to-end verification blocked; v1.4.1/v1.4.2 not re-run
-
-- **Description:** A v1.4.0 end-to-end test **was** run on the `veradai` app (host v1.52.1 → v1.53.0) — it surfaced two upstream starter issues, **both fixed in starter v1.54.0** (raw-body/webhook verification, and `template:update` not propagating sub-package `type-check` scripts). What remains: re-run the webhook sync leg end-to-end on a host ≥ v1.54.0 (it was unverifiable before — the handler rejects unverifiable deliveries by design), and the v1.4.1/v1.4.2 type-cleanliness fixes landed after that run and haven't been re-verified in the host.
-- **Where:** The whole generated output; re-run in a current starter app (host ≥ v1.54.0, after `template:update`).
+- **Description:** The generated code has not been type-checked or run in a host since **v1.4.0** (the `veradai` pass on host v1.52.1 → v1.53.0). The v1.4.1–v1.5.0 changes are verified only by the module's wrapper `type-check`, `check:templates`, `parity:check`, and a full generated-code TS/TSX **parse** — not by a host build or runtime. **v1.5.0 specifically needs host verification** because it adds a schema column (`Subscription.lastEventAt`, so `prisma generate` must run before the new sync/`select` code type-checks) and reworks the checkout-attribution + webhook trust path.
+- **Where:** The whole generated output; re-run in a current starter app (host ≥ v1.54.0) after `template:update` + `update-schema` + `prisma migrate dev`.
 - **Severity:** Medium
-- **Workaround:** None needed on ≥ v1.54.0 hosts; the rest of the module (checkout, portal, entitlements, admin page) is verifiable today.
+- **Workaround:** None needed on ≥ v1.54.0 hosts. Verification steps: type-check both sides; boot; complete a test-card checkout with `stripe listen`; confirm the subscription syncs (and that a devtools-edited `client-reference-id` is now rejected, not honoured); exercise the dunning/recovery transitions and `/admin/billing`.
 
 ### Shared CLAUDE.md scaffold section documents a removed import path
 
@@ -134,29 +85,6 @@ A four-dimension audit (standards / production / performance / security) of the 
 **Adopt the `migrations` array for any breaking schema change**
 - If the model-prefix rename (or the next re-key) goes ahead, ship it via the scaffold v1.18 per-module migration runner (`npx billing migrate-db`) with expand → backfill → contract steps rather than asking apps to hand-migrate.
 
-### Meta-audit polish (2026-07-23)
-
-The minor findings from the 2026-07-23 meta-audit — correctness/robustness/consistency gaps with bounded, self-healing, or edge-only impact. Grouped by file area for batching.
-
-**Backend service/handlers** (`src/templates/backend/index.ts`)
-- `handlePaymentFailed()` flips every row for a customer to `PAST_DUE` with no status guard, whereas `handlePaymentSucceeded()` guards on `status: 'PAST_DUE'`. A late/stray `invoice.payment_failed` after cancellation can resurrect a `CANCELED` row to `PAST_DUE` and show a spurious dunning banner. Mirror the counterpart's guard (`status: { in: ['ACTIVE','TRIALING','INCOMPLETE'] }`).
-- `getPlanLimits()` awaits `subscription.findUnique` then `getEntitlementConfig()` serially though they are independent — batch with `Promise.all` (and add a `select`).
-- `connectWebhook()` creates the Stripe endpoint then does an **unguarded** `billingSettings.upsert`; a DB failure orphans the endpoint whose signing secret Stripe returns only once. Wrap the upsert and delete the endpoint on failure (mirroring the encrypt-failure rollback). Self-heals on retry, hence minor.
-- `GET /invoices` caps `limit` at 100 but never floors it — a negative `?limit` passes `|| 10` and reaches Stripe as `limit: -N`, throwing. Floor with `Math.max(1, …)`.
-- `getStripe()`/`apiVersion '2024-12-18.acacia'` is duplicated verbatim in the service and the webhook handler — single-source it so a version bump touches one place.
-
-**Frontend settings page** (`src/templates/frontend/index.ts`, `BillingSettingsPage`)
-- `handleOpenPortal` has no try/catch, no in-flight state, and no button-disable (unlike `ManageSubscriptionButton`, which does it correctly a few hundred lines away) — a failed portal open is a silent unhandled rejection, and double-clicks fire multiple sessions.
-- Payment-method and invoice queries conflate loading/error with empty — a subscriber sees "No payment method on file." / "No invoices yet" while the query is in flight or errored. Add skeleton + distinct error states.
-- Invoice links use `window.open(url, '_blank')` without `'noopener,noreferrer'` (reverse-tabnabbing hardening; Stripe-hosted URLs so low risk).
-- The 5s success-param cleanup calls `setSearchParams({})`, wiping **all** query params and pushing a history entry — delete only `success`/`canceled` and pass `{ replace: true }`.
-- `planStatusLabel()` capitalises the raw Stripe status, rendering American "Canceled" — map to Australian/friendly labels as `SubscriptionStatus` already does.
-
-**Frontend admin page & hooks** (`src/templates/frontend/index.ts`)
-- `StripePricingTable` appends `pricing-table.js` with no `onerror` and never reads the config query's `isError` — a blocked script leaves the purchase section blank and a config-fetch error shows a misleading "not configured" message. Add an `onerror` fallback and branch on `isError`.
-- `BillingAdminPage` read-only status displays collapse `undefined` (loading/error) to definitive wrong values ("Not connected", "No active plan") — show "Checking…" / an error line first.
-- `useEntitlements.checkLimit()` gates its local-cache branch on `!isLoading`, so on an **errored** query (where `isLoading` is false but data is undefined) it silently computes against free-tier defaults instead of reaching the server fallback. Branch on `query.data` presence instead. Fails restrictive and self-heals on retry, hence minor.
-
 ### Long-term / Ideas
 
 **Multi-member tenancy readiness**
@@ -177,6 +105,10 @@ Most recent first. Items moved here from the sections above as they ship.
 
 | Item | Version | Date |
 |------|---------|------|
+| **Meta-audit (2026-07-23) — cross-tenant subscription-binding hole closed (critical):** `client-reference-id` is HMAC-signed and verified in the webhook; tenant resolution trusts a signed reference → existing customer row → customer metadata, and never rebinds a tenant to a different Stripe customer without proof | v1.5.0 | 2026-07-23 |
+| Meta-audit — read-path resilience (stale-on-error cache + DB-backed degradation + Stripe-status translation to 503); monotonic webhook sync via `Subscription.lastEventAt`; `handlePaymentFailed` status guard; `connectWebhook` endpoint rollback on DB failure; `/invoices` limit floored | v1.5.0 | 2026-07-23 |
+| Meta-audit — admin-page save guards (buttons gated on query success + load-error states, no more silent config wipe); settings-page post-checkout refresh/poll + copy, portal error/in-flight handling, payment-method/invoice load states, scoped param cleanup, `noopener` invoice links; pricing-table script-error + config-error states; `useEntitlements` server fallback on error | v1.5.0 | 2026-07-23 |
+| Meta-audit — entitlements product cache (no live Stripe call per check) + parallel reads; Stripe SDK pinned `^22.3.1`; `getStripe`/`apiVersion` single-sourced; Australian-spelled status labels | v1.5.0 | 2026-07-23 |
 | Production webhook delivery — webhook route registered with `allowNoOrigin: true` (server-to-server deliveries carry no `Origin` header; the HMAC authenticates the caller). Module now requires **starter ≥ v1.54.0** | v1.4.3 | 2026-07-16 |
 | Module repo `CLAUDE.md` refreshed for v1.4.2 — tenant-keyed models, seats/metered retirement noted as permanent, admin-page config, current endpoints and env vars, `settings-blocks` import path (clears the stale-CLAUDE.md known issue) | — | 2026-07-15 |
 | Scaffold merged v1.18.2 (EOL-normalised migration checksums — CRLF regression fix); all release tags v1.0.1–v1.4.2 created and pushed (release commits existed but were never tagged) | — | 2026-07-15 |
