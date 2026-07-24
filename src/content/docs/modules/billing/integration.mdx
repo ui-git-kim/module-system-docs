@@ -36,8 +36,8 @@ Billing exists so **other modules can gate features on the tenant's plan**. This
 | Read subscription state | ✅ | ✅ | `useSubscription()` / `serviceRegistry.get('billing').getSubscription()` |
 | Access the billing service | — | ✅ | `serviceRegistry.get('billing')` |
 | Use billing types | ✅ | ✅ | Import from `@/features/billing` / `../billing/index.js` |
-| Action hooks | — | — | **None registered** — see [below](#action-and-filter-hooks) |
-| Filter hooks | — | — | **None registered** — see [below](#action-and-filter-hooks) |
+| Action hooks | — | — | 5 subscription-lifecycle hooks — see [below](#action-and-filter-hooks) |
+| Filter hooks | — | — | `billing.entitlements` — see [below](#action-and-filter-hooks) |
 | Dashboard widgets | — | — | **None registered** — use the hooks in your own widget |
 
 ### Declaring the Dependency
@@ -294,11 +294,56 @@ Every method is tenant-scoped — pass the tenant ID (`req.user.tenantId ?? req.
 
 ## Action and Filter Hooks
 
-Billing currently registers **no action hooks and no filter hooks** — there is nothing to list in either registry. If your module needs to react to subscription changes today, poll `getSubscription`/`getPlanLimits` from the service registry, or key off the subscription status when handling your own requests.
+Billing fires backend hooks (v2.2.0) so other modules can react to subscription changes without polling. Import the stable names and context types from the billing barrel — never hard-code the strings.
 
-<Aside type="note" title="Planned">
-Action hooks on subscription-state transitions (e.g. `billing.subscription.updated`, `billing.payment.failed` fired from the webhook sync) are on the [Roadmap](/modules/billing/roadmap/) so modules can react to plan changes without polling. If you need this, add your use case to the roadmap item.
-</Aside>
+```typescript
+import { actionRegistry } from '../../config/action.registry.js';
+import { BILLING_HOOKS } from '../billing/index.js';
+import type { BillingSubscriptionUpdatedContext } from '../billing/index.js';
+
+actionRegistry.addActionAsync(
+  BILLING_HOOKS.subscriptionUpdated,
+  'my-module',
+  async (ctx: BillingSubscriptionUpdatedContext) => {
+    if (ctx.status === 'active' && ctx.previousStatus !== 'active') {
+      await provisionFor(ctx.tenantId);
+    }
+  },
+);
+```
+
+### Action hooks
+
+All fire **after** the local `Subscription` row is committed, and **fire-and-forget** (`doActionParallel`) — they run on the Stripe webhook path, so a slow or failing consumer can never delay the webhook acknowledgement (Stripe would retry) or roll back the sync. Delivery is therefore **best-effort**: the authoritative state is always the DB (`billingService.getSubscription`). A consumer needing guaranteed handling should reconcile against it rather than rely solely on the hook.
+
+| Hook (`BILLING_HOOKS.*`) | Name | When | Context |
+|--------------------------|------|------|---------|
+| `subscriptionUpdated` | `billing.subscription.updated` | Every webhook sync (created/updated) | `{ tenantId, status, previousStatus, productId, priceId, cancelAtPeriodEnd, trialEndsAt, currentPeriodEnd }` |
+| `subscriptionCanceled` | `billing.subscription.canceled` | `customer.subscription.deleted` | `{ tenantId, stripeSubscriptionId }` |
+| `paymentFailed` | `billing.payment.failed` | Renewal failed → `past_due` | `{ tenantId }` |
+| `paymentRecovered` | `billing.payment.recovered` | `past_due` → `active` after payment | `{ tenantId }` |
+| `trialWillEnd` | `billing.trial.will_end` | `customer.subscription.trial_will_end` (~3 days out) | `{ tenantId, trialEndsAt }` |
+
+`status`/`previousStatus` are lowercased, matching `getSubscription`. `previousStatus` is `null` on the first sync.
+
+### Filter hook
+
+| Hook (`BILLING_HOOKS.*`) | Name | Transforms | Context |
+|--------------------------|------|-----------|---------|
+| `entitlements` | `billing.entitlements` | The resolved limits map (`Record<string, number>`) before it is returned | `{ tenantId, status, planName }` |
+
+Applied inside `getPlanLimits`, after the admin defaults + Stripe metadata are merged — so a module can grant or cap limits at runtime (e.g. grandfathered users). Return the (possibly modified) map:
+
+```typescript
+import { filterRegistry } from '../../config/filter.registry.js';
+import { BILLING_HOOKS } from '../billing/index.js';
+
+filterRegistry.registerAsync(
+  BILLING_HOOKS.entitlements,
+  'my-module',
+  (limits, ctx) => ({ ...limits, max_things: (limits.max_things ?? 0) + 5 }),
+);
+```
 
 ## Dashboard Widgets
 
