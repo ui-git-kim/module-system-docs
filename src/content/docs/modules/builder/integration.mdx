@@ -88,10 +88,11 @@ declare module '../../config/service.registry.js' {
 | `setBuilderStyle(style)` | `string` | Set shadcn style |
 | `getIconLibrary()` | `string` | Get current icon library |
 | `setIconLibrary(library)` | `string` | Set icon library |
-| `findUserByHandle(handle)` | `{ id: string } \| null` | Find user by registry handle (returns the user id only) |
+| `findUserByHandle(handle)` | `{ id: string } \| null` | Resolve a registry handle to a user id (indexed lookup via the `registry_handle` table, self-heals legacy `preferences`-only handles) |
+| `setUserHandle(userId, handle)` | `'ok' \| 'taken'` | Claim or change the caller's registry handle. `registry_handle` is the uniqueness authority; returns `'taken'` on conflict (the `PUT /handle` route maps that to 409) |
 
 <Aside type="note">
-Block scoping is done through the `getBlocks(userId, filters?)` argument, not dedicated methods. `getBlocksByProject`, `getGlobalBlocks`, `getSystemBlocks`, `getBlocksByCollection` and `checkHandle` are **frontend** API-client wrappers (`builderService` in `services/builder.service.ts`), not backend service methods — calling them on `serviceRegistry.get('builder')` would fail. Handle availability at the backend is `findUserByHandle` (surfaced to the client by the `GET /check-handle` route).
+Block scoping is done through the `getBlocks(userId, filters?)` argument, not dedicated methods. `getBlocksByProject`, `getGlobalBlocks`, `getSystemBlocks`, `getBlocksByCollection`, `checkHandle` and `claimHandle` are **frontend** API-client wrappers (`builderService` in `services/builder.service.ts`), not backend service methods — calling them on `serviceRegistry.get('builder')` would fail. At the backend, handle availability is `findUserByHandle` (surfaced by `GET /check-handle`) and claiming is `setUserHandle` (behind `PUT /handle`).
 </Aside>
 
 ---
@@ -100,7 +101,7 @@ Block scoping is done through the `getBlocks(userId, filters?)` argument, not de
 
 Each project can vendor its own timestamped snapshot of the shadcn component sources for its chosen library + style — a lockfile for the generated UI. Different projects can therefore use different libraries (radix **or** base) and styles concurrently, and updates stay explicit and reviewable.
 
-- **Storage:** the `builder_component_set` table (one row per project) holds `library`, the combined `style` key (e.g. `radix-luma`), `syncedAt`, the `files` map (`{ componentName: rewrittenSource }`), a derived `baseClasses` manifest (see [below](#base-class-manifest)), and an optional `pending` update candidate.
+- **Storage:** the `builder_component_set` table (one row per project) holds `library`, the combined `style` key (e.g. `radix-vega`), `syncedAt`, the `files` map (`{ componentName: rewrittenSource }`), a derived `baseClasses` manifest (see [below](#base-class-manifest)), and an optional `pending` update candidate.
 - **Management UI:** the **Component Sources** panel in the project's Blocks tab drives **Sync**, **Check for updates** (diff-only), **Re-sync**, and **Update files** (promote the pending candidate). Every route is scoped by project ownership. This UI is backed by an internal `useProjectComponentSet(projectId)` hook (`{ set, isLoading, sync, checkUpdates, promote, … }`); it is used within the module and is intentionally **not** part of the public frontend export surface.
 - **Style source:** the library + style come from the project's config, which the [style module](/modules/style/) writes to the structure node's `theme_config` field (`{ componentLibrary, styleName, cssVars }`). The builder derives the registry key as `` `${componentLibrary}-${styleName}` `` and fetches sources from `ui.shadcn.com`.
 
@@ -297,6 +298,9 @@ When a project (or any structure node) is deleted, this action removes all assoc
 1. All `block` rows with that `projectId`
 2. All `block_category` rows with that `projectId`
 3. All `block_collection` rows with that `projectId`
+4. All `builder_component_set` rows with that `projectId` (the project's pinned component snapshot)
+
+All four run in a single `prisma.$transaction` with an `{ audit: true }` log.
 
 ```typescript
 // Context received:
@@ -373,8 +377,8 @@ All 10 hooks follow the same pattern — use `actionRegistry.addActionAsync()` w
 
 The builder registers with the starter's `securityRegistry` (via `security.registration.ts`) so its per-user data participates in the platform's data-classification and account-deletion flows.
 
-- **Data-classification manifest** — `securityRegistry.register()` classifies `block`, `block_category`, and `block_collection` as **`owned`** user data. `native_component` and `builder_config` are deliberately **excluded** — they are app-wide shared state, not per-user data.
-- **Account-deletion handler** — `securityRegistry.registerDeletionHandler({ id: 'builder.user-data', … })` hard-deletes the subject's blocks, categories, and collections in a single `prisma.$transaction` when their account is deleted. It is idempotent and returns `{ action: 'hard-delete', recordsAffected }`.
+- **Data-classification manifest** — `securityRegistry.register()` classifies `block`, `block_category`, `block_collection` and `registry_handle` as **`owned`** user data. `native_component` and `builder_config` are deliberately **excluded** — they are app-wide shared state, not per-user data.
+- **Account-deletion handler** — `securityRegistry.registerDeletionHandler({ id: 'builder.user-data', … })` hard-deletes the subject's blocks, categories, collections and registry handle in a single `prisma.$transaction` when their account is deleted. It is idempotent and returns `{ action: 'hard-delete', recordsAffected }`. (Deleting the handle matters: a deleted user must not keep squatting a public registry handle.)
 
 Companion modules or operators auditing the per-user data cascade can rely on this manifest to know exactly what the builder owns and removes on deletion.
 
@@ -602,7 +606,7 @@ personalInfoFieldsRegistry.register({
 });
 ```
 
-The handle is stored in `user.preferences.handle` and is used to construct registry URLs.
+**Claim flow (v1.31.2+).** The `registry_handle` table is the uniqueness authority, not `preferences`. When you save a handle, `HandleField` runs `checkHandle` → `claimHandle`, which hits `PUT /handle` → `builderService.setUserHandle(userId, handle)`; the claim is atomic against `registry_handle` (DB-level uniqueness + a reserved-name denylist), and a race returns 409. `preferences.handle` is kept only as a display copy — the public `/r` resolver reads the authoritative mapping via `findUserByHandle` (an indexed `registry_handle` lookup that lazily backfills any legacy `preferences`-only handle on first resolution).
 
 ---
 
