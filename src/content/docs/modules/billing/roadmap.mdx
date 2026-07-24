@@ -56,6 +56,20 @@ A four-dimension audit (standards / production / performance / security) of the 
 
 ### Short-term (next version)
 
+**Phase 2 — plan authoring on `/admin/billing` (v2.0.0, breaking)**
+- Add a `BillingPlan` model holding **authoring intent only** (drafts, compare-at prices, mode-scoped product ids); Stripe stays the render source, read back via `products.list`/`prices.list`, so there is deliberately **no local price table and no drift workflow**. Price identity is the `lookup_key` (`transfer_lookup_key` on version), since Stripe already stores every price version forever and `Subscription.stripePriceId` already says which one each subscriber sits on.
+- Provision **eagerly on Save**, never lazily at checkout — the deliberate rejection of how Gravity Forms and Paid Memberships Pro both do it, whose provisioning bugs all surface at *checkout time*, in front of a customer, rather than on the admin page where they can be retried.
+- Price edits are a **server-enforced `409 price_change_requires_confirmation`** carrying `affectedSubscribers`, not a UI nicety: create new price → move the lookup key → set `default_price` → archive old. Archiving never disturbs existing subscribers, so no admin edit can ever reprice a live customer.
+- Publish writes plan limits straight into product metadata, so `BillingSettings.entitlements` demotes to the **free/no-subscription fallback only** (retitle that editor accordingly).
+- Replace the Stripe Pricing Table with our own plan cards driving the existing `POST /checkout`; remove `stripePricingTableId` and `stripePublishableKey`, which become dead. Push the authored catalogue into the Customer Portal via `billing_portal/configurations` (never `is_default`), so plan changes for existing subscribers stay native.
+- **Why the Pricing Table must go:** there is no `/v1/pricing_tables` resource — it is Dashboard-only and capped at 4 products, so an API-created product can never appear in one. Confirmed 2026-07-23.
+
+**Phase 3 — mode safety and promotions (v2.1.0)**
+- `copy-to-live` replay plus the blocking mode-mismatch banner (test and live objects never cross; this also fixes the latent key-swap hazard that already exists for `stripePricingTableId` / `stripeWebhookEndpointId`).
+- Promotions: start with *select an existing Stripe coupon* + an `allow_promotion_codes` toggle, which delivers most of the value for a fraction of the surface. The full builder (reference-B style) is a second versioning UI on near-immutable Coupons. Two hard rules when it lands: "Free Trial" must write `trial_period_days`, **not** a 100%-off coupon (which still collects a payment method and yields `active`, not `trialing`, breaking `TrialCountdown`/`TrialExpiringAlert`); and on the pinned `2024-12-18.acacia` API version promotion codes use the flat `coupon` param, not the 2025-09-30 polymorphic shape.
+
+**Permanently out of scope** (these are per-seat/metered billing wearing a different hat — principle 4): installment payments, per-seat quantity, adjustable quantity in the Portal, product variants, and proforma-invoice line-item builders. Stripe's native Entitlements API is also *not* adopted — it is boolean feature flags with no numeric field, so `max_projects: 3` has no representation there.
+
 **Complete the end-to-end host verification**
 - Re-run the full pass in a current starter app (host ≥ v1.54.0) at v1.4.3: install, `prisma migrate dev`, type-check both sides (confirms the v1.4.1/v1.4.2 fixes and the v1.4.3 `allowNoOrigin` registration), boot, complete a test-card checkout with `stripe listen`, verify webhook sync and the dunning/recovery transitions, exercise `/admin/billing` (Stripe config save, webhook connect refusal on localhost, entitlement config save).
 - *Context:* the v1.4.0 pass on `veradai` surfaced the two upstream issues, both fixed in starter v1.54.0; this item closes the loop. Record the result on this page.
@@ -105,6 +119,8 @@ Most recent first. Items moved here from the sections above as they ship.
 
 | Item | Version | Date |
 |------|---------|------|
+| **Guided owner setup + webhook verification** — setup checklist derived from live probes, account/mode banner, webhook health with missing-events diff and Rebuild, three-assertion verification (probe created / signed delivery received / subscription event processed), read-only Stripe catalogue with health warnings, `lastWebhookEventAt` stamping | v1.6.0 | 2026-07-23 |
+| Design principle 2 amended — "Stripe owns payment data, not the catalogue" (PCI scope stays with Stripe; use Stripe's native UI wherever a **provisionable** one exists). Research confirmed the Pricing Table has no API and is capped at 4 products, so plan authoring must replace it | — | 2026-07-23 |
 | **Meta-audit (2026-07-23) — cross-tenant subscription-binding hole closed (critical):** `client-reference-id` is HMAC-signed and verified in the webhook; tenant resolution trusts a signed reference → existing customer row → customer metadata, and never rebinds a tenant to a different Stripe customer without proof | v1.5.0 | 2026-07-23 |
 | Meta-audit — read-path resilience (stale-on-error cache + DB-backed degradation + Stripe-status translation to 503); monotonic webhook sync via `Subscription.lastEventAt`; `handlePaymentFailed` status guard; `connectWebhook` endpoint rollback on DB failure; `/invoices` limit floored | v1.5.0 | 2026-07-23 |
 | Meta-audit — admin-page save guards (buttons gated on query success + load-error states, no more silent config wipe); settings-page post-checkout refresh/poll + copy, portal error/in-flight handling, payment-method/invoice load states, scoped param cleanup, `noopener` invoice links; pricing-table script-error + config-error states; `useEntitlements` server fallback on error | v1.5.0 | 2026-07-23 |
