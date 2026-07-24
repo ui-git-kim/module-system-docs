@@ -111,7 +111,8 @@ Callers should probe the capability rather than hard-import the service — the 
 ```typescript
 // Always available, even without embeddings
 const caps = await structureService.getCognitiveCapabilities();
-// → { embeddings: { enabled: boolean, dimensions: number | null } }
+// → { embeddings: { enabled: boolean, dimensions: number | null }, chunks: { enabled: boolean } }
+// chunks.enabled mirrors embeddings.enabled — chunk storage rides the same opt-in.
 
 // Type-safe access on embeddings-enabled installs
 import { serviceRegistry } from '../../config/service.registry.js';
@@ -129,6 +130,83 @@ An install that answered *No* can opt in afterwards: set `enableEmbeddings: true
 <Aside type="caution">
 **Dimensions are baked in.** `embeddingDimensions` is fixed at install into the column type and the service constant. Changing it later is a manual migration — alter the column type and re-embed every node. Pick the dimension your embedding model produces before enabling.
 </Aside>
+
+## Chunk storage
+
+Nodes carry one embedding of the whole record; retrieval-augmented workflows also need **sub-node spans** — the paragraphs or sections a node's content was split into — each embedded on its own. Structure v1.22.0 adds a dedicated **`structure_chunk`** table for exactly that. As with node embeddings, the division holds: **Structure owns chunk storage and search; the engine owns chunking and generation** (it splits the text, writes the spans, and embeds each one).
+
+Chunk storage **rides the same `enableEmbeddings` opt-in** — no extra prompt, and the same `embeddingDimensions`. When embeddings are enabled the install adds the `structure_chunk` model, a partial HNSW index (`structure_chunks_embedding_hnsw_idx`, module migration `1.22.0__chunk-storage.sql`), and a chunk-scoped erasure handler; when they are not, none of it is generated.
+
+### The `structure_chunk` model
+
+| Column | Notes |
+|--------|-------|
+| `nodeId` | Source node the span came from (plain FK — no cascade; see lifecycle below) |
+| `chunkIndex` | Ordinal within the node's chunk sequence; `@@unique([nodeId, chunkIndex])` |
+| `content` | The chunk text — **this is exactly what gets embedded** (no separate `embeddingText`) |
+| `tokenCount` | Optional, engine-provided |
+| `embedding` | `vector(<dimensions>)` — same dimension as the node column; `NULL` until embedded |
+| `embeddingModel` | `NULL` marks a chunk as *needs embedding* |
+| `metadata` | Chunk provenance (char offsets, heading path, …) |
+
+### Chunk methods on `structureEmbeddings`
+
+The chunk surface lives on the same `structureEmbeddings` service (same registry entry, same guarded generation). All methods are `userId`-scoped.
+
+```typescript
+interface StructureEmbeddingsService {
+  // …node methods (see above)…
+
+  /** Replace a node's chunk set (the engine's chunk / re-chunk path) */
+  replaceNodeChunks(
+    nodeId: string,
+    userId: string,
+    chunks: Array<{ chunkIndex?: number; content: string; tokenCount?: number; metadata?: Record<string, unknown> }>
+  ): Promise<Array<{ id: string; chunkIndex: number }>>;
+
+  /** Store a chunk's embedding (the engine's write path) */
+  setChunkEmbedding(chunkId: string, userId: string, embedding: number[], embeddingModel: string): Promise<void>;
+
+  /** Backfill query: chunks not yet embedded, oldest first */
+  listChunksNeedingEmbedding(userId: string, options?: { nodeIds?: string[]; limit?: number }): Promise<StructureChunk[]>;
+
+  /** A node's chunks, ordered by chunkIndex */
+  getNodeChunks(nodeId: string, userId: string): Promise<StructureChunk[]>;
+
+  /** Delete every chunk of a node (returns the row count) */
+  deleteNodeChunks(nodeId: string, userId: string): Promise<number>;
+
+  /** Semantic search over chunks by query vector (the caller embeds the query text) */
+  semanticSearchChunks(userId: string, queryEmbedding: number[], options?: ChunkSearchOptions): Promise<ChunkSearchResult[]>;
+}
+
+interface ChunkSearchOptions {
+  topK?: number;        // default 20, max 200
+  minScore?: number;    // default 0.5; score = 1 - cosine distance
+  nodeIds?: string[];   // restrict to chunks of these source nodes
+  nodeTypes?: string[]; // restrict to chunks whose source node is one of these types
+  status?: string[];    // source-node status filter (default ['active'])
+}
+
+interface ChunkSearchResult {
+  chunk: StructureChunk; // the vector column is never returned
+  nodeId: string;        // the source node id (also on chunk.nodeId)
+  score: number;         // 1 - cosine distance (higher is better)
+  distance: number;      // raw cosine distance (lower is better)
+}
+```
+
+Method semantics:
+
+- **`replaceNodeChunks`** verifies node ownership, then in one transaction deletes the node's existing chunks and inserts the new spans with `embeddingModel: null`. `chunkIndex` defaults to array order. Returns the created `{ id, chunkIndex }` so the caller can embed each; fires `structure.node.chunksReplaced`. Passing `[]` clears a node's chunks.
+- **`setChunkEmbedding`** validates the vector dimension, writes via parameterised raw `UPDATE`, throws `NotFoundError` when the chunk doesn't exist, and fires `structure.chunk.embeddingUpdated`.
+- **`semanticSearchChunks`** uses the cosine operator (`<=>`) and **joins `structure_nodes`** so the source node's `status` (default `['active']`) and optional `nodeTypes` filter apply — a chunk of an archived or deleted node never surfaces. Over-fetches 2× `topK`, tunes `hnsw.ef_search` per query, converts distance to score, applies `minScore`.
+- **`listChunksNeedingEmbedding` / `getNodeChunks` / `deleteNodeChunks`** are Prisma-backed reads/deletes, all `userId`-scoped.
+
+### Chunk lifecycle
+
+- **No database cascade.** `nodeId` is a plain FK. A node's `deleteNode` is a *soft* delete (`status: 'deleted'`), and chunk search filters the parent node's status — so a soft-deleted (or archived) node's chunks simply stop surfacing, and `restoreNode` brings them back. Re-chunking is `replaceNodeChunks` (delete + insert). Chunks are hard-removed only at **account erasure**, via the `structure.chunks` deletion handler (generated only on embeddings-enabled installs).
+- **Runtime self-heal.** `ensureInfrastructure()` also creates the chunk HNSW index, so the same lazy, idempotent repair covers chunk search.
 
 ## Connection provenance & promotion
 
