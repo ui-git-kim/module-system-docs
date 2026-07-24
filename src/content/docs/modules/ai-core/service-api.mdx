@@ -1,0 +1,548 @@
+---
+title: Service API
+description: The full aiCoreService surface a consumer programs against, method by method
+lastUpdated: 2026-07-24
+sidebar:
+  order: 6
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+This is the reference for `aiCoreService` — the single object AI Core registers into the starter's `serviceRegistry` under the key `ai-core`, and the whole of what another module may call. The facade adds no behaviour of its own: each method is a thin delegate to the run engine, the flow runner, the records service or the ledger. This page documents every method — signature, parameters, return shape, what it throws — then the key types a caller handles.
+
+> **Consumers name jobs, never models.** No model id string appears anywhere in this surface.
+
+<Aside type="note" title="Implemented in v1.5.0 — first live call pending">
+This page describes AI Core as implemented in module v1.5.0 (July 2026). The module installs into a real app, type-checks clean there, and its admin page renders and serves records at runtime. What is **not** yet verified is a first live provider call. Retrieval, the semantic cache, and groundedness scorers are not built — where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+</Aside>
+
+---
+
+## The Surface at a Glance
+
+| Method | Purpose | Returns |
+|---|---|---|
+| [`run`](#run) | Run a named language operation | `Promise<RunResult>` |
+| [`embed`](#embed) | Run a named embedding operation over a batch | `Promise<EmbedRunResult>` |
+| [`runFlow`](#runflow) | Start a flow — operations in order | `Promise<FlowRunResult>` |
+| [`resumeFlow`](#resumeflow) | Resume a suspended flow run | `Promise<FlowRunResult>` |
+| [`registerFlowHandler`](#registerflowhandler) | Register a non-AI flow step handler (**register**) | `void` |
+| [`ensureOperation`](#ensureoperation) | Seed an operation if absent (**seed**) | `Promise` — see below |
+| [`ensureSegment`](#ensuresegment) | Seed a prompt segment if absent (**seed**) | `Promise` — see below |
+| [`getCurrentUsage`](#getcurrentusage) | The billing callback — AI Core counts, billing asks | `Promise<CurrentUsage>` |
+| [`getOperationInfo`](#getoperationinfo) | Public metadata about a job | `Promise<OperationInfo>` |
+
+`registerFlowHandler` **registers** code that runs; `ensureOperation` and `ensureSegment` **seed** records that persist. That distinction is the architecture — the mechanics of both live in [Registering & Seeding](/modules/ai-core/registering-and-seeding/), which this page links to rather than repeats.
+
+---
+
+## Reaching the Service
+
+Consumers reach AI Core through `serviceRegistry.getOptional('ai-core')`, never `get()`. An app with no AI Core installed still runs its non-AI paths — **AI Core absent is a smaller app, not a broken one.**
+
+```ts
+import { serviceRegistry } from '@/config/service.registry';
+
+const aiCore = serviceRegistry.getOptional('ai-core');
+if (!aiCore) {
+  // Non-AI path — the feature still works, without the AI-assisted parts
+  return;
+}
+const { result, feedback, audit } = await aiCore.run('extract-entities', input, { userId });
+```
+
+Every example below null-checks the same way. The contract and its boundaries — degrade-don't-fail, content-from-outside, the feedback contract — live in [Integration](/modules/ai-core/integration/); this page is the method-by-method surface.
+
+---
+
+## `run`
+
+Run a named language operation. This is the whole public surface of the module — the operation id and the segments in, a result plus structured feedback plus an audit reference out.
+
+```ts
+run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
+```
+
+**Parameters**
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `operationId` | `string` | The public job name. The consumer names a job; resolution turns it into a model behind this boundary. |
+| `input` | [`RunInput`](#runinput--consumersegment) | The segments — task, context, external material, optionally with media. |
+| `opts` | [`RunOptions`](#runoptions) | `userId` is required; everything else is optional. |
+
+**Returns** — a [`RunResult`](#runresult): `result` (`{ text, structured }`), `feedback` (the structured account of what the run could not do), and `audit` (audit-by-reference: the ledger id, the model actually used, parameters sent with any transforms, usage, warnings).
+
+**A shortfall is not an exception.** A schema-validation failure, an abstention below threshold, a truncated output, an unavailable framing segment — these all **return** normally with the outcome named in `feedback.reason` (for example `schema-validation-failed`, `abstained-below-threshold`, `output-truncated-by-length-limit`). The structured output is preserved even on abstention. The system may do less than it was asked; the feedback says so on the same return.
+
+**Throws** — a genuine failure to run. Every throwing path still writes a ledger row before it rethrows: refusals and provider errors are outcomes, not disappearances.
+
+| Error | When |
+|---|---|
+| `NotFoundError` | The operation id does not exist. An unknown job name is the caller's 404 — a bad request, not a refusal. |
+| `RefusedError` | The operation exists but cannot run under its declared constraints. See the reasons below. |
+| `UnsupportedModelKindError` | The operation resolved to a model whose kind is not `language`. |
+| `BadRequestError` | A dial mapped to a parameter the model's rules reject as out of range (for example a rejecting `temperature` bound). |
+| `ProviderCallError` | The upstream provider call failed; carries a `retryable` flag and, where known, the provider status. |
+| `ProviderUnavailableError` | The resolved model's provider has no API key configured or is disabled at the adapter layer. |
+
+`RefusedError` carries a machine-readable `reason` and a `detail` object naming which constraint failed. Verified reasons `run` can raise, from resolution and from the run engine:
+
+- `operation-disabled` — the operation record is disabled.
+- `discipline-integrity-violation` — the resolved discipline set violates the authority hierarchy. Re-validated on **every** call, not only at write time.
+- `model-choice-not-granted` / `model-not-in-allow-list` — a `userSelectedModelRecordId` was passed to an operation that does not grant user model choice, or the model is not in its allow-list.
+- `no-available-model` — the resolved model or its provider is missing, disabled, or has no key (`detail.failed` names which).
+- `no-model-under-acceptable-terms` — the sensitivity gate: the operation handles sensitive content but the model's provider is not under recorded zero-retention terms. Unrecorded terms are refused, not assumed compliant.
+- `preset-missing` / `invalid-operation-schema` — a dangling preset reference, or an operation schema that is not a supported object schema.
+- `prompt-segment-unavailable` — the operation references prompt segments that are missing or disabled (a silently dropped segment would change behaviour with no record).
+- `malformed-framework-record` — the resolved model's prompt framework record is malformed.
+- `model-lacks-image-input` — media was attached but the model's **fetched** capabilities say it does not accept image input. An unknown capability proceeds; only a known-false one refuses.
+
+**Example**
+
+```ts
+const aiCore = serviceRegistry.getOptional('ai-core');
+if (!aiCore) return;
+
+const { result, feedback, audit } = await aiCore.run(
+  'extract-entities',
+  { segments: [{ type: 'task', content: sourceText, origin: 'user-supplied' }] },
+  { userId },
+);
+
+if (feedback.reason) {
+  // The run did less than asked — render feedback.missing / coverage as the app sees fit.
+}
+// audit.ledgerId is the durable reference for this exact call.
+```
+
+---
+
+## `embed`
+
+Run a named embedding operation over a batch of input values: text in, vectors out. The thinnest operation in the system — no prompt, no dials, no disciplines. The transparency rule still applies in full: over-length input reports what each vector covers, and a width mismatch with the installed vector store refuses rather than corrupts.
+
+```ts
+embed(operationId: string, values: string[], opts: RunOptions): Promise<EmbedRunResult>
+```
+
+**Parameters**
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `operationId` | `string` | Must resolve to a model of kind `embedding`. |
+| `values` | `string[]` | The batch of values to embed. |
+| `opts` | [`RunOptions`](#runoptions) | `userId` required; `signal`, `tenantId`, `flowRunId` honoured. Prompt-only options are ignored. |
+
+**Returns** — an [`EmbedRunResult`](#key-types): `embeddings` (`number[][]`), plus the same `feedback` and `audit` fields every run carries. Partial coverage is reported in `feedback` (`reason: 'partial-embedding-coverage'`, with per-value character counts in `missing`) — never thrown, never silently truncated.
+
+**Throws**
+
+| Error | When |
+|---|---|
+| `NotFoundError` | The operation id does not exist. |
+| `RefusedError` | Any resolution refusal above, plus `embedding-dimension-mismatch`. |
+| `UnsupportedModelKindError` | The operation resolved to a model whose kind is not `embedding`. |
+| `ProviderCallError` / `ProviderUnavailableError` | The provider call failed, or the provider is unavailable. |
+
+`embedding-dimension-mismatch` is the dimension gate. When the optional Structure module reports an installed vector width, a resolved model whose dimensions do not match — or cannot be proven to match — refuses. A vector written at the wrong width is silent corruption of every later similarity search, so an unknown width refuses too: a match that cannot be proven is not a match.
+
+```ts
+const ai = serviceRegistry.getOptional('ai-core');
+const res = await ai?.embed('index-chunks', chunks, { userId });
+// res?.embeddings — one vector per input; res?.feedback reports any partial coverage.
+```
+
+---
+
+## `runFlow`
+
+Start a flow run. A flow is operations in order; AI steps resolve and run through `run`, and non-AI steps are consumer handlers. The run returns completed results, or suspends carrying the feedback that paused it.
+
+```ts
+runFlow(
+  flowId: string,
+  input: RunInput,
+  opts: RunOptions & { initialState?: Record<string, unknown> },
+): Promise<FlowRunResult>
+```
+
+**Parameters**
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `flowId` | `string` | Must exist and be enabled. |
+| `input` | [`RunInput`](#runinput--consumersegment) | Base segments passed to every operation step. |
+| `opts.initialState` | `Record<string, unknown>` | Seeds the flow's working memory. It travels the same path as all state — persisted on the run row, surfaced to operation steps as a **visible** context segment, handed to handler steps as their input. Never a hidden side channel. |
+
+**Returns** — a [`FlowRunResult`](#flows): `runId`, `status` (`running` · `suspended` · `completed` · `failed`), `stepResults` in order, and `suspendedFeedback` (present only when suspended: the feedback that paused the flow, tagged with `stepIndex` and `operationId`). **Feedback attaches to the operation that raised it, never to the flow** — the flow collects; it does not own.
+
+An operation step declared with `waitOnFeedback` suspends the flow when its feedback has a non-null reason: analysing unresolved data would produce confident output over gaps. The run row persists, and [`resumeFlow`](#resumeflow) continues once the feedback is answered.
+
+**Throws**
+
+| Error | When |
+|---|---|
+| `NotFoundError` | The flow id does not exist. |
+| `RefusedError` | `flow-disabled`; `flow-steps-invalid` (no runnable, or a malformed, step); `flow-handler-not-registered` (a handler step names a handler nobody registered — refused loudly, never silently skipped); plus any `RefusedError` bubbling out of an operation step. |
+
+Any error inside the step loop marks the run row `failed` and rethrows — a failed flow is a loud outcome, never a quietly abandoned row.
+
+---
+
+## `resumeFlow`
+
+Resume a suspended flow run from its persisted state, continuing from the step after the one that suspended. The caller's `resolution` merges into the flow's working memory — this is how the feedback that suspended the flow is answered before work continues.
+
+```ts
+resumeFlow(
+  runId: string,
+  opts: RunOptions & { resolution?: Record<string, unknown> },
+): Promise<FlowRunResult>
+```
+
+**Parameters**
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `runId` | `string` | The suspended run's id. |
+| `opts.resolution` | `Record<string, unknown>` | Merged into the flow's working memory before the next step. |
+
+**Returns** — a [`FlowRunResult`](#flows), as `runFlow`.
+
+**Throws**
+
+| Error | When |
+|---|---|
+| `NotFoundError` | No **suspended** run with that id exists **for the caller's tenant**. Tenant isolation: a cross-tenant or non-suspended id is reported as not found — no acknowledgement it exists elsewhere. |
+| `RefusedError` | The same step-loop refusals as `runFlow`. |
+
+<Aside type="caution" title="Resumed steps see only working memory">
+The original input segments are not persisted (the run row and the ledger hold references and working memory, never request content). A resumed operation step therefore sees only the flow's `state`, and the first resumed step starts with a `null` previous result. A flow that needs input material after a suspension must carry the parts that matter in `state` via a handler step.
+</Aside>
+
+---
+
+## `registerFlowHandler`
+
+**Register** a non-AI flow step handler. This is code that runs, not a record that persists — consumers call it at **import time** from a registration file, exactly like every other starter registry.
+
+```ts
+registerFlowHandler(handlerId: string, handler: FlowHandler): void
+```
+
+`FlowHandler` receives the flow's working memory and the previous step's result, and returns the next state:
+
+```ts
+type FlowHandler = (
+  state: Record<string, unknown>,
+  previous: unknown,
+) => Promise<Record<string, unknown>>;
+```
+
+The handlers live in an in-memory `Map` keyed by `handlerId`. Registration is **first-registration-wins**: a duplicate id logs a warning and is ignored — it does not throw. Nothing here persists; a flow step referencing an unregistered handler is refused at run time (`flow-handler-not-registered`), not at registration. This is the **register** side of the [register-vs-seed distinction](/modules/ai-core/registering-and-seeding/).
+
+```ts
+// consumer feature — flow-handlers.registration.ts, imported for side effect
+const ai = serviceRegistry.getOptional('ai-core');
+ai?.registerFlowHandler('cog-ingest/dedupe', async (state, previous) => {
+  return { ...state, deduped: dedupe(state.items) };
+});
+```
+
+---
+
+## `ensureOperation`
+
+**Seed** an operation if it does not exist. This plants a database record; an existing operation is **never** touched — admin edits always win over consumer defaults. The consumer states model **requirements**, never a model name.
+
+```ts
+ensureOperation(spec: EnsureOperationSpec): Promise<{ created: boolean; operation: ai_operation }>
+```
+
+**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` requirements object (`kind`, optional `needsImageInput`), and the optional operation shape (`description`, `presetId`, `dials`, `disciplineIds`, `segmentKeys`, `schema`, `sensitivity`).
+
+**Returns** — `{ created, operation }`. `created` is `false` when the operation already existed (returned untouched) and `true` when it was seeded. The seeded row carries `seeded: true` so its provenance is visible in the admin.
+
+Model selection is capability-based: enabled models of the required kind, from enabled providers, oldest record first; a known-true capability beats unknown; a known-false one is excluded. The admin repoints the operation later at will.
+
+**Throws**
+
+| Error | When |
+|---|---|
+| `IntegrityError` | No enabled model satisfies the requirements — enable a suitable model in the admin, then retry. Also raised by the delegated write-time integrity checks (disciplines, segments, schema). |
+| `NotFoundError` / `BadRequestError` | Surfaced from the underlying write when a referenced record is missing or a schema is malformed. |
+
+```ts
+await ai?.ensureOperation({
+  id: 'cog-ingest/analyse-image',
+  description: 'Vision analysis over ingested images',
+  model: { kind: 'language', needsImageInput: true }, // requirements, never a model name
+  segmentKeys: ['cog-ingest/method-extraction'],
+  schema: { type: 'object', properties: { /* ... */ }, additionalProperties: true },
+});
+```
+
+---
+
+## `ensureSegment`
+
+**Seed** a prompt segment if absent, by key. Create-if-absent; an existing segment is never touched.
+
+```ts
+ensureSegment(spec: EnsureSegmentSpec): Promise<{ created: boolean; segment: ai_prompt_segment }>
+```
+
+**Parameters** — an [`EnsureSegmentSpec`](/modules/ai-core/registering-and-seeding/#ensuresegment--ensuresegmentspec): `key` (kebab-case, namespaced with the consumer module id), `type` (`voice` · `method` · `discipline-text` · `schema-instruction` · `framing`), `name`, and `content`.
+
+**Returns** — `{ created, segment }`, with the same `created` semantics as `ensureOperation`. Seeded segments carry `seeded: true`.
+
+The full mechanics of both `ensure*` methods — idempotency, provenance, when to call them — live in [Registering & Seeding](/modules/ai-core/registering-and-seeding/).
+
+```ts
+await ai?.ensureSegment({
+  key: 'cog-ingest/method-extraction',
+  type: 'method',
+  name: 'Extraction method',
+  content: 'Quote the source span before you record a value...',
+});
+```
+
+---
+
+## `getCurrentUsage`
+
+The billing callback. **AI Core counts; billing asks.** AI Core owns its usage counter and hands this function to billing's limit check — so AI Core depends on nothing and billing does not depend on AI Core. The integration is this callback, not a dependency in either direction.
+
+```ts
+getCurrentUsage(args: { tenantId: string; since?: Date }): Promise<CurrentUsage>
+```
+
+**Parameters** — `tenantId` (required) and an optional `since` cut-off. Omitting `since` counts the tenant's whole ledger history.
+
+**Returns** — a [`CurrentUsage`](#currentusage): totals (`operations`, `inputTokens`, `outputTokens`) plus a per-operation breakdown in `byOperation`. Unknown token counts contribute zero to the sums but are never invented.
+
+```ts
+const usage = await ai?.getCurrentUsage({ tenantId, since: startOfMonth });
+// usage.operations, usage.inputTokens, usage.outputTokens, usage.byOperation[]
+```
+
+---
+
+## `getOperationInfo`
+
+Public metadata about an operation, for a consumer that wants to show what a job is before invoking it. Returns the job's **public** shape only — model, dials, disciplines and segment keys are resolution details that stay behind the boundary.
+
+```ts
+getOperationInfo(operationId: string): Promise<OperationInfo>
+```
+
+**Returns** — an `OperationInfo`:
+
+```ts
+interface OperationInfo {
+  id: string;
+  description: string | null;
+  sensitivity: string;        // 'normal' | 'sensitive'
+  userModelChoice: boolean;   // whether users may pick the model
+  enabled: boolean;
+}
+```
+
+**Throws** — `NotFoundError` when the operation does not exist.
+
+---
+
+## Typed Errors
+
+Every failure is loud, named and mapped. The base class carries an HTTP `status` and a machine-readable `code`; the AI Core route controller maps these to responses. A caller catching them should branch on the class (or on `RefusedError.reason` for the specific refusal).
+
+| Error | `status` | `code` | Extra fields | Meaning |
+|---|---|---|---|---|
+| `AiCoreError` | 500 | `ai_core_error` | — | Base class. `status`, `code`. |
+| `BadRequestError` | 400 | `bad_request` | — | Invalid input — bad body, unknown ids, malformed schema, a rejected parameter. |
+| `NotFoundError` | 404 | `not_found` | — | A referenced record does not exist. |
+| `RefusedError` | 409 | `refused` | `reason: string`, `detail: Record<string, unknown>` | The operation exists but could not run under its declared constraints. Never falls back silently to a compliant-looking alternative. |
+| `IntegrityError` | 422 | `integrity_violation` | — | A write (or a seed) would leave the record graph lying — an authority-hierarchy breach, a hard discipline with no rationale or check, no model for a requirement. |
+| `UnsupportedModelKindError` | 501 | `unsupported_model_kind` | — | The resolved model's kind has no adapter implementation in this version. |
+| `ProviderUnavailableError` | 503 | `provider_unavailable` | — | The provider has no API key configured or is disabled. |
+| `ProviderCallError` | 502 | `provider_call_failed` | `providerId`, `retryable`, `providerStatus?` | The upstream provider call failed; `retryable` says whether a retry is sensible. |
+
+**`RefusedError` is a first-class outcome, not an exception bolted on.** Its `reason` is the same kebab-code that lands in the ledger and in `feedback`, so a refused call is explicable after the fact by reference alone.
+
+---
+
+## Key Types
+
+The types a caller constructs or reads. All are defined in `ai-core.types.ts` (media and usage types are re-exported from the provider layer).
+
+### `RunInput` & `ConsumerSegment`
+
+A run's input is a list of segments — the assembly currency. A consumer segment declares its `type` and content; it does **not** declare its position (position depends on the resolved model's framework).
+
+```ts
+interface RunInput {
+  segments: ConsumerSegment[];
+}
+
+interface ConsumerSegment {
+  // "task" is the question/instruction; "context" is supporting material the
+  // consumer already knows about; "external" is third-party content.
+  type: 'task' | 'context' | 'external';
+  content: string;
+  origin?: 'authored' | 'user-supplied' | 'ingested';
+  verification?: 'unverified' | 'verified' | 'failed';
+  timestamp?: string;             // ISO 8601; rendered relative to the call's own moment
+  media?: MediaAttachment[];
+}
+```
+
+**The consumer assigns `origin`; AI Core honours it** and never treats an undeclared segment as authored. How external content is labelled, marked and framed is covered in [Integration](/modules/ai-core/integration/).
+
+### `MediaAttachment`
+
+Media for vision-capable models, attached to a segment. It never enters the assembled prompt text, the logs or the ledger — it travels to the provider adapter as file parts.
+
+```ts
+interface MediaAttachment {
+  mediaType: string;   // IANA media type, e.g. "image/png"
+  data: string;        // base64-encoded bytes or an http(s) URL
+  name?: string;
+}
+```
+
+### `RunOptions`
+
+```ts
+interface RunOptions {
+  userId: string;                       // required
+  tenantId?: string;                    // solo product: defaults to userId
+  signal?: AbortSignal;
+  userSelectedModelRecordId?: string;   // only honoured when the operation grants model choice
+  maxOutputTokens?: number;             // tighten-only — see below
+  flowRunId?: string;
+}
+```
+
+**`maxOutputTokens` is a tighten-only cap.** It may **lower** the operation's configured output limit, never raise it. A request above the configured cap is not honoured, and the refusal to raise is recorded as a `parameterTransform` in the ledger — so the cap is honest either way. `userSelectedModelRecordId` must be in the operation's allow-list, or the call refuses (`model-not-in-allow-list`).
+
+### `RunResult`
+
+```ts
+interface RunResult<T = unknown> {
+  result: {
+    text: string;
+    structured: T | null;   // present when the operation declares a schema
+  };
+  feedback: Feedback;
+  audit: RunAudit;
+}
+```
+
+### `Feedback`
+
+The structured field on every operation return — the never-prose contract. **The consumer writes the words; AI Core reports the facts.** Every field, as returned:
+
+```ts
+interface Feedback {
+  reason: string | null;   // machine-readable kebab-code; null = nothing to report
+  missing: string[];       // named gaps — what the operation could not do or find
+  confidence: number | null;
+  threshold: number | null;
+  coverage: { unit: string; covered: number; total: number | null } | null;
+  ref: string | null;      // ledger entry id — the audit reference for this exact call
+}
+```
+
+- **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `abstained-below-threshold`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `framing-segment-unavailable`, and so on.
+- **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line).
+- **`confidence` / `threshold`** — reported when known, even when the run passes. `confidence` is read from a top-level `confidence` field on structured output; abstention fires when it falls below `threshold` (the operation's `abstentionThreshold` dial).
+- **`coverage`** — `total: null` is itself a statement: no independent count of the whole exists, and inventing one is exactly what the module forbids.
+- **`ref`** — the ledger id for this call. The stored copy carries `ref: null` because the row is its own reference; the copy returned to you gets the id.
+
+Anything with a non-null `reason` also lands on the shipped review queue. The feedback contract as a design surface is covered in [Integration](/modules/ai-core/integration/); this is its shape.
+
+### `RunAudit`
+
+Audit-by-reference, returned with every run. The **ledger holds no prompt or response content** — references, versions, parameters and counts only — so this summary is the defensible account of what actually ran, keyed by `ledgerId`.
+
+```ts
+interface RunAudit {
+  ledgerId: string;
+  operationId: string;
+  modelRecordId: string;
+  requestedModelId: string;         // the pinned id sent to the provider
+  reportedModelId: string | null;   // what the provider says actually served the call
+  parametersSent: ResolvedParameters;
+  parameterTransforms: ParameterTransform[];  // every explicit, visible change
+  usage: NormalizedUsage;
+  warnings: ProviderWarning[];      // never swallowed
+  finishReason: string | null;
+  rawFinishReason: string | null;
+  latencyMs: number;
+  degraded: boolean;                // true when the provider returned warnings
+}
+
+interface ParameterTransform {
+  parameter: string;
+  requested: unknown;
+  sent: unknown;
+  rule: string;   // e.g. 'caller-cap-tighten-only', 'temperature.max=1'
+}
+```
+
+`NormalizedUsage` carries optional `inputTokens`, `outputTokens`, `totalTokens`, `cacheReadTokens`, `reasoningTokens` and a passthrough `raw` — **absent counts stay undefined, never reported as zero.** `ResolvedParameters` is the narrow set actually sent (`maxOutputTokens`, `temperature`, `topP`, `topK`, `stopSequences`, `seed`).
+
+### Flows
+
+```ts
+type FlowStep =
+  | { kind: 'operation'; operationId: string; waitOnFeedback?: boolean }
+  | { kind: 'handler'; handlerId: string };
+
+type FlowRunStatus = 'running' | 'suspended' | 'completed' | 'failed';
+
+interface FlowRunResult {
+  runId: string;
+  status: FlowRunStatus;
+  stepResults: unknown[];
+  suspendedFeedback: (Feedback & { stepIndex: number; operationId: string }) | null;
+}
+```
+
+### `CurrentUsage`
+
+```ts
+interface CurrentUsage {
+  tenantId: string;
+  since: string | null;   // ISO 8601, or null when unbounded
+  operations: number;
+  inputTokens: number;
+  outputTokens: number;
+  byOperation: Array<{
+    operationId: string;
+    operations: number;
+    inputTokens: number;
+    outputTokens: number;
+  }>;
+}
+```
+
+---
+
+## Related
+
+<CardGrid>
+  <Card title="Registering & Seeding" icon="setting">
+    The mechanics behind `registerFlowHandler` and the `ensure*` methods — the register-vs-seed distinction, the specs, and consumer event subscription. [Read →](/modules/ai-core/registering-and-seeding/)
+  </Card>
+  <Card title="Integration" icon="puzzle">
+    The contract and its boundaries — degrade-don't-fail, content from outside, the feedback contract, retrieval. [Read →](/modules/ai-core/integration/)
+  </Card>
+  <Card title="Hooks & Events" icon="list-format">
+    The action hooks AI Core fires — including `ai-core.run.completed` — and how a consumer subscribes. [Read →](/modules/ai-core/hooks-and-events/)
+  </Card>
+  <Card title="Usage" icon="open-book">
+    Operations, prompts, disciplines and flows — what the surface above runs against. [Read →](/modules/ai-core/usage/)
+  </Card>
+</CardGrid>

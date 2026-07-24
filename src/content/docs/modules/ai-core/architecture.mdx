@@ -1,0 +1,148 @@
+---
+title: Architecture
+description: How AI Core fits together — the three levels, the resolution pipeline, the request lifecycle, and where the provider SDK boundary sits
+lastUpdated: 2026-07-24
+sidebar:
+  order: 1
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+This is the page to read first. AI Core is shared AI infrastructure: a consumer names a job — *"extract-entities"* — and everything under that name (which model runs it, how the prompt is built, which rules brake it, what shape comes back) is resolved from database records the admin can edit. This page is the map. It shows the three levels the system is built from, the one line consumers call, what happens end to end when they call it, and where the provider SDK is walled off.
+
+<Aside type="note" title="Implemented in v1.5.0 — first live call pending">
+AI Core is implemented as of module v1.5.0 (July 2026): it installs into a real app, type-checks clean there, and its admin page renders and serves records at runtime. The one gate not yet proven is a first live provider call. Retrieval, the semantic cache, and groundedness-scorer implementations are **not** built — they are medium-term work, marked planned where they come up and tracked on the [Roadmap](/modules/ai-core/roadmap/).
+</Aside>
+
+---
+
+## The three levels
+
+Everything in AI Core is one of three things. The bottom level is a set of **libraries** — batteries, each one a database record the admin can edit. An **operation** sits above them and selects from each. A **flow** sits above operations and puts them in order.
+
+```
+LIBRARIES              the batteries — every one a database record, admin-editable
+  ├─ models            provider · pinned model id · framework · parameter rules · terms
+  ├─ prompt segments   voice · method · discipline text · schema instructions · framing
+  ├─ frameworks        per model: segment order + wrapping syntax (structure only)
+  ├─ disciplines       method rules — how the AI must work — with tier + authority
+  ├─ guardrail checks  the enforcement half of a discipline
+  ├─ presets           named dial bundles
+  └─ terms options     published data-handling arrangements a provider offers
+        │
+        ▼   an OPERATION selects from each
+OPERATION              the named job — "extract-entities"
+        resolves to → one model · dials or a preset · disciplines · segment keys
+                       · a schema · a sensitivity level · optional user model choice
+        │
+        ▼   a FLOW puts operations in order
+FLOW                   operations in sequence, plus non-AI handler steps;
+                       suspends and resumes when a step must wait on feedback
+```
+
+The load-bearing idea: **an operation is a level above the libraries, not a peer.** It holds only what a job holds — which model, which rules, which prompt segments, which schema. The libraries hold everything shared across jobs. What each level contains, and why the split lands where it does, is [Usage](/modules/ai-core/usage/); the libraries themselves and the admin that edits them are [Configuration](/modules/ai-core/configuration/).
+
+---
+
+## The one public line
+
+A consumer names a job. That is the whole surface.
+
+```ts
+const aiCore = serviceRegistry.getOptional('ai-core');
+if (!aiCore) return runWithoutAI();          // degrade, don't fail
+
+const { result, feedback, audit } = await aiCore.run(
+  'extract-entities',
+  { segments: [{ type: 'task', content: '…' }] },
+  { userId },
+);
+```
+
+> **Consumers name jobs, never models.**
+
+No model string ever appears in consumer code — models are records, and which model runs a job is an admin change with no deploy. Everything else in the design exists so that line stays true. The return is always three things: `result` (the text and any structured output), `feedback` (coverage, gaps, confidence, abstention — never silent), and `audit` (the ledger id, the model that actually ran, the parameters sent). That third value is the module's founding rule made concrete: **the system may do less than it was asked; it may not let anyone believe otherwise.** The full consumer contract — degrade-don't-fail, the feedback shape, what AI Core owns and what it does not — is [Integration](/modules/ai-core/integration/).
+
+---
+
+## The request lifecycle
+
+Here is what `run()` does, end to end, for a language operation. The order is the order in `run.ts`; each step either succeeds or refuses loudly with a named reason, and **every path leaves a ledger row** — a refusal is an outcome, not a disappearance.
+
+1. **Resolve the operation.** `resolveOperation` loads the operation record, applies the **sensitivity gate** (sensitive content may not route to an endpoint whose zero-retention terms are not recorded as in force), honours admin-granted **user model choice** against its allow-list, and selects and checks the model, its provider, and its API-key availability. Out of it comes the resolved model id, dials, discipline ids, segment keys, schema, and the terms in force. An unknown job name is a plain 404; an operation that exists but cannot run under its declared constraints refuses, named.
+
+2. **Re-validate the resolved discipline set** — on every call, not only at write time. An authority-hierarchy violation, or a `hard` rule with no live check, refuses here rather than running in a degraded shape nobody asked for. (Why this is checked at resolution time and not at boot is the section below.)
+
+3. **Load the prompt library and assemble.** Segment rows, discipline rows, and the model's framework are read; a missing or disabled authored segment refuses rather than silently changing the prompt. The assembler sorts segments by the framework's declared order, wraps each in the framework's syntax, and injects a **computed date anchor** built from this exact moment and the model's knowledge cutoff — rebuilt every call, never persisted. When the input carries external content, the **framing segment is included automatically**, whether or not the operation selected it: no operation supplies it, so no operation can omit it.
+
+4. **Validate parameters — tighten-only.** Dials become provider parameters only through mappings the model record declares; AI Core never invents a temperature the record did not specify. Out-of-range values clamp to the model's bounds (or reject, when the rule says reject), and a caller `maxOutputTokens` may lower the configured cap but never raise it. Every change is recorded as a parameter transform — a silently corrected parameter is a lie about what ran.
+
+5. **Generate**, through the owned adapter interface: `getAdapter(providerId).generate(...)`. Media attached to a segment travels to the provider as file parts, never in the prompt text, the logs, or the ledger; a model known to lack image input refuses instead of failing obscurely downstream.
+
+6. **Validate the schema.** When the operation declares one, structured output is parsed against it. A schema'd operation never hands back free-form output as if it satisfied the contract — that is a defect, and it is reported as one.
+
+7. **Run the deterministic checks and abstention.** Two built-in checks run on every call: `coverage-reported` (truncation states what was covered, or says plainly that it cannot) and `feedback-present` (a run may never return a malformed feedback object). Abstention compares the output's confidence against the operation's threshold and names the gap rather than letting the model fill it plausibly.
+
+8. **Build feedback and write the ledger.** One row per call, on every outcome (`ok`, `refused`, `error`, `abstained`). References, versions, parameters, and counts only — **no prompt or response content ever enters the ledger.** The ledger id becomes `feedback.ref`, and anything reportable also lands on the review queue.
+
+9. **Return** `{ result, feedback, audit }` and fire the `ai-core.run.completed` action so subscribers can react.
+
+Embeddings run a thinner version of the same pipeline — no prompt, no dials, no disciplines — but the one rule still holds: over-length input reports what each vector covered, and a dimension mismatch with the installed vector store refuses rather than corrupts.
+
+---
+
+## Records, not registrations
+
+AI Core leans on **seeded database records** for its domain — models, operations, disciplines, checks — rather than code registration, and the reason is an enforcement one.
+
+A code registry is populated by import-time side effects, ordered by file position, first-registration-wins. That makes registration-time rejection **unsound**: a rule can register before the rule it conflicts with, so at the moment of any one registration the registry cannot yet see the whole set. A database table has no such ordering problem — every rule and every check already exists in one table at the moment of a write. So the discipline authority hierarchy is enforced twice, both times soundly: **at write time**, admin CRUD refuses a violation transactionally (an `app`-authority write cannot edit, delete, or outrank an `ai-core` rule; a `hard` rule with no live check cannot be enabled); and **at resolution time**, `run()` re-validates the resolved set on every call and refuses an invalid one. A violation is refused the moment it is attempted, not discovered at the next restart.
+
+This is the line to keep straight, and the whole architecture rests on it:
+
+> **Register = behaviour that runs; seed = data that persists.**
+
+AI Core still *registers* code where code is what belongs there — it plugs itself into the starter's service, route, admin-page, and security registries at boot. It *seeds* its domain — providers, models, frameworks, disciplines, checks, terms options — as records at install, and consumers seed their own operations and segments the same way. The mechanics of each — `ensureOperation`, `ensureSegment`, `registerFlowHandler`, event subscription, and exactly what is registered versus seeded — are [Registering & Seeding](/modules/ai-core/registering-and-seeding/).
+
+---
+
+## The provider SDK boundary
+
+The Vercel AI SDK is a transport detail, and it is confined to one file.
+
+AI Core owns a provider interface — `ProviderAdapter`, `GenerateRequest`, `GenerateResult`, `EmbedResult` and their kin — and **nothing in that interface imports `'ai'` or any `@ai-sdk/*` package.** Every other file in the module, `run.ts` included, types against this owned interface and reaches a provider only through `getAdapter(providerId)`. The one file that imports the SDK is the adapter layer, which maps the owned request and result types onto whatever the SDK currently expects. The payoff is the acceptance test spelled out in [Usage](/modules/ai-core/usage/): swapping the SDK — or a provider — touches the adapter layer and nothing else. How the adapters are structured, and how models are listed from a provider's catalogue, is [Providers & Adapters](/modules/ai-core/providers-and-adapters/).
+
+---
+
+## Where things live
+
+AI Core's schema is 13 self-contained `ai_` tables, split by what they are for. Configuration is app-level and admin-managed; the data a run produces is tenant-scoped.
+
+<CardGrid>
+  <Card title="Config tables — app-level" icon="setting">
+    The libraries and their compositions: `ai_provider`, `ai_provider_terms_option`, `ai_model`, `ai_prompt_framework`, `ai_prompt_segment`, `ai_discipline`, `ai_guardrail_check`, `ai_preset`, `ai_operation`, `ai_flow`. No owner columns — these are the app's shared configuration, seeded at install and edited in the admin.
+  </Card>
+  <Card title="Data tables — tenant-scoped" icon="document">
+    What a run leaves behind: `ai_flow_run`, `ai_usage_ledger`, `ai_review_item`. Each carries `tenantId` (the isolation key) and `userId` (the actor). The ledger holds references, versions, and counts — never content.
+  </Card>
+</CardGrid>
+
+The full table-by-table breakdown, the indexes, and why the ledger carries no content columns is the [Data Model](/modules/ai-core/data-model/).
+
+---
+
+## Where to go next
+
+<CardGrid>
+  <Card title="Configuration" icon="setting">
+    The libraries an operation selects from — models, dials, terms, and the admin that edits them. [Configuration →](/modules/ai-core/configuration/)
+  </Card>
+  <Card title="Usage" icon="pencil">
+    Operations, prompts, voice, disciplines and guardrails, schema, and flows — the working core of the design. [Usage →](/modules/ai-core/usage/)
+  </Card>
+  <Card title="Integration" icon="puzzle">
+    The consumer contract: degrade-don't-fail, content-from-outside, the feedback contract, retrieval. [Integration →](/modules/ai-core/integration/)
+  </Card>
+  <Card title="Registering & Seeding" icon="list-format">
+    The mechanics of the register/seed distinction — `ensureOperation`, handlers, events. [Registering & Seeding →](/modules/ai-core/registering-and-seeding/)
+  </Card>
+</CardGrid>

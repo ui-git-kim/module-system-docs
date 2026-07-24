@@ -1,0 +1,228 @@
+---
+title: Disciplines & Guardrails
+description: Rules as records, their checks, and where the authority hierarchy is actually enforced
+lastUpdated: 2026-07-24
+sidebar:
+  order: 9
+---
+
+import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+A **discipline** is a rule about *how* the AI must go about an operation — the method, never the knowledge. *"Quote the source before you conclude." "Say when you don't know."* A **guardrail** is the check that the rule was followed. The **brake is both halves**: a rule with no check is not a brake, it is a request. This page is the deep dive on that pair — how a rule is stored, how its check is stored, and the one thing that is easy to get wrong and load-bearing when you do: **where the authority hierarchy is actually enforced.**
+
+The two sides live in two files, and that separation is deliberate. The rule is a database record. The check is a database record too — but the *implementation* of the most absolute checks is code. The design's whole thesis reduces to four words:
+
+> **Prose asks; code holds.**
+
+<Aside type="note" title="Implemented in v1.5.0 — first live call pending">
+The discipline and guardrail machinery described here is implemented in module v1.5.0 (July 2026): the CRUD service, the write-time integrity rules, the resolution-time re-validation, and the two built-in deterministic checks all ship and type-check clean in a real install. What is **not** yet verified is a first live provider call. The two things marked *planned* below — a seed CI lint, and classifier/grounding check implementations — are tracked on the [Roadmap](/modules/ai-core/roadmap/).
+</Aside>
+
+---
+
+## The brake is both halves
+
+The failure this module exists to prevent is not that **the AI was wrong** — it is that **the AI was wrong and looked right**. A confident answer over partial material is, to the reader, indistinguishable from a confident answer over everything. The discipline names the method that would have prevented that; the guardrail is what verifies the method was actually followed.
+
+Neither is the brake alone:
+
+<CardGrid>
+  <Card title="Discipline — the rule" icon="pencil">
+    An authored record. Says how the operation must proceed, and — where it prohibits something — what to do instead. A prohibition with no named alternative gets taken anyway under pressure.
+  </Card>
+  <Card title="Guardrail check — the verification" icon="approve-check">
+    A separate record that names the rule it enforces and points at an implementation. Deterministic code, a classifier, or a grounding scorer. Without it, the rule is merely written down.
+  </Card>
+</CardGrid>
+
+Every serious system in the field keeps the authored rule and its enforcement in different places and binds them loosely, and nobody has closed that seam. AI Core does not close it either — it **manages** the gap and makes its two permanent failure modes *detectable*:
+
+- **Orphaned check** — a check pointing at a rule that was renamed or deleted.
+- **Unreferenced rule** — a rule with no check. The "merely asked for" rule.
+
+The service refuses the writes that would create these at the moments it can (below), and a CI lint over the *seeded* rules and checks that would catch the rest before ship is **planned** — see the [Roadmap](/modules/ai-core/roadmap/).
+
+---
+
+## A discipline is a record — the six-field envelope
+
+Disciplines are authored records, never code: written, structured, editable, single-source. AI Core seeds good generic ones; apps author their own; both live in the same table with the same shape. Each is **a small machine-readable envelope wrapping human-readable prose** — six fields, and no more.
+
+| Field | Stored as | Purpose |
+|---|---|---|
+| **id** | `id` | Kebab-case, module-namespaced, e.g. `ai-core/no-silent-truncation`. The join key. Not updatable — the identity. |
+| **tier** | `tier` | `hard` · `default` · `guideline`. About overridability, not severity. |
+| **applies-to** | `appliesTo` | Scope or condition list, including runtime state. Empty means always-on. |
+| **authority** | `authority` | `ai-core` · `app` · `user`. Structural, additive-only. Not updatable — moving a rule between levels is a *different* rule. |
+| **version** | `version` | Independently versioned from its check. Bumps only on a substantive edit, so the ledger can tell an edited rule from the one that ran yesterday. |
+| **check** | `checkId` | Nullable pointer to a check record — **not the check itself.** |
+
+The **prose body** (`body`) is the rule, and — where it prohibits — what to do instead. `rationale` is required on `hard` and optional everywhere else. That is the complete surface: no free-text severity score (it collapses into tier), no priority integer beyond tier plus order, no tag taxonomy nobody queries, no author field distinct from `authority`.
+
+<Aside type="tip" title="Bodies are prompt content">
+Rule bodies and rationales are emitted into the prompt at assembly time, so the service treats them as prompt content: its logs carry ids, tiers, authorities and versions only — **never the prose.** For how a discipline's body is wrapped and ordered into the prompt, see [Prompt Assembly](/modules/ai-core/prompt-assembly/).
+</Aside>
+
+### The seeded set
+
+AI Core seeds five disciplines through its install migrations (`ON CONFLICT DO NOTHING`, so an admin edit is never clobbered). The hard set is small, front-loaded, and every hard member carries a rationale *and* a live check:
+
+| id | tier | check | The method it names |
+|---|---|---|---|
+| `ai-core/no-silent-truncation` | `hard` | `check-coverage-reported` | Never shorten, sample or skip input without reporting what was left out. |
+| `ai-core/report-coverage` | `hard` | `check-feedback-present` | Every operation reports what it processed and what it did not, or says no independent count exists. |
+| `ai-core/abstain-over-invent` | `hard` | `check-feedback-present` | When the material does not support an answer, abstain and name the gap — never fill it with a plausible value. |
+| `ai-core/say-when-unsure` | `default` | *(none)* | Where confidence is materially limited, say so alongside the claim. |
+| `ai-core/quote-source-before-conclusion` | `guideline` | *(none)* | Prefer quoting the supporting passage before stating a conclusion drawn from it. |
+
+Three hard, one default, one guideline — comfortably inside the single-digit hard budget. Note the loose join: `abstain-over-invent` and `report-coverage` both point their `checkId` at `check-feedback-present`. Several disciplines may share one check; a check names one discipline back, and the two need not be the same. What resolution requires is only that an enabled hard rule's pointer resolves to an *enabled* check — covered below.
+
+---
+
+## Tiers are about overridability, not severity
+
+| Tier | Who can override |
+|---|---|
+| `hard` | nobody |
+| `default` | a higher authority level |
+| `guideline` | implicitly steerable |
+
+Severity is the wrong axis: it is continuous and contestable, everything feels severe to its author, and that is the documented collapse mode — RFC 2119 needed a second RFC in 2017 because authors had made everything a MUST.
+
+So `hard` is made **expensive to declare.** The service enforces this at write time:
+
+- **Rationale is mandatory on every `hard` rule** — a hard rule with no stated reason for existing is refused, drafted or enabled.
+- **The always-on hard set is meant to stay in single digits.** Past a threshold of ten enabled hard rules, every discipline write logs an audited tier-inflation warning. It is not a refusal — growth can be legitimate — but the drift is made loud rather than left to be discovered.
+
+---
+
+## Checks are their own records
+
+A guardrail check is a separate record. It names the discipline `id` it enforces (the join key of the brake), declares a `kind`, and carries a `config`:
+
+| Field | Purpose |
+|---|---|
+| `id` | Kebab-case check id. |
+| `disciplineId` | The discipline this check enforces. An orphaned check — one naming a discipline that does not exist — is refused. |
+| `kind` | `deterministic` · `classifier` · `grounding`. |
+| `config` | Implementation config. For a deterministic built-in, `{ builtin: '...' }` names the runtime function. |
+| `enabled` | A disabled check cannot back an enabled hard rule. |
+
+Rules and checks **version independently** — that is exactly why `check` is a pointer, not an embedded body. A check's `version` bumps when its own substance (target, kind or config) moves; the discipline's `version` bumps on its own edits. The ledger records both, so a run is explicable against the precise rule *and* the precise check that were in force.
+
+### The two built-in deterministic checks
+
+`deterministic` checks name a runtime implementation that lives in the run engine (`run/run.ts`) via `config.builtin`. The rule is a database record; the brake is code. Two ship, both referenced by seeded check rows, and **both run on every language call** — they are cheap, universal, and enforce the one rule regardless of configuration:
+
+<CardGrid>
+  <Card title="coverage-reported" icon="warning">
+    When output was cut by the length limit, coverage must be stated. It records `covered` output tokens against `total: null` — because no independent count of the full output exists, and inventing one is exactly what this module forbids. Where it cannot state coverage at all, it says so rather than reporting a figure. Backs `ai-core/no-silent-truncation`.
+  </Card>
+  <Card title="feedback-present" icon="approve-check">
+    Belt-and-braces: a run may never return or ledger a partially formed feedback object. A failure here is a defect in AI Core itself, and it throws loudly (`feedback_invariant_violated`) rather than handing back a shape consumers cannot rely on. Backs `ai-core/report-coverage`.
+  </Card>
+</CardGrid>
+
+The `classifier` and `grounding` kinds are declared, but their check implementations — a groundedness scorer in particular — are **planned**, not shipped in v1.5.0. See the [Roadmap](/modules/ai-core/roadmap/) and the groundedness discussion in [Usage](/modules/ai-core/usage/).
+
+---
+
+## Where enforcement actually sits
+
+This is the load-bearing correction. Authority runs `ai-core` → `app` → `user`, and lower levels are **additive-only**: they may narrow scope by authoring a *new* rule, never widen, edit or delete a level above. This is the registry system's own ethos — downstream extends, never edits upstream — but the enforcement point is not where a code registry would put it.
+
+> **The July 2026 finding:** registration-time rejection is *unsound* for code registries. Registration is an ESM side-effect, ordered by file position, so a rule can register before the rule it conflicts with — the check runs against a set that isn't complete yet. A code registry cannot hold a sound enforcement point.
+
+**A database table can.** Every rule and every check already exists in one table at the moment of a write, so there is no ordering problem to lose to. AI Core therefore leans on **records, not code registration**, for disciplines — and enforces the hierarchy *twice*, at two moments, through **one function**.
+
+### At write time — the admin CRUD refuses violations transactionally
+
+Every create, update and delete validates the resulting record inside a transaction. The refusals are not warnings:
+
+- **Authority cannot be out-ranked or out-written.** The acting authority a runtime write may claim is typed `'app' | 'user'` — deliberately narrower than the stored values. **`ai-core` authority exists only in seed data**; no HTTP caller can claim the top of the hierarchy. An `app`-authority write may not create a rule *above* `app`, and may not edit or delete an `ai-core` rule at all. It narrows a higher rule only by authoring a new one.
+- **`hard` must be enforceable to be enabled.** Enabling a hard rule whose `checkId` is null, missing, or points at a *disabled* check is refused outright. A disabled hard rule may be *drafted* without a live check — it is the act of enabling that demands enforcement.
+- **A check cannot be pulled out from under a live hard rule.** Disabling or deleting a check that an enabled hard discipline relies on is refused, naming every reliant rule.
+- **A referenced discipline cannot be deleted.** Deleting a discipline still pointed at by an enabled check or an enabled operation is refused, naming every referrer — because deleting underneath them is precisely how you manufacture an orphaned check or a silently narrowed operation.
+
+Because of the enable-ordering, authoring a hard rule from scratch is a deliberate three-step sequence — which is the write-time integrity model made visible:
+
+<Steps>
+
+1. **Draft the discipline disabled.** A hard rule needs a rationale even when disabled, but may name a not-yet-existent check while it is off.
+
+   ```ts
+   import { disciplinesService } from './disciplines.service.js';
+
+   await disciplinesService.createDiscipline(
+     {
+       id: 'my-app/cite-policy-clause',
+       tier: 'hard',
+       appliesTo: [],
+       authority: 'app',
+       checkId: 'check-cite-policy-clause',
+       rationale:
+         'A conclusion about a policy that does not quote the clause it rests on cannot be audited.',
+       body:
+         'Quote the clause before stating a conclusion about it. If no clause supports the conclusion, say so instead of concluding.',
+       enabled: false,
+     },
+     'app', // actingAuthority — the HTTP API acts at most at 'app'
+   );
+   ```
+
+2. **Create the check.** It must name an existing discipline, so the draft above has to come first.
+
+   ```ts
+   await disciplinesService.upsertCheck({
+     id: 'check-cite-policy-clause',
+     disciplineId: 'my-app/cite-policy-clause',
+     kind: 'deterministic',
+     config: { builtin: 'coverage-reported' },
+     enabled: true,
+   });
+   ```
+
+3. **Enable the rule.** Now the check exists and is live, so the integrity gate passes.
+
+   ```ts
+   await disciplinesService.updateDiscipline(
+     'my-app/cite-policy-clause',
+     { enabled: true },
+     'app',
+   );
+   ```
+
+</Steps>
+
+### At resolution time — every call re-validates
+
+Write-time checks guard the admin surface, but records change between writes, so the hierarchy has to hold again at the moment of use. `aiCore.run` re-validates the operation's resolved discipline set on **every call** and refuses loudly — a `discipline-integrity-violation` — rather than running in a degraded shape nobody asked for. The resolver validates the set as it resolves the operation, and the run engine re-checks the resolved set before it assembles a prompt.
+
+Critically, both moments call the **same** function, `validateDisciplineSet(ids)`, so the two enforcement points cannot drift apart. It returns machine-readable kebab violations so either caller can name the exact problem:
+
+| Violation | Meaning |
+|---|---|
+| `unknown-discipline:<id>` | The operation references a rule that does not exist. |
+| `discipline-disabled:<id>` | A referenced rule is disabled. |
+| `hard-rule-without-check:<id>` | An enabled hard member has a null `checkId`. |
+| `hard-check-missing:<id>` | Its check id resolves to nothing. |
+| `hard-check-disabled:<id>` | Its check exists but is disabled. |
+
+This is stronger than the startup-barrier fallback the design originally reached for: a violation is refused at the exact moment it is attempted — a raced admin write cannot cause a silent bad run — not discovered at the next restart.
+
+---
+
+## The two failure modes are detectable, not prevented
+
+Nobody closes the seam between the authored rule and its enforcement, so the two permanent failure modes cannot be *prevented* — only detected. The runtime does catch the important cases: `hard-rule-without-check` and the missing/disabled-check violations mean an unreferenced *hard* rule can never resolve, and the CRUD refusals stop most orphaning at the source. But a `default` or `guideline` rule may legitimately run unchecked, and a check deleted out from under a non-hard rule is logged rather than refused — its pointer simply dangles.
+
+Catching *those* before they ship — a lint over the seeded rules and checks for orphaned checks and unreferenced rules — is **planned**, not built. It is tracked on the [Roadmap](/modules/ai-core/roadmap/).
+
+---
+
+## Related
+
+- **[Prompt Assembly](/modules/ai-core/prompt-assembly/)** — how a discipline's body is wrapped and ordered into the prompt sent to the model.
+- **[Registering & Seeding](/modules/ai-core/registering-and-seeding/)** — the mechanics of an app authoring its own disciplines and checks, and the register-vs-seed distinction.
+- **[Data Model](/modules/ai-core/data-model/)** — the full `ai_discipline` and `ai_guardrail_check` table shapes.
+- **[Usage](/modules/ai-core/usage/)** — where disciplines and guardrails sit in the wider design, alongside schema, feedback and flows.

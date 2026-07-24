@@ -1,0 +1,213 @@
+---
+title: Data Model
+description: The thirteen ai_ tables — what each holds, and the config-versus-data split
+lastUpdated: 2026-07-24
+sidebar:
+  order: 11
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+Everything AI Core ships is a database record. Models, prompt frameworks and segments, disciplines and their checks, presets, operations and flows are not hardcoded — they are rows in thirteen `ai_` tables, seeded at install and edited in the admin. This page is the reference for those tables: what each holds, and the line that runs down the middle of the schema.
+
+That line is **config versus data**:
+
+<CardGrid>
+  <Card title="Config tables (10)" icon="setting">
+    App-level, admin-managed, seeded as a starting palette. **No owner columns** — they are not anyone's personal data. `ai_provider`, `ai_provider_terms_option`, `ai_model`, `ai_prompt_framework`, `ai_prompt_segment`, `ai_discipline`, `ai_guardrail_check`, `ai_preset`, `ai_operation`, `ai_flow`.
+  </Card>
+  <Card title="Data tables (3)" icon="document">
+    Tenant-scoped runtime records. Every row carries `tenantId` + `userId`, is declared tenant-owned to the security registry, and is erased by the account-deletion cascade. `ai_flow_run`, `ai_usage_ledger`, `ai_review_item`.
+  </Card>
+</CardGrid>
+
+<Aside type="note" title="Implemented in v1.5.0 — first live call pending">
+This page describes the schema as implemented in module v1.5.0 (July 2026). The module installs into a real app, type-checks clean there, and its admin page renders and serves these records at runtime. What is **not** yet verified is a first live provider call. The tables for unbuilt features (retrieval, the semantic cache, groundedness scorers) are not part of this schema — those are marked planned where they appear elsewhere; see the [Roadmap](/modules/ai-core/roadmap/).
+</Aside>
+
+---
+
+## Conventions
+
+The whole schema follows the same handful of rules, so a reader can predict a table before reading it.
+
+- **`ai_` prefix, singular model, plural table.** Model names are snake_case singular (`ai_model`) and `@@map` to a plural physical table (`ai_models`). The prefix keeps the module's tables self-evidently its own.
+- **No `@relation` directives.** Every cross-table reference is a plain string key with an `@@index`, never a Prisma relation. The schema is **self-contained** — it can be reasoned about, migrated and deleted without reaching into another module's models. `ai_model.providerId` names `ai_provider.id`; the database does not enforce the join, the code does.
+- **Ids are either a slug or a `cuid()`.** Where the id *is* the name — providers, terms options, disciplines, checks, operations, flows — it is a human-meaningful slug (`anthropic`, `ai-core/no-silent-truncation`, `extract-entities`). Where the row is just an instance — models, frameworks, segments, presets, and all three data tables — the id is a generated `cuid()`, and the human key lives in a separate `@unique` column (`name` or `key`).
+- **`seeded` marks provenance.** Eight of the ten config tables carry a `seeded Boolean @default(false)`. Rows planted by AI Core's install migrations set it to `true`, so — in the schema comment's words — every value shows *"shipped default vs deliberate choice"*. Seeded rows are a **starting palette, not enforced state**: the seed migrations use `ON CONFLICT DO NOTHING`, and admin edits always win. (`ai_provider` and `ai_flow` are the two config tables with no `seeded` column.)
+- **Owner columns mark subject data.** The three data tables carry `tenantId` (isolation key) and `userId` (actor). The config tables carry neither, which is precisely why they are absent from the security registry — they are app configuration, not a person's data.
+
+For how those records are seeded at install versus registered as code, see [Developer Workflow](/modules/ai-core/developer-workflow/); for what an admin does with them, see [Configuration](/modules/ai-core/configuration/).
+
+---
+
+## Config tables
+
+App-level records. No `tenantId`, no `userId` — an admin manages them once for the whole app, and they are the same for every user. Grouped below by what they configure.
+
+### Providers and their terms
+
+**`ai_provider`** → `@@map("ai_providers")` — one row per model provider; admin intent, plus the data-handling terms of *your* account.
+
+| Column | What it holds |
+|---|---|
+| `id` | provider slug — `"anthropic"`, `"openai"`, `"google"`, `"voyage"`, `"black-forest-labs"`, `"replicate"` |
+| `enabled` | admin intent; runtime availability *additionally* requires the API key to be present |
+| `zeroRetention` / `noTraining` | nullable — the contractual state of *your* account. Admin-entered, never fetched |
+| `termsOptionId` | `ai_provider_terms_option.id` — which published arrangement the admin attests this account holds |
+| `termsRecordedAt` | dated, so a stale attestation is visible — selecting an option is a dated claim, not an acquisition |
+
+**`ai_provider_terms_option`** → `@@map("ai_provider_terms_options")` — a catalogue of the **real, named data-handling arrangements** each provider publishes. A row *describes* what is on offer; it never asserts your account has it.
+
+| Column | What it holds |
+|---|---|
+| `id` | kebab-case, provider-prefixed — `"anthropic-zdr"` |
+| `providerId` | `ai_provider.id` (plain key) |
+| `zeroRetention` / `noTraining` / `humanReview` | what *this arrangement grants* — not what the account has |
+| `residency` | free text, e.g. `"United States or global only"` |
+| `howObtained` / `covers` | the real mechanism (sales-negotiated, self-serve toggle, default…) and the scope it applies to |
+| `carveOuts` | `Json` array of strings — never empty in practice; zero retention has never meant nothing is retained |
+| `confidence` | `"confirmed"` (read off a primary source) or `"unconfirmed"` (could not be verified) |
+| `verifiedAt` | when a human or fetch last read the primary source; `NULL` on unconfirmed rows |
+
+See [Configuration → the arrangement catalogue](/modules/ai-core/configuration/#the-arrangement-catalogue-v150) for how these rows and the provider row combine at the sensitivity gate.
+
+### Models
+
+**`ai_model`** → `@@map("ai_models")` — one row per **pinned** model version. `@@unique([providerId, modelId])`, `@@index([kind])`.
+
+| Column | What it holds |
+|---|---|
+| `modelId` | the exact pinned version — never an alias |
+| `kind` | `"language"` · `"embedding"` · `"image"` · `"rerank"` |
+| `frameworkId` / `frameworkOverride` | the prompt framework this model uses; the override is the *only* override in the module — a hand-written full framework |
+| `capabilities` / `capabilitiesFetchedAt` / `capabilitiesStale` | `Json`, fetched from the provider and never assumed; `capabilitiesStale` is set when a refresh fails, because a stale capability nobody knows is stale is a lie |
+| `knowledgeCutoff` | feeds the computed date segment at assembly |
+| `parameterRules` | `Json` — what this model accepts and rejects. The model's problem, not the consumer's |
+| `dimensions` | embedding models only |
+| `zeroRetention` / `noTraining` / `termsOptionId` | per-model terms override; `null` = inherit the provider (a covered model can sit outside its provider's arrangement) |
+
+### Prompts
+
+**`ai_prompt_framework`** → `@@map("ai_prompt_frameworks")` — structure only, per model family. **No content lives here.**
+
+| Column | What it holds |
+|---|---|
+| `name` | `@unique` framework name, e.g. `"anthropic-xml"` |
+| `segmentOrder` | `Json` — the ordered segment types, e.g. `["voice","method","discipline","schema","framing","external","context","date","task"]` |
+| `wrapping` | `Json` — per segment type, `{ kind: "xml" \| "markdown" \| "plain", tag?: string }` |
+
+**`ai_prompt_segment`** → `@@map("ai_prompt_segments")` — a reusable section of prompt text (a *library* segment; the user's runtime message is a consumer segment and is never stored here).
+
+| Column | What it holds |
+|---|---|
+| `key` | `@unique`, kebab-case — `"framing-external-content"` |
+| `type` | `"voice"` · `"method"` · `"discipline-text"` · `"schema-instruction"` · `"framing"` |
+| `content` | `@db.Text` — the words |
+| `version` | bumped on edit; the ledger records which version ran |
+
+### Disciplines and guardrail checks
+
+**`ai_discipline`** → `@@map("ai_disciplines")` — a rule about *how* the AI must go about an operation.
+
+| Column | What it holds |
+|---|---|
+| `id` | kebab-case, module-namespaced — `"ai-core/no-silent-truncation"` |
+| `tier` | `"hard"` · `"default"` · `"guideline"` — about overridability, not severity |
+| `authority` | `"ai-core"` · `"app"` · `"user"` — lower levels are additive-only |
+| `checkId` | nullable pointer into `ai_guardrail_check` — a hard rule with no check is a request, not a brake |
+| `rationale` | `@db.Text`, required on `hard` (enforced at write time) |
+| `body` | `@db.Text` — the rule, and where it prohibits, what to do instead |
+
+**`ai_guardrail_check`** → `@@map("ai_guardrail_checks")` — the check that a discipline was followed. `@@index([disciplineId])`.
+
+| Column | What it holds |
+|---|---|
+| `disciplineId` | `ai_discipline.id` — the join key. Rules and checks version independently |
+| `kind` | `"deterministic"` · `"classifier"` · `"grounding"` |
+| `config` | `Json`, e.g. `{ "builtin": "coverage-reported" }` — a deterministic check names a built-in runtime check implemented in code |
+
+The write-time and resolution-time enforcement of the `tier` / `authority` / `checkId` relationship is the subject of [Usage → Disciplines & Guardrails](/modules/ai-core/usage/#disciplines--guardrails); this table is only where the rule and its check are stored.
+
+### Presets, operations and flows
+
+**`ai_preset`** → `@@map("ai_presets")` — a named bundle of dial settings.
+
+| Column | What it holds |
+|---|---|
+| `name` | `@unique`, admin-named — AI Core ships dials, not opinions |
+| `dials` | `Json` |
+
+**`ai_operation`** → `@@map("ai_operations")` — the record behind a job name. Its `id` is the public job name — **the whole consumer surface**.
+
+| Column | What it holds |
+|---|---|
+| `id` | the public job name — `"extract-entities"` |
+| `modelId` | `ai_model.id` (cuid) — resolution happens here; consumers never name models |
+| `presetId` / `dials` | a preset, plus per-operation dial overrides on it |
+| `disciplineIds` / `segmentKeys` | `Json` arrays — which disciplines apply, and the ordered library segments |
+| `schema` | `Json` — the shape of the answer. Guarantees shape, never truth |
+| `sensitivity` | `"normal"` · `"sensitive"` — may tighten the app floor, never relax it |
+| `userModelChoice` / `userModelAllowList` | admin-granted model choice, default off, with a named allow-list |
+
+**`ai_flow`** → `@@map("ai_flows")` — operations in order. No `seeded` column.
+
+| Column | What it holds |
+|---|---|
+| `id` | kebab-case flow id |
+| `steps` | `Json` — `[{ kind: "operation", operationId, waitOnFeedback? } \| { kind: "handler", handlerId }]` |
+| `enabled` | whether the flow can run |
+
+A `"handler"` step runs a consumer's own code, not an operation — see [Usage → Flows](/modules/ai-core/usage/#flows).
+
+---
+
+## Data tables
+
+Tenant-scoped runtime records. Every row carries `tenantId` (isolation key) and `userId` (actor). All three are declared to the security registry as **tenant-owned** — `ownerColumn: 'tenantId'` — which brings them under the app's row-level tenant isolation and registers them for the **account-deletion cascade**. The config tables are deliberately *absent* from that declaration: they carry no owner columns because they are app configuration, not a person's data.
+
+<Aside type="caution" title="The ledger never stores content">
+`ai_usage_ledger` records references, versions, hashes and outcomes — **never prompt or response content**. That is the property that lets account erasure remove *the last trace of the subject's usage rather than a second copy of their data*. API keys are not in the schema at all: they live in environment variables, so there is nothing to encrypt in the database.
+</Aside>
+
+**`ai_flow_run`** → `@@map("ai_flow_runs")` — a single execution of a flow, suspendable and resumable. `@@index([tenantId])`, `@@index([tenantId, status])`.
+
+| Column | What it holds |
+|---|---|
+| `flowId` / `status` | which flow; `"running"` · `"suspended"` · `"completed"` · `"failed"` |
+| `stepIndex` / `state` / `stepResults` | progress through the steps and the accumulated state |
+| `suspendedFeedback` | `Json` — the feedback that suspended the flow. It attaches to the operation that raised it; the flow only collects it |
+
+**`ai_usage_ledger`** → `@@map("ai_usage_ledger")` — one row per run: audit **by reference**. Append-only (there is a `createdAt` and no `updatedAt`). `@@index` on `tenantId`, `[tenantId, createdAt]` and `operationId`.
+
+| Column | What it holds |
+|---|---|
+| `operationId` / `flowRunId` | the job that ran, and the flow run it belonged to (if any) |
+| `modelRecordId` / `requestedModelId` / `reportedModelId` | which `ai_model` resolved, the pinned id asked for, and what the provider says actually ran |
+| `segmentVersions` / `disciplineVersions` | `Json` `[{ key, version }]` — audit by reference into the config tables |
+| `parametersRequested` / `parametersSent` / `parameterTransforms` | before and after explicit, visible transforms — a silently corrected parameter is a lie about what ran |
+| `usage` / `warnings` / `finishReason` / `rawFinishReason` / `latencyMs` | normalised token usage, provider warnings (never swallowed), and timing |
+| `outcome` / `refusalReason` | `"ok"` · `"refused"` · `"error"` · `"abstained"` |
+| `feedback` / `groundedness` | the structured feedback returned to the consumer, and the groundedness score where one was produced |
+| `termsInForce` / `degraded` | the provider terms at call time, and whether the run was degraded |
+
+**`ai_review_item`** → `@@map("ai_review_items")` — a flagged item queued for human review. `@@index([tenantId, status])`.
+
+| Column | What it holds |
+|---|---|
+| `operationId` / `ledgerId` | the operation, and the ledger row it came from (if any) |
+| `reason` | machine-readable kebab reason — the consumer writes the human words |
+| `missing` / `coverage` | `Json` — what was not covered |
+| `confidence` / `threshold` | the score and the bar it fell under |
+| `status` | `"open"` · `"resolved"` · `"dismissed"` |
+
+---
+
+## Where the split is enforced
+
+The config-versus-data line is not a naming convention that hopes to be respected — it is enforced by which registry each table is declared to, and how each is created.
+
+- **Config tables are seeded, then admin-owned.** They arrive through the install seed migrations (`ON CONFLICT DO NOTHING`, byte-stable, append-only) as a palette, and from then on the admin's edits win. Because they have no owner columns, they are absent from the security registry and untouched by account deletion. See [Developer Workflow](/modules/ai-core/developer-workflow/) for the migration discipline.
+- **Data tables are tenant-owned, then erased.** Their `ownedModels` declaration gives every query a tenant boundary, and a registered deletion handler hard-deletes all three (`ai_usage_ledger`, `ai_review_item`, `ai_flow_run`) in one transaction when a subject is erased. The ledger's no-content rule is what makes that erasure complete rather than partial.
+
+The result is a schema that is defensible in two directions at once: an admin can change what the AI does app-wide by editing config rows, and a subject can be forgotten entirely by deleting their data rows — without either action touching the other.

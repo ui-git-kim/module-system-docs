@@ -1,0 +1,245 @@
+---
+title: Providers & Adapters
+description: The owned provider interface, how the Vercel AI SDK is contained to one file, and adding a provider or model
+lastUpdated: 2026-07-24
+sidebar:
+  order: 10
+---
+
+import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+AI Core talks to model providers through an interface it owns, not through the Vercel AI SDK directly. The SDK is a transport detail, confined to a single file. Everything else in the feature — the resolver, the run engine, the ledger — types against AI Core's own `ProviderAdapter` contract and never learns what package moves the bytes. This page is the boundary: the owned interface, how the SDK is contained, the REST model-listing path that sits beside it, and how a new provider or model is added.
+
+<Aside type="note" title="Implemented in v1.5.0 — first live call pending">
+This page describes AI Core as implemented in module v1.5.0 (July 2026). The module installs into a real app, type-checks clean there, and its admin page renders and serves records at runtime. What is **not** yet verified is a first live provider call. Items still unbuilt (retrieval, semantic cache, groundedness scorers, the image/video adapters below) are marked inline — see the [Roadmap](/modules/ai-core/roadmap/).
+</Aside>
+
+---
+
+## The boundary
+
+> **Never leak the provider SDK.** The Vercel AI SDK is a transport detail confined to the provider-adapter layer.
+
+The rule has an exit test that makes it checkable rather than aspirational:
+
+> **Swapping the SDK touches the adapter layer and nothing else.**
+
+If replacing the transport meant editing the resolver, the run engine, or a consumer, the boundary would be a fiction. It is real because exactly one file (`providers/adapters.ts`) imports `ai`, `@ai-sdk/*` or `voyage-ai-provider`, and nothing that file exports carries an SDK type outward. Every other file in the feature imports its provider-shaped types from `providers/provider.types.ts` (re-exported through `providers/index.ts`), which imports nothing from the SDK — *that is the point*.
+
+---
+
+## The owned provider interface
+
+`providers/provider.types.ts` declares the only contract the rest of the module knows. An adapter is one implementation of `ProviderAdapter` per provider:
+
+```ts
+// backend/src/features/ai-core/providers/provider.types.ts
+
+/** One adapter per provider. Lazy-initialised; available when its key is present. */
+export interface ProviderAdapter {
+  readonly providerId: string;
+  generate(modelId: string, req: GenerateRequest): Promise<GenerateResult>;
+  embed(modelId: string, values: string[], opts?: { dimensions?: number }): Promise<EmbedResult>;
+  rerank?(modelId: string, query: string, documents: string[], topN?: number): Promise<RerankResult>;
+}
+```
+
+`generate` and `embed` are mandatory shapes; `rerank` is optional and present only where a provider serves reranking. The request and result types are AI Core's own, chosen so nothing the SDK returns escapes normalisation:
+
+| Type | What it carries |
+|---|---|
+| `GenerateRequest` | `instructions`, `input`, `parameters: ResolvedParameters`, optional `schema` (structured output), optional `attachments: MediaAttachment[]`, optional `signal` |
+| `GenerateResult` | `text`, optional `structured`, `usage: NormalizedUsage`, `warnings: ProviderWarning[]`, `finishReason`, optional `rawFinishReason`, optional `reportedModelId`, `latencyMs` |
+| `NormalizedUsage` | `inputTokens?`, `outputTokens?`, `totalTokens?`, `cacheReadTokens?`, `reasoningTokens?`, and the provider-native `raw?` passed through for the ledger |
+| `ProviderWarning` | `kind` (`unsupported` · `compatibility` · `deprecated` · `other`) and a `detail` string |
+| `EmbedResult` | `embeddings: number[][]`, optional `tokens`, `coverage: EmbedCoverage[]`, `warnings`, `latencyMs` |
+| `EmbedCoverage` | `index`, `covered`, `total`, `unit: 'characters'` — what portion of each input the vector covers |
+| `RerankResult` | `ranking: RerankEntry[]` (each `{ originalIndex, score }`), optional `tokens`, `latencyMs` |
+| `MediaAttachment` | `mediaType`, `data` (base64 bytes or an http(s) URL the provider fetches), optional `name` |
+| `ResolvedParameters` | `maxOutputTokens?`, `temperature?`, `topP?`, `topK?`, `stopSequences?`, `seed?` — the values after explicit validation |
+
+Two design commitments are baked into these shapes:
+
+- **An unknown count is reported as unknown, never invented as zero.** Every numeric field in `NormalizedUsage` is optional; an absent token count stays `undefined` rather than being filled with `0`. A fabricated zero would be a quiet lie about what ran.
+- **Attachments reach the provider and never the ledger.** `MediaAttachment` bytes ride to the adapter as file parts alongside the assembled input; they are never concatenated into the prompt text and never written to the usage ledger.
+
+`ListedModel` (`modelId`, optional `displayName`, optional `metadata`) is the one other exported shape — it belongs to the REST model-listing path below, not to a live generation call.
+
+---
+
+## Containment — one file imports the SDK
+
+`providers/adapters.ts` is the sole import site for the transport. Its imports are the entire SDK surface the module uses:
+
+```ts
+// backend/src/features/ai-core/providers/adapters.ts — the ONLY SDK import site
+import { APICallError, LoadAPIKeyError, Output, embedMany, generateText, rerank } from 'ai';
+import type { EmbeddingModel, LanguageModel, RerankingModel } from 'ai';
+import { createAnthropic } from '@ai-sdk/anthropic';
+import { createOpenAI } from '@ai-sdk/openai';
+import { createGoogle } from '@ai-sdk/google';
+import { createVoyage } from 'voyage-ai-provider';
+```
+
+Everything downstream imports the owned interface instead:
+
+```ts
+import type { GenerateRequest, GenerateResult, ProviderAdapter } from './provider.types.js';
+```
+
+Inside the adapter file, four provider factories each return a `ProviderAdapter`. They are asymmetric on purpose, because the providers are:
+
+| Provider | `generate` | `embed` | `rerank` |
+|---|---|---|---|
+| `createAnthropic` | yes | throws `UnsupportedModelKindError('embedding')` | — |
+| `createOpenAI` | yes | yes | — |
+| `createGoogle` | yes | yes | — |
+| `createVoyage` | throws `UnsupportedModelKindError('language')` | yes | yes |
+
+A provider that does not serve a kind **refuses loudly** with a typed error rather than approximating — if the catalogue ever routes an embedding to Anthropic, that is a defect made visible, not smoothed over. Each factory is memoised per API key (keys can rotate at runtime, so the cache is keyed by the key value, not a process singleton), and every call is timed for `latencyMs`.
+
+Failures never surface as bare SDK throws. `toTypedError` maps them to AI Core's own error classes using the SDK's `isInstance` guards (which survive duplicate package instances where `instanceof` would fail):
+
+- `LoadAPIKeyError` → `ProviderUnavailableError`
+- `APICallError` → `ProviderCallError` (carrying the SDK's `isRetryable` and `statusCode`)
+- anything else → `ProviderCallError`, non-retryable
+
+The failure log records the error shape, provider and latency — **never prompt or response content**, so a log line cannot become a second copy of sensitive data.
+
+---
+
+## AI SDK v7 as the current transport
+
+The adapters are written against AI SDK v7. A generation call goes through `generateText`, with AI Core's validated parameters mapped straight onto the SDK options:
+
+```ts
+const options = {
+  model,
+  instructions: req.instructions,
+  ...promptPart,                              // { prompt } or { messages } when media is attached
+  maxOutputTokens: req.parameters.maxOutputTokens,
+  temperature: req.parameters.temperature,
+  topP: req.parameters.topP,
+  topK: req.parameters.topK,
+  stopSequences: req.parameters.stopSequences,
+  seed: req.parameters.seed,
+  abortSignal: req.signal,
+};
+```
+
+When the operation declares an output schema, the adapter requests structured output — the owned JSON-schema subset is converted to a zod schema and handed to `Output.object`:
+
+```ts
+const result = await generateText({
+  ...options,
+  output: Output.object({ schema: zodFromJsonSchema(req.schema) }),
+});
+```
+
+The structured value is validated upstream in the run engine, not trusted from the wire. Three things are captured from every outcome and normalised into the owned result:
+
+- **Usage** is mapped through `mapUsage` into `NormalizedUsage` (including `cacheReadTokens` and `reasoningTokens` where the provider reports them).
+- **Warnings are never swallowed.** `mapWarnings` turns each SDK warning into a `ProviderWarning`; an unlabelled one becomes `"unspecified provider warning"` rather than vanishing.
+- **The reported model id** — the id the provider says actually served the call — is captured from the response and returned as `reportedModelId`, so the ledger records what really ran, not just what was requested.
+
+Embeddings go through `embedMany` and reranking through `rerank`, each wrapped the same way: timed, typed on failure, warnings surfaced. Where the SDK exposes no signal — embedding coverage, rerank token usage — AI Core reports the honest unknown (full character coverage for embeddings, `undefined` tokens for rerank) rather than manufacturing a number.
+
+---
+
+## Lazy initialisation — a key is availability
+
+`providers/index.ts` is the provider registry: a lazy factory keyed on environment variables. **A provider is available at runtime when its API key is present** — zero-config, so the module works with any one key set. Nothing in this file touches the SDK; it only decides which adapter factory to invoke.
+
+```ts
+const PROVIDER_ENV_KEYS: Record<string, string> = {
+  anthropic: 'ANTHROPIC_API_KEY',
+  openai: 'OPENAI_API_KEY',
+  google: 'GOOGLE_GENERATIVE_AI_API_KEY',
+  voyage: 'VOYAGE_API_KEY',
+};
+```
+
+The public helpers:
+
+| Function | Returns |
+|---|---|
+| `getProviderApiKey(providerId)` | the key from the environment, or `undefined` when the provider is unknown or its key is absent/blank |
+| `isProviderAvailable(providerId)` | `true` when the key is present |
+| `getAdapter(providerId)` | the adapter, built on first use and cached; throws `ProviderUnavailableError` when there is no factory or no key |
+| `listAvailableProviders()` | the provider ids whose keys are present, in declaration order |
+
+Key presence and admin intent are **two separate gates**. `getAdapter` cares only about the key; the `ai_provider.enabled` flag is admin intent and is checked by the [resolver](/modules/ai-core/usage/), not here. A provider can be enabled in the admin yet unavailable at runtime because no key is configured — and the resolver refuses that combination loudly, naming the missing key, rather than silently substituting another provider.
+
+---
+
+## Model listing is REST, not the SDK
+
+The AI SDK exposes no model-listing surface, so the catalogue is fetched directly over REST in `providers/model-listing.ts` — plain `fetch`, no SDK involved. This is what refreshes the capability metadata on model records (see [Configuration](/modules/ai-core/configuration/)).
+
+| Provider | Endpoint | Auth header | Pagination |
+|---|---|---|---|
+| Anthropic | `GET api.anthropic.com/v1/models?limit=1000` | `x-api-key` + `anthropic-version: 2023-06-01` | `has_more` / `after_id` |
+| OpenAI | `GET api.openai.com/v1/models` | `Authorization: Bearer` | none (single response) |
+| Google | `GET generativelanguage.googleapis.com/v1beta/models?pageSize=1000` | `x-goog-api-key` | `nextPageToken` / `pageToken` |
+| Voyage | — | — | no listing endpoint |
+
+**Voyage publishes no catalogue endpoint** — its model ids are documented constants, so `listProviderModels('voyage')` returns an empty list, meaning *"nothing to refresh"* rather than *"no models exist."* The seeded records are the Voyage catalogue.
+
+Listing failures throw typed `ProviderCallError`s and are **not** caught in this file — the caller (the records service) treats a failed refresh as a logged fallback and marks the affected model records `capabilitiesStale`, so a refresh that did less than asked is always visible. A misbehaving endpoint that keeps promising more pages is capped and the cap-hit is logged.
+
+---
+
+## Parameter validation sits above the SDK
+
+AI Core validates parameters against the model record's own rules **before** anything reaches the SDK — it does not lean on the provider to clamp values.
+
+> **A silently clamped parameter is a lie about what ran.**
+
+Several SDKs quietly coerce an out-of-range value and carry on. AI Core refuses that behaviour: `validateParameters(dials, parameterRules, capabilities)` in the resolver either **rejects** the value (when the model rule says `reject`, raising `BadRequestError`) or **transforms** it to the bound and records a `ParameterTransform` — `{ parameter, requested, sent, rule }`. An unsupported parameter is omitted with a transform entry (`sent: null`) so the omission is visible. `maxOutputTokens` is clamped to both the declared ceiling and the provider-reported capability ceiling, each recorded separately. Every transform lands in the usage ledger, so the difference between what was asked and what was sent is always explainable after the fact. The mechanics of dials and rules live on the [Usage](/modules/ai-core/usage/) and [Configuration](/modules/ai-core/configuration/) pages.
+
+---
+
+## Adding a provider
+
+A new provider is part code, part [seed data](/modules/ai-core/registering-and-seeding/). The distinction matters: the adapter is behaviour that runs; the provider and model rows are data that persists and the admin can then edit.
+
+<Steps>
+
+1. **Implement the interface.** Add a factory to `providers/adapters.ts` that returns a `ProviderAdapter` — implement `generate` and `embed` (and `rerank` where the provider serves it), and throw `UnsupportedModelKindError` for any kind it does not serve. This is the only file that may import the transport package.
+
+2. **Wire it into the provider registry.** Add the provider's env var to `PROVIDER_ENV_KEYS` and its factory to `ADAPTER_FACTORIES` in `providers/index.ts`. Availability then follows key presence automatically — no further configuration step.
+
+3. **Add a listing client (if it has one).** If the provider exposes a catalogue endpoint, add a `listProviderModels` client in `model-listing.ts` so capability refresh works; if it does not, leave it out and let the seeded records be the catalogue, as Voyage does.
+
+4. **Seed the records.** Add a provider row, its model rows (each pinning an exact version), and a data-handling **terms option** via a seed migration (`ON CONFLICT DO NOTHING`). These become admin-editable records the moment they land.
+
+</Steps>
+
+---
+
+## Pinning a model
+
+A model is a record naming an **exact provider version, never an alias**. An alias lets the provider change the model underneath you with no deploy, no notice and no record — behaviour changed and nothing said so, which is the module's core failure in its purest form. Pinning a new model is therefore a seed (or an admin edit), not a code change: add or edit a model record with the exact version string. The [Configuration](/modules/ai-core/configuration/) page covers the full model record and why a version change is treated as a migration with a before/after evaluation set.
+
+---
+
+## Image and video providers
+
+Two providers are **seeded as rows but deliberately have no adapter**: Black Forest Labs (`black-forest-labs`) and Replicate (`replicate`), both mapped to the `image` kind. Their rows exist so the catalogue is complete, but they ship **disabled**, and `getAdapter` throws a typed `UnsupportedModelKindError` for them rather than routing content anywhere.
+
+<Aside type="note" title="Planned">
+The image/video adapters are not built. These providers have materially weaker data-handling terms than the language and embedding providers; until those terms are confirmed acceptable, no adapter routes content to them, and no model-listing client exists for them either. This is tracked on the [Roadmap](/modules/ai-core/roadmap/).
+</Aside>
+
+---
+
+## Related
+
+<CardGrid>
+  <Card title="Configuration" icon="setting">
+    Models, provider terms, capabilities and the admin — the records this page's adapters resolve against. See [Configuration](/modules/ai-core/configuration/).
+  </Card>
+  <Card title="Architecture" icon="puzzle">
+    Where the provider layer sits in the module, and the other boundaries it enforces. See [Architecture](/modules/ai-core/architecture/).
+  </Card>
+</CardGrid>

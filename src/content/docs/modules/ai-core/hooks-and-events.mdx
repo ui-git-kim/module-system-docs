@@ -1,0 +1,170 @@
+---
+title: Hooks & Events
+description: The action hooks AI Core fires, and how a consumer subscribes and registers flow handlers
+lastUpdated: 2026-07-24
+sidebar:
+  order: 7
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+After it is installed, AI Core talks back to consumers two ways, and they are not the same mechanism. It **fires action hooks** on the starter's `actionRegistry` that a consumer can **subscribe** to — reacting after the fact. And it accepts **flow-step handlers** a consumer **registers** — code that runs *as a step inside a flow*. Both are code, wired at import time; neither is a database record. That places this whole page on the *register* side of the module's founding distinction — see [Registering & Seeding](/modules/ai-core/registering-and-seeding/) for the line between behaviour that runs and data that persists.
+
+<Aside type="note" title="Implemented in v1.5.0 — first live call pending">
+The hooks and the handler registry described here ship in module v1.5.0 (July 2026) and type-check clean in a real app. The one unproven gate is a first live provider call; nothing on this page depends on that gate. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+</Aside>
+
+---
+
+## What every payload carries — and never carries
+
+Every hook fires **fire-and-forget, after the durable write it reports** — the ledger row for a run, the record row for an admin edit. AI Core dispatches with `void actionRegistry.doAction(...)`: it does not await subscribers and never lets a subscriber affect the write path.
+
+The payloads carry **identifiers, versions, counts, actions and outcomes — never prompt or response content.** This is the ledger's no-content rule applied to the event stream: a run's segment text, a discipline's prose body, the values a model returned — none of it travels on a hook. A subscriber that needs numbers reads them back through the [Service API](/modules/ai-core/service-api/); a hook tells it *that* something happened and *which* record, not *what was said*.
+
+> **The event says what changed and to which record — never what was in it.**
+
+---
+
+## The event catalogue
+
+Two families: the **run lifecycle** hook, fired once per operation or embed call, and the **record-CRUD** hooks, fired when an admin (or a consumer's `ensure*` call) writes a configuration record.
+
+### Run lifecycle
+
+| Hook | Payload | Fired when |
+|---|---|---|
+| `ai-core.run.completed` | `{ ledgerId, operationId, tenantId, outcome }` | Immediately after the ledger row is written, on **every** terminal outcome of `run`, `embed` and each AI step of a flow. |
+
+`outcome` is one of `'ok'`, `'error'`, `'refused'` or `'abstained'`. It fires on the success path, the abstention path *and* the shared failure/refusal path — a refused or errored run is an outcome, not a disappearance, so it still emits. Embeds emit `'ok'` on success. The payload does **not** carry token counts; read those from `getCurrentUsage` (worked example below).
+
+### Record CRUD
+
+Each fires fire-and-forget after the transaction commits. `action` names what happened to the record.
+
+| Hook | Payload | `action` values |
+|---|---|---|
+| `ai-core.provider.updated` | `{ id, action }` | `'updated'` |
+| `ai-core.model.updated` | `{ id, action }`, or the refresh variant `{ action: 'capabilities-refreshed', refreshed, stale }` (no `id`) | `'created'` · `'updated'` · `'deleted'` · `'capabilities-refreshed'` |
+| `ai-core.framework.updated` | `{ id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.segment.updated` | `{ key, version, action }` on write; `{ key, action }` on delete — keyed by `key`, not `id` | `'upserted'` · `'ensured'` · `'deleted'` |
+| `ai-core.preset.updated` | `{ id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.operation.updated` | `{ id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.flow.updated` | `{ id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.discipline.updated` | `{ entity, action, id }`; check writes also carry `disciplineId` | discipline: `'created'` · `'updated'` · `'deleted'` — check: `'upserted'` · `'deleted'` |
+| `ai-core.review-item.updated` | `{ id, status, tenantId, operationId }` (the admin-route variant omits `tenantId`) | the item's `status`, e.g. `'open'` |
+
+<Aside type="caution" title="There is no ai-core.check.updated">
+Guardrail-check writes ride on **`ai-core.discipline.updated`** with `entity: 'check'` (and a `disciplineId` naming the rule the check enforces). Disciplines fire the same hook with `entity: 'discipline'`. One hook, discriminated by `entity` — subscribe to `ai-core.discipline.updated` and branch on the field if you only care about one.
+</Aside>
+
+The `'ensured'` action on `ai-core.segment.updated` is what a consumer's `ensureSegment` seed emits on first run — the same hook the admin's own edit fires. Its mechanics live in [Registering & Seeding](/modules/ai-core/registering-and-seeding/).
+
+---
+
+## Subscribing to events
+
+A consumer subscribes with the starter's `actionRegistry.addAction(hook, id, callback, order?)` at **import time**, from a side-effect registration file. This is registering code that runs — it lives in memory, re-runs every boot, and nothing persists.
+
+```ts
+// consumer: features/my-feature/ai-core.subscriptions.ts
+import { actionRegistry } from '@/config/action.registry';
+
+actionRegistry.addAction(
+  'ai-core.run.completed',      // hook
+  'my-feature-usage-meter',     // your unique subscriber id
+  (payload) => {
+    // react — but do not block the run thread; see the caution below
+  },
+);
+```
+
+<Aside type="caution" title="Use addAction, not addActionAsync — and don't block">
+AI Core fires its hooks through `doAction`, which runs the **sync** handler pool only. A handler registered with `addActionAsync` would be **skipped** (the starter dev-warns when this happens). So subscribe with `addAction`. Because the callback runs on the firing thread, keep it non-blocking: dispatch any I/O as deferrable work (`queueMicrotask`, or your own un-awaited async call) rather than doing it inline.
+</Aside>
+
+Two consequences of fire-and-forget dispatch, both load-bearing:
+
+- **No ordering guarantee across subscribers.** The `order?` argument sequences your own handlers; it is not a contract between modules. Never assume another module's subscriber ran first.
+- **No happens-before with `run()`.** AI Core does not await subscribers, so your handler may run after `run()` has already returned to its caller. Treat the event as an eventually-consistent notification, not a synchronisation point.
+
+### Worked example — meter a tenant's usage from run.completed
+
+The payload names the run and its outcome; it carries no token counts. So the subscriber uses the event as a *trigger* and reads the numbers back through the facade's billing callback — the "AI Core counts, billing asks" model. Reach AI Core the same degrade-don't-fail way consumers always do, with `serviceRegistry.getOptional('ai-core')`.
+
+```ts
+import { actionRegistry } from '@/config/action.registry';
+import { serviceRegistry } from '@/config/service.registry';
+
+actionRegistry.addAction(
+  'ai-core.run.completed',
+  'my-feature-usage-meter',
+  (payload: { ledgerId: string; operationId: string; tenantId: string; outcome: string }) => {
+    // Non-blocking: mark the job's outcome now, refresh totals off-thread.
+    void (async () => {
+      await myFeature.markJobOutcome(payload.ledgerId, payload.operationId, payload.outcome);
+
+      const aiCore = serviceRegistry.getOptional('ai-core');
+      if (!aiCore) return; // AI Core absent — smaller app, not a broken one
+      const usage = await aiCore.getCurrentUsage({ tenantId: payload.tenantId });
+      await myFeature.updateMeter(payload.tenantId, usage.inputTokens, usage.outputTokens);
+    })();
+  },
+);
+```
+
+`getCurrentUsage` returns tenant-scoped totals (`operations`, `inputTokens`, `outputTokens`, plus a `byOperation` breakdown), never per-run content. Its full shape and the callback contract are on the [Service API](/modules/ai-core/service-api/) page.
+
+---
+
+## Flow-step handlers
+
+A [flow](/modules/ai-core/usage/#flows) is operations in order, and it contains AI steps and non-AI steps. AI Core resolves and runs the AI steps; the **non-AI steps are consumer handlers**, registered with:
+
+```ts
+// consumer: features/my-feature/ai-core.flow-handlers.ts
+import { serviceRegistry } from '@/config/service.registry';
+
+const aiCore = serviceRegistry.getOptional('ai-core');
+aiCore?.registerFlowHandler('my-feature/dedupe-conversations', async (state, previous) => {
+  // ... do non-AI work, return the flow's next working memory
+  return { ...state, deduped: true };
+});
+```
+
+`registerFlowHandler(handlerId, fn)` writes into an **in-memory Map at import time**, and **first registration wins** — a duplicate `handlerId` warns and is ignored, matching the starter's registry convention. This is registering, not seeding: nothing persists, and no admin edits it. The *flow* that references the handler by id is the record that persists — configured, not coded (see [Configuration](/modules/ai-core/configuration/)).
+
+The handler signature is:
+
+```ts
+type FlowHandler = (
+  state: Record<string, unknown>,
+  previous: unknown,
+) => Promise<Record<string, unknown>>;
+```
+
+It receives the flow's current **working memory** (`state`) and the **previous step's result** (`previous` — the prior operation's `RunResult`, or the prior handler's returned state), and returns the **new** working memory that the next step will see. AI Core awaits it in sequence, then carries its return forward.
+
+### A handler is a step; a subscription is a reaction
+
+This is the distinction that keeps the two halves of this page apart:
+
+<CardGrid>
+  <Card title="Flow-step handler" icon="right-arrow">
+    **Runs inside the flow, awaited, in order.** Its return value becomes the flow's next state. If it throws, the flow fails loudly. It is part of the work, not an observer of it.
+  </Card>
+  <Card title="Event subscription" icon="information">
+    **Runs after the fact, un-awaited, unordered.** It cannot change what happened and must not block it. It observes the work; it is not part of it.
+  </Card>
+</CardGrid>
+
+One more property worth stating plainly: a flow that names a handler **nobody registered refuses loudly** — the run raises a `flow-handler-not-registered` refusal rather than silently skipping the step. A flow running around a step nobody can execute would misreport what actually ran, which is exactly the failure the module exists to prevent.
+
+---
+
+## See also
+
+- [Registering & Seeding](/modules/ai-core/registering-and-seeding/) — the full register-versus-seed distinction, `ensureOperation` / `ensureSegment`, and where `registerFlowHandler` and event subscription sit.
+- [Service API](/modules/ai-core/service-api/) — the facade surface: `run`, `embed`, `runFlow`, `resumeFlow`, `getCurrentUsage` and the shapes the worked example reads back.
+- [Integration](/modules/ai-core/integration/) — the consumer contract: degrade-don't-fail, the empty `depends` list, and the billing callback.
+- [Usage — Flows](/modules/ai-core/usage/#flows) — what a flow is, suspend/resume on feedback, and why a step may wait.

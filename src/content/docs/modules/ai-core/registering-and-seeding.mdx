@@ -1,0 +1,224 @@
+---
+title: Registering & Seeding
+description: How a consumer module plugs into AI Core — registering code that runs versus seeding records that persist
+lastUpdated: 2026-07-24
+sidebar:
+  order: 5
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+A consumer module plugs into AI Core two ways, and they are not the same thing. One **registers** code that runs on every boot. The other **seeds** a record that persists in the database and can then be edited by an admin. This page is about that line — where it falls, why it falls where it does, and the exact calls on each side. For the contract you code against, see [Integration](/modules/ai-core/integration/); for the full method surface, see [Service API](/modules/ai-core/service-api/); for the events you can subscribe to, see [Hooks & Events](/modules/ai-core/hooks-and-events/).
+
+<Aside type="note" title="Implemented in v1.5.0 — first live call pending">
+This page describes AI Core as implemented in module v1.5.0 (July 2026). The module installs into a real app, type-checks clean there, and its admin page renders and serves records at runtime. What is **not** yet verified is a first live provider call.
+</Aside>
+
+---
+
+## The distinction
+
+Two verbs, one architectural line. Say them precisely — blurring them is how the design goes wrong.
+
+<CardGrid>
+  <Card title="Register — code that runs" icon="setting">
+    You plug a function into a registry at import time. It lives in memory, re-registers on every boot, ordering follows file position, and the **first registration wins**. Nothing persists, and an admin cannot edit it — it is code.
+  </Card>
+  <Card title="Seed — a record that persists" icon="document">
+    You plant a row in an `ai_*` table, once, at install or first run. It is durable, an admin can then edit it, **admin edits always win**, and every seeded row carries `seeded: true` so its provenance stays visible.
+  </Card>
+</CardGrid>
+
+| | Register (code that runs) | Seed (a record that persists) |
+|---|---|---|
+| **What it is** | A function plugged into a code registry or in-memory map | A row planted in an `ai_*` database table |
+| **When** | Import/boot time, every boot | Once — at install (migration) or first run (`ensure*`) |
+| **Lives** | In memory | In the database, durable |
+| **Ordering** | ESM/file position; first-registration-wins | No ordering problem — the whole table exists at write time |
+| **Admin-editable** | No — it is code | Yes — and admin edits always win |
+| **Provenance** | None | `seeded: true` on every seeded row |
+| **A consumer uses it for** | Flow-step handlers, event subscriptions, and its own service/routes/pages | Its operations and prompt segments (`ensureOperation` / `ensureSegment`) |
+
+> **Register = behaviour that runs; seed = data that persists and can then be edited.**
+
+### Why AI Core seeds its domain instead of registering it
+
+AI Core's own domain — operations, disciplines, models, frameworks — lives as **seeded records**, not code registrations. That is a deliberate choice with a reason.
+
+The July 2026 investigation found registration-time rejection **unsound** for code registries. A registration is an ESM side effect, ordered by file position, so a rule can register before the rule it conflicts with — there is no moment at which the whole set is known, so there is no sound place to refuse a violation. A database write has no such problem: every rule and every check already exists in one table at the instant of the write. So records give AI Core an enforcement point code cannot — the authority hierarchy is checked **at write time** (admin CRUD refuses violations transactionally) *and* re-checked **at resolution time** (`aiCore.run` re-validates the discipline set on every call and refuses loudly). The [Usage](/modules/ai-core/usage/#authority-is-structural-or-it-is-decorative) page carries the full disciplines argument.
+
+The consumer's side of the line follows the same logic. What a consumer contributes to AI Core's domain — its operations, its prompt segments — it **seeds** as records, so the admin can repoint and edit them afterwards. What a consumer contributes as behaviour — flow-step handlers, event subscriptions — it **registers** as code.
+
+---
+
+## Seeding
+
+A consumer seeds its operations and prompt segments through the idempotent `ensure*` API. Both are **create-if-absent**: if the record already exists it is returned untouched, and an admin's later edits are never overwritten.
+
+> **An existing record is never touched — admin edits always win over consumer defaults.**
+
+Run the seed at boot, from a registration/seed file. Because `ensure*` is idempotent, running it on every boot is safe — the second call is a no-op.
+
+```ts
+// backend/src/features/cog-ingest/ai-core.seed.ts — runs at boot
+import { serviceRegistry } from '../../config/service.registry.js';
+
+export async function seedAiCore(): Promise<void> {
+  const ai = serviceRegistry.getOptional('ai-core');
+  if (!ai) return; // AI Core absent — nothing to seed, and the app still runs
+
+  // Seed a prompt segment (create-if-absent; an edited one is left untouched)
+  await ai.ensureSegment({
+    key: 'cog-ingest/method-extraction',
+    type: 'method',
+    name: 'Extraction method',
+    content: 'Quote the source span before recording any extracted value.',
+  });
+
+  // Seed the operation — stating model REQUIREMENTS, never a model name
+  await ai.ensureOperation({
+    id: 'cog-ingest/extract-entities',
+    description: 'Pull named entities out of ingested documents',
+    model: { kind: 'language', needsImageInput: false },
+    segmentKeys: ['cog-ingest/method-extraction'],
+    schema: {
+      type: 'object',
+      properties: { entities: { type: 'array', items: { type: 'string' } } },
+      required: ['entities'],
+    },
+    sensitivity: 'sensitive',
+  });
+}
+```
+
+Both calls return `{ created, operation }` / `{ created, segment }` — `created` tells you whether this boot planted the row or found it already there. Most seed code ignores the return; it is there for callers that want to log first-run setup.
+
+### Consumers state requirements, never a model
+
+`ensureOperation` takes a **model requirement**, not a model id. Selection prefers enabled models whose fetched capabilities are known to satisfy the requirement, excludes known-false, and never guesses beyond that — and the admin repoints the operation later at will.
+
+> **Consumers name jobs, never models.**
+
+If no enabled model satisfies the requirement, `ensureOperation` throws an `IntegrityError` naming the requirement and telling the admin to enable a suitable model first — it never seeds an operation that cannot resolve.
+
+### `ensureOperation` — `EnsureOperationSpec`
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `string` | The public job name. Namespace it with the consumer module id. |
+| `description` | `string` (optional) | Human-readable summary of the job. |
+| `model` | `EnsureModelRequirements` | What the job requires of a model — never a model name (below). |
+| `presetId` | `string \| null` (optional) | A dial preset by id, if the consumer has one in mind. |
+| `dials` | `Dials` (optional) | Inline dial settings — see [Configuration](/modules/ai-core/configuration/). |
+| `disciplineIds` | `string[]` (optional) | Disciplines the operation must observe. |
+| `segmentKeys` | `string[]` (optional) | Prompt segments to compose, in declared order. |
+| `schema` | `JsonSchemaObject \| null` (optional) | The shape of the answer. |
+| `sensitivity` | `'normal' \| 'sensitive'` (optional) | Gates the operation against provider terms; defaults to `normal`. |
+
+Note what is **not** here: `userModelChoice` and its allow-list are admin-only. A consumer cannot grant its own users a model picker — that is the app owner's decision, made in the admin.
+
+### `EnsureModelRequirements` — what a consumer may require
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | `'language' \| 'embedding' \| 'rerank'` | The model class the job needs. |
+| `needsImageInput` | `boolean` (optional) | When true, models whose fetched capabilities deny image input are ineligible; known-true support is preferred over unknown. |
+
+### `ensureSegment` — `EnsureSegmentSpec`
+
+| Field | Type | Notes |
+|---|---|---|
+| `key` | `string` | Kebab-case, namespaced with the consumer module id. |
+| `type` | `'voice' \| 'method' \| 'discipline-text' \| 'schema-instruction' \| 'framing'` | The segment type the framework orders. |
+| `name` | `string` | Admin-facing label. |
+| `content` | `string` | The prompt text. |
+
+Flows are the exception on the seed side: there is no consumer `ensureFlow`. A flow is composed in the admin from operations the way an operation is composed from libraries — see [Usage](/modules/ai-core/usage/#flows). The consumer's job for flows is on the register side, below.
+
+---
+
+## Registering
+
+A consumer registers two kinds of code with AI Core, both at import time.
+
+### Flow-step handlers
+
+A flow is operations in order, and its non-AI steps are **consumer handlers**. You register each handler by id, at import time, with the AI Core service:
+
+```ts
+// backend/src/features/cog-ingest/ai-core.registration.ts — side-effect import
+import { serviceRegistry } from '../../config/service.registry.js';
+import { actionRegistry } from '../../config/action.registry.js';
+
+const ai = serviceRegistry.getOptional('ai-core');
+
+// Register a non-AI flow-step handler WITH ai-core (import-time, first-wins)
+ai?.registerFlowHandler('cog-ingest/persist-entities', async (state, previous) => {
+  // A non-AI step: do work with the previous step's result, return new state
+  return { ...state, persisted: true };
+});
+```
+
+The handler signature is `(state: Record<string, unknown>, previous: unknown) => Promise<Record<string, unknown>>` — it receives the flow's working memory and the previous step's result, and returns the next state. Registration is an in-memory map: a duplicate handler id warns and the **first registration wins**, matching the starter's registry convention everywhere else. Nothing persists — this is code, not a record.
+
+### Event subscriptions
+
+To react to a run finishing, subscribe through the **starter's** action registry — not through AI Core:
+
+```ts
+// Subscribe to an ai-core event WITH the starter's action registry
+actionRegistry.addAction('ai-core.run.completed', 'cog-ingest', (ctx) => {
+  // ctx: { ledgerId, operationId, tenantId, outcome }
+  // ...meter usage, notify, refresh a view
+});
+```
+
+`ai-core.run.completed` fires fire-and-forget after every run — success, refusal, abstention or error — carrying `{ ledgerId, operationId, tenantId, outcome }`. It is one of several `ai-core.*` action hooks; the full catalogue and each payload live on [Hooks & Events](/modules/ai-core/hooks-and-events/).
+
+### A consumer's own feature registers with the starter, not with AI Core
+
+Only flow-step handlers register **with** AI Core. Everything else a consumer module exposes — its own service, its routes, its admin pages — registers with the **starter's** registries (`serviceRegistry`, `routeRegistry`, `adminPagesRegistry`) exactly as any module does. AI Core registered *itself* the same way at install; a consumer does no differently. See the [Registry Reference](/starter-template/registries/) for those.
+
+---
+
+## Where register and seed meet: flows
+
+A flow makes the line concrete. The flow itself is a **record** — configured in the admin, composed of steps. Its operation steps resolve to **seeded** operations; its handler steps resolve to **registered** handlers.
+
+That split is also where the two enforcement styles show their difference. Operation steps are checked at write time — the admin cannot save a flow that steps through an operation that does not exist. Handler steps cannot be: a handler registers in consumer code at import time, invisible to a database write, so the check moves to run time. A flow that names a handler nobody registered is refused **loudly** when it runs (`flow-handler-not-registered`), never silently skipped. The record is validated where records can be; the code is validated where code must be.
+
+---
+
+## Degrade, don't fail
+
+Every reach into AI Core goes through `serviceRegistry.getOptional('ai-core')` and a null-check — including the seed and the handler registration above. An app with no AI Core installed still runs its non-AI paths.
+
+```ts
+const ai = serviceRegistry.getOptional('ai-core');
+if (!ai) return; // no seeding, no registration — the feature still works without AI
+
+await ai.ensureOperation({ /* ... */ });
+```
+
+> **AI Core absent is a smaller app, not a broken one.**
+
+The contract this belongs to — zero-config, the empty `depends` list, the billing callback — is [Integration](/modules/ai-core/integration/); this page only covers the mechanics of plugging in.
+
+---
+
+## Related
+
+<CardGrid>
+  <Card title="Integration" icon="puzzle">
+    The **contract**: the consumer surface, degrade-don't-fail, content from outside, the feedback field, and what AI Core does not own. [Read](/modules/ai-core/integration/)
+  </Card>
+  <Card title="Service API" icon="list-format">
+    The **surface**: every method on `aiCoreService`, with signatures and returns. [Read](/modules/ai-core/service-api/)
+  </Card>
+  <Card title="Hooks & Events" icon="rss">
+    The **events**: the full `ai-core.*` action-hook catalogue and each payload. [Read](/modules/ai-core/hooks-and-events/)
+  </Card>
+  <Card title="Usage" icon="open-book">
+    Operations, prompts, disciplines, schema and flows in depth. [Read](/modules/ai-core/usage/)
+  </Card>
+</CardGrid>
