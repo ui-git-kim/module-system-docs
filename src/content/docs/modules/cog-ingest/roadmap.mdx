@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features, known issues, and future direction for Cog Ingest
-lastUpdated: 2026-07-15
+lastUpdated: 2026-07-24
 sidebar:
   order: 6
 ---
@@ -19,6 +19,34 @@ This roadmap reflects current plans and may change based on feedback and require
 ## Known Issues
 
 Issues discovered but not yet fixed.
+
+### Large Documents Are Silently Truncated at 8,000 Characters
+
+**Severity:** High
+**Where:** vendored engine — `cognitive-db/src/core/embedding.service.ts` (`generateEmbeddingText`, `DEFAULT_MAX_TEXT_LENGTH`)
+
+A document of any length is **stored** in full but **embedded over only its first 8,000 characters** (≈2,000 tokens). `generateEmbeddingText` uses a content node's `summary` when one exists and otherwise calls `truncateText(rawContent, 8000)`; the ingest flow never sets a summary on the content node, so in practice every content node is embedded from its opening ~8,000 characters. Nothing errors and nothing is logged — the remainder is simply absent from the vector.
+
+Consequences:
+
+- A 60-page affidavit is retrievable on its first two or three pages only. A query about anything later either misses or returns a plausible-but-wrong neighbour — the retrieval failure that most reliably produces fabricated answers.
+- The truncation happens **inside the engine, before the provider is called**, so the embedding model's own input window (Voyage 3.5 is 32K tokens) is never reached and raising it changes nothing.
+- `embeddingDimensions` is unrelated — it sets vector *width*, not how much text can be embedded.
+
+**Workaround:** None that preserves recall. Splitting a long document into separate ingests before submission is the only way to get more than the opening pages into vectors today. Fixed by *Chunking for Large Documents* below.
+
+### Embedding Seams Are Dormant, and One Is Misleading
+
+**Severity:** Medium
+**Where:** vendored engine `providers/embedding.provider.ts`; structure `templates/backend/index.ts` (`setNodeEmbedding`)
+
+Several embedding seams exist but are not connected, and one will actively mislead whoever wires chunking:
+
+- **`needsChunking()` is dead code carrying the wrong unit.** The engine exports `needsChunking(text, maxTokens = 8000)` and re-exports it from the package root, but nothing calls it and there is no splitter for it to gate. Its threshold is 8,000 **tokens**, whereas the truncation that actually fires is 8,000 **characters** — roughly a four-fold difference. Sizing chunks from this helper would be wrong.
+- **Structure's embedding write path has no caller.** `structureEmbeddings.setNodeEmbedding` is registered and documented as "the engine write path", but nothing in cog-ingest or Structure calls it. Embeddings today are written by the vendored engine into `cog_nodes`, never `structure_node`.
+- **A host may have no embedding column at all.** The Structure embedding column is opt-in at install, so an app that did not opt in has no `structure_node.embedding` and Structure-side semantic search cannot run there regardless of what the engine stores.
+
+**Workaround:** None needed today — the engine's own path works. This matters at the v2 engine retarget, when embeddings move onto `structure_node`: verify the column exists and the caller is wired rather than assuming either.
 
 ### Processing Is Synchronous
 
@@ -70,6 +98,36 @@ No behavioural impact — a mechanical template sweep when prioritised.
 ---
 
 ## Planned Improvements
+
+### Urgent — Chunking for Large Documents
+
+<Aside type="caution" title="Next up — everything else in this section waits behind it">
+One node carries exactly one vector, generated from at most the first 8,000 characters of its content (see *Large Documents Are Silently Truncated* above). Long documents are therefore largely unretrievable, and retrieval that returns nothing relevant but plausible is a direct cause of model fabrication — the failure AI Core exists to prevent. A splitter plus somewhere to put per-chunk vectors is the smallest change that fixes it.
+</Aside>
+
+**Already decided — do not re-litigate:**
+
+- **AI Core will not chunk.** Per the AI Core ownership table, the splitter is **cog-ingest work**. AI Core supplies the embedding operations (`cog-embed-document`, `cog-embed-query`) and nothing more.
+- AI Core already carries an `EmbedCoverage` result field (`covered` / `total` / `unit`), currently hardcoded to full coverage because the provider SDK exposes no partial-coverage signal (`ai-core/src/templates/backend/provider-adapters.ts`, `fullCoverage()`). It is the natural home for a truthful truncation signal once a chunk-length policy exists — its own comment says as much.
+
+**Open — decide before writing code:**
+
+- **Where chunk vectors live.** Structure stores one `embedding` column per `structure_node` and has no chunk table; the engine writes to `cog_nodes`. The options are child `structure_node` rows (one per chunk, parent-linked), a dedicated chunk table, or engine-internal rows. This choice lands on Structure, cog-ingest and AI Core simultaneously, so it is a schema decision rather than a local patch — which is why no interim fix should be applied inside cog-ingest alone.
+- **Chunk shape** — size, overlap, and strategy (fixed / recursive / semantic / contextual / late). The engine roadmap names **late chunking** as research item R3, "so document-level context survives chunk boundaries", but specifies no size, overlap or storage, and states that none of that layer is built. Nothing in any other planning document defines a shape.
+- **Retrieval semantics** — whether a chunk hit returns the chunk or its parent node, and how duplicate parents collapse when several chunks of one document match.
+- **Re-embedding** — what invalidates chunks when content changes, and who drives it.
+
+**Sequencing:** the v2 RFC moves embeddings onto `structure_node` with the engine generating and querying them (Phase 3 engine retarget). Settling chunk storage *before* that retarget avoids designing the same table twice.
+
+**Files likely to change:**
+
+- `src/templates/backend/services.ts` — split before the engine call; today `preprocessorsRegistry.run()` returns a single combined string that yields exactly one content node
+- `src/templates/schema.ts` — chunk storage, if it lands in cog-ingest rather than Structure
+- `src/templates/backend/ai.ts` — the embedding operations, once `cog-embed-document` is consumed
+
+<Aside type="note" title="Provenance — re-derive rather than trust">
+The working notes from an earlier audit of this area (2026-07-16) were overwritten during a later session; only the "AI Core will not chunk" ownership line survived, and it is reproduced above. A fresh audit on 2026-07-24 re-established everything else stated here directly from the code. If that earlier audit reached any further conclusion — particularly on chunk storage shape or retrieval semantics — it is not recorded anywhere and should be re-derived rather than assumed.
+</Aside>
 
 ### Three-Field Generated Headers
 
