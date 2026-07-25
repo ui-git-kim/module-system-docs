@@ -3,7 +3,7 @@ title: CLI Scripts
 description: Create apps, update from template, and customize scripts
 ---
 
-import { Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Badge, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
 
 The starter template includes shell scripts for creating new apps and keeping them updated with template changes. Both PowerShell (`.ps1`) and Bash (`.sh`) versions are provided.
 
@@ -22,6 +22,7 @@ The starter template includes shell scripts for creating new apps and keeping th
 | `npm run deps:check` / `deps:update` / `deps:update:latest` / `deps:lockfile` | Check or apply dependency updates across root/frontend/backend (cross-platform; preserves `npm link`s) | [Dependency Updates](#dependency-updates) |
 | `npm run release:{patch,minor,major}` | Bump the **app's** version (not the template's) in apps cloned from this starter | [Version Tracking](#app-version) |
 | `npm run security:setup-kms` | Interactive AWS KMS field-encryption setup (prompts for KMS/IAM values, generates the wrapped data key, writes to `backend/.env`) | [Field encryption with AWS KMS](/getting-started/aws-kms-setup/) |
+| `npm run ensure-pgvector` | Declare pgvector in the Prisma generator/datasource — non-interactive, idempotent, **declaration only** | [Ensure pgvector](#ensure-pgvector) |
 
 ---
 
@@ -351,6 +352,103 @@ An admin-UI reinstall flow (confirmation dialog, streamed progress) is [planned 
 
 ---
 
+## Ensure pgvector
+
+<Badge text="v1.65.0" variant="tip" /> A cross-platform **Node** primitive (`scripts/ensure-pgvector.mjs`) that guarantees the app's Prisma schema **declares** the pgvector extension — and does nothing else.
+
+```bash
+npm run ensure-pgvector
+```
+
+### Why it exists
+
+`generator` and `datasource` blocks are **app-owned**. The module scaffold strips them out of module schemas, so a vector-using module (structure, cog-ingest) physically cannot declare pgvector for you. Without the declaration, `prisma migrate dev` builds a shadow database with no `vector` extension, and any migration adding a vector column fails with **P3006 / P3009** on non-Neon Postgres.
+
+Before v1.65.0 the only enable paths were the interactive *"Enable vector database? (y/N)"* prompt in `create-app` / `update-template` and the Windows-only `scripts/enable-vectors.ps1` — all of which also write a demo `Embedding` model. None was safe for a module to shell out to. This script is the piece that was missing.
+
+### What it does
+
+Exactly two injections, when they are missing:
+
+```prisma
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  previewFeatures = ["postgresqlExtensions"]   // <- added
+}
+
+datasource db {
+  provider = "postgresql"
+  extensions = [pgvector(map: "vector")]       // <- added
+}
+```
+
+<Aside type="caution" title="Declaration only">
+  It does **not** write an `Embedding` model — that is the consuming module's (or your app's) concern, and it is the key difference from the interactive *"Enable vector database?"* flow. It also never touches the database: with `postgresqlExtensions` declared, `prisma migrate dev` emits `CREATE EXTENSION IF NOT EXISTS "vector"` itself and provisions the shadow database, so a pre-create is redundant.
+</Aside>
+
+### Contract
+
+| Property | Behaviour |
+|----------|-----------|
+| Interactive? | **Never** — no prompts, safe under captured stdio (a module lifecycle hook calls it) |
+| Idempotent? | Yes — a second run prints `pgvector already declared` and rewrites nothing |
+| Exit code | `0` on success **and** on no-op; non-zero on failure (no schema, no `datasource` block, unwritable file) |
+| Output | One status line on stdout |
+| Schema layouts | Single-file (`prisma/schema.prisma`) and multi-file (`prisma/schema/base.prisma`) — including a layout where the `generator` and `datasource` live in different files |
+| Encoding | Preserves the file's existing line endings and UTF-8 BOM |
+
+Already-declared schemas are detected precisely: every spelling Prisma accepts counts (`pgvector(map: "vector")`, the legacy `pgvector(map: "vector", schema: "public")`, the bare `vector`, or any alias mapped to `vector`), and a *comment* mentioning pgvector does not.
+
+If the block already has a `previewFeatures` / `extensions` list, the value is **merged into that list** — not appended as a second attribute, which Prisma rejects. Where a schema declares several generators, `previewFeatures` lands on the `prisma-client` one specifically — including when an unrelated generator (`prisma-erd-generator`, `zod-prisma-types`, …) lives in a different file of a multi-file schema.
+
+Arguments are strict, because the consumer is automated: an unknown flag, or `--schema` with no path, is a hard error rather than a silent fallback to the default schema. Both `--schema <path>` and `--schema=<path>` are accepted.
+
+### Direct usage
+
+<Tabs>
+  <TabItem label="Windows">
+    ```powershell
+    node scripts\ensure-pgvector.mjs
+    node scripts\ensure-pgvector.mjs --schema backend\prisma\schema
+    ```
+
+    `.\scripts\ensure-pgvector.ps1` is a thin shim that calls the Node script.
+  </TabItem>
+  <TabItem label="macOS/Linux">
+    ```bash
+    node scripts/ensure-pgvector.mjs
+    node scripts/ensure-pgvector.mjs --schema backend/prisma/schema
+    ```
+
+    `./scripts/ensure-pgvector.sh` is a thin shim that calls the Node script.
+  </TabItem>
+</Tabs>
+
+Without `--schema` it looks for `backend/prisma/schema/`, then `backend/prisma/schema.prisma`, then falls back to the `schema:` path declared in `backend/prisma.config.ts`.
+
+### Calling it from a module
+
+The npm script is reconciled into existing apps by [`sync-package-scripts.mjs`](#reaching-host-apps), so a module can treat it as a **capability probe** — if the key is there, the app can declare pgvector:
+
+```ts
+const pkg = JSON.parse(await readFile(join(appRoot, 'package.json'), 'utf8'));
+
+if (pkg.scripts?.['ensure-pgvector']) {
+  await run('npm', ['run', 'ensure-pgvector'], { cwd: appRoot });
+} else {
+  // Older app — advise upgrading the template, or ask the user to declare it.
+}
+```
+
+Apps on template versions older than v1.65.0 pick the script up on their next `npm run template:update`.
+
+<Aside type="note" title="One implementation">
+  `create-app`, `update-template` and `enable-vectors.ps1` all delegate their generator/datasource edit to this same primitive, so there is a single implementation to keep correct. Those three still write the demo `Embedding` model and run the migration — that is what makes them the opinionated wrappers and this the primitive.
+</Aside>
+
+---
+
 ## Dependency Updates
 
 Keep the root, frontend and backend dependencies up to date. The updater is a cross-platform **Node** script (`scripts/update-deps.mjs`) — it runs the same on Windows, macOS and Linux with no PowerShell dependency. Four modes cover everything from a quick peek to a full major-version sweep to a `node_modules`-free lockfile refresh.
@@ -411,7 +509,9 @@ npm run deps:relink         # Re-create npm-link symlinks from the last snapshot
 
 ### Reaching host apps
 
-All three `package.json` files (root, `frontend/`, `backend/`) are **user-owned**, so `template:update` never overwrites them — which means foundation scripts added to the template never reached apps created before they existed (`npm run deps:update` → `Missing script`; from v1.38/v1.43, the sub-package `type-check`/`test` scripts the CI workflow calls). To fix that, `template:update` runs `scripts/sync-package-scripts.mjs` after merging, which ensures the foundation script set exists and points at the canonical commands in **all three files** (v1.54.0 — previously root-only): root gets the `deps:*` aliases, `security:setup-kms`, `predev`/`prebuild` and the `test*` + `type-check*` wrappers; `frontend/` gets `type-check`/`test`/`test:watch`; `backend/` gets `type-check`/`pretest`/`test`/`test:watch`. Only those foundation keys are touched — and they are forced to canonical; your own scripts are left alone.
+All three `package.json` files (root, `frontend/`, `backend/`) are **user-owned**, so `template:update` never overwrites them — which means foundation scripts added to the template never reached apps created before they existed (`npm run deps:update` → `Missing script`; from v1.38/v1.43, the sub-package `type-check`/`test` scripts the CI workflow calls). To fix that, `template:update` runs `scripts/sync-package-scripts.mjs` after merging, which ensures the foundation script set exists and points at the canonical commands in **all three files** (v1.54.0 — previously root-only): root gets the `deps:*` aliases, `security:setup-kms`, [`ensure-pgvector`](#ensure-pgvector) (v1.65.0), `predev`/`prebuild` and the `test*` + `type-check*` wrappers; `frontend/` gets `type-check`/`test`/`test:watch`; `backend/` gets `type-check`/`pretest`/`test`/`test:watch`. Only those foundation keys are touched — and they are forced to canonical; your own scripts are left alone.
+
+`ensure-pgvector` is reconciled for a specific reason: modules **probe for it**. A vector-using module checks `scripts["ensure-pgvector"]` in the app's root `package.json` to decide whether the app can declare pgvector, so the key's presence is itself the capability signal.
 
 **Env keys** have the same problem: `.env` is user-owned, so new foundation knobs the template introduces (e.g. `SECURITY_PROFILE`, `SECURITY_ENCRYPTION_KEY`, the deletion-cascade `NEON_AUTH_*`) never reach existing apps. `template:update` also runs `scripts/sync-env.mjs`, which **appends** any missing foundation key to `frontend/.env` / `backend/.env` — the security tier active (matching the code default), secrets as commented placeholders to fill if needed. It only ever appends; existing values are never touched, and `.env` stays git-ignored (nothing is committed). You don't hand-add these per app.
 
@@ -577,7 +677,10 @@ Both scripts follow the same structure and can be customized.
   - bump-app-version.sh (App version bumping — used by release scripts)
   - bump-app-version.ps1 (App version bumping — used by release scripts)
   - setup-kms.mjs (AWS KMS field-encryption setup)
-  - enable-vectors.ps1 (Add pgvector support to an existing app)
+  - ensure-pgvector.mjs (Declare pgvector in the Prisma schema — cross-platform Node, canonical)
+  - ensure-pgvector.sh (Shim → ensure-pgvector.mjs)
+  - ensure-pgvector.ps1 (Shim → ensure-pgvector.mjs)
+  - enable-vectors.ps1 (pgvector declaration + demo Embedding model + migrate — wraps ensure-pgvector.mjs)
   - update-deps.mjs (Dependency updates — cross-platform Node, canonical)
   - update-deps.sh (Shim → update-deps.mjs)
   - update-deps.ps1 (Shim → update-deps.mjs)
