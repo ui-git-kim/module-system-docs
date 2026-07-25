@@ -275,6 +275,10 @@ export default defineConfig({
                   label: "Upstream Issues",
                   slug: "module-starter/upstream-issues",
                 },
+                {
+                  label: "Archive Audit",
+                  slug: "module-starter/archive-audit",
+                },
               ],
             },
             { label: "Changelog", slug: "module-starter/changelog" },
