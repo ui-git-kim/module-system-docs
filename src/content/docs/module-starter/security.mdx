@@ -28,20 +28,33 @@ const log = createModuleLogger('my-feature:security');
 securityRegistry.register({
   moduleId: 'my-feature',
   ownedModels: [],                                           // RLS — opt-in (see below)
-  dataCategories: [{ name: 'my_feature_items', classification: 'owned' }],
+  dataCategories: [
+    { name: 'my_feature_item', classification: 'owned' },
+    { name: 'my_feature_settings', classification: 'owned' },
+  ],
   // encryptedFields, hashedSecrets, auditEvents, minimumTier — opt-in below
 });
 
 securityRegistry.registerDeletionHandler({
-  id: 'my-feature.items',
+  id: 'my-feature.user-data',
   moduleId: 'my-feature',
   classification: 'owned',
-  description: "Hard-delete the subject's my-feature items",
+  description: "Hard-delete the subject's my-feature items and settings",
   async run(ctx) {
     const userId = ctx.subject.userId ?? ctx.subject.tenantId;
-    const { count } = await prisma.my_feature_item.deleteMany({ where: { userId } });
-    log.info({ audit: true, userId, count }, 'my-feature items deleted (account erasure)');
-    return { action: 'hard-delete', recordsAffected: count };
+    // Refuse to run unscoped — an undefined where-value would match every row.
+    if (!userId) {
+      throw new Error('my-feature deletion handler: subject has no userId/tenantId — refusing unscoped deleteMany');
+    }
+    // Erase every owned per-user table atomically (all-or-nothing). deleteMany is
+    // idempotent, so a retried cascade succeeds on an already-cleared account.
+    const [items, settings] = await prisma.$transaction([
+      prisma.my_feature_item.deleteMany({ where: { userId } }),
+      prisma.my_feature_settings.deleteMany({ where: { userId } }),
+    ]);
+    const recordsAffected = items.count + settings.count;
+    log.info({ audit: true, userId, recordsAffected }, 'my-feature user data deleted (account erasure)');
+    return { action: 'hard-delete', recordsAffected };
   },
 });
 ```

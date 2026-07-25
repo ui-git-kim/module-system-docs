@@ -1,0 +1,118 @@
+---
+title: Conformance Contract
+description: The stabilised set of patterns every generated module must emit — derived from the gold-standard reference modules and enforced by the scaffold templates
+---
+
+import { Aside, Badge } from '@astrojs/starlight/components';
+
+The **conformance contract** is the stabilised set of patterns every module in this system must emit — the shape that makes a module a *good citizen* of the host app: registered through the right registries, safe on account deletion, typed for cross-module callers, namespaced so it can't collide, observable, and portable in and out as JSON.
+
+It was **derived from the two gold-standard reference modules** — [Structure](/modules/structure/) (fullstack, content graph) and [Builder](/modules/builder/) (fullstack, visual builder) — by extracting the patterns they independently converged on. Where the two diverge, the contract picks the stronger pattern and says why. The [scaffold templates](/module-starter/templates/) emit this contract by construction, so a **freshly created module is conformant on day one**; this page is the checklist an existing module (or a reviewer) can measure against.
+
+<Aside type="note" title="What “conformant” means here">
+Each item below is written to be checked against the **emitted** code — the contents of the backtick string constants in `src/templates/**`, i.e. what actually lands in a consuming app. **MUST** = a contract requirement. **SHOULD** = a recommended improvement, sometimes one not yet met even by the reference modules (called out where that's the case). A [conformance linter](/module-starter/roadmap/) that asserts these items automatically is planned.
+</Aside>
+
+The contract is organised into seven dimensions (**D1–D7**) plus cross-cutting conventions (**META**).
+
+---
+
+## D1 — Registry registration files
+
+Every extension point the module plugs into is a **separate `*.registration.ts` side-effect file**, wired into the barrel before anything else. This is the core of the [registry pattern](/starter-template/registries/) — modules extend the app by registering, never by editing core files.
+
+- **C1** — Every registry surface MUST be its own `*.registration.ts` side-effect file. Registration MUST NOT be inlined into `index.ts`, a service, or a route. The backend minimum set is `route.registration.ts`, `service.registration.ts`, `security.registration.ts`, `module.registration.ts`.
+- **C2** — The generated barrel (`index.ts`) MUST import every `*.registration` file for its side effects **before any value or type export** — the registrations must run at import time, ahead of anything that reads the registries.
+- **C3** — A static registration MUST call `registry.register(...)` exactly once. A **dynamic** registration (e.g. navigation keyed on DB rows) MUST unregister its prior ids before re-registering and re-run on the host's sync hook.
+- **C4** — `route.registration.ts` MUST register via `routeRegistry.register({ path, router, feature, versions, requiresAuth, description })`. A second public / API-key router MUST be a **separate** register call with `requiresAuth: false` and its own sibling path.
+- **C5** — `module.registration.ts` MUST register `{ id, name, version, depends }` with the host `moduleRegistry` through the guarded optional-dependency idiom (variable specifier + `await import()` in `try/catch`), end with `export {};`, and substitute `{{moduleNameJson}}` / `{{moduleVersion}}` / `{{moduleDepends}}`.
+
+<Aside type="tip">Reference: both Structure and Builder ship one file per surface; the `index.ts` side-effect-first invariant is explicit in both barrels.</Aside>
+
+## D2 — Security manifest & deletion cascade <Badge text="v1.24.2" variant="success" />
+
+The module declares its data surface to the [security registry](/module-starter/security/) and provides a deletion handler so an account erasure removes its rows. Getting this wrong leaks personal data past account deletion.
+
+- **C6** — MUST emit `security.registration.ts` calling `securityRegistry.register({ moduleId, ownedModels, dataCategories, [encryptedFields], [hashedSecrets], [minimumTier] })`. `dataCategories` MUST list **every** owned table with a `classification`, and `moduleId` MUST equal the module id.
+- **C7** — `ownedModels` MUST default to `[]` (userId-keyed). RLS / `tenantId` isolation is an explicit opt-in — only list a model here once it carries a `tenantId` column.
+- **C8** — The deletion cascade MUST be a **separate** `securityRegistry.registerDeletionHandler({...})` call and MUST erase **every** owned per-user table. For a multi-table module the handler SHOULD wrap all `deleteMany` calls in a single `prisma.$transaction([...])` so erasure is atomic (all-or-nothing) — chosen over per-store handlers because account erasure across N tables should not partially succeed. Any table deliberately **not** erased (e.g. a global singleton) MUST be documented in a comment.
+- **C9** — The handler body MUST resolve `const userId = ctx.subject.userId ?? ctx.subject.tenantId`, **`throw` if it's absent** (refuse an unscoped `deleteMany` — Prisma treats an undefined `where` value as *match every row*), use idempotent `deleteMany`, audit-log `{ audit: true, userId, ... }`, and `return { action, recordsAffected }`.
+
+<Aside type="tip">Reference: Builder's single atomic `$transaction` (C8) combined with Structure's per-handler `throw` guard (C9). Since **v1.24.2** the scaffold emits both — the earlier template deleted only the primary table and omitted the guard.</Aside>
+
+## D3 — Service key & `ServiceTypes` augmentation <Badge text="v1.24.2" variant="success" />
+
+A module that exposes a service to other modules registers it under a stable key and augments the `ServiceTypes` interface so cross-module callers get types.
+
+- **C10** — `service.registration.ts` MUST call `serviceRegistry.register('<moduleId>', <impl>, { feature, description, version })`, and `version` MUST be `{{moduleVersion}}`-substituted — **never a hardcoded literal**. A stale literal misreports the service version to the registry.
+- **C11** — MUST include a `declare module '../../config/service.registry.js' { interface ServiceTypes { '<moduleId>': typeof <service> } }` augmentation so `serviceRegistry.get('<moduleId>')` is typed for callers.
+- **C12** — SHOULD export a single stable key constant reused at both the registration and augmentation sites, so a rename is one edit. <Badge text="deferred" variant="caution" /> Currently unmet by every module including the references (all use a bare string literal); adopting it needs a scaffold placeholder for the screaming-snake case first.
+
+<Aside type="tip">Reference: Builder and Structure both pass `version: '{{moduleVersion}}'`. Since **v1.24.2** the scaffold does too — the earlier template hardcoded `'1.0.0'`.</Aside>
+
+## D4 — Query-key namespacing <Badge text="conforms" variant="success" />
+
+Frontend cache keys are namespaced by module id so a module can invalidate its own cache without touching another module's.
+
+- **C13** — Each hook file MUST instantiate `const <mod>Keys = createModuleQueryKeys('<moduleId>')` (from `@/lib/query-keys`) and build **every** `queryKey` via `<mod>Keys.key(...)`, so the first array element is always the module id.
+- **C14** — Mutations MUST invalidate / seed / remove through the **same** factory (prefix invalidation on the parent segment), never a hand-built array.
+
+<Aside type="tip">Reference: all reference modules and the scaffold conform — the strongest-conforming dimension. Never construct a custom `QueryClient`; the app mounts exactly one at the root.</Aside>
+
+## D5 — Structured logging <Badge text="conforms" variant="success" />
+
+- **C15** — Backend: MUST declare `const log = createModuleLogger('<moduleId>')` (from `../../lib/logger.js`) at file top; sub-loggers MUST be colon-namespaced (`'<mod>:security'`, `'<mod>:routes'`). **No `console.*` anywhere in backend code.**
+- **C16** — Log calls MUST be pino-style object-first (`log.info({ ...fields }, 'message')`); audit-relevant lines MUST carry `{ audit: true }`.
+- **C17** — Frontend: MUST NOT use `createModuleLogger` (there is no frontend logger). `console.*` is permitted only for browser-runtime diagnostics with a bracketed `[Module]` prefix; user-facing errors go through `toast`.
+
+## D6 — Action hooks after CRUD <Badge text="v1.24.2" variant="success" />
+
+After a write, the service fires an action so other modules can react. The dispatch method matters.
+
+- **C18** — After **each** successful create/update/delete in the **service** layer, the code MUST fire `actionRegistry.doActionAll('<moduleId>.<entity>.<verb>', payload)` — **`doActionAll`, not `doAction`**. `doAction` runs the sync handler pool only and **silently skips every `addActionAsync` consumer** (the host dev-warns on this); `doActionAll` fans out to both pools.
+- **C19** — The action name MUST be `<moduleId>.<entity>.<past-tense-verb>`; the prefix segment MUST equal the module id exactly. The payload MUST always include `userId`; create/update carry the row, delete carries the id.
+- **C20** — The fan-out SHOULD be `void`-ed for fire-and-forget (the scaffold default, so the response isn't blocked on listeners) **or** `await`-ed when the caller must observe listener completion. The **frontend MUST NOT** fire domain actions — post-write signalling on the frontend is query invalidation, so D6 is backend-only.
+
+<Aside type="tip">Reference: both gold standards use `doActionAll` (Structure `void`s it, Builder `await`s it). Since **v1.24.2** the scaffold fires `void doActionAll` — the earlier template used `doAction` and dropped async listeners.</Aside>
+
+## D7 — Admin JSON import/export envelope <Badge text="planned" variant="note" />
+
+A module's data should round-trip as JSON through an admin surface.
+
+- **C21** — MUST emit backend `GET /export` and `POST /import` routes, both `requireAdmin`-gated, delegating to service methods.
+- **C22** — Export MUST produce a **versioned** envelope. The stabilised shape for new CRUD modules is `{ version, moduleId, exportedAt, counts, data }`. Secrets MUST be redacted or re-encrypted on export.
+- **C23** — Import MUST validate `version` + `moduleId` before any write and reject a mismatch; partial failures MUST be surfaced via a `failed` counter, never silent. Server-managed ids MUST be stripped for round-trip safety.
+- **C24** — A frontend admin page MUST own both directions (Blob download + upload/paste import) and MUST invalidate namespaced queries after import.
+
+<Aside type="caution" title="Not yet emitted by the scaffold">
+This is the largest gap: the scaffold does not yet generate an import/export surface. It is the scope of the next release (see the [roadmap](/module-starter/roadmap/)). The reference modules emit domain-specific envelopes that predate the `moduleId` + `counts` shape and are grandfathered; **new** modules should include both.
+</Aside>
+
+## META — cross-cutting conventions
+
+- **C25** — Every emitted file MUST open with the `// ===` / `FILE:` / `PURPOSE:` box header. The `// @generated-by: <mod> v<x> | hash:` line is injected by the scaffold at write time and MUST NOT appear in the template body.
+- **C26** — **Backend** relative imports MUST use a `.js` extension and MUST NOT use the `@/` alias. **Frontend** MUST use `@/` for host code and extensionless relative paths for feature code, and MUST NOT use `.js`.
+- **C27** — `frontend.shadcnComponents` in `module.ts` MUST list every `@/components/ui/*` primitive any template imports — including optional/off-by-default ones. There is no auto-detection.
+- **C28** — Optional/guarded features MUST use the variable-specifier + `try/catch await import()` idiom, degrading to a silent no-op on older hosts.
+- **C29** — Templates MUST escape backticks and `${}` intended as literal emitted code; `node scripts/check-templates.cjs` MUST pass.
+
+---
+
+## Scaffold conformance status
+
+Where a freshly-generated module stands against the contract, as of scaffold **v1.24.2**:
+
+| Dimension | Items | Scaffold status |
+|-----------|-------|-----------------|
+| D1 Registrations | C1–C5 | ✅ Conforms |
+| D2 Security & deletion | C6–C9 | ✅ Conforms (C8/C9 since v1.24.2) |
+| D3 Service key & types | C10, C11 | ✅ Conforms (C10 since v1.24.2) · C12 SHOULD deferred |
+| D4 Query-key namespacing | C13, C14 | ✅ Conforms |
+| D5 Structured logging | C15–C17 | ✅ Conforms |
+| D6 Action hooks | C18–C20 | ✅ Conforms (since v1.24.2) |
+| D7 Admin import/export | C21–C24 | 🔲 Planned — not yet emitted |
+| META | C25–C29 | ✅ Conforms |
+
+<Aside type="note" title="Applying the contract to an existing module">
+Existing modules own their templates (module-owned since v1.12.0), so contract updates do **not** auto-merge — they surface as advisory diffs via `npm run scaffold:check` to hand-port. A module generated before v1.24.2 should port the three D2/D3/D6 backend fixes; see the [changelog](/module-starter/changelog/#scaffold-v1242).
+</Aside>

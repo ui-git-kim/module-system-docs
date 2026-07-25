@@ -254,6 +254,10 @@ export default defineConfig({
                   label: "Security",
                   slug: "module-starter/security",
                 },
+                {
+                  label: "Conformance Contract",
+                  slug: "module-starter/conformance-contract",
+                },
               ],
             },
             {
