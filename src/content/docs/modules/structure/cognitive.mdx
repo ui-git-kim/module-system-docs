@@ -31,7 +31,7 @@ When embeddings are enabled, the install adds:
 
 - **Schema columns** on `structure_node`: `embedding vector(<dimensions>)`, `embeddingText` (the exact text that was embedded — kept for re-embed and staleness checks), and `embeddingModel` (`NULL` marks a node as *needs embedding*).
 - **Module migration** `1.16.0__cognitive-foundations.sql` — Structure's first module migration. Its statements are idempotent, exception-safe `DO` blocks that can never fail an install (privilege problems degrade to `NOTICE`s): `CREATE EXTENSION IF NOT EXISTS vector` (only when the extension is available), then a partial HNSW index `structure_nodes_embedding_hnsw_idx` (`vector_cosine_ops`, `WHERE embedding IS NOT NULL`).
-- **Install heal** in `onInstall`/`onUpdate` — the pgvector extension must exist *before* Prisma can apply the migration that adds the `vector` column, and a failed attempt leaves a P3009 migration lock. The heal runs the extension setup directly, resolves any failed migration, re-applies, and re-runs the index setup. Every step is idempotent.
+- **Install heal** in `onInstall`/`onUpdate`/`onReconfigure` — the pgvector extension must exist *before* Prisma can apply the migration that adds the `vector` column, and a failed attempt leaves a P3009 migration lock. The heal runs the extension setup directly, resolves any failed migration, re-applies, and re-runs the index setup. Every step is idempotent. (`onReconfigure` covers a `reconfigure` that flips `enableEmbeddings` on at the *same* module version, where `onUpdate` — a version-transition heal — deliberately does not fire.)
 
 ### The `structureEmbeddings` service
 
@@ -125,7 +125,7 @@ if (embeddings) {
 
 ### Opting in later
 
-An install that answered *No* can opt in afterwards: set `enableEmbeddings: true` in `.module-state.json`, then run `npx structure update` (regenerates the schema and the embeddings-gated files; the runtime `ensureInfrastructure` pass creates the extension and index) — or `npx structure init --force` for the full heal.
+An install that answered *No* can opt in afterwards. The cleanest path is **`npx structure reconfigure --set enableEmbeddings=true`** (or plain `npx structure reconfigure` for an interactive re-prompt): it re-renders the schema and the embeddings-gated files, re-runs the module migrations, and fires the **`onReconfigure`** heal — the same extension/index provisioning and P3009 recovery a fresh opt-in install runs, even though the module version hasn't changed. Manual alternatives still work: set `enableEmbeddings: true` in `.module-state.json` then run `npx structure update` (the runtime `ensureInfrastructure` pass creates the extension and index), or `npx structure init --force` for the full heal.
 
 <Aside type="caution">
 **Dimensions are baked in.** `embeddingDimensions` is fixed at install into the column type and the service constant. Changing it later is a manual migration — alter the column type and re-embed every node. Pick the dimension your embedding model produces before enabling.
@@ -351,4 +351,4 @@ Six hooks join the [Structure action hooks](/modules/structure/integration/#reac
   ```
 
 - **Windows line endings.** Module migration files are checksummed byte-exact. Keep `backend/prisma/module-migrations/**` as LF — add `backend/prisma/module-migrations/** text eol=lf` to `.gitattributes` — or updates fail with a "history diverged" error after Git normalises them to CRLF.
-- **Runtime self-repair.** `ensureInfrastructure()` runs lazily (memoised) before every embedding write and search, re-creating the extension and indexes if missing. It repairs states the install ordering can't reach — such as flipping `enableEmbeddings` on without a version change — and each statement is individually guarded, so a permissions problem logs a warning instead of crashing the request.
+- **Runtime self-repair.** `ensureInfrastructure()` runs lazily (memoised) before every embedding write and search, re-creating the extension and indexes if missing. It is the ultimate backstop for states the eager heals can't reach. (A same-version `enableEmbeddings` flip is now healed eagerly by the `onReconfigure` hook when done via `reconfigure`; this lazy repair still covers anything that bypasses it — a hand-edited `.module-state.json`, or an extension dropped after install.) Each statement is individually guarded, so a permissions problem logs a warning instead of crashing the request.
