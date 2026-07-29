@@ -19,14 +19,16 @@ The current veradai-driven build plan, grounded against the structure code on 20
 ### Adding a per-node-type config object — the 12 mirror sites
 Use `workflowConfig` (full, has an admin editor) or `contextConfig` (stored, no editor) as the copy-paste exemplar. For a new config `foo`:
 
-1. **Prisma column** — `src/templates/schema.ts` `model structure_node_type` (config block ~L213-234): `foo Json @default("{}")`. New column ⇒ a migration entry in `src/templates/migrations.ts` (JSON defaults `{}`, no backfill).
+1. **Prisma column** — `src/templates/schema.ts` `model structure_node_type` (config block ~L213-234): `foo Json @default("{}")`. **No `migrations.ts` entry is needed** for a plain JSON column — the host's `prisma migrate dev` (run by `structure update`) adds it; `migrations.ts` is only for raw SQL Prisma can't express (pgvector extension / HNSW indexes). Confirmed against git history: the `permissions` and `conditionalColor` config columns were added schema-only, with no `migrations.ts` entry. *(Corrected 2026-07-29 during Phase 1 — the earlier "⇒ a migration entry" note was wrong.)*
 2. **Frontend type** — `frontend/index.ts` `NodeTypeConfig` (starts L244), after the `permissions` block (~L299).
 3. **Backend type copy** — `backend/index.ts` `NodeTypeConfig` (L5956, after ~L5993) and `NodeTypeProposal` (L6061) if it should ride proposals.
 4. **Backend 8 mapping sites** (each has a `workflowConfig`/`contextConfig` line adjacent): `mapNodeTypeProposal` L2507/2509 · `listNodeTypes` L3881/3886 · `getNodeType` L3990/3997 (keep parity with listNodeTypes — noted bug at L3991) · `createNodeType` L4048/4053 · `updateNodeType` L4113/4118 · `exportNodeTypes` L4236/4241 · `importNodeTypes` L4295/4300 · `proposeNodeType` L4446/4448.
 5. **Zod** — `backend/index.ts` `createNodeTypeSchema` L5603 (~L5627). `updateNodeTypeSchema` (`.partial()`, L5635) and `proposeNodeTypeSchema` (`.extend()`, L5638) inherit automatically.
 6. **Admin form** — `frontend/pages.ts` `NodeTypeForm` (L3489): **seed it in `formData` init (~L3567)** — the form PATCHes the whole object, so an unseeded key is wiped on save — then add a UI section (model on the `conditionalColor` block ~L4045 or the workflow editor ~L5106). `updateField('foo.key', v)` supports dotted nested paths.
 
-## Phase 1 — Primary-node scope selector + parent enforcement (NEXT)
+## Phase 1 — Primary-node scope selector + parent enforcement (✅ SHIPPED v1.24.0)
+
+> **Shipped in v1.24.0** (2026-07-29). Delivered as designed: `primaryScope` config (`isPrimary` + `scopedTypes`) via the mirror-site pattern (11 sites — **no `migrations.ts` entry**, see the correction above); `useCurrentScope` store cloning the registry singleton, persisted through `patchSetting`; a `ScopeSelector` header component (`type: 'custom'`, self-hiding until a primary type exists); `pathPrefix` injection in `NodeListPage` (self-type never scoped; empty/`*` = all, else listed); and `enforceHierarchyRules` in `createNode`/`moveNode` (opt-in per rule → no regression for unconfigured types). Host-validated against veradai's installed types (type-clean; the only host errors were the expected `primaryScope` Prisma-column regen). **Deferred follow-ups:** `bulkCreateNodes` does not run enforcement; `moveNode`'s `maxDepth` checks the moved node's own new depth, not each descendant of a moved subtree; scoped **tree** (`getTree` `pathPrefix`) untouched. Original plan retained below for provenance.
 
 **Goal:** an admin marks a node type as the *primary scope* (e.g. Matter); a header dropdown picks the current instance; list/detail queries scope to that node's subtree. Scoped types are an **admin choice** (a list; empty/`*` = everything). Also close the must-have enforcement gap: `createNode` must require a valid parent for non-root types and reject disallowed parent/child.
 
@@ -45,7 +47,7 @@ Use `workflowConfig` (full, has an admin editor) or `contextConfig` (stored, no 
 4. **Query wiring** — where list pages call `useNodes(query)`, inject `pathPrefix: scopeNode.path + '/'` when the queried type is in the active `scopedTypes` (or `*`). Central spot: `NodeListPage` (`pages.ts`). Unscoped/reference types ignore the scope. (Scoped tree would need `getTree`/`useNodeTree` to accept `pathPrefix` — `frontend/index.ts:3136`, `backend/index.ts:3514` — defer.)
 5. **Parent enforcement (the trust-fix half)** — in `createNode` (`backend/index.ts:2839`, after the parent-existence check ~L2867) and `moveNode` (L3119): read the child + parent type `rules` and **reject** when a non-`isRoot` type has no parent; the parent's type is not in the child's `allowedParents` (if set); the child's type is not in the parent's `allowedChildren` (if set); `maxChildren`/`maxDepth` exceeded. `rules` is currently mapping-only, **never enforced** — net-new server logic.
 
-## Phase 2 — AI fields tab (when AI Core is installed)
+## Phase 2 — AI fields tab (when AI Core is installed) (NEXT)
 
 **Goal:** an admin surface to define per-node-type and per-connection-type AI config — context hints, **prompt segments, output examples** — that plumb into AI Core's prompt-assembly. Visible only when ai-core is present.
 
