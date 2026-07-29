@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features and future direction for the module starter
-lastUpdated: 2026-07-25
+lastUpdated: 2026-07-29
 ---
 
 import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
@@ -44,7 +44,7 @@ A central registry for discovering and installing community modules:
 
 ### Module Dependencies (Enhanced)
 
-**Priority:** Medium — the `depends` field **landed in scaffold v1.16.0** (recording only); enforcement remains.
+**Priority:** Medium — recording (v1.16.0), install-time range enforcement (v1.27.0), and host boot-time enforcement + topological ordering (starter v2.0.0) have all shipped. The one piece left is **download-based auto-install** of *uninstalled* deps — see [the plan](#download-based-auto-install) below.
 
 Modules declare dependencies via the foundation contract's `depends` map (the deprecated `requiredModules` is still honoured):
 
@@ -57,11 +57,25 @@ export const moduleDefinition: ModuleDefinition = {
 ```
 
 Shipped in v1.16.0: `depends` on the contract, presence checks at init (union with `requiredModules`), and runtime mirroring via `module.registration.ts` → the starter's `moduleRegistry` (which catches uninstall drift at boot). Shipped in v1.17.0 (warn-only): **version compatibility checking** — the contract (v1.1.0) carries `compareSemver`/`satisfiesRange` and both the CLI (at install, via `.module-state.json` versions) and the host (at boot, via registered versions) warn on range mismatches; the host also computes the **Kahn topological order** with cycle-path reporting. Planned enhancements:
-- ✅ Automatic installation of missing dependencies — **partially SHIPPED v1.28.0**: `init` offers to initialise a dependency that's already **installed locally** by running its init directly with node against the resolved local path (a concrete file — never an npm download; TTY-only; one-level recursion cap). Full npm-**download** of *uninstalled* deps + topological auto-install across a dependency tree stays **deferred to the [Module Marketplace/Registry](#module-marketplaceregistry)** — it needs id→package resolution + dependency-graph visibility, and crosses the supply-chain boundary of fetching arbitrary packages
+- ✅ Automatic installation of missing dependencies — **partially SHIPPED v1.28.0**: `init` offers to initialise a dependency that's already **installed locally** by running its init directly with node against the resolved local path (a concrete file — never an npm download; TTY-only; one-level recursion cap). Download-based auto-install of *uninstalled* deps is the remaining slice — its plan is now decided (below)
 - ✅ HARD enforcement of range mismatches **at install (CLI)** — SHIPPED v1.27.0 (aborts unless `--skip-dep-check`, implied by `--dry-run`); host **boot-time** enforcement **SHIPPED in starter v2.0.0** (contract v1.3.0) — enforces per `MODULES_DEPENDENCY_POLICY`
 - ✅ Driving install/boot order from the computed topological order — **host-side**: **SHIPPED in starter v2.0.0** (contract v1.3.0). The host runs an ordered, dependency-first `init` pass consuming `computeModuleOrder().order` and ENFORCES `missing` / `version-mismatch` / `cycle` per `MODULES_DEPENDENCY_POLICY` (fail/degrade/warn), then re-synced the contract. See the [starter upstream issue](/starter-template/upstream-issues/) (Completed) and the [starter roadmap](/starter-template/roadmap/). Generated modules opt in via an `init` callback in `module.registration.ts`
 
 **Dependency resolution — topological sort.** Drive install/boot order from the manifest `depends` field with a **topological sort** (Kahn's algorithm: repeatedly emit in-degree-zero nodes; a valid order exists iff the dependency graph is a DAG; runs in linear **O(V + E)** time). On a cycle, fail fast and **report the cycle path** rather than a generic "unresolved dependencies" error.
+
+#### Download-based auto-install
+
+**Decided direction (2026-07-29):** the end-state is **full download-based auto-install**, with modules fetched from a **private registry** — not public npm. Sourcing from a controlled registry is deliberate: it sidesteps the "fetch and run codegen from an arbitrary package" supply-chain boundary that kept this deferred, because the registry is the trust anchor (only vetted, publishable modules resolve). The private registry doubles as the missing **id→package resolver** the [Marketplace/Registry](#module-marketplaceregistry) item describes.
+
+Everything *around* the download already exists — `depends` recording, install-time range enforcement (v1.27.0), host boot-time enforcement + topological ordering (starter v2.0.0), and local single-hop auto-init (v1.28.0). Only the fetch + tree-wide multi-install is new, so it can land in individually-shippable phases, each keeping the "never silently fetch or run untrusted code" property until the trust step is explicitly reached:
+
+- **G0 — Resolver contract (design only).** Define the `id → package` resolution interface the private registry must satisfy (lookup, version listing, integrity metadata). No fetching. The first artifact; unblocks everything.
+- **G1 — Full-graph resolution as a dry-run.** Given a root module's `depends`, compute the complete topological order **and** cross-graph version resolution, then *print the install plan* (extends the existing `init --dry-run`). No download, no writes. Surfaces the real shape — including diamond deps (A and B both need C at different ranges → pick the highest satisfying version, or fail on an unsatisfiable intersection, reusing the existing `satisfiesRange` logic across the tree).
+- **G2 — Trusted download** from the private registry, behind an explicit gate, with integrity pinning (lockfile + hashes). Single package first.
+- **G3 — Topological multi-install** across the resolved tree, per-package confirmation, honouring `MODULES_DEPENDENCY_POLICY`; a considered depth/recursion policy and a non-interactive/CI story replacing the conservative v1.28.0 one-level-TTY-only gate.
+- **G4 — Rollback/snapshot** wrapping the multi-install as one transaction (snapshot before modify, auto-rollback on partial failure) — ties into the [Rollback Support](#under-consideration) idea.
+
+**Near-term scope:** G0 + G1 only — the resolver contract and the dry-run graph resolution. Both are no-download, no-writes, and reversible, so they surface the design before committing to the registry infrastructure and trust model. G2–G4 wait on the private registry existing.
 
 **✅ Per-module schema migration system — SHIPPED (scaffold v1.18.0).** A module ships ordered migration files (`<version>__<slug>.{sql,ts}`) in its `migrations` array; the runner applies them at CLI time (`init`/`update`/`migrate-db`), after `prisma migrate dev` and before the lifecycle hooks. See [Database Migrations](/module-starter/migrations/).
 
@@ -72,7 +86,7 @@ Shipped in v1.16.0: `depends` on the contract, presence checks at init (union wi
 
 ### Module contract stabilisation
 
-**✅ Largely delivered (scaffold v1.24.2 → v1.26.0).** The scaffold emits a *stable* module contract, not a snapshot that drifts.
+**✅ Delivered (scaffold v1.24.2 → v1.29.0).** The scaffold emits a *stable* module contract, not a snapshot that drifts.
 
 A **conformance contract (C1–C29)** was derived from the reference implementations — **Structure** and **Builder** — covering registry registration files, the `security.registration.ts` manifest + deletion handler, service-key + `ServiceTypes` augmentation, query-key namespacing, structured logging, action hooks after CRUD, and the admin JSON import/export shape. It is published as the plan of record at [Conformance Contract](/module-starter/conformance-contract/), and the templates now emit it so **new modules are conformant by construction**:
 
@@ -80,9 +94,10 @@ A **conformance contract (C1–C29)** was derived from the reference implementat
 - **v1.25.0** — the admin JSON import/export surface, dimension **D7** (C21–C24): a versioned `{version, moduleId, exportedAt, counts, data}` envelope + admin page.
 - **v1.26.0** — a [conformance linter](/module-starter/changelog/#scaffold-v1260) (`npm run conformance:check`) that guards the contract on every release.
 
+- **v1.29.0** — **C12** (a single exported service-key constant): a new screaming-snake `MY_FEATURE` placeholder drives `service.registration.ts` to export `MY_FEATURE_SERVICE_KEY`, register via it, and re-export it from the barrel for typed cross-module access. All of C1–C29 now conform (see the [Conformance Contract status table](/module-starter/conformance-contract/#scaffold-conformance-status)).
+
 **Remaining:**
 - Existing modules — including **Document Management** V1 — get the checklist applied **retroactively** (in each module's own repo).
-- **C12** (a single exported service-key constant) is the one contract SHOULD deferred — it needs a screaming-snake (`MY_FEATURE`) placeholder in the substitution table first.
 - The **first module scaffolded after stabilisation** should be born fully conformant, proving the emitted contract is correct.
 
 ### Stage-2 consistency items
