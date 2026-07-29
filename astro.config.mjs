@@ -201,6 +201,10 @@ export default defineConfig({
             },
             { label: "Changelog", slug: "starter-template/changelog" },
             { label: "Roadmap", slug: "starter-template/roadmap" },
+            {
+              label: "Archive Audit",
+              slug: "starter-template/archive-audit",
+            },
           ],
         },
         {
