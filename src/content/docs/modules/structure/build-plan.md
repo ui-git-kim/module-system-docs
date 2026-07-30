@@ -47,7 +47,7 @@ Use `workflowConfig` (full, has an admin editor) or `contextConfig` (stored, no 
 4. **Query wiring** — where list pages call `useNodes(query)`, inject `pathPrefix: scopeNode.path + '/'` when the queried type is in the active `scopedTypes` (or `*`). Central spot: `NodeListPage` (`pages.ts`). Unscoped/reference types ignore the scope. (Scoped tree would need `getTree`/`useNodeTree` to accept `pathPrefix` — `frontend/index.ts:3136`, `backend/index.ts:3514` — defer.)
 5. **Parent enforcement (the trust-fix half)** — in `createNode` (`backend/index.ts:2839`, after the parent-existence check ~L2867) and `moveNode` (L3119): read the child + parent type `rules` and **reject** when a non-`isRoot` type has no parent; the parent's type is not in the child's `allowedParents` (if set); the child's type is not in the parent's `allowedChildren` (if set); `maxChildren`/`maxDepth` exceeded. `rules` is currently mapping-only, **never enforced** — net-new server logic.
 
-## Phase 2 — AI fields tab (when AI Core is installed) (NEXT)
+## Phase 2 — AI fields tab (when AI Core is installed) (DEFERRED — blocked on the ai-core prompt-assembly contract)
 
 **Goal:** an admin surface to define per-node-type and per-connection-type AI config — context hints, **prompt segments, output examples** — that plumb into AI Core's prompt-assembly. Visible only when ai-core is present.
 
@@ -57,7 +57,9 @@ Use `workflowConfig` (full, has an admin editor) or `contextConfig` (stored, no 
 
 **Net-new:** `aiFields` config (12-site pattern); the same context on `ConnectionTypeConfig` (`frontend/index.ts:809`) + `structure_connection_type` schema + connection-type CRUD (`backend/index.ts` ~L5143). **Coordinate the `aiFields` shape with ai-core's prompt-assembly contract first** (cross-module contract).
 
-## Phase 3 — Generic node-type "rules" section (sensitivity first)
+## Phase 3 — Generic node-type "rules" section (sensitivity first) (✅ SHIPPED v1.25.0)
+
+> **Shipped in v1.25.0** (2026-07-30). Built as a generic `governance` config sibling to `primaryScope` (14 mirror sites — the block is generic so retention/access rules can join `classification` later), plus per-field `sensitivity?` on `NodeTypeField`, a per-node `structure_node.classification` override column (full `workflowState` mirror + a `classificationChanged` hook), and exported pure evaluators `getEffectiveClassification` / `isExportSafe(node, type, level)` (rank-ordered; unclassified = fail-open, unknown level = fail-closed; an empty-string override falls through to the type default — a fail-open closed during review, with `.min(1)` on the classification zod fields as defence-in-depth). Admin UI: a levels/default editor on the Hierarchy tab + a per-field Sensitivity picker. Host-validated against veradai's installed types (type-clean; only the expected `governance`/`classification` Prisma-column regen). **Design calls:** levels are **per-type** (own-config, NOT inherited via `superClasses`), the per-node override is **API-only** (no UI picker yet), and export-pipeline enforcement stays a consuming module's job. Original plan retained below for provenance.
 
 **Goal:** an extensible per-type rules block; first rule type is **sensitivity/privilege classification** (court-ready / internal / privilege-claimed).
 
@@ -65,7 +67,7 @@ Use `workflowConfig` (full, has an admin editor) or `contextConfig` (stored, no 
 
 **Net-new:** a classification block (extend `NodeTypeRules` or a sibling `rules` config via the 12-site pattern): per-type **default** sensitivity + optional per-field sensitivity (add `sensitivity?` to `NodeTypeField`, both copies) + per-node override. Plus an **`isExportSafe(node, level)`** helper (structure stores + evaluates; the export pipeline in a consuming module enforces the gate). Keep the block generic/extensible; ship only classification now.
 
-## Phase 4 — Field UX: collapsible fields + repeater `allData` fix
+## Phase 4 — Field UX: collapsible fields + repeater `allData` fix (NEXT)
 
 **Net-new / fix:**
 
