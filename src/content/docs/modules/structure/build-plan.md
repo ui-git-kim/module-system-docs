@@ -99,10 +99,28 @@ Use `workflowConfig` (full, has an admin editor) or `contextConfig` (stored, no 
 - **Audit-log storage** — **Activity module** (structure already fires `doActionAll` CRUD hooks).
 - **Tree view** — deferred (was for a different app; stays on the general roadmap).
 
+## Shared field templates across node types (candidate — UX not yet designed)
+
+**Does this exist? No** (verified 2026-07-29). There is no first-class, admin-authorable "define a field or field-group once, reuse across many node types" feature. Candidate mechanisms and why they fall short:
+
+- **`structure_template` is a false friend** — it stores **rendering/layout** templates only (`type: card | listItem | detailHeader | overview`; `config` = slots/layout + a `showFields` *display filter*). No field sets, no `fieldTemplateId`. (`schema.ts:321-354`; zod enum `backend/index.ts:5873`.)
+- **`superClasses` (type hierarchy)** — the closest *admin-usable* mechanism: a multi-parent is-a DAG (≤10 parents) whose fields merge into `resolved.fields` (id-shadowed, tagged `inheritedFrom`) via `resolveTypeInGraph` (`backend/index.ts:2429`). But it's **is-a inheritance, not free composition** — reusing a field group means making unrelated types subtype a shared base, which also drags in that base's `features`, subsumption, scope-expansion, etc. You inherit the *whole* base, not a named, selectable bundle.
+- **Module-registered fields** (`structureRegistry.register({ fields })`, `nodeTypes: '*' | slug[]`, `frontend/index.ts:1811/1865`) — genuine "define-once, attach-to-many," but authored in **TypeScript at boot, not by admins**; admins can only toggle/relabel via `fieldIntegrations`.
+- **`field-group`** — a **within-one-type** repeater; sub-fields live in that type's own config, not shared.
+
+**Net-new to build (reusing existing pieces):**
+1. A **shared field-set entity** — a dedicated `structure_field_template` table `{ name, slug, description, fields: NodeTypeField[] }` (cleaner than overloading `structure_template`, whose semantics are rendering-only).
+2. An **attachment point** on `structure_node_type` — a `fieldTemplateIds` column parallel to the per-view `*TemplateId` columns (`schema.ts:241-245`) + an admin picker.
+3. **Merge into effective fields** — splice the attached template's fields into `resolved.fields` inside `resolveTypeInGraph` (`:2429`) and/or `getFieldsForNodeType` (`:1865`), tagged with provenance like `inheritedFrom` so they render but aren't persisted as own fields. The single read-path `resolved.fields ?? fields` (used by every consumer) is the one integration point.
+4. **Watch-out:** the server field-def walkers — `getFieldDefs`/`getSecretFieldIds` + `editableBy` enforcement (`backend/index.ts:2175-2199`) — MUST include template fields, or secret sealing and permission checks would silently skip fields coming from a shared template.
+
+**UX is not yet designed** — settle before building: how templates are authored/edited; how a type attaches one (ordering/precedence vs its own + inherited fields); how same-id conflicts resolve; whether a template may contain a `field-group`; how the admin distinguishes template vs own vs inherited fields. Worth deciding whether this, `superClasses`, and the Phase 5 merge-field exposure should share one coherent "reusable fields" story.
+
 ## Suggested phase order & sizing
 
-1. Primary scope + parent enforcement — **M** (mostly frontend + a focused backend enforcement block; scoping is free via `pathPrefix`).
+1. Primary scope + parent enforcement — ✅ **SHIPPED v1.24.0**.
 2. AI fields tab — **M**, blocked on ai-core contract alignment.
 3. Generic rules / sensitivity — **M**.
 4. Field UX (collapse + repeater fix) — **S** (the repeater fix alone is a one-line high-value bug fix).
 5. Merge-field exposure — **L**, spec with useFoundry; rescopes custom layouts.
+6. Shared field templates across node types — **L**, UX design first (candidate; section above).
