@@ -67,7 +67,11 @@ Use `workflowConfig` (full, has an admin editor) or `contextConfig` (stored, no 
 
 **Net-new:** a classification block (extend `NodeTypeRules` or a sibling `rules` config via the 12-site pattern): per-type **default** sensitivity + optional per-field sensitivity (add `sensitivity?` to `NodeTypeField`, both copies) + per-node override. Plus an **`isExportSafe(node, level)`** helper (structure stores + evaluates; the export pipeline in a consuming module enforces the gate). Keep the block generic/extensible; ship only classification now.
 
-## Phase 4 — Field UX: collapsible fields + repeater `allData` fix (NEXT)
+## Phase 4 — Field UX: collapsible fields + repeater `allData` fix (✅ SHIPPED v1.26.0)
+
+> **Shipped in v1.26.0** (2026-07-30). `defaultCollapsed?: boolean` on the **frontend** `NodeTypeField` only (a pure render concern — the backend copy omits UI flags like `isHidden` by design; it rides in the fields JSON). `NodeFieldRenderer` wraps the field container (edit **and** read-only) in a shadcn `Collapsible` when set — which also covers `field-group`s, since they render through that container, so a whole repeater group collapses. Field-editor toggle added. The repeater `allData` fix passes `{ ...allData, ...item }` to the nested sub-field renderer (row wins on id collision) — a **behaviour change** for existing repeater sub-fields with `visibleWhen`/`computedTemplate` (previously silent no-ops, now live), noted in the changelog. Frontend-only, no schema change; host-validated type-clean against veradai (Collapsible present, no regen needed). Original plan retained below.
+
+**Net-new / fix:**
 
 **Net-new / fix:**
 
