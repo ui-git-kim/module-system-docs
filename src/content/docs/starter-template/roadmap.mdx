@@ -441,7 +441,9 @@ Install Neon's official Claude Code plugin (`neon@claude-plugins-official`) and 
 
 **Expected outcome:** either "current setup matches project state, nothing to change" (most likely) or a short punch-list of Neon Console configuration items to update for a specific environment. No template code changes anticipated.
 
-### Database internals in `/admin/system` (native pg_stat subset)
+### ✅ Database internals in `/admin/system` (native pg_stat subset) — SHIPPED (v2.2.0)
+
+**Shipped in v2.2.0.** A **Database internals** section on `/admin/system` shows real table / index sizes, live-row and dead-tuple bloat, and unused-index signals via `prisma.$queryRaw` over `pg_stat_user_*` on the app's own connection (admin-gated, best-effort, adapter-agnostic; folded into the existing `overview` response). `pg_stat_statements` (slow-query text) was deliberately left out. See the [changelog](/starter-template/changelog/#v220) and [System page](/starter-template/system/). Original rationale retained below.
 
 **Priority:** Medium — the app-side complement to Neon's [`inspect db`](https://neon.com/blog/neon-inspect-db) CLI.
 
@@ -737,7 +739,19 @@ npm's severity summary is misleading here, because most advisories target Better
 The vulnerable auto-link / OAuth-callback logic runs on **Neon's auth server**, not in the client bundle that `npm audit` scans. We can see Neon's *client* pins better-auth 1.4.18; their server build is not observable from here. The table above therefore states **precondition match**, not verified exploitability — treat it as "assume exposed until Neon confirms otherwise", not as a proven live exploit.
 </Aside>
 
-**Action:** everything applicable is fixed in **better-auth ≥ 1.6.11**, so the concrete ask of Neon is now a specific version rather than a vague "the 1.6 upgrade". Raise it with Neon, re-audit when their SDK/server moves, and add the recurring CI audit gate (still outstanding).
+**Action (updated 2026-07-31):** the fixed line has moved on — Better Auth is now at **1.6.14** (its June 2026 security update), everything applicable fixed at **≥ 1.6.11**. Neon's Managed Better Auth, however, still runs **1.4.18** (confirmed against Neon's [auth overview](https://neon.com/docs/auth/overview); their [auth roadmap](https://neon.com/docs/auth/roadmap) announces no better-auth-version upgrade timeline). Because the vulnerable logic runs on Neon's *managed* server, an app on Neon Auth **cannot** update it — so the concrete moves are: (1) press Neon for a move to ≥ 1.6.11; (2) for tiers that can't wait (legal / evidence-grade), **own the auth version** via a self-hosted Better Auth server — see [Self-hostable auth](#self-hostable-auth-own-the-better-auth-version) below; and (3) add the recurring CI audit gate (still outstanding).
+
+### Self-hostable auth (own the Better Auth version)
+
+**Priority:** High for legal / evidence-grade tiers; optional otherwise. **Status:** decision pending — do not implement before sign-off.
+
+Neon's **Managed** Better Auth is convenient (no auth server to run, identity in your own database, JWKS provided) but the version is **Neon's to set** — currently **1.4.18**, below the **1.6.11** that fixes [GHSA-g38m-r43w-p2q7](https://github.com/advisories/GHSA-g38m-r43w-p2q7) and the other applicable advisories above. An app on managed auth therefore cannot remediate the account-takeover precondition itself, and cannot set the documented `disableImplicitLinking: true` server option.
+
+The escape hatch is to **run Better Auth ourselves** for the tiers that need it: a self-hosted Better Auth server (≥ 1.6.11 / latest 1.6.x), its tables in the same Neon database, exposing its own JWKS. The backend already verifies JWTs via `jose` against `${NEON_AUTH_URL}/.well-known/jwks.json` (see [auth feature](/starter-template/auth-feature/)), so the **verification** side is provider-agnostic — pointing it at a self-hosted issuer is a config change, not a rewrite. What self-hosting adds is the auth **server**: sign-up / sign-in / OAuth / password-reset endpoints, session + token issuance, and the operational surface (deploy, rotate, patch) managed auth handles today.
+
+This is a **tiering** decision, not a wholesale replacement — most apps stay on managed auth; the legal tier opts into self-hosted so it can run a patched Better Auth with implicit linking disabled. Same "own the risky part for the tier that needs it" instinct as per-tenant KMS.
+
+**A design must answer:** the auth-provider seam (managed vs self-hosted, selected per deployment, both emitting a JWKS the backend already trusts); where the Better Auth server runs and how it stays patched; the sign-in UI (the custom shadcn auth pages already call `authClient` — does the client swap cleanly?); ownership / migration of existing identities; and whether the [forgot-password flow](#finalise-the-forgot-password--reset-password-flow) — still gated on Neon's 1.4.18 — is unblocked by owning ≥ 1.6.x.
 
 ---
 
@@ -745,14 +759,14 @@ The vulnerable auto-link / OAuth-callback logic runs on **Neon's auth server**, 
 
 Findings from the v1.20.4 performance audit. Grouped by where the cost actually lands.
 
-<Aside type="danger" title="Blocker before production">
-  **Group C — Backend list perf** is a pre-production blocker. The `getAllUsers()` endpoint returns every user row in the database with no `take`/`skip` pagination, and `User` has no index on `createdAt` (used for ORDER BY in the admin users list) or `role` (used for the "last admin" check). This is fine at dev scale but will degrade quickly past a few thousand rows and must be fixed before shipping to real traffic.
+<Aside type="tip" title="Group C resolved">
+  **Group C — Backend list perf** is addressed. `User` gained `@@index([createdAt])` and `@@index([role])` in **v1.55.0** (backing the admin Users list's `ORDER BY createdAt` and the role guards / last-admin check), and server-side pagination shipped as `adminService.listUsers({ page, pageSize })` — the `/admin/users` route uses it whenever `page`/`pageSize` are passed, and the admin Users page (`useAdminUsers`) always paginates. The unindexed full-scan the original v1.20.4 audit flagged is gone; the param-less `getAllUsers()` remains only as a backwards-compatible array response for callers that don't page.
 </Aside>
 
 **Status as of v1.20.7:**
 - ✅ Group A — Context + callback hygiene (v1.20.5)
 - ✅ Group B — Bundle + debounce (v1.20.6)
-- 🚧 **Group C — Backend list perf (pre-production blocker)**
+- ✅ **Group C — Backend list perf** — indexes v1.55.0; server-side `listUsers` pagination, used by the admin Users page
 - ✅ Group D — Correctness cleanup (v1.20.7)
 
 ### Context & callback hygiene
