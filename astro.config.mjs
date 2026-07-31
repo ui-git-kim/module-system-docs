@@ -49,6 +49,10 @@ export default defineConfig({
               slug: "getting-started/backup-restore",
             },
             {
+              label: "Anonymised Branches",
+              slug: "getting-started/anonymized-branches",
+            },
+            {
               label: "Field Encryption with AWS KMS",
               slug: "getting-started/aws-kms-setup",
             },
