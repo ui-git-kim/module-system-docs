@@ -260,9 +260,87 @@ Each entry accepts:
 
 In the admin panel, the **Built-in Fields** section provides a **Merge Template** input (with the same **Insert field...** picker) and an **Editable By** dropdown for each of name, description, and slug.
 
-<Aside type="caution">
-Built-in field merge templates are persisted and edited in the admin UI, but the runtime does not currently resolve them the way it resolves custom-field `computedTemplate` values. Treat `builtInFieldConfig` templates as configuration for the `editableBy` lock; for an auto-computed value that renders on the form, use a custom field with `computedTemplate` instead.
+<Aside type="note">
+Built-in field merge templates resolve at runtime (since v1.23.3). The create/edit form computes the **name**, **description**, and **slug** values from the node's data using the same `{expression}` syntax as custom fields and syncs each into its read-only input. The `editableBy` lock applies independently of the template.
 </Aside>
+
+---
+
+## Exposing merge fields to other tools
+
+*(Added in v1.28.0.)* Structure **exposes** its merge fields so an external visual builder — such as **useFoundry** — can bind components to a node type's fields (the JetEngine / Dynamic.ooo ↔ Elementor model). Structure owns the data and the exposure; the builder owns presentation. Everything lives in the React-free `utils/merge-fields.ts`.
+
+### The token schema — `getMergeFieldSchema`
+
+`getMergeFieldSchema(nodeType)` returns the flattened set of **bindable tokens** for a node type as `MergeFieldToken[]`:
+
+```ts
+interface MergeFieldToken {
+  path: string;        // bare id, no braces — the canonical binding. e.g. "assigned_client->name"
+  insertText: string;  // ready to insert, braces included. e.g. "{assigned_client->name}"
+  label: string;       // group-qualified human label. e.g. "Assigned Client -> Name"
+  type: string;        // the resolved value's field type (drives the builder's component binding)
+  kind: 'builtin' | 'field' | 'group-subfield' | 'node-ref';
+  via?: string;        // owning container / reference field id (for group-subfield & node-ref)
+  multiple?: boolean;  // array-shaped value (multiselect / multiple node-reference)
+  inheritedFrom?: string; // set when the source field came from a superClass ancestor
+}
+```
+
+The token set is at **full parity with the resolver**: built-in `name` / `description` / `slug`; every top-level field; each `field-group` subfield as a first-item token (`{group.sub}`); and one-hop node-reference deref targets (`{ref->field}`) drawn from the referenced type's own fields. It includes own + inherited (Type Hierarchy) + module-registered fields. Pass `{ includeBuiltins: false }` to omit the built-ins (useful in the create/edit form, where `name` / `description` / `slug` are separate inputs, not entries in `node.data`).
+
+The pure core, `flattenMergeFields(fields, refFieldsBySlug, options)`, is exported too — call it directly when you already have field descriptors and a map of referenced-type fields (e.g. a payload from the schema endpoint below).
+
+### The public schema endpoint
+
+For a consumer that runs outside the app, the [public REST API](/modules/structure/configuration/) gains a schema surface (API-key authed; the node type must have `features.publicApi.enabled`):
+
+```
+GET /api/v1/public/structure/:type/schema
+```
+
+It returns the flattener's **inputs** — not pre-baked tokens — so token generation stays in exactly one place:
+
+```json
+{
+  "type": "matter",
+  "fields": [ /* lean, secret-filtered field descriptors (id, type, label, fields?, nodeReferenceConfig?) */ ],
+  "referencedTypes": { "client": [ /* the client type's descriptors, for -> deref */ ] }
+}
+```
+
+Run `flattenMergeFields(response.fields, response.referencedTypes)` on the payload to get the same `MergeFieldToken[]`. Secret fields (`type: 'secret'` or any field with a `secretConfig`) are dropped, and reference targets that are not themselves exposed are redacted — the endpoint never reveals a hidden type's existence or field shape.
+
+### Resolving a template without React — `resolveMergeFields`
+
+The resolver is React-free and exported, so a card renderer or an external tool can resolve tokens without the `useResolvedTemplate` hook:
+
+```ts
+import { resolveMergeFields } from '@/features/structure/utils/merge-fields';
+
+// Merges name/description/slug into the data bag, then resolves every token.
+const title = await resolveMergeFields('{matter_number} — {assigned_client->name}', node);
+```
+
+`resolveTemplateAsync(template, data, cache?, fetchNode?)` is the lower-level primitive. Its `fetchNode` is injectable — supply your own node fetcher for a non-app runtime; it defaults to `structureService.getNode`.
+
+### Merge-field-driven cards
+
+A node type's card can drive its title and body from merge templates. `CardTemplateConfig` (and `navigation.listPage.card`) accept `titleTemplate` and `bodyTemplate`:
+
+```json
+{
+  "templateOverrides": {
+    "card": {
+      "titleTemplate": "{matter_number} — {assigned_client->name}",
+      "bodyTemplate": "{status} · {responsible_lawyer->name}",
+      "showFields": ["jurisdiction"]
+    }
+  }
+}
+```
+
+`NodeCard` resolves these against the node's data (with `name` / `description` / `slug` available), falling back to `node.name` for the title. A node type may also point at a reusable card-template row via `cardTemplateId`; `NodeCard` resolves that row and applies its config, with inline `templateOverrides.card` and `navigation.listPage.card` taking precedence.
 
 ---
 
