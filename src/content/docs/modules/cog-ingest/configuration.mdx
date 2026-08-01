@@ -1,12 +1,12 @@
 ---
 title: Configuration
 description: Environment variables, init prompts, and provider setup for Cog Ingest
-lastUpdated: 2026-07-15
+lastUpdated: 2026-08-01
 sidebar:
   order: 1
 ---
 
-import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
 
 This page covers everything you configure when installing and running Cog Ingest — the init prompts, environment variables, provider setup, and runtime configuration.
 
@@ -38,6 +38,7 @@ All environment variables are backend-only. Which ones are required depends on y
 | `ANTHROPIC_API_KEY` | LLM provider = Anthropic | API key for Claude models |
 | `OPENAI_API_KEY` | LLM provider = OpenAI, **or** Embedding provider = OpenAI | API key for GPT and/or OpenAI embeddings |
 | `VOYAGE_API_KEY` | Embedding provider = Voyage AI | API key for Voyage embeddings |
+| `DOCLING_SERVE_URL` | Optional (v1.15.0) | Base URL of a running `docling-serve` sidecar for Office and audio/video acquisition. Unset = inert (built-in processors used). See [Deploying the Docling Sidecar](#deploying-the-docling-sidecar) |
 
 ### Common Configurations
 
@@ -94,6 +95,56 @@ The module uses `voyage-3` for dimensions ≤ 1024 and `voyage-3-lite` for large
 
 ---
 
+## Deploying the Docling Sidecar
+
+From v1.15.0, Office documents (DOCX/XLSX/PPTX) and audio/video **recordings** are acquired through an optional [Docling](https://github.com/docling-project/docling) sidecar — IBM's `docling-serve`. It is **inert until you set `DOCLING_SERVE_URL`**; without it the built-in processors handle PDFs (`pdf-parse`) and the `office` / `recording` content types are unavailable. When configured, PDFs route through Docling with the built-in extractor as a fallback.
+
+<Aside type="caution" title="Verify the API shape against the running service">
+The client talks to docling-serve's async API (`POST /v1/convert/source/async` → poll `/v1/status/poll/{task_id}` → `GET /v1/result/{task_id}`). The exact request/response field names should be confirmed against the live service's OpenAPI at `GET {DOCLING_SERVE_URL}/docs` — they are isolated in two adapter functions in the client, so they are cheap to adjust if your service differs.
+</Aside>
+
+### Local Development (docker-compose)
+
+Run docling-serve alongside your backend. The container listens on port **5001**; the convention here maps it to host **3260**:
+
+```yaml
+# docker-compose.yml
+services:
+  docling:
+    image: quay.io/docling-project/docling-serve
+    # or: ghcr.io/docling-project/docling-serve
+    ports:
+      - "3260:5001"
+    restart: unless-stopped
+```
+
+Then point the backend at it:
+
+```env
+# backend/.env
+DOCLING_SERVE_URL=http://localhost:3260
+```
+
+<Aside type="note" title="ASR (recordings) needs a larger image">
+The base image converts documents (Office, PDF). Audio/video transcription (`recording` → Whisper ASR) additionally needs `ffmpeg` and the Whisper models, which ship in the larger ASR-enabled / GPU variant of the image (e.g. a `-cu` / GPU tag). Use that image if you need `recording` support; the base image is enough for `office` and PDF.
+</Aside>
+
+### Deploying on Coolify
+
+Deploy docling-serve as its own Docker service and give the backend its internal URL:
+
+<Steps>
+
+1. In your Coolify project, add a new **Docker Image** resource using `quay.io/docling-project/docling-serve` (or the ASR / GPU variant if you need recordings).
+2. Set the container port to **5001** (optionally expose it on `3260` for external testing — internal service-to-service traffic does not need a public port).
+3. Deploy it on the same internal network as the backend.
+4. On the backend service, set `DOCLING_SERVE_URL` to the sidecar's **internal** URL — e.g. `http://docling:5001` (use the service name Coolify assigns, not a public hostname).
+5. Redeploy the backend so it picks up the variable, then confirm the OpenAPI is reachable at `{DOCLING_SERVE_URL}/docs`.
+
+</Steps>
+
+---
+
 ## Runtime Configuration (Admin UI)
 
 From v1.4.0, engine configuration is managed at runtime through the admin page. The static config file provides **defaults**; the database provides **overrides**. Database overrides always win.
@@ -110,7 +161,7 @@ The Engine Configuration tab is organised into collapsible sections:
 |---------|-----|-----------------|
 | **LLM Configuration** | `engine` | Provider (Anthropic/OpenAI), model, API key status (read-only) |
 | **Embedding Configuration** | `engine` | Provider (Voyage/OpenAI), model. Dimensions are read-only (changing requires re-embedding) |
-| **Processing Defaults** | `processing` | Default level, batch size, pattern growth mode/threshold |
+| **Processing Defaults** | `processing` | Default level, mode (sync/async), chunking defaults, batch size, pattern growth mode/threshold |
 | **Feature Flags** | `features` | Toggle switches for: understanding, patterns, proactive, entity extraction, relationship discovery, question detection, emotion detection |
 | **Prompts** | `prompts` | System context, content description, custom prompt overrides |
 | **Extraction Depth** | `extraction` | Visual analysis master toggle, per-type toggles (URL screenshots, PDF rendering, enhanced images), PDF sampling strategy |
@@ -155,6 +206,7 @@ Export the current configuration as a JSON file for backup or transfer between e
   "processing": {
     "defaultLevel": "standard",
     "mode": "sync",
+    "chunking": { "enabled": true, "strategy": "structural", "preset": "balanced" },
     "batchSize": 10,
     "patternGrowthMode": "off",
     "patternGrowthThreshold": 0.85
@@ -277,6 +329,54 @@ The acquisition tab has two distinct jobs: **field scraping** (deterministic CSS
 **PDF Acquisition:** text extraction method, layout preservation, page rendering, optional `scrapedFields` for structured PDF data.
 
 **Image Acquisition:** vision analysis type, EXIF, colour palette, OCR.
+
+### Content Handling / Parsing (v1.15.0)
+
+Large documents are split into chunks before embedding, so retrieval works over the whole document rather than only its opening pages. Each source carries a `contentHandling` block in its `config`; a global default lives in the engine `processing.chunking` config, and a source's `contentHandling` overrides it. The admin surfaces this as a **Parsing** section at the top of the Acquisition tab.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `enabled` | `boolean` | `true` | Master toggle — off means one vector per document (legacy behaviour) |
+| `strategy` | enum | `structural` | `structural` (split only) or `contextual` (split + per-chunk context blurb) |
+| `preset` | enum | `balanced` | `precise`, `balanced`, `broad`, or `custom` (see below) |
+| `chunkSize` | `number` (tokens) | from preset | Advanced — target chunk size, used when `preset` is `custom` |
+| `chunkOverlap` | `number` (fraction) | from preset | Advanced — overlap between adjacent chunks (e.g. `0.12` = 12%) |
+| `contextual.contextTokens` | `number` | — | Target size of the per-chunk context blurb (50–100 tokens) |
+| `contextual.maxChunksPerDocument` | `number` | — | Cost cap — how many chunks per document get a contextual blurb (`0` = unlimited) |
+
+**Presets:**
+
+| Preset | Chunk size | Overlap |
+|--------|-----------|---------|
+| `precise` | ~700 tokens | 10% |
+| `balanced` (default) | ~1000 tokens | 12% |
+| `broad` | ~1500 tokens | 15% |
+| `custom` | `chunkSize` | `chunkOverlap` |
+
+The splitter is **recursive / structural** — it splits on headings, then blank-line paragraphs, then chat/message lines (timestamp / sender), packing to the token target with overlap. Whatever size a preset or `custom` value asks for, the chunk size is clamped to a **model-aware ceiling (~80% of the embedding model's input window)**, so a chunk can never re-introduce the truncation that chunking exists to prevent.
+
+<Aside type="note" title="Contextual chunking is opt-in and cost-gated">
+With `strategy: 'contextual'`, a 50–100 token document-context blurb is generated per chunk (via the AI Core `cog-ingest/contextualise-chunk` operation) and prepended before embedding — Anthropic-style contextual retrieval, which improves recall on chunks that would otherwise lose their document context. It is cost-gated per source via `contextual.maxChunksPerDocument` and skipped silently when no language model is available.
+</Aside>
+
+<Aside type="caution" title="Capability-gated">
+Chunk vectors are written to Structure's chunk store (`replaceNodeChunks` / `setChunkEmbedding`) and embedded via the AI Core `cog-ingest/embed-document` operation. The path is **inert until Structure `enableEmbeddings` is on**, and degrades when AI Core is absent — chunks are stored unembedded and back-filled later via `listChunksNeedingEmbedding`. AI Core must also land a live `embed` provider call for vectors to actually generate.
+</Aside>
+
+### Processing Mode (v1.15.0)
+
+Ingestion can run synchronously (the API waits for cognitive-db to finish) or asynchronously (the API enqueues and returns immediately). This is configurable per source **and** globally — some sources ("pipelines") can wait while others run in the background; AI pipelines that need immediate feedback should stay sync.
+
+| Setting | Where | Values | Default | Effect |
+|---------|-------|--------|---------|--------|
+| `processingMode` | per-source `config` | `default`, `sync`, `async` | `default` (inherit global) | Overrides the global mode for this source |
+| `mode` | global `processing` config | `sync`, `async` | `sync` | Default mode for sources set to `default` |
+
+In async mode, `POST /ingest` enqueues onto the starter jobs seam (`enqueueJob('cog-ingest.ingest', …)`) and returns `{ jobId, status: 'queued' }` immediately; a job handler runs the ingest and the frontend polls `GET /jobs/:id`. If a job cannot be queued, it falls back to sync so nothing is lost.
+
+<Aside type="caution" title="Durable async needs pg-boss">
+Durable, restart-surviving queuing requires the host to run `JOBS_RUNNER=pg-boss`. Without it, the starter's inline runner executes the job immediately and non-durably (still off the request's critical path, but not persisted across a restart). The default remains **sync**, matching pre-v1.15.0 behaviour.
+</Aside>
 
 ### Extraction (v1.8.0 — Reworked)
 

@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features, known issues, and future direction for Cog Ingest
-lastUpdated: 2026-07-24
+lastUpdated: 2026-08-01
 sidebar:
   order: 6
 ---
@@ -35,6 +35,10 @@ Consequences:
 
 **Workaround:** None that preserves recall. Splitting a long document into separate ingests before submission is the only way to get more than the opening pages into vectors today. Fixed by *Chunking for Large Documents* below.
 
+<Aside type="tip" title="Update (2026-08-01): module-side chunking shipped in v1.15.0">
+cog-ingest now splits documents and writes **per-chunk vectors** to Structure's chunk store, embedded through AI Core — so retrieval no longer depends on this coarse node vector (see *Chunking for Large Documents* below and the [v1.15.0 changelog](/modules/cog-ingest/changelog/)). What remains is **engine-side**: this node-level vector is still generated from the first 8,000 characters via `generateEmbeddingText`. Making it summary-based (or retiring it in favour of chunk vectors) is a separate engine session. The two live in parallel today — chunk vectors carry retrieval; the node vector still truncates.
+</Aside>
+
 ### Embedding Seams Are Dormant, and One Is Misleading
 
 **Severity:** Medium
@@ -56,6 +60,10 @@ Several embedding seams exist but are not connected, and one will actively misle
 The API route waits for cognitive-db to finish processing before responding. For large documents or deep processing, this can cause request timeouts. The job record is created with `status: 'processing'` but the response isn't sent until processing completes or fails.
 
 **Workaround:** Keep content size reasonable and use `'standard'` processing level for large documents. Batch ingestion processes items sequentially, compounding the issue.
+
+<Aside type="tip" title="Update (2026-08-01): async processing shipped in v1.15.0">
+Ingestion can now run in the background: a per-source `processingMode` (`default` | `sync` | `async`) and a global `processing.mode` default. In async mode `POST /ingest` enqueues onto the starter jobs seam and returns `{ jobId, status: 'queued' }`; the frontend polls `GET /jobs/:id`. **Default remains sync** (today's behaviour), durable queuing needs `JOBS_RUNNER=pg-boss`, and a job that can't be queued falls back to sync. The timeout risk is now opt-out per source rather than unavoidable.
+</Aside>
 
 ### Settings Page State Is Local Only
 
@@ -109,6 +117,12 @@ One node carries exactly one vector, generated from at most the first 8,000 char
 The **"Where chunk vectors live"** question below is now **settled and shipped**: Structure v1.22.0 adds a **dedicated `structure_chunk` table** (the middle option) with a chunk-scoped write/search surface on the `structureEmbeddings` service — `replaceNodeChunks`, `setChunkEmbedding`, `listChunksNeedingEmbedding`, `getNodeChunks`, `deleteNodeChunks`, and `semanticSearchChunks` (which joins `structure_nodes` for source-node status/type filtering). It rides the existing `enableEmbeddings` opt-in. See [Structure → Chunk storage](/modules/structure/cognitive/#chunk-storage).
 
 So the storage half of this item is **done**; what remains on cog-ingest is the **splitter** (chunk shape, below) and the **chunk-aware adapter** that calls those methods (part of the Phase-3 engine retarget). Two of the open questions are partly answered by the storage contract: a chunk hit returns `{ chunk, nodeId, score, distance }` (the chunk plus its source node id — collapsing duplicate parents stays a consumer concern), and re-chunking is `replaceNodeChunks` (delete + insert). Structure holds no chunk-level staleness signal, so *what* invalidates a chunk when content changes remains cog-ingest's call.
+</Aside>
+
+<Aside type="tip" title="Shipped (v1.15.0): the module side of this item is done">
+cog-ingest v1.15.0 ships the **splitter** and the **chunk-aware embedding path**: a per-source `contentHandling` block (strategy, preset, size/overlap, contextual), a recursive structural splitter, a model-aware chunk-size ceiling, and per-chunk embedding via `structureEmbeddings.replaceNodeChunks` + `setChunkEmbedding` and the AI Core `cog-ingest/embed-document` operation. Optional **contextual chunking** (`cog-ingest/contextualise-chunk`) prepends a per-chunk document-context blurb before embedding. See the [v1.15.0 changelog](/modules/cog-ingest/changelog/) and *Completed* below.
+
+**What remains:** (1) the engine's coarse node-level vector is still summary-truncated (see the Known Issue above) — a separate engine session; (2) AI Core must land a live `embed`/`run` provider call before chunk vectors and contextual blurbs actually generate. The storage questions above ("Where chunk vectors live") are settled and shipped — retained here for history.
 </Aside>
 
 **Already decided — do not re-litigate:**
@@ -167,6 +181,10 @@ Add a way to browse all ingested content for a source — not just stats, but th
 
 #### Content Parsing Configuration
 
+<Aside type="tip" title="Shipped in v1.15.0">
+Both the UI and the backend landed. A **Parsing** section at the top of the Acquisition tab exposes chunk on/off, the size preset + advanced size/overlap, the contextual toggle + cost limit, and the per-source processing mode, backed by the `contentHandling` block and the recursive structural splitter. Chunks embed per-chunk into Structure's chunk store rather than becoming separate ingest jobs (the storage model changed — see *Chunking for Large Documents*). Remaining sub-ideas (per-format message/thread splitting heuristics) can layer on the same splitter.
+</Aside>
+
 Add admin-configurable content parsing/splitting before ingestion. The `ContentHandling` section of `SourceConfigJson` already defines the schema (`chunkingStrategy`, `chunkSize`, `chunkOverlap`, etc.) but has no UI or backend implementation.
 
 <Aside type="note">
@@ -218,6 +236,22 @@ Add a "Mappings" tab to the Source Config Dialog for managing multiple source-to
 
 **Files to change:**
 - `src/templates/frontend/components.ts` — `SOURCE_CONFIG_DIALOG_TEMPLATE`
+
+### Short-Term — Retrieval (`retrieve()`) Follow-Ups
+
+The interim `retrieve()` service method and `POST /retrieve` route shipped in **v1.15.0** (embed query → `semanticSearchChunks` → collapse duplicate parents → optional one-hop connection expansion → `{ query, chunks, nodes, relatedNodeIds, provenance, notFound }`). Its signature is stable so it can become a thin wrapper over AI Core's future retrieval operation without consumers migrating. Planned improvements to the ranking and shaping it does today:
+
+- **Rerank the collapsed results** once AI Core exposes a callable `rerank` operation — reorder the parent nodes by a cross-encoder score rather than best-chunk cosine similarity alone.
+- **MMR "serendipity" slot** — reserve a slot in the result set for a maximal-marginal-relevance pick, so results are not all near-duplicates of the top hit.
+- **Graph-distance ordering + token budgeting** — order the one-hop expansion by connection distance / type and trim the returned chunk set to a token budget, so consumers get a bounded, relevance-ordered context window.
+
+### Short-Term — Parsing & Acquisition Follow-Ups
+
+Follow-ups to the v1.15.0 splitter and the optional Docling sidecar:
+
+- **Validate the Docling request/response shape against the live service.** The docling-serve field names are isolated in two adapter functions in the client and were written against the documented API; confirm them against `GET {DOCLING_SERVE_URL}/docs` (the running service's OpenAPI) and adjust the adapters if they drift.
+- **Docling image-OCR routing.** Route image content through Docling's OCR when the sidecar is configured, alongside the existing `office` / `recording` / PDF routing, for scanned-image text extraction.
+- **Contextual-chunking retrieval-quality measurement.** Build a small evaluation set and measure whether contextual chunking (the `cog-ingest/contextualise-chunk` blurb) improves retrieval quality enough to justify its per-chunk cost, and use it to tune the `contextual.maxChunksPerDocument` defaults.
 
 ### Medium-Term — Document Management upload pipeline (auto-ingest)
 
@@ -282,6 +316,10 @@ Extend the existing URL processor to optionally crawl linked pages from a starti
 ### Medium-Term — Processing Improvements
 
 #### Asynchronous Processing
+
+<Aside type="tip" title="Shipped in v1.15.0 (option 1 — polling)">
+Option 1 landed: `POST /ingest` returns `{ jobId, status: 'queued' }` in async mode and the frontend polls `GET /jobs/:id`, via a `jobs.registration.ts` handler on the starter jobs seam. Per-source `processingMode` and a global `processing.mode` default select it; durable queuing needs `JOBS_RUNNER=pg-boss`, and it falls back to sync when a job can't be queued. Options 2 (WebSocket/SSE push) and 3 (a dedicated queue such as BullMQ) remain future enhancements.
+</Aside>
 
 Move ingestion to a background job system so the API responds immediately with a `queued` status. Options:
 
@@ -350,6 +388,10 @@ Accept content via webhook endpoint for automated ingestion from external system
 ## Completed
 
 Items that have been done.
+
+### v1.15.0 — Chunking, Contextual Retrieval, Async Processing & Docling
+
+The module side of *Chunking for Large Documents*: a per-source `contentHandling` block (strategy `structural` / `contextual`, presets precise / balanced / broad / custom, size / overlap, contextual cost cap), a recursive structural splitter with a model-aware chunk-size ceiling, and per-chunk embedding into Structure's chunk store (`replaceNodeChunks` + `setChunkEmbedding`) via the AI Core `cog-ingest/embed-document` operation — capability-gated on Structure `enableEmbeddings` and degrade-safe without AI Core. Opt-in **contextual chunking** (`cog-ingest/contextualise-chunk`). **Asynchronous processing** via per-source `processingMode` + global `processing.mode` (enqueue → `{ jobId, status: 'queued' }` → poll `GET /jobs/:id`; durable under `JOBS_RUNNER=pg-boss`; sync fallback). Optional **Docling acquisition sidecar** (`DOCLING_SERVE_URL`) adding `office` and `recording` content types. Interim **`retrieve()`** service method + `POST /retrieve` (Stage-3 preview). New **Parsing** section on the Acquisition tab. Engine-side node-vector truncation and AI Core live embed / rerank calls remain (see *Known Issues* and *Chunking* above).
 
 ### v1.12.0 — Working Memory
 

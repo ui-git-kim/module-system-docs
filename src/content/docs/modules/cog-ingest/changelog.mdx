@@ -1,7 +1,7 @@
 ---
 title: Changelog
 description: Version history and release notes for the Cog Ingest module
-lastUpdated: 2026-07-16
+lastUpdated: 2026-08-01
 sidebar:
   order: 5
 ---
@@ -16,6 +16,32 @@ This page documents notable changes to the Cog Ingest module. The module uses se
 
 <Aside type="tip">
 Check your installed version with `npx cognitive-ingest info`.
+</Aside>
+
+---
+
+## v1.15.0 — 2026-08-01
+
+**Stage 1 — chunking, contextual retrieval, asynchronous processing, and the Docling acquisition sidecar**
+
+The largest ingest change since the pipeline redesign: large documents are split into per-chunk vectors, ingestion can run in the background, and an optional Docling sidecar unlocks Office and audio/video content.
+
+**Content splitter + chunking** — the module side of the roadmap's *Chunking for Large Documents*. A new per-source `contentHandling` block in `SourceConfigJson`: `enabled` (default true), `strategy` (`structural` | `contextual`), `preset` (`precise` ~700 tokens/10% overlap, `balanced` ~1000/12% — the default, `broad` ~1500/15%, or `custom`), advanced `chunkSize` (tokens) + `chunkOverlap` (fraction), and `contextual.{contextTokens, maxChunksPerDocument}`. A global default lives in the engine `processing.chunking` config; a source's `contentHandling` overrides it. The splitter is **recursive / structural** — it splits on headings, then blank-line paragraphs, then chat/message lines (timestamp / sender), packing to the token target with overlap. Chunk size is clamped to a **model-aware ceiling (~80% of the embedding model's input window)** so a chunk can never re-introduce truncation.
+
+**Chunk storage + embedding through Structure and AI Core.** Chunks are written to Structure's chunk store via `structureEmbeddings.replaceNodeChunks(nodeId, userId, chunks)` and embedded per chunk via the AI Core operation `cog-ingest/embed-document`, then `setChunkEmbedding`. **Capability-gated:** inert until Structure `enableEmbeddings` is on, and degrades when AI Core is absent (chunks are stored unembedded and back-fillable via `listChunksNeedingEmbedding`). Chunks attach to the Structure node the ingest resolves (the passed `structureNodeId` or the post-ingest created node).
+
+**Contextual chunking (opt-in).** New AI Core operation `cog-ingest/contextualise-chunk` (`kind: 'language'`). When a source's `strategy` is `contextual`, a 50–100 token document-context blurb is generated per chunk and prepended before embedding (Anthropic-style contextual retrieval). Cost-gated per source via `contextual.maxChunksPerDocument` (`0` = unlimited); skipped silently when no language model is available.
+
+**Asynchronous processing.** New per-source `processingMode` (`default` | `sync` | `async`) plus a global `processing.mode` default. In async mode `POST /ingest` **enqueues** onto the starter jobs seam (`enqueueJob('cog-ingest.ingest', { jobId, userId }, { tenantId: userId })`) and returns `{ jobId, status: 'queued' }` immediately; a handler in a new `jobs.registration.ts` runs `runQueuedIngest`, and the frontend polls `GET /jobs/:id`. Durable queuing needs `JOBS_RUNNER=pg-boss` (otherwise the inline runner runs it immediately, non-durably). Default is **sync** (today's behaviour); a job that can't be queued falls back to sync so nothing is lost. Configurable globally **and** per source — AI pipelines that need feedback should stay sync.
+
+**Docling acquisition sidecar (optional).** New env `DOCLING_SERVE_URL` (unset = inert; built-in processors used). An async HTTP client against IBM `docling-serve` (`POST /v1/convert/source/async` → poll `/v1/status/poll/{task_id}` → `GET /v1/result/{task_id}`) adds two ingest content types: `office` (DOCX/XLSX/PPTX) and `recording` (audio/video → Whisper ASR). The ingest route maps uploads by MIME (audio/video → recording, Office docs → office); PDF routes through Docling when configured, with the built-in `pdf-parse` extractor as fallback. Confirm the exact docling-serve request/response field names against the live service's OpenAPI (`GET {DOCLING_SERVE_URL}/docs`) — they are isolated in two adapter functions in the client. See [Deploying the Docling Sidecar](/modules/cog-ingest/configuration/#deploying-the-docling-sidecar).
+
+**Interim `retrieve()` (Stage-3 preview).** New service method `retrieve(userId, query, options?)` and `POST /retrieve` route: embeds the query (`cog-ingest/embed-query`), runs `semanticSearchChunks`, collapses duplicate parents (best score + chunk count per node), optionally expands one hop over connections (`getNodeConnections`), and returns `{ query, chunks, nodes, relatedNodeIds, provenance, notFound }`. Degrade-safe; the signature is stable so it can later become a thin wrapper over AI Core's future retrieval operation without consumers migrating.
+
+**Parsing UI.** A new **Parsing** section at the top of the admin Acquisition tab exposes all of the above — chunk on/off, size preset + advanced, the contextual toggle + cost limit, and the per-source processing mode.
+
+<Aside type="note" title="What still lives in the engine and AI Core">
+The historical 8,000-**character** embedding truncation lives in the vendored engine (`generateEmbeddingText`), not this module — the module now produces fine-grained chunk vectors, but making the engine's coarse node vector summary-based is a separate engine session. AI Core must land a live `embed`/`run` provider call for chunk vectors and contextual blurbs to actually generate; an optional callable `rerank` would let `retrieve()` reorder later.
 </Aside>
 
 ---
