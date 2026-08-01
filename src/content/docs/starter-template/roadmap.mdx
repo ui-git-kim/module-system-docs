@@ -186,10 +186,11 @@ Replace CLI-based module operations with an admin panel UI. Currently modules ar
 
 - **Browse & install** — Discover available modules (from a registry or local packages) and install them from the admin panel
 - **Configure** — Module-specific settings and prompt answers managed through a UI instead of interactive CLI prompts
-- **Deactivate / activate** — Toggle modules on or off without removing files (replaces `npx my-module disable/enable`)
-- **Uninstall** — Remove modules cleanly with confirmation, data export options, and rollback (replaces `npx my-module uninstall`)
-- **Update** — Check for module updates and apply them with a diff preview (replaces `npx my-module update`)
-- **Module status dashboard** — ✅ Shipped read-only (v1.50.0): the admin **Modules** page (`/admin/modules`, `adminPagesRegistry` order 16) shows registered modules merged with `InstalledModule` state, dependency issues (presence + range, with excusal flags), cycles and the computed boot order. Everything below still requires the trust-boundary decision first
+- **Deactivate / activate** — ✅ **Shipped (v2.4.1).** A per-module enable/disable toggle on the admin Modules page. It runs **no module code** — it records enablement intent in `.module-admin-intent.json` that the DB-free boot gate honours at the next restart (restart-to-apply; there is no live mount/unmount). One-way rule: the UI can never re-enable a module an operator disabled via the CLI or `MODULES_DISABLED`. Replaces `npx my-module disable/enable` for the common case.
+- **Uninstall** — Remove modules cleanly with confirmation, data export options, and rollback (replaces `npx my-module uninstall`). Deferred: runs the module's untrusted uninstall lifecycle hook (code execution) and removes static wiring a one-shot-mounted process still holds.
+- **Update** — Check for module updates and apply them with a diff preview (replaces `npx my-module update`). Deferred: runs untrusted lifecycle hooks + DB migrations and re-wires a running process.
+- **Browse & install** — Deferred: runs a new module's arbitrary import-time side effects (frontend) and spawns `npx` (backend) — untrusted code with no containment, into an already-sealed router.
+- **Module status dashboard** — ✅ Shipped read-only (v1.50.0): the admin **Modules** page (`/admin/modules`, `adminPagesRegistry` order 16) shows registered modules merged with `InstalledModule` state, dependency issues (presence + range, with excusal flags), cycles and the computed boot order.
 
 **Implementation considerations:**
 - Backend service that wraps scaffold operations (init, update, uninstall, enable, disable)
@@ -198,7 +199,13 @@ Replace CLI-based module operations with an admin panel UI. Currently modules ar
 - Restart or hot-reload mechanism after module changes take effect
 - Permission-gated to admin role
 
-**Trust boundary (flagged in the v1.26.0 audit):** installing a module from the admin UI means executing untrusted code — arbitrary side-effect imports run on the frontend at registration time, and the backend would spawn `npx`. There is no sandboxing or isolation today, and none is yet designed. Before this feature ships, decide what runs untrusted module code and how it is contained (signed modules / allowlist registry / out-of-process execution). Also note today's **build-time coupling** that blocks true runtime install-uninstall: features are wired via static side-effect imports in `app.ts` and `routeRegistry.mountAll()` is one-shot (it sets `mounted = true` and warns that late registration "may not work"). Runtime module management needs a dynamic mount/unmount story, not just a UI over the CLI.
+**Trust boundary (flagged in the v1.26.0 audit) — has two distinct teeth, resolved separately:**
+
+1. **Code execution.** install/update/uninstall mean running untrusted module code — arbitrary side-effect imports on the frontend, an `npx` spawn on the backend — with no sandbox. **Decision (2026-08-01):** keep them CLI-only until a *managed* trust delegatee exists, consistent with "delegate security, no bespoke". A research pass confirmed the honest state of the art: **no provider answers "is this code safe to execute?"** — npm/Sigstore **provenance** (GA; `npm publish --provenance`, `npm audit signatures`) proves build *origin* only, and **SLSA** grades build *integrity*, not safety. Behavioural scanners — **[Socket](https://socket.dev)** (block-at-download, transitive-aware) foremost, with Snyk / GitHub Advisory as known-bad gates — are the delegatee to graduate from *advisory* to *blocking* when the verbs are built. The authorisation decision itself (allow-list + operator review) is correctly a business call no vendor makes. The eventual substrate is an **out-of-process, minimal-env `npx` runner** (no `DATABASE_URL`/KMS creds in the child — out-of-process contains crashes, not credentials — with a run-time-only cross-process lock); the [in-app component reinstall](#in-app-component-reinstall-for-style-registry) reuses it.
+
+2. **Build-time coupling.** Features are wired via **static** side-effect imports and `routeRegistry.mountAll()` is one-shot (`mounted = true`, warns that late registration "may not work"). A running process therefore cannot un-mount a module's routes or undo its already-run import-time registrations/singletons/listeners — there is no dispose hook. **Conclusion:** live (no-restart) mount/unmount is not worth building; enable/disable is **restart-to-apply** (shipped v2.4.1) — durable intent the next boot honours, without pretending to tear a module out of a live process.
+
+**Shipped in v2.4.1:** enable/disable — the trust-boundary-free action (runs no module code). Intent lives in an app-owned `.module-admin-intent.json` read by the synchronous, DB-free boot gate as a third additive source (`env` > `cli` > `admin`, one-way); a separate file so it can never flip the CLI's install evidence and brick a boot. Still deferred behind tooth 1: browse/install, update, uninstall, and per-module configure (blocked on a module config contract, not the trust boundary).
 
 ### Email OTP / magic link sign-in
 
