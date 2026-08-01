@@ -13,47 +13,7 @@ This page covers everything about how Structure is configured — from the CLI p
 
 ## Installation Prompts
 
-When you run `npx structure init`, the CLI asks you to define your app's structure. Some prompts are conditional.
-
-### Container Node (Optional)
-
-A container is a top-level grouping node. Use this when your primary entity belongs to something else (e.g., Client contains Projects, Building contains Units).
-
-| Prompt | Default | Condition | Description |
-|--------|---------|-----------|-------------|
-| `hasContainer` | No | — | Do you need a container type? |
-| `containerNodeName` | Client | hasContainer=true | Singular name |
-| `containerNodePlural` | Clients | hasContainer=true | Plural form |
-| `containerSlug` | clients | hasContainer=true | URL slug |
-| `containerNodeIcon` | Building2 | hasContainer=true | Lucide icon |
-
-**When to use a container:**
-- Legal: Clients contain Matters
-- Agency: Clients contain Projects
-- Property: Buildings contain Units
-
-**When NOT to use a container:**
-- Simple project management (just Projects)
-- Personal productivity (just Tasks or Notes)
-
-### Primary Node
-
-The main entity your users work with.
-
-| Prompt | Default | Condition | Description |
-|--------|---------|-----------|-------------|
-| `primaryNodeName` | Project | — | Singular name (e.g., "Matter", "Case") |
-| `primaryNodePlural` | Projects | — | Plural form for navigation |
-| `primarySlug` | projects | — | URL path |
-| `primaryNodeIcon` | Briefcase | — | Lucide icon |
-| `primaryInMainNav` | Yes | hasContainer=false | Show in main navigation? |
-
-### Optional Features
-
-| Prompt | Default | Description |
-|--------|---------|-------------|
-| `enableFolders` | Yes | Allow folders within nodes for organisation |
-| `enableTags` | Yes | Allow tags for categorisation |
+`npx structure init` asks only two questions — both about opt-in semantic embeddings. There is **no** node-type onboarding wizard: node types are defined *after* installation via the admin **App Structure** page, or by importing a JSON config (`POST /types/import`).
 
 ### Cognitive Foundations (Optional)
 
@@ -64,7 +24,7 @@ Opt-in vector embedding support for semantic search. Requires a Postgres databas
 | `enableEmbeddings` | No | — | Add embedding columns to `structure_node` and generate the semantic search service |
 | `embeddingDimensions` | 1024 | enableEmbeddings=true | Embedding vector dimensions — 1024, 512, 1536, or 3072 |
 
-To opt in later, set `enableEmbeddings: true` in `.module-state.json` and run `npx structure update` (or `npx structure init --force` for a full heal). Changing dimensions after installation requires a manual migration.
+To opt in later, run `npx structure reconfigure --set enableEmbeddings=true`. That records the new answer, re-syncs the generated files and schema, and fires the embeddings heal hook to provision the pgvector infrastructure — no hand-editing of `.module-state.json`. Changing dimensions after installation requires a manual migration.
 
 ---
 
@@ -89,35 +49,23 @@ To opt in later, set `enableEmbeddings: true` in `.module-state.json` and run `n
    // routes take precedence over Structure's catch-all patterns.
    ...structureRoutes,
    ```
-
-4. **Initialise backend** in `server.ts`
-   ```typescript
-   import { initStructure } from './features/structure';
-
-   await initStructure();
-   ```
 </Steps>
+
+There is **no backend init step.** Structure sets `hasInit: false` — the API routes and the backend service self-register through side-effect imports (`route.registration.ts` / `service.registration.ts`) that run the moment the feature's backend `index.ts` is imported. You do not call `initStructure()` anywhere.
 
 Sidebar navigation populates automatically — when the feature module loads post-login, it fetches node types and syncs the registry. If your app imports the feature before auth is ready, mount the optional `<StructureInit />` component (exported from `@/features/structure`) inside your authenticated layout for an explicit re-prime.
 
 <Aside type="note" title="Gotchas">
-- **`initStructure()` only exists when `hasInit: true`** is set in `src/module.ts`. Structure ships with it enabled by default.
+- **No backend init call.** Structure sets `hasInit: false` — there is no `initStructure()`. Routes and the service self-register via side-effect imports (`route.registration.ts` / `service.registration.ts`) when the feature is imported.
 - **Route ordering matters.** Structure's protected routes use catch-all patterns (`/:nodeType`, `/:nodeType/:nodeId`). Spread them at the end of your route table — anything after them with a specific path will never match.
-- **Default node types are seeded with `userId: null`.** This makes them system-level and visible to all users. Modules that register their own node types at init should pass their own userId or set `moduleId` for ownership tracking.
+- **Node types are not auto-seeded.** A fresh install has no node types — create them via Admin > App Structure or a JSON import. Modules that register their own node types should set `moduleId` (and typically `userId: null` for system-level types) for ownership tracking.
 </Aside>
 
 ---
 
-## Module Initialisation
+## Node Types
 
-On first backend start, `initStructure()` seeds default node types based on your installation prompts. The default types are:
-
-- **Container type** (if `hasContainer` was true) — e.g., Client
-- **Primary type** — e.g., Project
-- **Folder type** (if `enableFolders` was true) — for organisation within nodes
-- **Tag type** (if `enableTags` was true) — for categorisation
-
-Default types are created with `userId: null`, making them system-level types visible to all users.
+Structure does **not** auto-seed any node types. A fresh install has an empty structure — there is no `initStructure()` and no default Container/Primary/Folder/Tag types. Create node types via the admin **App Structure** page, or import a JSON config (`POST /types/import`).
 
 ### System vs User Node Types
 
@@ -140,7 +88,7 @@ When a module registers a node type with `moduleId` set, the system tracks owner
 
 ## Database Schema
 
-Structure creates six tables in your database.
+Structure creates eight tables in your database, plus a ninth (`structure_chunk`) when embeddings are enabled.
 
 ### structure_node
 
@@ -238,6 +186,22 @@ Reusable rendering templates for views. A template defines how nodes render in a
 | `isDefault` | Boolean | Default template for this type |
 | `sortOrder` | Int | Display order |
 
+### structure_field_template
+
+Reusable shared field sets. A field template defines a `NodeTypeField[]` that can be attached to many node types (via `structure_node_type.fieldTemplateIds`). Its fields merge into each attaching type's resolved fields — and are included by the secret-sealing and `editableBy` walkers — but are never persisted into the type's own `fields` column (define once, reference many).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | String | CUID primary key |
+| `userId` | String | Owner |
+| `name` | String | Display name |
+| `slug` | String | URL-friendly identifier (unique per user) |
+| `description` | String? | Template description |
+| `fields` | JSON | `NodeTypeField[]` — the shared field set |
+| `sortOrder` | Int | Display order (default 0) |
+| `createdAt` | DateTime | Creation timestamp |
+| `updatedAt` | DateTime | Last update timestamp |
+
 ### structure_settings
 
 User-specific preferences and UI state.
@@ -289,11 +253,33 @@ Configuration for typed connections between nodes. Controls which node types can
 | `isEnabled` | Boolean | Whether the type is active |
 | `sortOrder` | Int | Display order (default 50) |
 
+### structure_api_key
+
+Per-user API keys for the public, key-authed [REST API](/modules/structure/public-api/). Only the SHA-256 hash of the key is stored (via the security feature's `hashSecret`) — the raw key is shown once at creation and never persisted.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | String | CUID primary key |
+| `userId` | String | Owner |
+| `name` | String | Human label (e.g. `Zapier integration`) |
+| `keyHash` | String | `hashSecret(fullKey)` — lookup + verify; `@unique`; raw key never stored |
+| `keyPrefix` | String | First chars of the key, for display only (e.g. `sk_3f9a1c`) |
+| `scopes` | JSON | `string[]` — `read` and/or `write` |
+| `lastUsedAt` | DateTime? | Best-effort usage timestamp |
+| `expiresAt` | DateTime? | Optional expiry (null = never) |
+| `revokedAt` | DateTime? | Set when revoked (null = active) |
+| `createdAt` | DateTime | Creation timestamp |
+| `updatedAt` | DateTime | Last update timestamp |
+
+### structure_chunk (opt-in)
+
+Created **only when embeddings are enabled** (added by the chunk-storage module migration, not the base schema). A dedicated pgvector table holding per-node text chunks and their embedding vectors for chunk-level semantic search. See [Cognitive Foundations](/modules/structure/cognitive/) for its columns and the chunk search service.
+
 ### Raw SQL access notes
 
 If your code queries these tables directly (outside of Prisma), note two things:
 
-- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`). Use the plural names in raw SQL.
+- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`). Use the plural names in raw SQL.
 - **Unique constraints on `structure_node`.** Beyond the primary key, there are two compound uniques that the API surfaces as `400` errors:
   - `@@unique([userId, slug])` — a user can't have two nodes with the same slug
   - `@@unique([userId, parentId, name])` — a user can't have two siblings with the same name under the same parent
@@ -343,6 +329,8 @@ interface NodeTypeConfig {
   listItemTemplateId?: string | null;
   detailHeaderTemplateId?: string | null;
   overviewTemplateId?: string | null;
+  // Shared field templates — attached reusable field-set ids (structure_field_template)
+  fieldTemplateIds?: string[];
   templateOverrides?: NodeTypeTemplateOverrides;
   labels?: NodeTypeLabels;
   integrations?: NodeTypeIntegrations;
@@ -350,6 +338,8 @@ interface NodeTypeConfig {
   workflowConfig?: WorkflowConfig;
   // Context provider — hints for AI and assembled context endpoint
   contextHints?: string;
+  // AI Core prompt-assembly config (storage-only; consumed by AI Core's AI tab)
+  aiFields?: AiFieldsConfig;
   contextConfig?: {
     includeAncestors?: boolean;
     ancestorDepth?: number;
@@ -422,6 +412,30 @@ governance?: {
 <Aside type="note">
 Classification levels are **per node type** and are **not** inherited through `superClasses` (own-config only, like the hierarchy rules). For an app-wide scheme, configure consistent levels across the types that need it. The per-node override is **API-only** for now (no UI picker yet), and export-pipeline enforcement is a consuming module's responsibility — structure only evaluates.
 </Aside>
+
+### AI Fields
+
+Per-type prompt-assembly config, stored by Structure and consumed by AI Core — Structure never interprets it. Surfaced on the node type **AI** tab. Added in v1.30.0. `promptSegments[].type` maps to AI Core's `ConsumerSegment.type` (`task` | `context` | `external`).
+
+```typescript
+// On NodeTypeConfig:
+aiFields?: AiFieldsConfig;
+
+interface AiFieldsConfig {
+  // Structured prompt segments a consumer supplies to AI Core on a run.
+  promptSegments?: Array<{
+    type: 'context' | 'task' | 'external';
+    label?: string;
+    content: string;
+  }>;
+  // Output examples that guide the model (rendered by the consumer).
+  outputExamples?: Array<{
+    label?: string;
+    input?: string;
+    output: string;
+  }>;
+}
+```
 
 ### Features
 
@@ -531,7 +545,7 @@ interface NodeTypeField {
 }
 ```
 
-**Built-in field types:** text, textarea, number, date, datetime, time, select, multiselect, chained-select, toggle, boolean, url, email, phone, address, name-field, secret, hidden, section-break, node-reference, media, field-group. See the [Field Types Reference](/modules/structure/fields/) for the full list with configuration and examples.
+**Built-in field types:** text, textarea, number, date, datetime, time, select, multiselect, chained-select, toggle, boolean, url, email, phone, address, name-field, secret, hidden, section-break, node-reference, field-group. See the [Field Types Reference](/modules/structure/fields/) for the full list with configuration and examples.
 
 **New field types:**
 - `boolean` — renders as Yes/No radio buttons (not a toggle switch)
@@ -673,6 +687,7 @@ calling, or delete the created ids on a non-empty `errors` array.
 | GET | `/nodes/:id/connections` | Get connections for a node (`?status=`, `?origin=` filters; active-only by default) |
 | GET | `/connections` | List connections with pagination (`?status=`, `?origin=`, `?connectionType=`, `?page=`, `?limit=`) |
 | POST | `/connections` | Create a connection (optional `origin` and `status` body fields) |
+| POST | `/connections/bulk` | Bulk create connections — per-row atomic, partial success; fires one `structure.connections.bulkCreated` (v1.27.0) |
 | POST | `/connections/:id/promote` | Promote a pending connection to active |
 | DELETE | `/connections/:id` | Remove a connection |
 
@@ -751,6 +766,18 @@ The public, API-key-authed data endpoints live under `/api/v1/public/structure/:
 | POST | `/templates` | Create template |
 | PATCH | `/templates/:id` | Update template |
 | DELETE | `/templates/:id` | Delete template |
+
+### Field Templates
+
+Reusable shared field sets (`structure_field_template`) attached to node types via `fieldTemplateIds`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/field-templates` | List field templates |
+| GET | `/field-templates/:id` | Get single field template |
+| POST | `/field-templates` | Create field template (admin only) |
+| PATCH | `/field-templates/:id` | Update field template (admin only) |
+| DELETE | `/field-templates/:id` | Delete field template (admin only) |
 
 ### Settings
 
@@ -832,9 +859,11 @@ Complete list of subcommands exposed by `npx structure <command>`.
 
 | Command | Flags | Purpose |
 |---------|-------|---------|
-| `init` | `--force`, `--no-interactive` | Install the module. `--force` overwrites existing files; `--no-interactive` skips prompts and uses defaults |
-| `update` | `--dry-run`, `--force`, `--skip-schema` | Update templates and schema. `--dry-run` previews, `--force` proceeds through conflicts, `--skip-schema` updates templates only |
+| `init` | `--force`, `--no-interactive`, `--dry-run`, `--skip-dep-check` | Install the module. `--force` overwrites existing files; `--no-interactive` skips prompts and uses defaults; `--dry-run` previews what would be generated without writing; `--skip-dep-check` proceeds even when required modules are missing or outside the declared version range |
+| `update` | `--dry-run`, `--force`, `--skip-schema`, `--set <assignments...>` | Update templates and schema. `--dry-run` previews, `--force` proceeds through conflicts, `--skip-schema` updates templates only, `--set <assignments...>` also changes install-time answers (delegates to `reconfigure`) |
+| `reconfigure` | `--dry-run`, `--force`, `--set <assignments...>`, `--skip-schema` | Change install-time answers (toggle gated features) and re-sync files/schema, e.g. `--set enableEmbeddings=true` |
 | `migrate` | `--dry-run` | Add version headers to existing files (for installations that pre-date version tracking) |
+| `migrate-db` | `--dry-run` | Run the module's database migrations (SQL + TS backfills). `--dry-run` lists pending migrations without applying |
 | `uninstall` | `--force`, `--keep-data`, `--export <path>` | Remove the module. `--keep-data` preserves tables, `--export <path>` writes data to JSON before removal |
 | `disable` | `--force` | Temporarily disable without removing files |
 | `enable` | `--force` | Re-enable a disabled module |
