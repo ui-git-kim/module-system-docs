@@ -111,8 +111,15 @@ Callers should probe the capability rather than hard-import the service — the 
 ```typescript
 // Always available, even without embeddings
 const caps = await structureService.getCognitiveCapabilities();
-// → { embeddings: { enabled: boolean, dimensions: number | null }, chunks: { enabled: boolean } }
-// chunks.enabled mirrors embeddings.enabled — chunk storage rides the same opt-in.
+// → {
+//     embeddings: { enabled: boolean, dimensions: number | null },
+//     chunks:     { enabled: boolean },
+//     lexical:    { enabled: boolean },
+//     graph:      { enabled: true },
+//   }
+// chunks.enabled and lexical.enabled both mirror embeddings.enabled — chunk
+// storage and lexical/hybrid search ride the same opt-in. graph.enabled is
+// always true: connection-nodes are core, so graph expansion needs no opt-in.
 
 // Type-safe access on embeddings-enabled installs
 import { serviceRegistry } from '../../config/service.registry.js';
@@ -212,6 +219,107 @@ Method semantics:
 - **No database cascade.** `nodeId` is a plain FK. A node's `deleteNode` is a *soft* delete (`status: 'deleted'`), and chunk search filters the parent node's status — so a soft-deleted (or archived) node's chunks simply stop surfacing, and `restoreNode` brings them back. Re-chunking is `replaceNodeChunks` (delete + insert). Chunks are hard-removed only at **account erasure**, via the `structure.chunks` deletion handler (generated only on embeddings-enabled installs).
 - **Runtime self-heal.** `ensureInfrastructure()` also creates the chunk HNSW index, so the same lazy, idempotent repair covers chunk search.
 
+## Lexical & hybrid search
+
+Semantic search answers "what is this *about*"; it misses the exact tokens — an identifier, a code, a rare surname — that a keyword match nails. Structure v1.32.0 adds a **lexical (keyword) arm** and a **hybrid** fusion of both, on the same `structureEmbeddings` service (same registry entry, same guarded generation). They ride the same `enableEmbeddings` opt-in: the lexical arm is pure Postgres full-text and needs no embedder, but the `searchText` column and the GIN indexes are only generated on embeddings-enabled installs.
+
+The **caller still supplies everything an embedder would produce** — lexical takes only the query text; hybrid takes the query text *and* its embedding. Structure never calls an LLM or embedder; it owns storage and search.
+
+The shipped baseline is a functional **GIN** index over `to_tsvector('english', coalesce(searchText, name || description))` (nodes) or `to_tsvector('english', content)` (chunks), queried with `websearch_to_tsquery` and ranked by **`ts_rank_cd`**. `ts_rank_cd` scores are unbounded relevance (higher is better) — **not** a 0..1 similarity like the cosine `score`. A blank query returns `[]` (lexical) or degrades cleanly to the semantic arm (hybrid).
+
+```typescript
+interface StructureEmbeddingsService {
+  // …node + chunk methods (see above)…
+
+  /** Keyword search over nodes (caller supplies query text only) */
+  lexicalSearchNodes(userId: string, query: string, options?: LexicalSearchOptions): Promise<LexicalSearchResult[]>;
+
+  /** Keyword search over chunks (joins structure_nodes for parent status/type scoping) */
+  lexicalSearchChunks(userId: string, query: string, options?: ChunkLexicalOptions): Promise<ChunkLexicalResult[]>;
+
+  /** Fused keyword + semantic search over nodes (caller supplies query text AND its embedding) */
+  hybridSearchNodes(
+    userId: string,
+    query: string,
+    queryEmbedding: number[],
+    options?: HybridSearchOptions
+  ): Promise<HybridSearchResult[]>;
+
+  /** The chunk analogue of hybridSearchNodes */
+  hybridSearchChunks(
+    userId: string,
+    query: string,
+    queryEmbedding: number[],
+    options?: ChunkHybridOptions
+  ): Promise<ChunkHybridResult[]>;
+}
+
+interface LexicalSearchOptions {
+  topK?: number;        // default 20, max 200
+  nodeTypes?: string[]; // filter by node type slugs
+  status?: string[];    // default ['active']
+}
+
+interface HybridSearchOptions {
+  topK?: number;           // default 20, max 200
+  rrfK?: number;           // RRF constant k (default 60); larger flattens each rank's contribution
+  lexicalWeight?: number;  // weight on the lexical arm (default 1)
+  semanticWeight?: number; // weight on the semantic arm (default 1)
+  nodeTypes?: string[];
+  status?: string[];       // default ['active']
+}
+
+interface LexicalSearchResult { node: StructureNode; score: number; } // score = ts_rank_cd (higher is better; not 0..1)
+interface HybridSearchResult  { node: StructureNode; score: number; } // score = fused RRF (higher is better)
+```
+
+The chunk options mirror the node ones and add `nodeIds?` (restrict to spans of these source nodes), exactly like `semanticSearchChunks`.
+
+### Reciprocal rank fusion
+
+`hybridSearchNodes` / `hybridSearchChunks` run the lexical and semantic arms and fuse them **in SQL** by reciprocal rank fusion — it combines *ranks*, so the incomparable `ts_rank_cd` and cosine scales never touch:
+
+```
+score = Σ_arm  weight_arm / (rrfK + rank_arm)
+```
+
+Each arm over-fetches 3× `topK`; a node that surfaces in only one arm contributes `0` from the other. `lexicalWeight` / `semanticWeight` bias the mix (both default `1`), and `rrfK` (default `60`) flattens how much each rank position contributes. A blank query drops the lexical arm and the result is the pure semantic ranking.
+
+<Aside type="note" title="Lakebase full-text search">
+Neon **Lakebase Search** has been GA since 2026-06-26 (Postgres 16+). Structure deliberately ships the **portable baseline** — a functional GIN index plus `ts_rank_cd` — which runs on *any* Postgres. Lakebase's `lakebase_bm25` (true BM25 with top-K pushdown) and `lakebase_ann` are a **documented follow-up**, gated on a Neon-branch enablement test (`shared_preload_libraries` plus a compute restart) *and* on switching to a materialised `tsvector` column (`lakebase_bm25` indexes a stored `tsvector`, not a functional expression). The module does not default to it until that test is run.
+</Aside>
+
+## Graph expansion
+
+Semantic and lexical relevance are content signals; **graph proximity** is a structural one — what is connected to what. `structureService.expandGraph` is the retrieval primitive for it: given seed node ids it returns their **N-hop neighbourhood** over connection-nodes, each result carrying its **minimum hop distance** from any seed.
+
+```typescript
+const reached = await structureService.expandGraph(userId, seedIds, {
+  hops: 2,                          // neighbourhood radius (default 1, max 6)
+  status: ['active', 'pending'],    // default ['active']; add 'pending' for unpromoted discovered edges
+  origin: 'discovered',             // only traverse edges with this data.origin
+  connectionTypes: ['relates-to'],  // only traverse these connection type slugs
+  limit: 500,                       // cap on returned neighbours (default 500, max 5000)
+});
+// → [{ nodeId: string, hopDistance: number }, …]  (ordered by hopDistance; seeds excluded)
+```
+
+Behaviour:
+
+- **Undirected.** A connection matches as either endpoint (`fromNodeId` *or* `toNodeId`) — traversal ignores direction.
+- **`userId`-scoped, one recursive CTE.** The whole neighbourhood is a single parameterised recursive query; every caller value is bound.
+- **Minimum hop distance.** A node reachable by several paths reports its shortest. Seeds are excluded from the results, and only **active, owned** nodes come back.
+- **Filters.** `origin` and `connectionTypes` choose which edges are walked; `status` picks which connection rows count (active only by default — pass `pending` to traverse unpromoted discovered edges).
+- **Strictly a query primitive.** Orchestration, reranking, and budgets live upstream (cog-ingest / the engine). Graph distance is a **structural** relevance signal — never a temporal one.
+
+## Bi-temporal (`observedAt`)
+
+`structure_node` gains an **`observedAt`** timestamp (`DateTime?`) — bi-temporal provenance: *when the fact was true in the world*, as distinct from `createdAt` (when the row was written). It is **additive and ungated** — present on every install, not just embeddings-enabled ones — nullable, and **engine-populated**: Structure stores it but never derives it.
+
+<Aside type="caution" title="A filter, never a weight">
+`observedAt` is for **time-scoped `WHERE` filters only** — "facts true during Q3", "as of this date". It is **never** a ranking or decay input; recency is not relevance. It is indexed `[userId, observedAt]` (nulls sort last, so the index only pays for rows the engine has stamped).
+</Aside>
+
 ## Connection provenance & promotion
 
 ### Origin
@@ -310,15 +418,26 @@ Proposal endpoints (declared before `/types/:slug` so `proposals` is never match
 
 ## features.cognitiveIngest
 
-`NodeTypeFeatures` gains `cognitiveIngest?: { enabled?: boolean }` (mirroring `publicApi`). It marks a node type as **participating in cognitive processing** — the flag that tells cognitive modules which types to embed and ingest against.
+`NodeTypeFeatures` gains `cognitiveIngest?: { enabled?: boolean; textTemplate?: string }` (mirroring `publicApi`). It marks a node type as **participating in cognitive processing** — the flag that tells cognitive modules which types to embed and ingest against.
 
 ```typescript
 features: {
-  cognitiveIngest: { enabled: true },
+  cognitiveIngest: {
+    enabled: true,
+    textTemplate: '{name} — {description} ({caseNumber}, {jurisdiction})',
+  },
 }
 ```
 
 Admins toggle it per type as **Cognitive Processing** on the node-type *Properties* tab. Inside Structure it drives one thing today: `listNodesNeedingEmbedding` resolves its default `nodeTypes` from types with the flag enabled. Cognitive modules read it for their own type selection.
+
+### Searchable text (`textTemplate`)
+
+`textTemplate` is an optional **merge template** that Structure resolves into the node's lexical `searchText` column on every create and update. It runs `{name}`, `{description}`, and `{fieldId}` tokens (top-level `data` fields) through simple, deref-free `{token}` substitution — no LLM, no embedder, just the node's own fields. Empty or missing tokens resolve to blank.
+
+- **What it does.** It opts a node type's **custom-field content** into the lexical GIN index — and therefore into `lexicalSearchNodes` / `hybridSearchNodes`. When `textTemplate` is unset, `searchText` stays `null` and the lexical index falls back to **`name` + `description`**, so keyword search works out of the box; the template only *adds* fields to what is searchable.
+- **Own-config only.** Unlike most node-type config, `textTemplate` is **not** hierarchy-resolved — keep it on each type that needs it, which keeps the write path to a single type lookup.
+- **Opt-in gated.** The `searchText` column is only generated on embeddings-enabled installs, so `textTemplate` has no effect until you opt in.
 
 ## New action hooks
 
