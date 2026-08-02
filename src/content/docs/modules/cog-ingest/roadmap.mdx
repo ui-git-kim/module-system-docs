@@ -385,6 +385,79 @@ Accept content via webhook endpoint for automated ingestion from external system
 
 ---
 
+## Stage 2 — Ingestion Quality & Rich Acquisition
+
+The next major push. Guiding principle, backed by two research reviews and Anthropic's Contextual Retrieval: **ingestion quality is the highest-leverage investment, and because cognitive-db computes connections once at ingest and they never decay, quality gains compound permanently.** So Stage 2 spends at ingest — and leads with *validation*, so clean data in means retrieval has far less to compensate for.
+
+Everything below honours the platform invariants: **never-decay** (no age/disuse down-weighting — explicit/structural signals only) and **provider-agnosticism** (models are named as AI Core operations, never wired directly). Sequenced highest-quality-per-cost first.
+
+<Aside type="note">
+Concepts here are **inspired by** the Open Knowledge Format (OKF), Anthropic Contextual Retrieval, and corpus-curation practice (C4 / FineWeb / Dolma) — adapted to the `structure_node` model, **not adopted literally**. No architecture change.
+</Aside>
+
+### Stage 2.0 — Foundations (cheap, deterministic, first)
+
+<Aside type="tip" title="Where RAG actually costs money">
+Embedding is cheap (~18¢ / 1,000 pages, one-time); the recurring spend is vector storage, indexing/retrieval, and — most of all — the **LLM read at query time**. So the two biggest levers are (a) **don't re-process content you already have**, and (b) **retrieve fewer chunks** (rerank top-k down — see the retrieval follow-ups). This is why the identity gate below runs first.
+</Aside>
+
+- **Content-identity & change-detection gate — the single biggest ingest-cost saver, and it runs FIRST** (right after extract + clean, *before* chunk / embed / store). Hash the normalised content and ask *"have I seen this, unchanged, under the current pipeline?"* — keyed on `(raw-hash, stage-version)`:
+  - **Same** → **skip** the whole expensive tail (chunk / embed / store). In the source analysis ~80% of re-ingests were unchanged, so this avoids ~80% of downstream work.
+  - **Changed** → **re-process only what changed** — delete + re-embed the affected spans (`replaceNodeChunks`), guided by page/section/version metadata, rather than the whole document.
+  - **Stage bumped** (new chunker / embedder / model) → re-derive even when content is identical. That is why the key is `(raw-hash, stage-version)` and not the hash alone — it reconciles "skip to save money" with never-decay's "re-derive when models improve."
+- **Store raw immutably + re-derivable stages.** Every derived artefact (parse → clean → chunk → embed → extract → connect) re-derivable from the stored raw (medallion Bronze/Silver/Gold inspiration) — this is what makes the gate above *safe*: skipping is only sound because the raw is retained for later re-processing.
+- **Cleaning craft.** `ftfy` + NFC normalisation for canonical text (a separate NFKC / case-folded copy for search keys); strip zero-width / soft-hyphen / directional marks; de-hyphenate across line breaks. (A documented post-mortem lost 21% of a corpus to an encoding bug this prevents.)
+- **Cross-document dedup — before any quality filter.** SHA-256 exact + MinHash-LSH near-dup (~0.85) *across* documents (distinct from the same-document gate above). Order matters: filtering before dedup over-amplifies high-scoring boilerplate. Extends the existing `ContentIntegrityConfig` hashing.
+- **Cheap deterministic gates → quarantine.** Length / boilerplate ratio / punctuation ratio / language-ID confidence / parse-tree integrity; failures go to a dead-letter queue rather than propagating silently.
+
+### Stage 2.1 — Validation & QA harness (TOP priority)
+
+Clean, validated data is what lets retrieval stay simple.
+
+- **Ingestion golden set** (source → expected parse / extraction / entities), a few hundred cases. DeepEval in CI to block regressions + RAGAS sampling 1–5% of live ingests with drift alerts. Track a *retrieval* metric **and** a *generation* metric (faithfulness alone can be high while recall is poor).
+- **LLM-as-judge parse-QA** (an AI Core language op): compare parsed output against the source / rendered page, score coverage + faithfulness, flag dropped tables/figures. Version-pin the judge, temperature 0, calibrate against human labels (track correlation, not raw pass-rate).
+- **Provenance & citations** (≈80% of perceived quality): per-chunk character offsets so every chunk resolves to its source. Adopt an **OKF-inspired provenance/trust vocabulary** on nodes/chunks — `sources[]` (author, last-modified), `generated { by, at }`, `verified [{ by, at }]`, `status` (draft/stable/deprecated), actor ids (`human:<id>`, `<producer>/<version>`, `process:<id>`), per-claim footnote attribution. **Never-decay caveat:** record these as *explicit* signals only — do **not** use OKF's `usage_count` or `stale_after` to rank or auto-down-weight anything.
+- **Canary documents** re-ingested on every pipeline change + score-distribution drift monitoring.
+
+### Stage 2.2 — Rich-record contract (generic, not use-case-specific)
+
+Every input carries signal beyond its plain text; capture it as a uniform record instead of lossy text.
+
+- **Parent node = a "concept" with an auto-generated summary** (OKF-concept + NotebookLM "Source Guide" inspiration); its chunks are the embedded spans that link to it (small-to-big — already shipped). That summary also becomes the **document-context input for the contextual blurb** (see 2.3).
+- **Perception / rich signals** as generic typed metadata per modality — audio: speakers + sentiment + **tone/prosody** + timestamps; image/web: visual description + palette + layout; document: figures / tables / formulae. A generic shape, nothing hardcoded per use-case (extends the existing `extractionFeatures`).
+- **Assets** (screenshots, extracted figures) in object storage (Document Management's territory), referenced by metadata rows + an optional multimodal embedding — never binaries in Postgres.
+
+### Stage 2.3 — Contextual Retrieval hardening
+
+- Feed `contextualise-chunk` a **fuller document (or the 2.2 concept summary)** rather than the first ~1,500 characters, made affordable by **AI Core prompt caching** — the current input weakens situatedness on long documents, and generic summaries give "very limited gains" (Anthropic).
+- Revisit the **default chunk size** (evidence leans ~512 tokens / 10–15% overlap; `balanced` is ~1,000) — decide it on the 2.1 golden set, not by guess.
+
+### Stage 2.4 — Rich acquisition lanes
+
+- **Playwright / browserless capture sidecar** (self-hosted, env-gated like `DOCLING_SERVE_URL`; replaces in-process Puppeteer) — robust JS rendering, computed styles (fonts/colours), full-page screenshots, image-asset harvest, OG / JSON-LD. Firecrawl an optional managed fallback.
+- **Vision cross-validation for tables / numbers** — cross-check Docling text against a vision model reading the rendered page; escalate disagreements. Attacks the single strongest documented silent failure (financial tables parsed into scrambled flat text).
+
+### Stage 2.5 — Confidence-gated escalation (only where it pays)
+
+- Cheap-first parse (Docling) → the 2.1 QA gate → **escalate only the failures** to a cloud parser (env-gated LlamaParse → Reducto). Reflection / double-pass **only on low-confidence** items — never blanket (self-critique was measured turning 98% → 57% accuracy on easy tasks). Prefer *external* verification (re-read source for coverage, hard-constraint checks) over "are you sure?".
+
+### Stage 2.6 — Entity canonicalisation (EDC)
+
+- Extract → schema-guide → **post-hoc canonicalise** entities/relations at ingest (with an LLM feasibility check to avoid over-merging); confidence per edge, provenance per assertion. Directly addresses node duplication — ties into the deferred **Node Merge** work.
+
+### Cross-module hand-offs for Stage 2
+
+- **AI Core** (requirements, not providers — AI Core owns the SDK/gateway, Vercel now / TanStack later): live `embed` / `run` provider calls + **prompt caching**; a **multimodal / visual embedding** op (embed screenshots/figures for visual retrieval); a **rich transcription** op (tone / sentiment / diarisation — Docling's Whisper ASR is text-only); the **parse-QA judge** and **per-source summary** language ops; an optional callable **rerank** for `retrieve()`.
+- **Structure**: **hybrid (vector + BM25)** search for exact IDs / codes (+10–20% on entity-heavy corpora) — only `semanticSearchChunks` exists today.
+- **Engine session**: summary-based node vector (the real fix for the engine's 8,000-character truncation).
+- **Document Management**: object storage for binary assets + a `getParsedArtefact` cache so re-ingest never re-parses.
+
+### Stage 3+ — OKF interchange
+
+- **OKF import + export** as an interchange lane — ingest an OKF bundle (concept → node, body → chunks, links → connections, `sources` / `verified` → provenance), and export the knowledge base as portable markdown. Fits the own-your-data ethos; interchange only, never internal storage.
+
+---
+
 ## Completed
 
 Items that have been done.
