@@ -1,7 +1,7 @@
 ---
 title: Archive Audit
 description: Per-session archive-readiness log — unfinished work, loose ends, decisions, and ideas captured before a session is archived
-lastUpdated: 2026-08-02
+lastUpdated: 2026-08-03
 sidebar:
   order: 12
 ---
@@ -38,6 +38,33 @@ At the end of a session you want to archive, run the archive-readiness prompt (b
 ```
 
 ---
+
+## 2026-08-03 — Auto-declare extensions (v1.33.1) → scaffold v1.31.7–1.31.9 (TS7, react-router v8, onPrepareDatabase, drift-immune apply) → v1.33.3 hook adoption → Lakebase BM25 + column self-heal (v1.33.4)
+
+**Verdict:** ✅ Safe to archive. Everything pushed; structure + docs working trees clean; structure `HEAD = origin/main = 214df4f` (v1.33.4), docs `origin/main = 4c3f430`; `dist` rebuilt after the final bump (stamps **1.33.4**). All this session's commits are reachable from `origin/main` (HEAD == origin, so every commit below is an ancestor). Open items are documented pick-ups (automated), not losses.
+
+**Shipped this session** (all pushed):
+- **v1.33.1 — auto-declare Prisma extensions in the embeddings heal.** `healEmbeddingsSetup` flips advise→auto-run `npm run ensure-pgvector`; a read-only `pg_extension` probe (via `prisma db execute`, exit-code) gates the opt-in `-- --lakebase`; `--no-lakebase` makes the heal's argv authoritative over an ambient `ENSURE_PGVECTOR_LAKEBASE` env; flags only passed to an ensure-pgvector that supports them. Feat `d64404a`, release `936bb05`, docs `2390168`. **Starter side** (`ensure-pgvector --lakebase`/`--no-lakebase`) is Kim's **v2.4.2** (`3a73239`). Adversarial review (12 agents) → 2 low findings, both fixed (env-authority via `--no-lakebase`; per-condition advisory gating). 51/51 script fixtures; probe semantics + real-schema declare validated on veradai.
+- **Scaffold v1.30.0 → v1.31.9** (three merges): **v1.31.7** (TypeScript 7 toolchain, esbuild 0.28/commander 15, react-router-dom removed in the module-starter, list-query-key fix, `onPrepareDatabase` hook), **v1.31.8** (`onPrepareDatabase` runs for *every* enabled installed module pre-migrate), **v1.31.9** (**drift-immune schema apply** — `migrate diff` datamodel→datamodel → real migration file → `migrate deploy`; never `migrate dev`, so a DB carrying runtime objects like the lakebase/HNSW indexes is never drift-reset; `deployPendingMigrations` retries on every step; "already exists" auto-baseline). Merges `c32cc08` / `c2b67f7` / `3b7eb3e`, lockfile `14c2db3`. Builds + `tsc` + `check:templates` clean under TS7; identity preserved; module-owned files untouched.
+- **react-router v8 alignment** — the generated-frontend import migration is **Kim's v1.33.2** (`1606753`). Verified no `react-router-dom` remains and `react-router@8.3.0` exports `Link`/`useNavigate`/`useParams`/`RouteObject`; **host-tsc clean in veradai** (0 structure errors, backend + frontend; the 14 remaining errors are billing/document-management, not structure).
+- **v1.33.3 — adopt `onPrepareDatabase`.** Extracted `declareDatasourceExtensions`; the pre-migrate hook declares the datasource extensions *before* `prisma migrate dev` (both install + update), with the post-migrate heal keeping it as an idempotent fallback for scaffolds < 1.31.3. Resolves the update-ordering upstream issue (fixed scaffold-side v1.31.3, now **Completed** in the docs). Feat `2dfc67f`, release `4fbb5d7`, docs `7071b76`.
+- **v1.33.4 — Lakebase BM25 keyword ranking + runtime column self-heal.** `searchNodes` ranks with BM25 (`<@>`/`to_bm25query`, feature-detected on the `lakebase_bm25` index) with a **query-time fallback** to GIN+`ts_rank_cd`; `ensureKeywordInfrastructure`/`ensureInfrastructure` now `ADD COLUMN IF NOT EXISTS searchVector/contentVector` so keyword search self-provisions even if the Prisma migrate never landed. bm25 `5c1b5bd`, self-heal `fb23a71`, fallback `203ed6f`, release `9c7bb45`, docs `214df4f`. Adversarial review (11 agents) → 2 issues, both handled (query-time fallback added; ownership tradeoff shipped per Kim). Validated end-to-end (self-heal + BM25 + fallback) on veradai's live Neon Lakebase.
+
+**Unfinished / WIP:** None unpushed. All ships committed + pushed; structure + docs trees clean; `dist` rebuilt at 1.33.4; feature branch `feat/lakebase-bm25-search` merged (fast-forward) + deleted.
+
+**Loose ends & follow-ups:**
+- **veradai keyword-search verify (automated, non-blocking):** Kim ran `structure update`; the self-heal fired (searchVector/contentVector **present**). The `lakebase_bm25` index builds on the **first `searchNodes` (keyword) call** — a keyword search hasn't run yet, so bm25 isn't active. Pick-up: run one keyword search, confirm bm25 index builds + `searchNodes` returns ranked hits.
+- **Stale `searchText` column in veradai** — still present (v1.33.0 removed it from the schema; the self-heal doesn't drop it). Harmless/derived; leave or drop later.
+- **BM25 for chunks/hybrid** (`lexicalSearchChunks` + `hybridSearchNodes/Chunks`) — deliberately NOT done (searchNodes-only, embeddings-tier, separate service file). Follow-up if wanted.
+
+**Decisions & ideas:**
+- **Self-heal ownership = ship it (Kim's call).** searchVector/contentVector are `Unsupported("tsvector")` in schema.prisma so Prisma also creates them (bare `ADD COLUMN`); the self-heal's `IF NOT EXISTS` is belt-and-suspenders. Rejected: removing them from schema.prisma (the offline diff would `DROP` them) and a scaffold-level "apply schema-ahead-of-DB" fix (bigger, Kim's domain). Safe under v1.31.9 (schema→schema diff never re-adds an unchanged column; auto-baseline covers failed-then-retried). Documented in the v1.33.4 changelog.
+- **Self-heal is module-level (not scaffold)** — request-time resilient (works even with a pending migrate), which the install-time scaffold can't be. And **no manual app fixes** (Kim's directive) — a hand-written veradai migration was generated then removed in favour of the automated self-heal.
+- **BM25 API (Lakebase 0.1.0-dev, reverse-engineered + validated):** `CREATE INDEX … USING lakebase_bm25 (col tsvector_bm25_ops)`; `col <@> to_bm25query(to_tsvector(q), idx::regclass)` returns a **distance** (matches negative → negate for higher-is-better); the index **must exist** (errors otherwise); indexed KNN confirmed. Captured in the search-arm memory.
+
+**Recorded where:** memory `search-arm-v1-32-0.md` + `pgvector-datasource-ownership.md` (fully updated) and `MEMORY.md` index lines; structure `changelog.mdx` (v1.33.1–v1.33.4) + `cognitive.mdx`; `module-starter/upstream-issues.mdx` + `starter-template/upstream-issues.mdx` (ordering + Lakebase-drift issues → Completed, scaffold-side).
+
+**Open items for next session:** (1) veradai — run a keyword search, verify BM25 activates + `searchNodes` returns ranked hits; (2) optional — BM25 for chunks/hybrid; (3) optional — drop the stale `searchText` column in veradai.
 
 ## 2026-08-02 — Docs accuracy audit + search arm v1.32.0→v1.33.0 (always-on keyword search, Lakebase ann)
 
