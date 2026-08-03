@@ -17,7 +17,7 @@ A new command or template on its own is a **patch**, not a minor. If you're reac
 
 <Aside type="tip">
 The module starter has **two version numbers**:
-- **Scaffold version** (`VERSION` file) — Infrastructure version (currently 1.31.8)
+- **Scaffold version** (`VERSION` file) — Infrastructure version (currently 1.31.9)
 - **Module version** (`package.json`) — Your module's version
 </Aside>
 
@@ -26,6 +26,25 @@ The cross-repo arc this changelog tracked is complete. The host enforces `depend
 </Aside>
 
 ---
+
+## Scaffold v1.31.9
+
+**Drift-immune schema apply — `migrate diff` → migration file → `migrate deploy` (replaces `migrate dev`)**
+
+`init` and `update` no longer apply a module's schema with `prisma migrate dev`. On a shared database that carries **runtime-created objects Prisma's migration history doesn't know about** — e.g. a vector module's `lakebase_*`/pgvector extensions and HNSW indexes, whose shape depends on the app's configured vector width so they can't be static migration files — `migrate dev` drift-checks the *whole* DB and **resets** it on every module schema change. The migrate is abandoned, `schema.prisma` ends up ahead of the DB, and Step-4 change detection then reports "up to date" forever, leaving manual `ALTER`s as the only path. (Diagnosed on veradai + Neon Lakebase; ai-core is a clean victim of the shared DB.) The starter's `prisma.config.ts` can declare known runtime *tables* external, but that can't cover dynamic extensions/indexes — so the fix stops drift-checking altogether.
+
+The new flow keeps Prisma migrations for production and never resets:
+
+1. **Delta computed OFFLINE** — `prisma migrate diff --from-schema <before> --to-schema <after> --script` (the Prisma 7 flag names, renamed from `--*-schema-datamodel` in v7), where `before` is a snapshot of the datamodel taken *before* the module's edit and `after` is the edited schema. Datamodel→datamodel never connects to the DB, so runtime objects are invisible and nothing can reset. The diff is **exactly this module's `ALTER`s** — it never diffs DB→schema (which would try to `DROP` Structure's undeclared indexes). `migrate dev --create-only` is **not** enough (it still drift-checks); `migrate diff` is the only offline generator. Multi-file schemas are concatenated to a single temp `.prisma` file, so the diff flags always receive a plain file path.
+2. **Written as a real Prisma migration** — `prisma/migrations/<timestamp>_<name>/migration.sql` (+ `migration_lock.toml`), so `prisma migrate deploy` runs the same committed files in production unchanged.
+3. **Applied with `prisma migrate deploy`** — which does **not** drift-check or reset, and records `_prisma_migrations`. Run on **every** DB step (including an `update` whose schema is already current) so a pending/failed migration is retried/surfaced instead of the silent "up to date" skip.
+4. **Auto-baseline guard** — if `deploy` fails because our just-written migration hits an object that already exists without history (the DB reports **"already exists"** — a drifted dev DB), the migration is marked `--applied` (recorded, **not** re-run) and `deploy` retried. The trigger keys on the DB-level "already exists" text, **not** the generic `P3018` code (which wraps *any* failed migration — e.g. a `NOT NULL` violation — and must never be auto-baselined). It only ever targets our own migration; the one residual caveat (a single migration mixing an existing object with a new one rolls back as a whole, so the new object needs a manual apply) is logged.
+
+All failures stay **warn-only** — the worst case is "apply the migration manually", never a reset. New `execCommandCapture` (captures `migrate diff --script` stdout, which the inherit-stdio `execCommand` can't) plus `snapshotDatamodelBeforeEdit` / `applyModuleSchemaToDatabase` / `deployPendingMigrations` live in `src/scaffold/utils.ts`; `init.ts` (`setupDatabase` + a Step-1 snapshot) and `update.ts` (`runPrismaAfterSchemaUpdate` + the no-change deploy retry) call them. The module SQL/TS migration runner (`runModuleMigrationsForHost`, `_module_migrations`) is unchanged, and `onPrepareDatabase` (v1.31.8) still runs first.
+
+<Aside type="note">
+Can't be runtime-tested in the module-starter (no DB — it's a template). Type-checked (`tsc --noEmit` clean) and reasoned against the Prisma 7 CLI semantics; real validation is a drifty host app on starter v2.5.2 (e.g. veradai).
+</Aside>
 
 ## Scaffold v1.31.8
 
