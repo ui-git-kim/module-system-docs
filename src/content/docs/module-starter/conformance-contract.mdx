@@ -10,7 +10,7 @@ The **conformance contract** is the stabilised set of patterns every module in t
 It was **derived from the two gold-standard reference modules** — [Structure](/modules/structure/) (fullstack, content graph) and [Builder](/modules/builder/) (fullstack, visual builder) — by extracting the patterns they independently converged on. Where the two diverge, the contract picks the stronger pattern and says why. The [scaffold templates](/module-starter/templates/) emit this contract by construction, so a **freshly created module is conformant on day one**; this page is the checklist an existing module (or a reviewer) can measure against.
 
 <Aside type="note" title="What “conformant” means here">
-Each item below is written to be checked against the **emitted** code — the contents of the backtick string constants in `src/templates/**`, i.e. what actually lands in a consuming app. **MUST** = a contract requirement. **SHOULD** = a recommended improvement, sometimes one not yet met even by the reference modules (called out where that's the case). A [conformance linter](/module-starter/changelog/#scaffold-v1260) — `scripts/check-conformance.cjs` (`npm run conformance:check`) — asserts the mechanically-checkable subset of these items against `src/templates/**` on every release (since scaffold v1.26.0).
+Each item below is written to be checked against the **emitted** code — the contents of the backtick string constants in `src/templates/**`, i.e. what actually lands in a consuming app. **MUST** = a contract requirement. **SHOULD** = a recommended improvement, sometimes one not yet met even by the reference modules (called out where that's the case). A [conformance linter](/module-starter/changelog/#scaffold-v1260) — `scripts/check-conformance.cjs` (`npm run conformance:check`) — asserts the mechanically-checkable subset of these items against `src/templates/**`. **As of scaffold v1.31.4 it is an enforced release gate:** `scaffold:version:*` (`bump-version.ps1`/`.sh`) runs it alongside `sync-contract.cjs --check` **before** bumping and aborts the release if it fails, so a scaffold release can't ship a non-conformant template. The gate is existence-guarded (a no-op if a module removed the linter). A downstream module's own release runs through `bump-module-version`, which (since **v1.31.5**) applies a **softer** gate: on a conformance failure it **prompts** `Continue with the version bump anyway? [y/N]` (default N) rather than hard-aborting — a module owns its templates and may legitimately diverge — and in CI / no-TTY it warns and proceeds so it never hangs a pipeline. For a hard CI gate on a module, run `npm run conformance:check` as its own step. You can run the linter manually anytime for detail.
 </Aside>
 
 The contract is organised into seven dimensions (**D1–D7**) plus cross-cutting conventions (**META**).
@@ -25,7 +25,7 @@ Every extension point the module plugs into is a **separate `*.registration.ts` 
 - **C2** — The generated barrel (`index.ts`) MUST import every `*.registration` file for its side effects **before any value or type export** — the registrations must run at import time, ahead of anything that reads the registries.
 - **C3** — A static registration MUST call `registry.register(...)` exactly once. A **dynamic** registration (e.g. navigation keyed on DB rows) MUST unregister its prior ids before re-registering and re-run on the host's sync hook.
 - **C4** — `route.registration.ts` MUST register via `routeRegistry.register({ path, router, feature, versions, requiresAuth, description })`. A second public / API-key router MUST be a **separate** register call with `requiresAuth: false` and its own sibling path.
-- **C5** — `module.registration.ts` MUST register `{ id, name, version, depends }` with the host `moduleRegistry` through the guarded optional-dependency idiom (variable specifier + `await import()` in `try/catch`), end with `export {};`, and substitute `{{moduleNameJson}}` / `{{moduleVersion}}` / `{{moduleDepends}}`.
+- **C5** — `module.registration.ts` MUST register `{ id, name, version, depends, init }` with the host `moduleRegistry` through the guarded optional-dependency idiom (variable specifier + `await import()` in `try/catch`), end with `export {};`, and substitute `{{moduleNameJson}}` / `{{moduleVersion}}` / `{{moduleDepends}}`. `init` is the optional, host-run, dependency-ordered startup callback (contract v1.3.0) the scaffold now emits by default with an empty body; it is skipped when the module is disabled or its dependencies are unmet.
 
 <Aside type="tip">Reference: both Structure and Builder ship one file per surface; the `index.ts` side-effect-first invariant is explicit in both barrels.</Aside>
 
@@ -39,7 +39,7 @@ If a barrel genuinely can't be resolved, C2 stands down for that side with a sin
 
 The module declares its data surface to the [security registry](/module-starter/security/) and provides a deletion handler so an account erasure removes its rows. Getting this wrong leaks personal data past account deletion.
 
-- **C6** — MUST emit `security.registration.ts` calling `securityRegistry.register({ moduleId, ownedModels, dataCategories, [encryptedFields], [hashedSecrets], [minimumTier] })`. `dataCategories` MUST list **every** owned table with a `classification`, and `moduleId` MUST equal the module id.
+- **C6** — MUST emit `security.registration.ts` calling `securityRegistry.register({ moduleId, ownedModels, dataCategories, [encryptedFields], [hashedSecrets], [auditEvents], [minimumTier] })`. `dataCategories` MUST list **every** owned table with a `classification`, and `moduleId` MUST equal the module id.
 - **C7** — `ownedModels` MUST default to `[]` (userId-keyed). RLS / `tenantId` isolation is an explicit opt-in — only list a model here once it carries a `tenantId` column.
 - **C8** — The deletion cascade MUST be a **separate** `securityRegistry.registerDeletionHandler({...})` call and MUST erase **every** owned per-user table. For a multi-table module the handler SHOULD wrap all `deleteMany` calls in a single `prisma.$transaction([...])` so erasure is atomic (all-or-nothing) — chosen over per-store handlers because account erasure across N tables should not partially succeed. Any table deliberately **not** erased (e.g. a global singleton) MUST be documented in a comment.
 - **C9** — The handler body MUST resolve `const userId = ctx.subject.userId ?? ctx.subject.tenantId`, **`throw` if it's absent** (refuse an unscoped `deleteMany` — Prisma treats an undefined `where` value as *match every row*), use idempotent `deleteMany`, audit-log `{ audit: true, userId, ... }`, and `return { action, recordsAffected }`.
@@ -60,7 +60,7 @@ A module that exposes a service to other modules registers it under a stable key
 
 Frontend cache keys are namespaced by module id so a module can invalidate its own cache without touching another module's.
 
-- **C13** — Each hook file MUST instantiate `const <mod>Keys = createModuleQueryKeys('<moduleId>')` (from `@/lib/query-keys`) and build **every** `queryKey` via `<mod>Keys.key(...)`, so the first array element is always the module id.
+- **C13** — Each hook file MUST instantiate `const <mod>Keys = createModuleQueryKeys('<moduleId>')` (from `@/lib/query-keys`) and build every `queryKey` from that factory so the first array element is always the module id: via `<mod>Keys.key(...)` when the segments are all strings/ids (e.g. `.key('item', id)`, or `.key('list')` for invalidation), or — for the list query, whose `options` object isn't a valid `.key()` segment (`.key()` takes only `string | number`) — by spreading the namespaced root: `[...<mod>Keys.root, 'list', options]`.
 - **C14** — Mutations MUST invalidate / seed / remove through the **same** factory (prefix invalidation on the parent segment), never a hand-built array.
 
 <Aside type="tip">Reference: all reference modules and the scaffold conform — the strongest-conforming dimension. Never construct a custom `QueryClient`; the app mounts exactly one at the root.</Aside>
@@ -106,7 +106,7 @@ A freshly generated CRUD module ships this surface: backend `exportUserData` / `
 
 ## Scaffold conformance status
 
-Where a freshly-generated module stands against the contract, as of scaffold **v1.29.0**:
+Where a freshly-generated module stands against the contract, as of scaffold **v1.31.3**:
 
 | Dimension | Items | Scaffold status |
 |-----------|-------|-----------------|

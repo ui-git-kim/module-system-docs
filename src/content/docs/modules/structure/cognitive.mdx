@@ -114,12 +114,13 @@ const caps = await structureService.getCognitiveCapabilities();
 // → {
 //     embeddings: { enabled: boolean, dimensions: number | null },
 //     chunks:     { enabled: boolean },
-//     lexical:    { enabled: boolean },
+//     lexical:    { enabled: true },
 //     graph:      { enabled: true },
 //   }
-// chunks.enabled and lexical.enabled both mirror embeddings.enabled — chunk
-// storage and lexical/hybrid search ride the same opt-in. graph.enabled is
-// always true: connection-nodes are core, so graph expansion needs no opt-in.
+// chunks.enabled mirrors embeddings.enabled — chunk storage rides the opt-in.
+// lexical.enabled is ALWAYS true: node keyword search (structureService
+// .searchNodes) is pure Postgres full-text and needs no embedder. graph.enabled
+// is always true: connection-nodes are core, so graph expansion needs no opt-in.
 
 // Type-safe access on embeddings-enabled installs
 import { serviceRegistry } from '../../config/service.registry.js';
@@ -221,18 +222,37 @@ Method semantics:
 
 ## Lexical & hybrid search
 
-Semantic search answers "what is this *about*"; it misses the exact tokens — an identifier, a code, a rare surname — that a keyword match nails. Structure v1.32.0 adds a **lexical (keyword) arm** and a **hybrid** fusion of both, on the same `structureEmbeddings` service (same registry entry, same guarded generation). They ride the same `enableEmbeddings` opt-in: the lexical arm is pure Postgres full-text and needs no embedder, but the `searchText` column and the GIN indexes are only generated on embeddings-enabled installs.
+Semantic search answers "what is this *about*"; it misses the exact tokens — an identifier, a code, a rare surname — that a keyword match nails. Structure ships a **lexical (keyword) arm** and a **hybrid** fusion of both. Node keyword search is **always on**; chunk keyword search and hybrid fusion are **embeddings-tier**.
 
-The **caller still supplies everything an embedder would produce** — lexical takes only the query text; hybrid takes the query text *and* its embedding. Structure never calls an LLM or embedder; it owns storage and search.
+### Node keyword search (always on)
 
-The shipped baseline is a functional **GIN** index over `to_tsvector('english', coalesce(searchText, name || description))` (nodes) or `to_tsvector('english', content)` (chunks), queried with `websearch_to_tsquery` and ranked by **`ts_rank_cd`**. `ts_rank_cd` scores are unbounded relevance (higher is better) — **not** a 0..1 similarity like the cosine `score`. A blank query returns `[]` (lexical) or degrades cleanly to the semantic arm (hybrid).
+Keyword search over nodes is **always available — no embeddings required**. It lives on the core service as **`structureService.searchNodes`**:
+
+```typescript
+structureService.searchNodes(
+  userId: string,
+  query: string,
+  options?: {
+    topK?: number;        // default 20, max 200
+    nodeTypes?: string[]; // filter by node type slugs
+    status?: string[];    // default ['active']
+  }
+): Promise<{ node: StructureNode; score: number }[]>;
+```
+
+It **auto-indexes** `name` + `description` + **every string value in the node `data` JSON** (via `jsonb_to_tsvector`) into a **trigger-maintained `structure_node.searchVector` tsvector column**, served by a **GIN** index. Queries run `websearch_to_tsquery` and rank by **`ts_rank_cd`** — `score` is the raw `ts_rank_cd` (higher is better, unbounded — **not** a 0..1 similarity like the cosine `score`). A blank query returns `[]`. There is no per-type configuration knob: a database trigger maintains the column on every insert/update, so keyword search works out of the box across name, description, and custom-field content.
+
+This is the **ranked upgrade** of the `listNodes` `search` substring filter, and it is what `getCognitiveCapabilities().lexical.enabled` (now always `true`) reports.
+
+### Chunk keyword + hybrid (embeddings-tier)
+
+The remaining arms **need embeddings** and stay on the `structureEmbeddings` service (same registry entry, same guarded generation): `lexicalSearchChunks` for chunk keyword search, and `hybridSearchNodes` / `hybridSearchChunks`, which **fuse the keyword and semantic arms** and therefore require the vector column. The **caller still supplies everything an embedder would produce** — chunk keyword search takes only the query text; hybrid takes the query text *and* its embedding. Structure never calls an LLM or embedder; it owns storage and search.
+
+Chunk keyword search runs the same **GIN + `ts_rank_cd`** baseline over a trigger-maintained `structure_chunk.contentVector` column. A blank query returns `[]` (chunk lexical) or degrades cleanly to the semantic arm (hybrid).
 
 ```typescript
 interface StructureEmbeddingsService {
   // …node + chunk methods (see above)…
-
-  /** Keyword search over nodes (caller supplies query text only) */
-  lexicalSearchNodes(userId: string, query: string, options?: LexicalSearchOptions): Promise<LexicalSearchResult[]>;
 
   /** Keyword search over chunks (joins structure_nodes for parent status/type scoping) */
   lexicalSearchChunks(userId: string, query: string, options?: ChunkLexicalOptions): Promise<ChunkLexicalResult[]>;
@@ -254,10 +274,11 @@ interface StructureEmbeddingsService {
   ): Promise<ChunkHybridResult[]>;
 }
 
-interface LexicalSearchOptions {
+interface ChunkLexicalOptions {
   topK?: number;        // default 20, max 200
-  nodeTypes?: string[]; // filter by node type slugs
-  status?: string[];    // default ['active']
+  nodeIds?: string[];   // restrict to spans of these source nodes
+  nodeTypes?: string[]; // restrict to chunks whose source node is one of these types
+  status?: string[];    // source-node status filter (default ['active'])
 }
 
 interface HybridSearchOptions {
@@ -269,11 +290,11 @@ interface HybridSearchOptions {
   status?: string[];       // default ['active']
 }
 
-interface LexicalSearchResult { node: StructureNode; score: number; } // score = ts_rank_cd (higher is better; not 0..1)
-interface HybridSearchResult  { node: StructureNode; score: number; } // score = fused RRF (higher is better)
+interface ChunkLexicalResult { chunk: StructureChunk; nodeId: string; score: number; } // score = ts_rank_cd (higher is better; not 0..1)
+interface HybridSearchResult  { node: StructureNode; score: number; }                  // score = fused RRF (higher is better)
 ```
 
-The chunk options mirror the node ones and add `nodeIds?` (restrict to spans of these source nodes), exactly like `semanticSearchChunks`.
+`ChunkHybridOptions` mirrors `HybridSearchOptions` and adds `nodeIds?` (restrict to spans of these source nodes), exactly like `semanticSearchChunks`.
 
 ### Reciprocal rank fusion
 
@@ -285,8 +306,12 @@ score = Σ_arm  weight_arm / (rrfK + rank_arm)
 
 Each arm over-fetches 3× `topK`; a node that surfaces in only one arm contributes `0` from the other. `lexicalWeight` / `semanticWeight` bias the mix (both default `1`), and `rrfK` (default `60`) flattens how much each rank position contributes. A blank query drops the lexical arm and the result is the pure semantic ranking.
 
-<Aside type="note" title="Lakebase full-text search">
-Neon **Lakebase Search** has been GA since 2026-06-26 (Postgres 16+). Structure deliberately ships the **portable baseline** — a functional GIN index plus `ts_rank_cd` — which runs on *any* Postgres. Lakebase's `lakebase_bm25` (true BM25 with top-K pushdown) and `lakebase_ann` are a **documented follow-up**, gated on a Neon-branch enablement test (`shared_preload_libraries` plus a compute restart) *and* on switching to a materialised `tsvector` column (`lakebase_bm25` indexes a stored `tsvector`, not a functional expression). The module does not default to it until that test is run.
+<Aside type="note" title="Lakebase (feature-detected, embeddings-tier)">
+On embeddings-enabled installs the v1.33.0 migration also provisions a **`lakebase_ann`** index for each vector column when Neon **Lakebase** is available. It is **pgvector-compatible** — the same `<=>` cosine operator, so no query change — but **storage-resident** (survives Neon scale-to-zero) and builds **50–100× faster** than HNSW. It is **feature-detected**: `CREATE EXTENSION` fails cleanly when the Lakebase preload libraries are not loaded, so non-Lakebase hosts are unaffected and **HNSW stays the automatic fallback**. `lakebase_bm25` for the keyword (text) tier **shipped in v1.33.4**: when the `lakebase_bm25` index is available, `searchNodes` ranks with **BM25** (`<@>` / `to_bm25query`, IDF + length-normalised) instead of `ts_rank_cd` — feature-detected, with a query-time fallback to **GIN + `ts_rank_cd`** if the index is ever absent, so non-Lakebase installs (and any degraded state) are unaffected.
+
+**Enabling Lakebase (verified 2026-08-02).** Lakebase Search is not self-serve at the current `0.1.0-dev` preview — there is no console toggle. Enable it through the Neon **management API**: `PATCH` the project's `settings.preload_libraries.enabled_libraries` to include `lakebase_vector` and `lakebase_text`, `POST` to restart the compute, then `CREATE EXTENSION lakebase_vector CASCADE; CREATE EXTENSION lakebase_text CASCADE`. It requires Postgres 16+ and is reversible.
+
+**Prisma-drift caveat.** The extensions must be **declared in the app's Prisma datasource** — `extensions = [vector, lakebase_vector, lakebase_text]` — otherwise Prisma sees the installed-but-undeclared pair as drift and blocks `prisma migrate` / `db push`. Structure declares them **automatically**: as of **v1.33.3** the `onPrepareDatabase` lifecycle hook runs the starter's `ensure-pgvector --lakebase` primitive **before** `prisma migrate dev` (on both `init` and `update`), gated on a `pg_extension` probe — so the very first migrate on a Lakebase-enabled app already sees the extensions declared and never fails on drift (needs the module-starter scaffold v1.31.3+; on older scaffolds structure falls back to declaring in the post-migrate heal, as it did from v1.33.1). You only declare by hand on a starter that predates `ensure-pgvector --lakebase`.
 </Aside>
 
 ## Graph expansion
@@ -418,26 +443,21 @@ Proposal endpoints (declared before `/types/:slug` so `proposals` is never match
 
 ## features.cognitiveIngest
 
-`NodeTypeFeatures` gains `cognitiveIngest?: { enabled?: boolean; textTemplate?: string }` (mirroring `publicApi`). It marks a node type as **participating in cognitive processing** — the flag that tells cognitive modules which types to embed and ingest against.
+`NodeTypeFeatures` gains `cognitiveIngest?: { enabled?: boolean }` (mirroring `publicApi`). It marks a node type as **participating in cognitive processing** — the flag that tells cognitive modules which types to embed and ingest against.
 
 ```typescript
 features: {
   cognitiveIngest: {
     enabled: true,
-    textTemplate: '{name} — {description} ({caseNumber}, {jurisdiction})',
   },
 }
 ```
 
 Admins toggle it per type as **Cognitive Processing** on the node-type *Properties* tab. Inside Structure it drives one thing today: `listNodesNeedingEmbedding` resolves its default `nodeTypes` from types with the flag enabled. Cognitive modules read it for their own type selection.
 
-### Searchable text (`textTemplate`)
-
-`textTemplate` is an optional **merge template** that Structure resolves into the node's lexical `searchText` column on every create and update. It runs `{name}`, `{description}`, and `{fieldId}` tokens (top-level `data` fields) through simple, deref-free `{token}` substitution — no LLM, no embedder, just the node's own fields. Empty or missing tokens resolve to blank.
-
-- **What it does.** It opts a node type's **custom-field content** into the lexical GIN index — and therefore into `lexicalSearchNodes` / `hybridSearchNodes`. When `textTemplate` is unset, `searchText` stays `null` and the lexical index falls back to **`name` + `description`**, so keyword search works out of the box; the template only *adds* fields to what is searchable.
-- **Own-config only.** Unlike most node-type config, `textTemplate` is **not** hierarchy-resolved — keep it on each type that needs it, which keeps the write path to a single type lookup.
-- **Opt-in gated.** The `searchText` column is only generated on embeddings-enabled installs, so `textTemplate` has no effect until you opt in.
+<Aside type="note" title="textTemplate removed in v1.33.0">
+The v1.32.0 `cognitiveIngest.textTemplate` option (and the `searchText` column behind it) is **gone**. Node keyword search now **auto-indexes** `name` + `description` + all `data` string values into the trigger-maintained `searchVector` column, so there is no longer a per-type search-text knob to configure — see [Node keyword search](#node-keyword-search-always-on).
+</Aside>
 
 ## New action hooks
 
@@ -459,7 +479,8 @@ Six hooks join the [Structure action hooks](/modules/structure/integration/#reac
 ## Notes & troubleshooting
 
 - **Init/update now needs a reachable database.** v1.16.0 ships Structure's first module migration, so `npx structure init` and `npx structure update` must be able to connect via `backend/.env` (`DIRECT_DATABASE_URL` or `DATABASE_URL`). Previously the schema step was file-only.
-- **Declare pgvector in the datasource** so future `prisma migrate dev` shadow databases include the extension — otherwise `migrate dev` fails with **P3006** after the vector migration exists. These `generator`/`datasource` blocks are **owned by the starter template** (module schemas are models-only), so use the starter's vector setup rather than hand-editing: run `scripts/enable-vectors.ps1` (Windows) or answer *"y"* to **"Enable vector database?"** at your next template update. Structure's embeddings heal detects whether this is already present and only advises when it is missing. What the starter adds:
+- **Run `prisma migrate dev` after updating to v1.33.0.** `npx structure update` writes the schema with the new `searchVector` / `contentVector` columns (and `observedAt`); the host must then run `prisma migrate dev` to apply them to the database. The `searchVector` / `contentVector` **triggers and GIN indexes self-heal at runtime** — the first search after the columns exist runs the `ensure` provisioning (`ensureKeywordInfrastructure` for nodes, `ensureInfrastructure` for chunks) — so a missed migration surfaces as an empty keyword result, never a crash, until the columns are present.
+- **Declare pgvector in the datasource** so future `prisma migrate dev` shadow databases include the extension — otherwise `migrate dev` fails with **P3006** after the vector migration exists. These `generator`/`datasource` blocks are **owned by the starter template** (module schemas are models-only), so structure never edits them itself — it shells out to the starter's declaration-only `ensure-pgvector` primitive. As of **v1.33.1** the embeddings heal **auto-runs** `npm run ensure-pgvector` (declaring pgvector, plus the Lakebase pair when the `pg_extension` probe finds it installed) instead of only advising; on an older starter without the primitive it falls back to advising you to run `scripts/enable-vectors.ps1` (Windows) or answer *"y"* to **"Enable vector database?"** at your next template update. What the declaration adds:
 
   ```prisma
   generator client {

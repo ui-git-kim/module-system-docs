@@ -1,7 +1,7 @@
 ---
 title: Changelog
 description: Version history and release notes for the AI Core module
-lastUpdated: 2026-07-24
+lastUpdated: 2026-08-03
 sidebar:
   order: 14
 ---
@@ -20,6 +20,86 @@ Check your installed version with `npx ai-core info`.
 </Aside>
 
 ---
+
+## v1.12.0 — 2026-08-03
+
+**Guardrail-check execution — abstention now compares a MEASURED support score, not the model's own confidence.** The discipline↔check pairing was structurally enforced, but only the two deterministic checks (`coverage-reported`, `feedback-present`) actually ran, and abstention compared the model's *self-reported* `confidence` field — the model grading its own homework, the anti-pattern the design rejects. This release ships the execution layer and the two checks that matter most for legal work, both opt-in per operation through a discipline.
+
+- **Source verification** (a deterministic builtin, no model call) runs in two directions: every extracted item verified *verbatim* against the source (catches fabrication and misattribution), and — where an independent denominator is available — whether everything the source contains was returned (catches silent early-stop). Where no count exists, completeness is reported as `completeness-unverified` rather than assumed. Coverage lands in `feedback.coverage`; each unverified item in `feedback.missing`.
+- **Groundedness scoring** (a `grounding` check) runs a nested JUDGE operation that decomposes the output into claims and scores how many the source supports. AI Core seeds a batteries-included judge (`ai-core/groundedness-judge`) bound to a language model *by requirements at seed time* — no model string in code, admin-repointable. The judge runs the full pipeline with its own ledger row, inherits the calling operation's sensitivity (so sensitive content never routes to weaker terms), and is recursion-guarded (it carries no grounding check and runs internal). A measured score in `[0,1]` lands in the new `feedback.groundedness` and the `ai_usage_ledger.groundedness` column.
+- **Abstention rewired.** When a grounding check produced a score, abstention compares *that* against the threshold (`abstained-below-groundedness`). When only self-reported confidence is available, abstention may still use it — but the run NAMES that provenance (`abstention-on-self-reported-confidence`) so the weak signal is never mistaken for measured support. `Feedback` gains a `groundedness` field distinct from `confidence`; a groundedness score is an input to feedback, never a certificate the output is true.
+- **Degrade, don't fail.** A scorer outage, a misconfigured check, or a terms refusal on sensitive content becomes a named feedback gap (`groundedness-unavailable`, `source-verification-misconfigured`, …), never a failed user run. A check AI Core cannot run is named, never a silent pass.
+
+**Opt-in, not universal** — two seeded `default`-tier disciplines (`ai-core/ground-claims`, `ai-core/verify-extraction-against-source`) turn the checks on; a consumer adds them to an operation's `disciplineIds` (grounding belongs on retrieval-heavy operations, not everything). **No Prisma/schema change** — the model already anticipated this (`kind: 'grounding'`, the `config` bag, the `groundedness` ledger column). A host picks it up with `npx ai-core update`. Still to come: an admin editor for creating custom checks, and an `ensureCheck` consumer seed for a custom source-verification path (today the seeded checks plus `ensureOperation({ disciplineIds })` cover the common cases).
+
+## v1.11.3 — 2026-08-03
+
+**Fix: caching the system prompt (`cache.instructions`) under AI SDK v7.** The v1.9.0 caching path built a `role: 'system'` message so a `cacheControl` marker could ride on it — but AI SDK v7 rejects system-role messages outright (`AI_InvalidPromptError`, *"use the instructions option instead"*). Any operation with `cache.instructions: true` **and** a non-empty system prompt therefore threw at call time. Surfaced by a live verification run against Anthropic.
+
+- **The fix.** The system prompt now always travels through the `instructions` option (never a message), and its cache breakpoint is placed with a **top-level** `providerOptions.anthropic.cacheControl` — the one place AI SDK v7 attaches a marker to the system prompt. It coexists with the existing part-level context breakpoint, so the two-breakpoint contextual-retrieval shape still holds. Verified live: the system prompt is written to cache and read back on the next call (`cacheWriteTokens` → `cacheReadTokens`).
+- **`cache.context` was unaffected.** The context breakpoint is a user-content part marker and already worked end-to-end (it is what cog-ingest's contextualise step uses); only the separate system-prompt breakpoint was broken.
+
+Adapter-only change (`providers/adapters.ts`); no schema change. A host picks it up with `npx ai-core update`.
+
+## v1.11.0 — 2026-08-02
+
+**Multimodal embedding — embed images and text into one vector space.** For visual and design retrieval, cog-ingest needs to embed images (screenshots, mockups) the same way it embeds text, so a query can find them by similarity. A new surface does exactly that, added alongside `embed` rather than changing it — the live text-embed path is untouched.
+
+- **`aiCore.embedMultimodal(operationId, inputs, opts)`** — `inputs` are `{ text?, media? }` (media is the same `MediaAttachment` shape vision uses: base64 bytes or an http(s) URL). It returns the same `EmbedRunResult` envelope as `embed` — feedback, audit, and vectors into the same store — and runs the same dimension gate, so a multimodal vector can never be written at the wrong width. `POST /embed-multimodal/:operationId`.
+- **Confined to the adapter.** The Voyage adapter routes through `multimodalEmbeddingModel` (`voyage-multimodal-3` / `-3.5`): text rides in `values`, images in `providerOptions.voyage.content`. No other file touches the SDK. Two loud refusals keep it honest — an operation whose model is not marked multimodal refuses with `embedding-not-multimodal`, and a provider with no multimodal embedding refuses as an unsupported kind, rather than a silent empty result.
+- **A model marker, seeded.** A new `ai_model.multimodal` boolean marks image-capable embedding models; `voyage-multimodal-3` and `-3.5` are seeded with it (native 1024-wide, `supportedDimensions` left null rather than claiming unconfirmed Matryoshka widths — a wrong-width vector is silent corruption). `EnsureModelRequirements.multimodal` lets a consumer seed a multimodal operation that binds one of these models; admin model form gains a Multimodal toggle.
+
+New column `ai_model.multimodal` + seed-11; a host picks both up with `npx ai-core update` then `prisma migrate dev`. SDK-boundary types verified against `voyage-ai-provider@4` + `ai@7`. The second Stage-2 cog-ingest hand-off item after prompt caching; images never enter the ledger.
+
+## v1.10.0 — 2026-08-02
+
+**A `deterministic` dial — reproducible output for judges and extractions.** A parse-QA judge (or any extraction) wants the *same* answer for the same input, not a fresh sample each time; that means temperature 0. AI Core deliberately lets no consumer set a raw temperature — dials, not opinions, and it never invents a temperature the model record did not specify — so until now there was no way to ask for determinism at all (the seeded models carry empty `parameterRules`, so no temperature is set on any call). The new dial closes that, the design-honest way:
+
+- **`Dials.deterministic`** is a boolean knob with no opinion of its own. When set, the resolver reads the *model record's* `parameterRules.deterministic` mapping — `{ temperature?, seed? }` — and applies it, overriding the effort-derived temperature and setting a seed where the model supports one. A model that lists `seed` as unsupported drops it with a recorded transform, as always. Nothing is invented; the model still declares what determinism means for it.
+- **Seeded so it works out of the box.** A new seed (`1.10.0__seed-10-determinism`) merge-adds `deterministic: { temperature: 0 }` to every seeded *language* model, touching only rows that have no mapping yet — an admin's own value is never clobbered. So `deterministic: true` on an operation resolves to temperature 0 immediately.
+- Admin: a Deterministic control in the dials editor (Operations + Presets tabs); zod `dialsSchema` extended.
+
+This is the first half of the **parse-QA / per-source-summary** hand-off from cog-ingest. Both are *plain language operations the consumer seeds* — AI Core ships no operations — so the per-source summary needs nothing new, and the parse-QA judge needed exactly one thing AI Core lacked: a way to be deterministic. Delivered as a resolution-layer dial, not a new capability (no adapter, surface or run-kind). No schema change (the dial lives in the existing `ai_operation.dials` JSON); a host picks up the seed with `npx ai-core update`.
+
+## v1.9.0 — 2026-08-02
+
+**Prompt caching — an operation reuses its stable prompt prefix instead of paying for it on every call.** A named job that repeats a large, unchanging prefix — every chunk of one document through cog-ingest's contextualise step, say — can now have that prefix held by the provider and read back at a fraction of the cost, for a small one-time write. It is a pure cost-and-latency optimisation: it changes nothing about what the model sees or returns, and sends the provider no data the call did not already send.
+
+- **A policy on the operation, not a flag scattered in code.** A new nullable `ai_operation.cache` column holds `{ instructions?, context?, ttl? }` (type `CachePolicy`), editable in the admin (Operations tab) and seedable by consumers through `ensureOperation`. `instructions` caches the assembled system prompt (stable across every call of the operation); `context` caches the input up to and including the context block — the supporting material, e.g. a source document — while the task (the varying question or chunk) stays uncached. `ttl` is `5m` (default) or `1h` for a longer batch. Providers cache by *prefix*, so the two breakpoints nest: the system prompt is reusable across every call of the operation, and system-plus-document across every chunk of one document — the shape from Anthropic's contextual-retrieval guidance.
+- **Confined to the adapter.** The Vercel AI SDK stays the sole concern of `providers/adapters.ts`: it builds the message form with `cacheControl` on the system message and/or the context prefix, and the owned interface gains `cacheWriteTokens` (recorded in the ledger next to the existing `cacheReadTokens`) so the saving is visible, never hidden. Explicit prompt caching is Anthropic-only in this version.
+- **Silent about nothing.** An operation configured to cache but resolved to a provider that cannot honour it runs uncached and names the shortfall in feedback (`prompt-cache-unsupported`), with a provider warning — it never pretends to have cached. Caching sends the provider no new data, so it needs no new sensitivity gate: it is allowed wherever the call itself is.
+
+New column `ai_operation.cache`; a host picks this up with `npx ai-core update` followed by `prisma migrate dev`. The SDK-boundary types were verified against `ai@7` + `@ai-sdk/anthropic@4`. Raised by cog-ingest's contextualise-chunk step — feed the full source document per chunk affordably.
+
+## v1.8.2 — 2026-08-02
+
+**Patch: lifecycle and CRUD hooks now fire `doActionAll`, so asynchronous subscribers are no longer skipped.** Every hook AI Core fires — the run lifecycle (`ai-core.run.completed`) and the whole record-CRUD family (`ai-core.model.updated`, `ai-core.operation.updated`, `ai-core.discipline.updated`, `ai-core.review-item.updated` and the rest) — dispatched through plain `actionRegistry.doAction(...)`, which runs the **synchronous** handler pool only and silently skips any subscriber registered with `addActionAsync` (conformance contract **C18**). For a foundation module whose events consumers are meant to build on, that is a real correctness gap: an async usage-meter or audit subscriber would simply never run. All 24 call sites now dispatch with `void actionRegistry.doActionAll(...)`, which fires **both** the sync and async pools while staying fire-and-forget — the write path still never awaits a subscriber. Consumers may now subscribe with `addActionAsync` for I/O-bound reactions. Surfaced by the conformance linter added in the v1.8.1 scaffold sync (contract v1.3.0); the calls themselves predate it. See [Hooks & Events](/modules/ai-core/hooks-and-events/).
+
+## v1.8.0 — 2026-08-01
+
+**Configurable embedding widths — models declare what they can produce.** An embedding model record now carries `supportedDimensions` — the set of output widths it can emit (Matryoshka), e.g. `[256, 512, 1024, 2048]` — alongside its native `dimensions`. Three things change so the width becomes a property of the *store*, not a hard-coded number:
+
+- **Selection widens.** `ensureOperation`'s width requirement now matches any model that can *produce* the required width — natively, or as one of its supported widths — with a native match preferred over a Matryoshka down-projection. Previously only a model whose native width matched exactly was eligible, so a 1536-native model that can emit 1024 was wrongly excluded.
+- **The target follows Structure.** At run time `embed()` derives the target width from Structure's installed vector width (`getCognitiveCapabilities().embeddings.dimensions`) and asks the provider for exactly that — so the operation tracks the store's width automatically, and the gate refuses if the resolved model cannot produce it. With no vector store present, the model's native width stands.
+- **The adapter already forwarded it.** Each embed adapter already passes a per-provider output-dimension option (`dimensions` / `outputDimension` / `outputDimensionality`); this makes the pipeline set it to the store's width.
+
+Curated supported-width defaults are seeded for the OpenAI, Google and Voyage embedding models (admin-editable, comma-separated in the model form). New column `ai_model.supportedDimensions`; a host picks this up with `npx ai-core update` followed by `prisma migrate dev` for the new column. Raised while wiring cog-ingest's embed operations, so any store width can draw on the widest set of eligible models.
+
+## v1.7.1 — 2026-08-01
+
+**Patch: the embedding dimension gate now fires against a live Structure service.** The gate read `structure.getCognitiveCapabilities()` synchronously, but a real Structure install returns a Promise (it dynamically imports its embeddings module to read the width). The run engine now `await`s the probe — the earlier sync read threw `Cannot read properties of undefined` on the first embed with Structure registered, which is why the gate had never actually fired live. Awaiting a plain value is a no-op, so the fix is safe whichever shape Structure returns. Found by the first live embed with cog-ingest's operations and Structure both present.
+
+Verified in the same pass: cog-ingest's vision operations (`analyse-image` and friends) run the media path end to end (segment media → adapter file part → provider → text), and the v1.6.0 width-selection logic correctly filters embedding models by the required width. **Caution for hosts installed before v1.6.0** — see the [Roadmap](/modules/ai-core/roadmap/): generated code predating the width requirement ignores `dimensions` and binds the oldest embedding model, so `npx ai-core update` to v1.6.0+ is required for the width filter to apply.
+
+## v1.7.0 — 2026-08-01
+
+**The first live provider call — and a rerank surface.** The blocking gate is cleared. `aiCore.run()`, `embed()` and the new `rerank()` all executed end to end against live providers (Anthropic Claude Opus 4.6, Voyage) in a real installed app — prompt assembly → adapter → schema validation → deterministic checks → feedback → ledger write, with every path leaving a ledger row. As the roadmap predicted, the first call surfaced exactly one patch.
+
+- **Patch — an empty system prompt is now omitted, never sent.** An operation with no segments, disciplines or schema assembles an empty `instructions` string; the adapter was passing it through as an empty system content block, which the provider rejects (`system: text content blocks must be non-empty`). The adapter now omits the system field entirely when instructions are empty — a prompt-only call is valid; an empty system block is not. Structured-output and embed calls were unaffected (a schema makes the system prompt non-empty). Found by the very first live `run()`.
+- **Rerank is now a first-class surface.** The Voyage rerank adapter and a seeded `rerank-2.5` model row already existed; everything downstream was missing. Added `aiCore.rerank(operationId, { query, documents }, opts)` — a thin pipeline mirroring `embed()` (resolution, the same sensitivity gate, ledger, feedback; no prompt, no disciplines), a `RerankRunResult` consumer type, a `rerankBodySchema`, and a `POST /rerank/:operationId` route. `ai_model.kind: 'rerank'` and the `reranking` dial were already recorded — this makes them do something. The rerank *operation* stays consumer-seeded (cog-ingest names its own job): AI Core ships the surface, not the operation. Verified live against Voyage `rerank-2.5` with a correct relevance ordering.
+- **Claude Opus 4.6 added to the seed palette.** A new append-only migration (`1.7.0__seed-08-opus-4-6`) seeds `claude-opus-4-6`. Its 1M context window is standard on that id — there is no separate id or beta header for it, so "1M" is only a label.
+
+Verified live in a real installed app against Anthropic and Voyage; the generated code type-checks clean against AI SDK v7 and the Prisma 7 client. Truthful partial `EmbedCoverage` remains deliberately deferred — see the [Roadmap](/modules/ai-core/roadmap/).
 
 ## v1.6.0 — 2026-07-24
 

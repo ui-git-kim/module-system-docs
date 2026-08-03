@@ -5,15 +5,19 @@ description: Version history and release notes for the module starter
 
 import { Aside, Badge } from '@astrojs/starlight/components';
 
-This page documents notable changes to the module starter template. The module starter uses semantic versioning: **major.minor.patch**.
+This page documents notable changes to the module starter template. The module starter uses semantic versioning: **major.minor.patch**, with a deliberately **patch-default cadence**:
 
-- **Major** (1.0.0 → 2.0.0): Breaking changes requiring migration
-- **Minor** (1.0.0 → 1.1.0): New features, backwards compatible
-- **Patch** (1.0.0 → 1.0.1): Bug fixes, documentation updates
+- **Patch** (1.0.0 → 1.0.1): the default — almost everything. Bug fixes, new templates, new CLI commands/features, admin sections, tooling, refactors, removals, docs alignment.
+- **Minor** (1.0.0 → 1.1.0): rare — a genuinely new subsystem or registry, or a headline release worth signposting.
+- **Major** (1.0.0 → 2.0.0): a deliberate breaking epoch / post-launch migration requiring coordinated downstream changes.
+
+<Aside type="note">
+A new command or template on its own is a **patch**, not a minor. If you're reaching for `minor` because a change "adds a feature", it's almost certainly a patch. See [Versioning → Cadence](/module-starter/versioning/#version-bump-commands).
+</Aside>
 
 <Aside type="tip">
 The module starter has **two version numbers**:
-- **Scaffold version** (`VERSION` file) — Infrastructure version (currently 1.31.0)
+- **Scaffold version** (`VERSION` file) — Infrastructure version (currently 1.31.10)
 - **Module version** (`package.json`) — Your module's version
 </Aside>
 
@@ -22,6 +26,140 @@ The cross-repo arc this changelog tracked is complete. The host enforces `depend
 </Aside>
 
 ---
+
+## Scaffold v1.31.10
+
+**Health-check audit fixes — 6 moderate + 11 minor across templates + scaffold (+ `npm audit`)**
+
+A four-dimension audit (Standards / Production / Performance / Security) of the generated templates and the scaffold, adversarially verified. **Zero critical, zero performance findings.** All 17 code findings fixed, plus the 2 high-severity dependency advisories.
+
+**Generated code (templates):**
+- **`create`/`update` now validate the request body** — `backend/services.ts` parses `req.body` with a zod schema before it reaches Prisma, so a bad body returns **400** (not a 500) and only whitelisted fields are written (no `id`/`createdAt` mass-assignment via a spread). Mirrors the existing `importUserData` discipline.
+- **List endpoint survives a non-numeric `?limit`** — `?limit=abc` (→ `NaN`) is sanitised before the page-size clamp instead of reaching `prisma.findMany({ take: NaN })` and 500-ing.
+- **Import errors no longer leak internals** — a failed admin import returns a generic message; the raw Prisma error stays in the server log.
+- **`module.registration.ts` no longer swallows real failures** — the pre-v1.48 graceful no-op is scoped to the dynamic import only, so a genuine `moduleRegistry.register()` failure (bad `depends`, duplicate id) surfaces on a v1.48+ host.
+- **Frontend polish** — the debounced-save effect treats an aborted save as a no-op via `signal.aborted` (covers `fetch`'s `AbortError`, not just axios's `CanceledError`); the import file picker resets its value so re-selecting the same file re-fires. Dropped an unused `separator` from `shadcnComponents`.
+
+**Scaffold:**
+- **`enable`/`disable` no longer wipe asset tracking** — both spread the existing `ModuleState` before toggling `enabled`, so `installed*Deps`/`shadcn`/`env` survive; previously a toggle erased them and the next `update` silently skipped new dependency + env-var installs.
+- **`update` doesn't record declined deps as installed** — a dependency the user declines to install is re-offered next update instead of being lost.
+- **`init --force` can't leave a duplicate model** — the single-file re-init removes `allModelNames` (declared ∪ extracted-from-template), not just `modelNames`, so a model shipped in the template but absent from `modelNames` isn't left behind to collide with the re-append.
+- **Anchored env-var de-dupe** — `appendEnvFile` matches `^\s*KEY\s*=` instead of a substring, so a module key that is a suffix of an existing key isn't silently skipped.
+- **Defense-in-depth hardening** — module-authored install args (deps, shadcn ids/paths) are refused if they carry shell metacharacters (`isShellSafeArg`); an embedded migration filename that isn't a bare basename (`../…`) is refused before it can write outside the migrations dir.
+- **`uninstall` guidance** now points at `prisma migrate deploy` (a generated drop migration), not the drift-prone `migrate dev`.
+
+**Tooling / deps:**
+- `bump-module-version.sh`'s node-absent fallback replaces only the **first** `version:` in the file (awk), matching the `.cjs` and `.ps1` paths; `add-scaffold-scripts.cjs` now seeds `conformance:check`/`parity:check` aliases.
+- **`npm audit fix`** cleared the 2 high-severity advisories (`picomatch`, `rollup` — transitive via `tsup`); 1 low remains in `tsup`'s bundled esbuild (dev-server only; needs a breaking `tsup` bump).
+
+Verified: `tsc --noEmit` clean; `check-templates`/`conformance`/`parity` green; an isolated zod 4 + TS 7 compile of the new generated snippets; and an adversarial review of the full diff (which compiled the generated `module.registration.ts` under **TS 7.0.2** — the host version). As with every template change, the gold-standard validation is a real module update on a host app.
+
+## Scaffold v1.31.9
+
+**Drift-immune schema apply — `migrate diff` → migration file → `migrate deploy` (replaces `migrate dev`)**
+
+`init` and `update` no longer apply a module's schema with `prisma migrate dev`. On a shared database that carries **runtime-created objects Prisma's migration history doesn't know about** — e.g. a vector module's `lakebase_*`/pgvector extensions and HNSW indexes, whose shape depends on the app's configured vector width so they can't be static migration files — `migrate dev` drift-checks the *whole* DB and **resets** it on every module schema change. The migrate is abandoned, `schema.prisma` ends up ahead of the DB, and Step-4 change detection then reports "up to date" forever, leaving manual `ALTER`s as the only path. (Diagnosed on veradai + Neon Lakebase; ai-core is a clean victim of the shared DB.) The starter's `prisma.config.ts` can declare known runtime *tables* external, but that can't cover dynamic extensions/indexes — so the fix stops drift-checking altogether.
+
+The new flow keeps Prisma migrations for production and never resets:
+
+1. **Delta computed OFFLINE** — `prisma migrate diff --from-schema <before> --to-schema <after> --script` (the Prisma 7 flag names, renamed from `--*-schema-datamodel` in v7), where `before` is a snapshot of the datamodel taken *before* the module's edit and `after` is the edited schema. Datamodel→datamodel never connects to the DB, so runtime objects are invisible and nothing can reset. The diff is **exactly this module's `ALTER`s** — it never diffs DB→schema (which would try to `DROP` Structure's undeclared indexes). `migrate dev --create-only` is **not** enough (it still drift-checks); `migrate diff` is the only offline generator. Multi-file schemas are concatenated to a single temp `.prisma` file, so the diff flags always receive a plain file path.
+2. **Written as a real Prisma migration** — `prisma/migrations/<timestamp>_<name>/migration.sql` (+ `migration_lock.toml`), so `prisma migrate deploy` runs the same committed files in production unchanged.
+3. **Applied with `prisma migrate deploy`** — which does **not** drift-check or reset, and records `_prisma_migrations`. Run on **every** DB step (including an `update` whose schema is already current) so a pending/failed migration is retried/surfaced instead of the silent "up to date" skip.
+4. **Auto-baseline guard** — if `deploy` fails because our just-written migration hits an object that already exists without history (the DB reports **"already exists"** — a drifted dev DB), the migration is marked `--applied` (recorded, **not** re-run) and `deploy` retried. The trigger keys on the DB-level "already exists" text, **not** the generic `P3018` code (which wraps *any* failed migration — e.g. a `NOT NULL` violation — and must never be auto-baselined). It only ever targets our own migration; the one residual caveat (a single migration mixing an existing object with a new one rolls back as a whole, so the new object needs a manual apply) is logged.
+
+All failures stay **warn-only** — the worst case is "apply the migration manually", never a reset. New `execCommandCapture` (captures `migrate diff --script` stdout, which the inherit-stdio `execCommand` can't) plus `snapshotDatamodelBeforeEdit` / `applyModuleSchemaToDatabase` / `deployPendingMigrations` live in `src/scaffold/utils.ts`; `init.ts` (`setupDatabase` + a Step-1 snapshot) and `update.ts` (`runPrismaAfterSchemaUpdate` + the no-change deploy retry) call them. The module SQL/TS migration runner (`runModuleMigrationsForHost`, `_module_migrations`) is unchanged, and `onPrepareDatabase` (v1.31.8) still runs first.
+
+<Aside type="note">
+Can't be runtime-tested in the module-starter (no DB — it's a template). Type-checked (`tsc --noEmit` clean) and reasoned against the Prisma 7 CLI semantics; real validation is a drifty host app on starter v2.5.2 (e.g. veradai).
+</Aside>
+
+## Scaffold v1.31.8
+
+**`onPrepareDatabase` now runs for every enabled installed module before the migrate**
+
+Generalises the v1.31.3 pre-migrate hook. It previously ran only the *current* module's `onPrepareDatabase`, but `prisma migrate dev` reconciles the **whole** host schema — so updating module A can still fail the migrate on module B's undeclared Postgres extension. Now, before the migrate (in both `init` and `update`), the scaffold runs `onPrepareDatabase` for the current module **and every other enabled installed module**.
+
+- **Cross-module discovery:** installed modules are enumerated from `.module-manifests.json`; disabled ones (`.module-state.json` → `enabled: false`) are skipped; each is run with its own stored `moduleAnswers` and `backendPath`.
+- **Definition loading:** new `loadInstalledModuleDefinition()` best-effort resolves a sibling's package (`node_modules/<id>`, same convention as the dependency resolver) and imports its `moduleDefinition`. A sibling whose package isn't resolvable (bare-`npx` install not kept as a dependency, or a package name ≠ module id) is reported once and skipped — the migrate still runs.
+- Implemented in `src/scaffold/lifecycle-utils.ts` (`runPrepareDatabaseForModules`), wired into `init.ts` and `update.ts`.
+
+## Scaffold v1.31.7
+
+**Generator tooling modernised for the starter v2.5.2 stack + a list-hook fix**
+
+Brings the module starter in step with **starter template v2.5.2** (React Router v8, Vite 8, TypeScript 7, zod 4, vitest 4, lucide 1, pino 10).
+
+- **Generator devDeps** (the module starter's *own* build tooling — not what templates emit): `commander ^12→^15`, `typescript ^5→^7`, `esbuild ^0.24→^0.28`, `@types/node ^20→^26`, `tsup ^8.0→^8.5`. Generated modules still declare **no** react/vite/zod/ts versions — the host app supplies them.
+- **TS 7 build fix:** tsup's bundled `rollup-plugin-dts` (v6) crashes under TS 7 (it reads the moved `useCaseSensitiveFileNames` compiler API), so declarations are now emitted by TS 7's own `tsc --emitDeclarationOnly`; tsup still bundles the JS. `commander` 12→15 is a clean upgrade for the CLI.
+- **Emitted-code fix (`hooks.ts`):** the generated list hook keyed its query with `myFeatureKeys.key('list', options)`, but the starter's `createModuleQueryKeys().key(...)` accepts only string/number segments — the `options` object failed to compile under v2.5.2. It now builds the key from the namespaced root: `[...myFeatureKeys.root, 'list', options]` (a valid structural TanStack key; C13 namespacing preserved; `key('list')` invalidations still prefix-match).
+
+Verified by generating a throwaway module into a starter-v2.5.2 app and type-checking: **backend emitted templates 0 errors** (zod 4 / TS 7 / prisma 7 / express 5); frontend clean after the hook fix.
+
+## Scaffold v1.31.6
+
+**Generated frontend imports migrated to React Router v8**
+
+The starter template moved to React Router v8 — the package is `react-router` (no more `react-router-dom`). The frontend templates now import from `react-router`: `pages.ts` (`useParams`, `Link`) and `routes.ts` (`RouteObject`). This is the only emitted-code change RR8 required; generated modules declare no router version, so the host app's `react-router@^8` supplies it.
+
+## Scaffold v1.31.5
+
+**Soft conformance prompt on module releases**
+
+Complements the hard scaffold-side gate from v1.31.4. A downstream **module** release (`version:*`/`release:*` → `bump-module-version.ps1`/`.sh`) now runs the conformance linter against the module's own templates and, on failure, **prompts** `Continue with the version bump anyway? [y/N]` (default **N**) instead of hard-aborting — a module owns its templates and may legitimately diverge from a checked pattern, so the author decides.
+
+- **Never hangs unattended:** in CI / no-TTY it warns and proceeds (advisory). New `is_non_interactive` / `Test-NonInteractive` helpers mirror the `update-scaffold` detection (CI env + redirected stdin). For a *hard* CI gate on a module, run `npm run conformance:check` as its own step.
+- **Why softer than the scaffold gate:** `bump-version` (scaffold) hard-aborts because the scaffold owns the canonical templates; `bump-module-version` prompts because a module owns — and may diverge — its own.
+- `check-parity.cjs` now tracks `bump-module-version.ps1`/`.sh` as a pair (it wasn't before): +4 invariants (26 total across 3 pairs).
+
+## Scaffold v1.31.4
+
+**Conformance is now an enforced release gate**
+
+`check-conformance.cjs` was a manual pre-release step; the scaffold version bump ran only `sync-contract.cjs --check`. Now `scaffold:version:*` (`bump-version.ps1`/`.sh`) runs the conformance linter **before** bumping and **aborts the release if it fails** — so a scaffold release can no longer ship a template that regresses a mechanically-checked Conformance Contract item (C2 barrel wiring, C10 service version, C13 query-key namespacing, C15 no-console, C18 `doActionAll`, C26 backend `.js` imports, …).
+
+- The gate is **existence-guarded** (a no-op if a module removed the linter), mirroring the existing contract-drift gate. A downstream module's own release runs through `bump-module-version`, so its author flow stays opt-in.
+- `check-parity.cjs` gained two invariants so the `.ps1`/`.sh` gates can't drift apart.
+
+This makes the "asserts … on every release" description accurate (it was softened to "manual" in v1.31.2). See [Conformance Contract](/module-starter/conformance-contract/).
+
+## Scaffold v1.31.3
+
+**Bug fix: `onPrepareDatabase` hook — module DB prep now runs before `prisma migrate dev`**
+
+`update` ran `prisma migrate dev` (Step 4) **before** a module's `onUpdate` heal (Step 8), so a module couldn't declare a Postgres extension its new schema needs in time to unblock its own migrate. An *installed-but-undeclared* extension made the migrate fail on **drift**, and the new columns applied only after a manual re-run once the heal declared the extension. Surfaced on veradai enabling **Neon Lakebase** (`lakebase_vector`/`lakebase_text`).
+
+**The fix (`src/scaffold/types.ts`, `lifecycle-utils.ts`, `update.ts`, `init.ts`):** a new scaffold-owned lifecycle hook **`onPrepareDatabase(ctx)`** runs in the CLI **immediately before** the Prisma migrate — in both `update` (before `runPrismaAfterSchemaUpdate`) and `init` (before `setupDatabase`). Move extension-declaration (e.g. `ensure-pgvector --lakebase`) into it so the datasource is prepared first. Its context carries `phase` (`'install' | 'update'`), `backendPath`, and `moduleAnswers`. Like `onReconfigure`, it is scaffold-owned (CLI-only, never called by the host runtime), so it lives in `types.ts` — **not** the synced contract — and `contract:sync` can't clobber it. Best-effort: a hook failure warns and the migrate still runs. See [Lifecycle Hooks → onPrepareDatabase](/module-starter/lifecycle-hooks/).
+
+**Interim workaround** for apps not yet on v1.31.3 (and the pattern the hook automates): declare the extension before running `update` (`npm run ensure-pgvector -- --lakebase`).
+
+Type-check plus `check-templates`, `check-conformance`, `contract:check`, and `parity:check` all pass. Propagated via `scaffold:update`.
+
+## Scaffold v1.31.2
+
+**Docs accuracy pass + patch-default cadence + navigation legend fix**
+
+A documentation-accuracy audit (docs-vs-code) corrected 43 findings across the module-starter pages and the shared LLM Rules — stale CLI/command listings (`reconfigure`, `migrate-db`, DB steps), `module.registration.ts`/contract-v1.3.0 drift, template snippet regens, a `/api/v1/[module]` path fix, a non-compiling `database.mdx` transaction example, a security-checklist correction (single atomic deletion handler, C8), and more. See [Roadmap → Known Issues](/module-starter/roadmap/#known-issues).
+
+This release also **recalibrates the version cadence to patch-default** across the guidance (CLAUDE.md, `versioning.mdx`, `changelog.mdx`, LLM Rules): patch is the default for almost everything; minor is reserved for a genuinely new subsystem/registry or a headline release; major for a deliberate breaking epoch. A new command or template on its own is a patch.
+
+The only code change is a one-line template comment: the generated `navigation.registration.ts` order-value legend now matches the authoritative LLM-rules table (0-25 core, 26-50 feature, 51-75 secondary, 76-100 utility).
+
+## Scaffold v1.31.1
+
+**Bug fix: `update` now refreshes the install manifest — models added in later versions are no longer orphaned on uninstall**
+
+`uninstall` strips a module's Prisma model/enum blocks using the list stored in `.module-manifests.json` → `schemaModels`. That list was written **only at install** (`init.ts` — the scaffold's sole `saveModuleManifest` call) and **`update` never rewrote the manifest**. So a model added in a *later* module version was absent from the `schemaModels` of any app that reached that version via `update` (the normal upgrade path), and `uninstall` left its table/block **orphaned** in the host's Prisma schema. The manifest's `version` (shown in `uninstall`'s summary) went stale for the same reason. Surfaced by the structure module, whose `structure_field_template` model shipped in the schema template but never reached upgraded apps' manifests.
+
+**The fix (`src/scaffold/update.ts`, `src/scaffold/init.ts`):**
+
+- New `refreshInstallManifest()` merges the current `version` (always) and the freshly-derived `schemaModels`/`schemaFile` (when supplied) into an **existing** manifest. It never fabricates a manifest — `update` never created one, and a partial manifest (missing the frontend/backend paths and registrations only `init` records) would break `uninstall`'s file deletion. Modules installed before manifests existed are left untouched, exactly as before.
+- `applySchemaUpdate()` calls it in **both** branches. The single-file branch already computed the full model/enum set (`extractModelNamesFromSchema(template)` ∪ processed `modelNames`); the **multi-file** branch — which computed no names before — now derives it the same way and also records the `schemaFile`.
+- A **version-only** refresh runs after `applyUpdates()` so a schema-less version bump doesn't leave the manifest `version` stale.
+- **Install-time hardening:** `init.ts` now derives `schemaModels` from template extraction ∪ `modelNames` too, so a model present in the schema template but omitted from the hand-maintained `modelNames` array (exactly the structure bug) can't orphan even on a fresh install.
+
+**Interim mitigation for already-installed apps** (no scaffold change needed): re-run `npx <module> init --force`, or hand-add the missing model name to that module's `schemaModels` in `.module-manifests.json`.
+
+Type-check plus `check-templates`, `check-conformance`, `contract:check`, and `parity:check` all pass. Propagated via `scaffold:update`.
 
 ## Scaffold v1.31.0
 

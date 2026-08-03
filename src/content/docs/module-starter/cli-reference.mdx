@@ -53,7 +53,9 @@ npx my-module init --no-interactive
 7. **Collects environment variables** — Prompts for env var values (supporting `secret` masking and `when` conditionals), writes to `.env` files
 8. **Installs UI components** — Runs `npx shadcn add <components> -y` (a single batched call, falling back to per-component installs if the batch fails) for the module's required shadcn components
 9. **Installs dependencies** — Runs `npm install` in frontend and/or backend directories. If the module defines `backend.providerDependencies` and a prompt set a provider key (e.g. `provider: 'anthropic'`), the packages in `providerDependencies[provider]` are installed in addition to the base `backend.dependencies`
-10. **Saves manifest and runs hooks** — Saves `.module-manifests.json` tracking all installed files and registrations, saves `.module-state.json` with prompt answers, then runs `onInstall` and `onActivate` lifecycle hooks
+10. **Sets up database** — For schema-bearing modules, applies the schema the **drift-immune** way: `prisma generate`, then the delta is computed offline with `prisma migrate diff`, written as a real migration under `prisma/migrations/`, and applied with `prisma migrate deploy` — **never `prisma migrate dev`**, so a shared DB carrying runtime-created objects (a vector module's extensions/indexes) is never reset (skipped when the module ships no schema). Just before the migrate, runs `onPrepareDatabase` for the current module and every other enabled installed module (from `.module-manifests.json`); a sibling whose package isn't resolvable from `node_modules/<id>` is skipped and logged. Best-effort — a failure warns. See [Database](/module-starter/database/) and [Lifecycle Hooks](/module-starter/lifecycle-hooks/)
+11. **Runs module database migrations** — Materialises then applies the module's shipped SQL/TS backfill migrations, after the Prisma schema migrate and before the `onInstall` hook. A failure **stops the install** (manifest and lifecycle hooks are skipped) so the hook never runs against a half-migrated database — fix the migration and re-run `init`
+12. **Saves manifest and runs hooks** — Saves `.module-manifests.json` tracking all installed files and registrations, saves `.module-state.json` with prompt answers, then runs `onInstall` and `onActivate` lifecycle hooks
 
 ### Output
 
@@ -62,18 +64,20 @@ npx my-module init --no-interactive
                   AI Chat - Module Installation
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-[1/10] ✓ Required modules check passed
-[2/10] ✓ Interactive setup complete
+[1/11] ✓ Required modules check passed
+[2/11] ✓ Interactive setup complete
 ...
-[10/10] ✓ Manifest saved
+[10/11] ✓ Manifest saved
+[11/11] ✓ Lifecycle hooks complete
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                   ✨ AI Chat - Installation Complete
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Next steps:
-  1. Run database migration: cd backend && npx prisma migrate dev
-  2. Start the app: npm run dev
+🚀 Ready to go! Start your app:
+   npm run dev
+
+   Then visit: /dashboard/ai-chat
 ```
 
 ### Common Errors
@@ -120,10 +124,11 @@ npx my-module update --skip-schema
    - Template hash changed → **Update** — regenerates the file from the new template (overwrites local edits to that generated file; `--force` skips the prompt)
    - File has no version header → **Migrate** — offers to add a header for future tracking
 4. **Detects schema changes** — Compares current Prisma schema template against installed schema. If changed, prompts to update (uses stored `moduleAnswers` for variable substitution)
-5. **Runs Prisma commands** — If schema was updated, automatically runs `prisma generate` and `prisma migrate dev` in the backend directory so the database stays in sync
+5. **Runs Prisma commands** — If schema was updated, applies it the **drift-immune** way: `prisma generate`, then `prisma migrate diff` (offline) → a real migration file → `prisma migrate deploy` — **never `prisma migrate dev`**, so runtime-created DB objects can't trigger a reset. `migrate deploy` runs on every DB step (even when no schema change is detected), so a previously-pending migration still applies instead of a silent "up to date" skip. Just before the migrate, runs `onPrepareDatabase` for the current module and every other enabled installed module (from `.module-manifests.json`) — `migrate deploy` applies every pending migration across modules, so a sibling's DB prep (e.g. declaring an extension) must run too. See [Database](/module-starter/database/) and [Lifecycle Hooks](/module-starter/lifecycle-hooks/)
 6. **Installs new dependencies** — Compares the module's current dependencies against what was installed previously (tracked in `.module-state.json`). If new shadcn components, npm packages, or UI libraries were added, prompts to install them
 7. **Adds new env variables** — If new environment variables were added to the module definition, prompts for values and writes them to `.env` files
-8. **Runs `onUpdate` hook** — If version changed, passes rich context including `fromVersion`, `toVersion`, `schemaChanged`, `moduleAnswers`, and detailed `changes` object
+8. **Runs module database migrations** — Materialises & applies newly-shipped SQL/TS migrations after the Prisma schema migrate and before `onUpdate`; a failure stops the update
+9. **Runs `onUpdate` hook** — If version changed, passes rich context including `fromVersion`, `toVersion`, `schemaChanged`, `moduleAnswers`, and detailed `changes` object
 
 <Aside type="tip">
 The update command uses **delta detection** — it only installs dependencies and components that are new since the last install/update. It tracks what was installed in `.module-state.json` and compares against the current module definition. Modules installed before scaffold v1.5.0 will have their assets catalogued on the first update without reinstalling anything.
@@ -231,7 +236,7 @@ npx my-module uninstall --export ./backup
 After uninstalling, you need to manually:
 - Remove npm dependencies that may be shared with other modules
 - Remove environment variables from `.env` files
-- Run `npx prisma generate` and `npx prisma migrate dev` to sync the database
+- Run `npx prisma generate`, then reconcile the database — the module's models were removed from `schema.prisma`, so drop their tables with a migration and `npx prisma migrate deploy` (avoid `prisma migrate dev` on an app with runtime-created DB objects, which can reset)
 </Aside>
 
 ---
@@ -271,6 +276,7 @@ Commands:
   update         Update module templates and schema
   reconfigure    Change install-time answers (toggle gated features)
   migrate        Add version headers to existing files
+  migrate-db     Run the module's database migrations (SQL + TS backfills)
   disable        Disable module without removing files
   enable         Re-enable a disabled module
   info           Show this information

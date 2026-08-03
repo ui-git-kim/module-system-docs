@@ -24,6 +24,8 @@ This page describes AI Core as implemented in module v1.5.0 (July 2026). The mod
 |---|---|---|
 | [`run`](#run) | Run a named language operation | `Promise<RunResult>` |
 | [`embed`](#embed) | Run a named embedding operation over a batch | `Promise<EmbedRunResult>` |
+| [`embedMultimodal`](#embedmultimodal) | Embed text and/or images into one vector space | `Promise<EmbedRunResult>` |
+| [`rerank`](#rerank) | Order documents by relevance to a query | `Promise<RerankRunResult>` |
 | [`runFlow`](#runflow) | Start a flow — operations in order | `Promise<FlowRunResult>` |
 | [`resumeFlow`](#resumeflow) | Resume a suspended flow run | `Promise<FlowRunResult>` |
 | [`registerFlowHandler`](#registerflowhandler) | Register a non-AI flow step handler (**register**) | `void` |
@@ -155,6 +157,73 @@ const res = await ai?.embed('index-chunks', chunks, { userId });
 
 ---
 
+## `embedMultimodal`
+
+Embed text and/or images into one vector space — for visual and design retrieval, where an image is a first-class input, not a caption. Added alongside `embed` (the text path is unchanged); it returns the same `EmbedRunResult` and writes into the same store under the same dimension gate.
+
+```ts
+embedMultimodal(
+  operationId: string,
+  inputs: Array<{ text?: string; media?: MediaAttachment[] }>,
+  opts: RunOptions,
+): Promise<EmbedRunResult>
+```
+
+Each input is text, image(s), or both, embedded into a single vector. `media` is the same shape vision uses (`{ mediaType, data }`, where `data` is base64 bytes or an http(s) URL); images reach the provider and never the ledger. The operation must resolve to a model marked **multimodal** (the `voyage-multimodal` class) — if it does not, the call refuses with `embedding-not-multimodal` rather than handing images to a text-only model, and a provider without multimodal embedding refuses as an unsupported kind. Seed a multimodal operation with `ensureOperation({ model: { kind: 'embedding', multimodal: true }, ... })`.
+
+```ts
+const res = await aiCore?.embedMultimodal(
+  'my-feature/embed-visual',
+  [{ media: [{ mediaType: 'image/png', data: pngBase64 }] }, { text: 'a search phrase' }],
+  { userId },
+);
+// res?.embeddings — one vector per input, in the same space; res?.feedback reports any gap.
+```
+
+---
+
+## `rerank`
+
+Run a named rerank operation: a query and candidate documents in, a relevance ordering out. A thin operation like `embed` — no prompt, no dials, no disciplines — governed by the same sensitivity gate and the same audit-by-reference ledger (the query and documents are never stored). It exists so a consumer that has already retrieved a set of candidates can order them by a cross-encoder rather than by vector distance alone.
+
+```ts
+rerank(
+  operationId: string,
+  input: { query: string; documents: string[] },
+  opts: RunOptions,
+): Promise<RerankRunResult>
+```
+
+**Parameters**
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `operationId` | `string` | Must resolve to a model of kind `rerank`. |
+| `input.query` | `string` | The query the documents are ranked against. |
+| `input.documents` | `string[]` | The candidates to order. |
+| `opts` | [`RunOptions`](#runoptions) | `userId` required; `tenantId`, `flowRunId` honoured. Prompt-only options are ignored. |
+
+**Returns** — a `RerankRunResult`: `ranking` (an array of `{ index, score }`, best-first, where `index` is the position in the input `documents` array), plus the same `feedback` and `audit` fields every run carries.
+
+**Throws**
+
+| Error | When |
+|---|---|
+| `NotFoundError` | The operation id does not exist. |
+| `RefusedError` | Any resolution refusal, including the sensitivity gate under a sensitive floor. |
+| `UnsupportedModelKindError` | The operation resolved to a non-`rerank` model, or to a provider whose adapter has no rerank implementation. |
+| `ProviderCallError` / `ProviderUnavailableError` | The provider call failed, or the provider is unavailable. |
+
+The rerank **operation** is consumer-seeded — AI Core ships the `rerank` surface and the Voyage adapter, but a consumer (e.g. cog-ingest) names its own rerank job through `ensureOperation`, the same way it names any other. Reranking is also one of the grounding dials on the future retrieval operation.
+
+```ts
+const ai = serviceRegistry.getOptional('ai-core');
+const res = await ai?.rerank('rank-candidates', { query, documents }, { userId });
+// res?.ranking[0].index — the best-matching document; res?.ranking[0].score — its relevance score.
+```
+
+---
+
 ## `runFlow`
 
 Start a flow run. A flow is operations in order; AI steps resolve and run through `run`, and non-AI steps are consumer handlers. The run returns completed results, or suspends carrying the feedback that paused it.
@@ -260,7 +329,7 @@ ai?.registerFlowHandler('cog-ingest/dedupe', async (state, previous) => {
 ensureOperation(spec: EnsureOperationSpec): Promise<{ created: boolean; operation: ai_operation }>
 ```
 
-**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` requirements object (`kind`, optional `needsImageInput`, optional `dimensions` for a required embedding width), and the optional operation shape (`description`, `presetId`, `dials`, `disciplineIds`, `segmentKeys`, `schema`, `sensitivity`).
+**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` requirements object (`kind`, optional `needsImageInput`, optional `dimensions` for a required embedding width), and the optional operation shape (`description`, `presetId`, `dials`, `disciplineIds`, `segmentKeys`, `schema`, `cache`, `sensitivity`). `cache` is a prompt-caching policy (`{ instructions?, context?, ttl? }`) — a create-time default the admin owns thereafter.
 
 **Returns** — `{ created, operation }`. `created` is `false` when the operation already existed (returned untouched) and `true` when it was seeded. The seeded row carries `seeded: true` so its provenance is visible in the admin.
 
@@ -455,7 +524,7 @@ interface Feedback {
 ```
 
 - **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `abstained-below-threshold`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `framing-segment-unavailable`, and so on.
-- **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line).
+- **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line). It can also carry a gap that is not itself a `reason` — for example `prompt-cache-unsupported`, named when an operation configured to cache resolves to a provider that cannot honour it (the call runs uncached rather than pretending otherwise).
 - **`confidence` / `threshold`** — reported when known, even when the run passes. `confidence` is read from a top-level `confidence` field on structured output; abstention fires when it falls below `threshold` (the operation's `abstentionThreshold` dial).
 - **`coverage`** — `total: null` is itself a statement: no independent count of the whole exists, and inventing one is exactly what the module forbids.
 - **`ref`** — the ledger id for this call. The stored copy carries `ref: null` because the row is its own reference; the copy returned to you gets the id.
@@ -491,7 +560,7 @@ interface ParameterTransform {
 }
 ```
 
-`NormalizedUsage` carries optional `inputTokens`, `outputTokens`, `totalTokens`, `cacheReadTokens`, `reasoningTokens` and a passthrough `raw` — **absent counts stay undefined, never reported as zero.** `ResolvedParameters` is the narrow set actually sent (`maxOutputTokens`, `temperature`, `topP`, `topK`, `stopSequences`, `seed`).
+`NormalizedUsage` carries optional `inputTokens`, `outputTokens`, `totalTokens`, `cacheReadTokens`, `cacheWriteTokens`, `reasoningTokens` and a passthrough `raw` — **absent counts stay undefined, never reported as zero.** When an operation caches its prompt, `cacheWriteTokens` is the one-time write and `cacheReadTokens` the discounted reuse — both land in the ledger so the saving is visible. `ResolvedParameters` is the narrow set actually sent (`maxOutputTokens`, `temperature`, `topP`, `topK`, `stopSequences`, `seed`).
 
 ### Flows
 

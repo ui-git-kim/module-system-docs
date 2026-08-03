@@ -19,6 +19,74 @@ Check your installed version with `npx structure info`.
 
 ---
 
+## v1.33.4
+
+**Lakebase BM25 keyword ranking + runtime column self-heal** *(generated-output change)*
+
+Completes the v1.33.0 `lakebase_bm25` fast-follow and makes keyword search self-provisioning.
+
+- **BM25 ranking for `structureService.searchNodes` (feature-detected).** When a `lakebase_bm25` index over `searchVector` is available, `searchNodes` ranks with **BM25** (`<@>` / `to_bm25query`, IDF + document-length normalised) instead of `ts_rank_cd`; otherwise it uses the always-present GIN + `ts_rank_cd` path. Both are exposed as `score` where **higher is better**, so the `{ node, score }` contract is unchanged. `ensureKeywordInfrastructure` provisions the `lakebase_bm25` index at runtime, gated on the access method existing (non-Lakebase apps skip cleanly). A **query-time fallback** demotes to `ts_rank_cd` if the runtime-only index ever disappears, so keyword search degrades rather than errors.
+- **Runtime column self-heal.** `ensureKeywordInfrastructure` (node `searchVector`) and `ensureInfrastructure` (node `searchVector` + chunk `contentVector`) now run `ALTER TABLE … ADD COLUMN IF NOT EXISTS "<col>" tsvector` before the trigger/backfill/GIN — so the first search provisions **column → trigger → GIN → backfill** with no app intervention, even if the Prisma migrate that adds the `Unsupported("tsvector")` column never landed. Idempotent; a no-op once the column exists.
+
+<Aside type="note">
+No schema change. Requires Neon Lakebase for the BM25 path; every other install keeps GIN + `ts_rank_cd` (unchanged). **Ownership note:** the `searchVector` / `contentVector` columns are declared in `schema.prisma` as `Unsupported("tsvector")`, so Prisma also creates them via a bare `ADD COLUMN`; the self-heal's `ADD COLUMN IF NOT EXISTS` is a deliberate belt-and-suspenders. On the drift-immune scaffold (module-starter v1.31.9+) this is safe — the schema-vs-schema migrate diff never re-adds an unchanged column, and `migrate deploy`'s "already exists" auto-baseline covers a failed-then-retried column migration. Validated end-to-end (self-heal + BM25 ranking + fallback) against a live Neon Lakebase database.
+</Aside>
+
+## v1.33.3
+
+**Pre-migrate extension declaration via `onPrepareDatabase`** *(install-time only — no generated-output change)*
+
+Adopts the scaffold's new **`onPrepareDatabase`** lifecycle hook (module-starter scaffold **v1.31.3+**) to declare the Prisma datasource extensions **before** `prisma migrate dev` runs, rather than only in the post-migrate heal. This closes the ordering gap where an *installed-but-undeclared* extension (e.g. Neon Lakebase) made the migrate fail on **drift** before the heal could declare it — so `npx structure init` / `update` now applies the schema in a **single pass** on a fresh Lakebase-enabled app, with no manual `prisma migrate dev` re-run.
+
+- **`onPrepareDatabase`** (runs before the migrate, on both install and update) declares pgvector — plus the Lakebase pair when a read-only `pg_extension` probe confirms it is installed — via the starter's `ensure-pgvector --lakebase` primitive.
+- The **post-migrate embeddings heal repeats the same declaration idempotently** as a fallback for older scaffolds that never invoke the hook; it is a no-op once the datasource is fully declared.
+- Extracted a shared `declareDatasourceExtensions` helper — the declaration logic itself (the `--lakebase` / `--no-lakebase` argv-authoritative `pg_extension` probe) is unchanged from v1.33.1.
+
+<Aside type="note">
+Requires the module-starter scaffold **v1.31.3+** for the pre-migrate hook; this release ships on scaffold **v1.31.7** (TypeScript 7 toolchain). On older scaffolds the module degrades cleanly to the post-migrate declaration. No template or generated-output change — install-time logic only. Resolves the [module-starter upstream issue](/module-starter/upstream-issues/) (fixed scaffold-side in v1.31.3).
+</Aside>
+
+## v1.33.2
+
+**Generated frontend imports migrated to react-router v8** *(generated-output change)*
+
+Aligns the module's generated frontend with the starter's **react-router v8** upgrade, which consolidates `react-router-dom` into `react-router`. All generated components, pages, hooks, and route config now import `Link`, `useNavigate`, `useParams`, and the `RouteObject` type from **`react-router`** — no `react-router-dom` remains. Verified against `react-router@8`, which re-exports each of these at the top level. Apps on the react-router-v8 starter pick this up on their next `structure update`.
+
+## v1.33.1
+
+**Automatic Prisma extension declaration in the embeddings heal** *(install-time only — no generated-output change)*
+
+The embeddings install/reconfigure heal (`healEmbeddingsSetup`) now **auto-declares** the app's Prisma datasource extensions instead of only advising. It shells out to the starter's declaration-only `ensure-pgvector` primitive so a future `prisma migrate dev` builds a shadow database that includes the extensions — closing the drift / **P3006** gap that could silently stop the module's schema columns from applying (the exact failure hit on veradai enabling Lakebase against structure v1.33.0).
+
+- **pgvector: advise → auto-run.** When the datasource doesn't yet declare pgvector, the heal runs `npm run ensure-pgvector` (at the app root) rather than printing manual steps. It falls back to the previous advisory on older starters that predate the primitive.
+- **Lakebase pair — opt-in, DB-gated.** A read-only probe (`SELECT … FROM pg_extension` via `prisma db execute`) confirms both `lakebase_vector` + `lakebase_text` are installed *before* the heal passes the opt-in `-- --lakebase`. Declaring an extension makes `migrate dev` try to `CREATE` it, which fails without the Lakebase preload — so the live DB is the authority, never a guess.
+- **argv beats the environment.** The heal passes an explicit `--lakebase` / `--no-lakebase` flag (gated on the script supporting them) so its probe result wins over any ambient `ENSURE_PGVECTOR_LAKEBASE` env the child would inherit.
+- **Silent when healthy.** Skips the probe and the shell-out entirely once both extensions are already declared.
+
+<Aside type="note">
+No template or generated-output change — this is module install-time logic only, so a host `tsc` pass is N/A. Requires the starter's `ensure-pgvector` (v1.65.0) for the pgvector auto-run and **v2.4.2** for the `--lakebase` / `--no-lakebase` flags; older starters degrade to the manual advisory. Hardened by an adversarial multi-lens review and validated against veradai's live schema (probe exit-code semantics, `prisma validate`, npm flag forwarding). See the starter's [Ensure pgvector](/starter-template/scripts/#ensure-pgvector).
+</Aside>
+
+## v1.33.0
+
+**Always-on keyword search, plus a Lakebase `lakebase_ann` upgrade for vectors** *(reworks the v1.32.0 lexical arm)*
+
+Keyword search is now a first-class, **always-available** surface — no embeddings, no per-type config. Structure owns **storage only**; it never calls an LLM or embedder. This reworks the v1.32.0 lexical arm: the search text is now auto-indexed from every node, and the vector tier gains a Neon Lakebase acceleration path.
+
+- **Always-on keyword search — `structureService.searchNodes(userId, query, options?)`.** Ranks with `websearch_to_tsquery` + `ts_rank_cd` over a **trigger-maintained `tsvector` column** (`structure_node.searchVector`) built from `name` + `description` + every string value in the node's `data` JSON (via `jsonb_to_tsvector`), served by a GIN index. `options` is `{ topK?: number (default 20, max 200); nodeTypes?: string[]; status?: string[] (default ["active"]) }` and it returns `{ node, score }[]` where `score` is `ts_rank_cd` — higher is better, **not** a 0..1 similarity — and a blank query returns `[]`. This is the **ranked upgrade** of the `listNodes` `search` substring filter, and it needs **no embeddings opt-in**.
+- **Dropped `searchText` + `cognitiveIngest.textTemplate`.** The v1.32.0 `structure_node.searchText` column and the per-type `features.cognitiveIngest.textTemplate` merge template are **removed** — keyword search now **auto-indexes** `name` + `description` + `data` with no config knob. `cognitiveIngest` is back to `{ enabled?: boolean }`.
+- **Removed `structureEmbeddings.lexicalSearchNodes`** — superseded by the always-on `structureService.searchNodes`. Still on `structureEmbeddings` (embeddings-tier, unchanged surface, now over the new `tsvector` columns): `lexicalSearchChunks`, `hybridSearchNodes`, `hybridSearchChunks`, and the semantic methods. Hybrid still fuses keyword + semantic via RRF and needs embeddings.
+- **Lakebase `lakebase_ann` for the vector columns (feature-detected).** When Neon Lakebase is available the module now creates `lakebase_ann` indexes for the embedding columns — pgvector-compatible (same `<=>` operator, **no query change**), storage-resident (survives Neon scale-to-zero), with far faster builds than HNSW. It is **transparent**: `CREATE EXTENSION` fails cleanly when the Lakebase preload libraries are not loaded, so non-Lakebase hosts are unaffected and **HNSW stays the automatic fallback**. `lakebase_bm25` for the keyword tier is a **fast-follow** (not in v1.33.0); keyword search ships on GIN + `ts_rank_cd` for now.
+- **`getCognitiveCapabilities().lexical.enabled` is now always `true`** (was embeddings-gated), reflecting that `searchNodes` is unconditional. `hybrid` and chunk keyword search still ride the embeddings opt-in. `observedAt` is unchanged from v1.32.0.
+
+<Aside type="note">
+Migration `1.33.0__search-vectors.sql` adds the `searchVector` / `contentVector` `tsvector` columns, their maintaining triggers and GIN indexes, and (feature-detected) the `lakebase_ann` vector indexes — guarded and exception-safe like its sibling migrations, mirrored by the install heal and runtime `ensure`. After `npx structure update` to 1.33.0 the host **must run `prisma migrate dev`** to apply the new `searchVector` / `contentVector` / `observedAt` columns; the triggers + GIN self-heal at runtime on the first search once the columns exist. All raw SQL is parameterised. Validate with a host `tsc --noEmit -p` after install.
+</Aside>
+
+<Aside type="caution">
+**Lakebase Prisma-drift caveat.** Enabling Lakebase is a Neon **management-API** operation (add `lakebase_vector` + `lakebase_text` to `settings.preload_libraries`, restart the compute, then `CREATE EXTENSION lakebase_vector CASCADE; CREATE EXTENSION lakebase_text CASCADE` — Postgres 16+, reversible). The extensions must then be **declared in the app's Prisma datasource** (`extensions = [vector, lakebase_vector, lakebase_text]`) or Prisma treats them as drift and blocks `prisma migrate` / `db push`. **As of v1.33.1 the embeddings heal declares them automatically** (via the starter's `ensure-pgvector --lakebase`, gated on a live `pg_extension` probe) — see below.
+</Aside>
+
 ## v1.32.1
 
 **Fix: `StructureFieldTemplate` import in the generated service** *(bug fix)*

@@ -17,6 +17,109 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v2.5.4
+
+**Meta-audit remediation — 23 fixes across standards, production, performance, and security**
+
+The 2026-08-03 four-dimension meta-audit (see [Known Issues](/starter-template/roadmap/#known-issues--2026-08-03-meta-audit)) surfaced **0 critical, 6 moderate, 17 minor** findings, each adversarially verified. The implementation was then re-reviewed — which caught and corrected a hot-path regression in the `AppSettings` fix before ship.
+
+**Production**
+
+- **Compliance audit-chain verify no longer fails green** (`audit-sql-sink.ts`). `verifyAuditChain()`'s blanket `catch` returned `ok:true` for *any* error; it now distinguishes a genuinely absent table (P2021) from a verification that could not run (timeout, revoked `SELECT`, dropped table) and returns `ok:false` in the latter case, so a monitor keying on `ok` can't read a failed check as "chain intact".
+- **`AppSettings` get-or-create is race-safe and read-mostly** (`admin.service.ts`). The singleton fetch no longer risks an unhandled P2002 when two first-access callers race, and the steady state stays a plain read — no write, no `updatedAt` churn — on the branding hot path, falling to `upsert` only on the rare first-create race.
+- **`prisma.config.ts` self-heals across `template:update`.** It auto-detects the single- vs multi-file schema layout at runtime, so a force-sync onto a multi-file app no longer resets the schema path to a deleted file and breaks `prisma generate`/`migrate`. The now-redundant `create-app` config rewrite was removed.
+- **`DB_QUERY_TIMEOUT=0` no longer breaks transactions** (`prisma.ts`, `env.ts`). `withTransaction` omits `maxWait`/`timeout` when it's 0 (Prisma defaults) instead of passing a literal 0 ms budget; the env doc is corrected (0 ≠ unlimited).
+- **Unsaved profile edits no longer silently revert** (`PersonalInformationPage.tsx`). Editable fields seed once per user after the profile loads, so a preference auto-save that rewrites the query cache can't clobber a name/timezone edit in progress.
+- Minor: `getAppSettings` handles the concurrent-create P2002; the filter registry returns a stable-yet-changing snapshot for `useSyncExternalStore`; the settings `Dropdown` accepts `id`/`aria-label`/`aria-labelledby` for an accessible name.
+
+**Performance**
+
+- **IconPicker caps the unfiltered browse view** (`useIconPicker.ts`). With no search it now renders ~300 icons (with a "search to find more" hint) instead of mounting the full ~1600-icon set; any search or category filter still shows all matches. No new dependency.
+- **`Notification` gains `@@index([tenantId, createdAt, id])`** so the list/cursor query is served index-ordered instead of sorted in memory (single- and multi-file schema).
+
+**Security**
+
+- The public `/api/health/db` readiness probe gets a dedicated, generous rate limiter (it issues a `SELECT 1`), while the dependency-free `/health` liveness probe stays fully exempt.
+
+**Standards**
+
+- `SecurityPage` linked-accounts + active-sessions moved to TanStack Query (namespaced keys `['auth','accounts']` / `['auth','sessions']`, shared cache + invalidation) — the last of the `useUserProfile`-family off-convention fetches.
+- `sync-deps.mjs` foundation `vitest` pin corrected `^3` → `^4` (matches the template's own `package.json`); `useAdminUsers` error boundary `any` → `unknown`; `adminPagesRegistry` `order` default doc corrected (10 → 50); startup log reads validated `env.DATABASE_ADAPTER`; 8 files gained the required `DESCRIPTION` header field.
+
+**Downstream:** the `Notification` index is the only schema change — `template:update` applies it via the drift-safe migrate (v2.5.3). No manual env/package steps.
+
+---
+
+## v2.5.3
+
+**Drift-immune Prisma migrate (no more `migrate dev` resets) + a `name`-typed `$queryRaw` fix**
+
+Two host-side fixes surfaced by vector apps.
+
+**1. `prisma migrate dev` reset on vector apps → drift-safe migrate.** `migrate dev` drift-checks the whole database and **resets** it when the DB carries runtime-created objects its migration history can't track — a vector app's pgvector/Lakebase extensions and HNSW indexes (their shape depends on the configured vector width, so they can't be static migration files, and `prisma.config.ts` `tables.external` only covers runtime *tables*, not extensions/indexes). The migrate was then abandoned, `schema.prisma` ended up ahead of the DB, and the change was silently never applied. This is the app-side twin of the module-scaffold fix (module-starter v1.31.9).
+
+New **`scripts/prisma-migrate-safe.mjs`** replaces `migrate dev` in the starter's own paths: it computes the delta **offline** with `migrate diff` (datamodel → datamodel — never connects to the DB, so runtime objects are invisible and nothing can reset), writes a real migration file, and applies it with `migrate deploy` (which never drift-checks or resets). Cross-platform (one Node script, no `.ps1`/`.sh` drift); every failure is warn-only — the worst case degrades to "apply manually", never a reset.
+
+- **`update-template`** (both scripts) snapshots the pre-merge schema and applies the template's schema change drift-safely — the highest-value fix (it runs against an existing app that may already carry vector objects).
+- **`npm run db:migrate`** is now the drift-safe flow (it diffs your uncommitted `schema.prisma` change against git HEAD). **`npm run db:migrate:dev`** keeps plain `prisma migrate dev` as an escape hatch for non-vector apps.
+- **`create-app`** generates the app's init migration from empty (the template ships no migrations) rather than `migrate dev --name init`.
+- `enable-vectors` and the `ensure-pgvector` apply hint follow suit. `prisma.config.ts` `tables.external` is unchanged — still needed so a migration's SQL can reference a runtime table; complementary, not replaced.
+
+**2. `Failed to deserialize column of type 'name'` in `/admin/system` → `::text` casts.** The Database-internals panel's raw `pg_stat_user_tables` / `pg_stat_user_indexes` queries selected the Postgres `name`-typed catalog columns (`relname`, `indexrelname`) raw; Prisma 7's driver refuses to deserialize the `name` type. Cast them to `::text`.
+
+---
+
+## v2.5.2
+
+**Post-modernization review + `engines` consistency**
+
+A follow-up to v2.5.1. A multi-dimension review checked the template's code against the breaking changes in every major bump and found the modernization **clean** — no functional breakage from zod 4, lucide-react 1, Vite 8, Vitest 4, express-rate-limit 8, pino 10, or TypeScript 7. Findings were verified against the *actually-published* packages, and the TypeScript 7 `types`-default question was settled **empirically** (`tsc --noEmit` on the real 7.0.2 compiler with the template's exact backend config type-checks clean — `@types/node` globals still resolve).
+
+- **`engines.node` is now declared on all three `package.json` files.** Only `frontend/package.json` pinned `>=22.22.0` (added with the React Router v8 Node floor in v2.5.0); `backend/package.json` and the root now match, making the app-wide Node floor explicit. Advisory (npm `engines` isn't enforced without `engine-strict`).
+- **Watch item (no change needed yet):** TypeScript's merged `types: []` default (issue #62195 / PR #63054) is **not** active in 7.0.2, so `backend/tsconfig.json` (which declares no `types`) still auto-includes `@types/node`. If a future TypeScript ships that default, add `"types": ["node"]` to `backend/tsconfig.json`.
+
+---
+
+## v2.5.1
+
+**Dependency modernization — the latest app-validated stack (Vite 8, TypeScript 7, Vitest 4, zod 4, …)**
+
+Brings the template's committed dependency baseline up to the latest versions the apps (veradai / use-foundry-ui) already run and build against. The template is a template repo (no build here), so the apps carrying its code are the validation source; `create-app` already installs `@latest`, so newly created apps were unaffected — this refreshes the committed baseline (and the three regenerated lockfiles).
+
+- **Frontend majors:** `vite` 6 → 8, `vitest` 3 → 4, `typescript` 5 → 7, `zod` 3 → 4, `lucide-react` 0.511 → 1.28. Plus `@types/node` 25 → 26, `@tanstack/react-query(-devtools)` 5.62 → 5.101, `react`/`react-dom` 19.2.7 → 19.2.8, `tailwindcss` + `@tailwindcss/vite` 4.1 → 4.3, `@vitejs/plugin-react-swc` 4.3.0 → 4.3.3, and `axios` / `date-fns` / `tailwind-merge` / `@types/react(-dom)`.
+- **Backend majors:** `express-rate-limit` 7 → 8, `pino` 9 → 10, `typescript` 5 → 7, `vitest` 3 → 4. Plus `@prisma/*` + `prisma` 7.4 → 7.9, `@neondatabase/serverless` 1.0 → 1.1, `pg` 8.18 → 8.22, `jose` 6.1 → 6.2, `zod` 4.3 → 4.4, and `dotenv` / `helmet` / `ws` / `@types/node` / `@types/pg` / `pino-pretty` / `tsx`. **Root:** `concurrently` 9 → 10.
+- **Vite 8:** the apps had already leapfrogged to Vite 8 (proving `@vitejs/plugin-react-swc` 4, `@tailwindcss/vite` 4, and Vitest 4 compatibility), so this aligns the template baseline rather than pioneering it. `react-router` stays `^8.3.0` (already current).
+- **No propagation to existing apps:** `package.json`/lockfiles are app-owned and are not carried by `template:update` — this only sets the create-app baseline. Type-check validates downstream on a fresh app or the next app update. Patch, per the dependency-bump cadence.
+
+---
+
+## v2.5.0
+
+**React Router v8 — `react-router-dom` → `react-router` (+ React 19.2.7 / Node 22.22 floors)**
+
+React Router v8 **removes `react-router-dom`** (it was a v6→v7 compat shim), so all imports move to **`react-router`**, and the DOM `RouterProvider` to **`react-router/dom`**. v8 also raises the floor to **React ≥ 19.2.7** and **Node ≥ 22.22**. This retires the `react-router` **RSC-mode CSRF** advisory (GHSA-qwww-vcr4-c8h2) — which never applied to the SPA — and gets the fleet onto the current line before launch.
+
+- **Template:** all 31 frontend files swapped `react-router-dom` → `react-router` (App.tsx's `RouterProvider` → `react-router/dom`); `frontend/package.json` now uses `react-router@^8.3.0` + `react`/`react-dom@^19.2.7` + `engines.node >= 22.22.0`; frontend lockfile regenerated; create-app install lists + CI node (20 → 22) updated.
+- **No Vite change needed:** the "Vite 7" requirement is **framework-mode only** — the core `react-router` package peer-depends solely on React (verified by isolated install; 0 vulns, no vite pulled). Library/SPA usage builds fine on Vite 6.
+- **Breaking for consumers** (import path) → a **minor**, not a patch; pre-launch, so not a major. **Downstream migrates in order:** each **module first** (its compiled output imports `react-router-dom`, which v8 deletes — swap imports, bump its React peer, rebuild), **then the apps** (bump `react-router`/`react`, swap app-src imports). cog-ingest is parked mid-refactor — sequence it when it lands.
+- Propagates via `template:update`; **no DB migration, no env key** (apps own their `package.json`/lockfile). Import/export map verified by isolated install; full type-check lands when a v8 app builds.
+
+---
+
+## v2.4.2
+
+**`ensure-pgvector --lakebase` — declare Neon Lakebase Search extensions (fixes a migration-blocking drift)**
+
+Enabling Neon's Lakebase Search installs `lakebase_vector` + `lakebase_text` in the database, but those extensions aren't declared in the app's Prisma datasource — so `prisma migrate dev` reports *"schema is not in sync with migration history"* and refuses, silently blocking any subsequent module schema change (surfaced on veradai validating the `structure` module). The datasource is **starter-owned** (modules can only detect + advise), so the declaration belongs here.
+
+`npm run ensure-pgvector` gains an **opt-in** `--lakebase` flag (or a truthy `ENSURE_PGVECTOR_LAKEBASE` env) that ALSO merges the Lakebase pair into the datasource `extensions = [...]` list, exactly as it already merges `pgvector`. **Opt-in on purpose:** a datasource-declared extension makes `prisma migrate dev` emit `CREATE EXTENSION IF NOT EXISTS "lakebase_vector"`, which *fails* on Postgres without the Lakebase preload libraries loaded — so a DB-aware caller (e.g. a module's embeddings-heal hook, which can `SELECT … FROM pg_extension`) passes the flag only after confirming both are installed. The **default `npm run ensure-pgvector` is unchanged** (pgvector only).
+
+- Idempotent + honest, as before: re-runs are a no-op; exactly one stdout line and exit 0 on every path.
+- Hardened the shared array editor while here (adversarial-review finding): an append never folds a new entry into a trailing `// comment` (it moves to a fresh line, comma before the comment), and the entry splitter now skips `//` comments so its idempotency check matches Prisma's parser. Verified by **running the script** across fresh / existing-pgvector / trailing-comment / env-var / idempotent-rerun / default-path-unchanged cases.
+- `scripts/ensure-pgvector.mjs` propagates via `template:update`; **no migration, no env key** (the flag/env are consumer-set). Resolves the [upstream issue](/starter-template/upstream-issues/). **Structure-side follow-up** (module repo, separate): flip pgvector detect→auto-run and pass the lakebase opt-in when Lakebase is detected.
+
+---
+
 ## v2.4.1
 
 **Admin Module Management — enable/disable from the UI (restart-to-apply)**

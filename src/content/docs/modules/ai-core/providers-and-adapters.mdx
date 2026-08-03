@@ -49,8 +49,9 @@ export interface ProviderAdapter {
 | Type | What it carries |
 |---|---|
 | `GenerateRequest` | `instructions`, `input`, `parameters: ResolvedParameters`, optional `schema` (structured output), optional `attachments: MediaAttachment[]`, optional `signal` |
-| `GenerateResult` | `text`, optional `structured`, `usage: NormalizedUsage`, `warnings: ProviderWarning[]`, `finishReason`, optional `rawFinishReason`, optional `reportedModelId`, `latencyMs` |
-| `NormalizedUsage` | `inputTokens?`, `outputTokens?`, `totalTokens?`, `cacheReadTokens?`, `reasoningTokens?`, and the provider-native `raw?` passed through for the ledger |
+| `GenerateResult` | `text`, optional `structured`, `usage: NormalizedUsage`, `warnings: ProviderWarning[]`, `finishReason`, optional `rawFinishReason`, optional `reportedModelId`, optional `cacheApplied`, `latencyMs` |
+| `NormalizedUsage` | `inputTokens?`, `outputTokens?`, `totalTokens?`, `cacheReadTokens?`, `cacheWriteTokens?`, `reasoningTokens?`, and the provider-native `raw?` passed through for the ledger |
+| `GenerateRequest.cache?` | a resolved `CacheDirective` (`{ instructions?, inputBreak?, ttl }`) — owned offsets, not an SDK type; absent = no caching |
 | `ProviderWarning` | `kind` (`unsupported` · `compatibility` · `deprecated` · `other`) and a `detail` string |
 | `EmbedResult` | `embeddings: number[][]`, optional `tokens`, `coverage: EmbedCoverage[]`, `warnings`, `latencyMs` |
 | `EmbedCoverage` | `index`, `covered`, `total`, `unit: 'characters'` — what portion of each input the vector covers |
@@ -138,11 +139,20 @@ const result = await generateText({
 
 The structured value is validated upstream in the run engine, not trusted from the wire. Three things are captured from every outcome and normalised into the owned result:
 
-- **Usage** is mapped through `mapUsage` into `NormalizedUsage` (including `cacheReadTokens` and `reasoningTokens` where the provider reports them).
+- **Usage** is mapped through `mapUsage` into `NormalizedUsage` (including `cacheReadTokens`, `cacheWriteTokens` and `reasoningTokens` where the provider reports them).
 - **Warnings are never swallowed.** `mapWarnings` turns each SDK warning into a `ProviderWarning`; an unlabelled one becomes `"unspecified provider warning"` rather than vanishing.
+
+### Prompt caching (v1.9.0)
+
+When an operation carries a `cache` policy, the run hands the adapter a resolved `CacheDirective` and the adapter places `providerOptions.anthropic.cacheControl` breakpoints the provider caches by prefix: a **top-level** one for the system prompt (under AI SDK v7 the system prompt travels through the `instructions` option — a `system`-role message is rejected outright — so its cache marker rides top-level, never on a message) and/or a **part-level** one on the context-prefix text part. Two things keep it honest:
+
+- **Anthropic-only, and it says so.** Only the Anthropic adapter honours explicit caching. If a cache directive reaches any other adapter the call still runs, `GenerateResult.cacheApplied` comes back `false`, and a `ProviderWarning` is attached — the run then names `prompt-cache-unsupported` in feedback. Caching is never faked.
+- **No new data, no content in the ledger.** The cached prefix is the *same* prompt the call already sends; caching adds no data the provider did not already receive, and the prefix text is never written to logs or the ledger — only the `cacheWriteTokens` / `cacheReadTokens` counts are.
 - **The reported model id** — the id the provider says actually served the call — is captured from the response and returned as `reportedModelId`, so the ledger records what really ran, not just what was requested.
 
 Embeddings go through `embedMany` and reranking through `rerank`, each wrapped the same way: timed, typed on failure, warnings surfaced. Where the SDK exposes no signal — embedding coverage, rerank token usage — AI Core reports the honest unknown (full character coverage for embeddings, `undefined` tokens for rerank) rather than manufacturing a number.
+
+**Multimodal embedding (v1.11.0)** is the optional `embedMultimodal` method on the interface, implemented only by the Voyage adapter: it resolves the model through `multimodalEmbeddingModel` (`voyage-multimodal-3` / `-3.5`) and calls the same `embedMany`, passing text in `values` and images via `providerOptions.voyage.content` (an `image_url` for an http(s) URL, otherwise an `image_base64` data URI). It returns the identical `EmbedResult`, so the run pipeline and the vector store treat a multimodal vector exactly like a text one. Images reach the provider as content parts and never the ledger.
 
 ---
 
