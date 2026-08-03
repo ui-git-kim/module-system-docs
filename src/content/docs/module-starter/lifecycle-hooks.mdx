@@ -28,8 +28,8 @@ lifecycle: {
     // Runs when `reconfigure` changes an install-time answer (same version)
   },
   onPrepareDatabase: async (context) => {
-    // Runs BEFORE `prisma migrate dev` (init + update) — declare/create a
-    // Postgres extension your new schema needs so the migrate doesn't drift
+    // Runs BEFORE the schema migrate (init + update) — declare/create a
+    // Postgres extension your new schema needs before the migration references it
   },
   onActivate: async (context) => {
     // Start background jobs, register webhooks
@@ -48,7 +48,7 @@ lifecycle: {
 | `onInstall` | After `npx my-module init` completes | Seed initial data, create database indexes, validate config |
 | `onUpdate` | During `update`, **only on an upgrade** (installed version older than the module version). Skipped on `--dry-run`; if it throws, the update aborts unless `--force` | Data migrations, deprecation handling |
 | `onReconfigure` | At the end of a **`reconfigure`** (a **same-version** change to stored prompt answers), after files/schema/migrations are reconciled and the new answers are committed. Skipped on `--dry-run`; **best-effort** — a failure warns and does not roll back. Does **not** fire on a plain `update` or an `init` | Heal data when a gated feature is toggled on/off |
-| `onPrepareDatabase` | In the CLI **immediately before `prisma migrate dev`**, during both `init` and `update`. Runs for **every enabled installed module** (not just the one being installed/updated), since the migrate reconciles the whole schema. **Best-effort** — a failure warns and the migrate still runs | Declare/create a Postgres extension your new schema depends on **before** the migrate references it (avoids a drift failure) |
+| `onPrepareDatabase` | In the CLI **immediately before the schema migrate (`prisma migrate deploy`)**, during both `init` and `update`. Runs for **every enabled installed module** (not just the one being installed/updated), since `migrate deploy` applies every pending migration across all modules. **Best-effort** — a failure warns and the migrate still runs | Declare/create a Postgres extension your new schema depends on **before** the migration references it |
 | `onActivate` | After install or `enable` command | Start background jobs, register webhooks |
 | `onDeactivate` | During `disable`, **and at the start of `uninstall`** (if the module is still enabled, before `onUninstall`) | Pause jobs, unregister webhooks |
 | `onUninstall` | During `uninstall` command (after `onDeactivate`) | Offer data export, clean up external resources |
@@ -58,11 +58,11 @@ Lifecycle hooks are optional. Most simple modules don't need them. Add them when
 </Aside>
 
 <Aside type="note" title="onPrepareDatabase — run DB prep before the migrate">
-`onPrepareDatabase` closes an ordering gap: `prisma migrate dev` runs **before** `onUpdate`, so a heal that runs in `onUpdate` can't unblock the very migrate that needs it. If your module's new schema depends on a Postgres **extension** (e.g. `pgvector`/Lakebase's `lakebase_vector`) that may be *installed but not yet declared* in the app's Prisma datasource, declare it here — this hook fires **immediately before** the migrate in both `init` and `update`.
+`onPrepareDatabase` closes an ordering gap: the schema migrate runs **before** `onUpdate`, so a heal that runs in `onUpdate` can't unblock the very migrate that needs it. If your module's new schema depends on a Postgres **extension** (e.g. `pgvector`/Lakebase's `lakebase_vector`) that may be *installed but not yet declared* in the app's Prisma datasource, declare it here — this hook fires **immediately before** the migrate in both `init` and `update`.
 
 Its context adds `phase` (`'install' | 'update'`), `backendPath`, and `moduleAnswers` (for gated-feature decisions) on top of the base context. Like `onReconfigure`, it is **scaffold-owned** (invoked only by the module CLI, never by the host runtime), so it lives in `src/scaffold/types.ts` rather than the synced module contract. It is **best-effort**: a failure warns and the migrate still runs (and may then fail as it would have without the hook).
 
-**Runs for every enabled installed module, not just the one being installed/updated.** Because `prisma migrate dev` reconciles the *whole* host schema, one module's update can trip on a *sibling* module's undeclared extension. So before the migrate the scaffold enumerates installed modules from `.module-manifests.json`, skips disabled ones, loads each module's definition from its package (`node_modules/<id>`), and runs its `onPrepareDatabase`.
+**Runs for every enabled installed module, not just the one being installed/updated.** Because `prisma migrate deploy` applies *every* pending migration across all modules, one module's update can trip on a *sibling* module's migration that references an undeclared extension. So before the migrate the scaffold enumerates installed modules from `.module-manifests.json`, skips disabled ones, loads each module's definition from its package (`node_modules/<id>`), and runs its `onPrepareDatabase`.
 </Aside>
 
 <Aside type="caution" title="Requirement: a module must be a resolvable dependency for its CROSS-module prep to run">
@@ -135,7 +135,7 @@ onUpdate: async (context) => {
   }
 
   if (context.schemaChanged) {
-    context.utils.log.info('Schema updated — you may need to run prisma migrate');
+    context.utils.log.info('Schema updated — the scaffold has already applied it (migrate deploy)');
   }
 
   // Access original prompt answers
