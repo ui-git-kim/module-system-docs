@@ -26,6 +26,7 @@ This page describes AI Core as implemented in module v1.5.0 (July 2026). The mod
 | [`embed`](#embed) | Run a named embedding operation over a batch | `Promise<EmbedRunResult>` |
 | [`embedMultimodal`](#embedmultimodal) | Embed text and/or images into one vector space | `Promise<EmbedRunResult>` |
 | [`rerank`](#rerank) | Order documents by relevance to a query | `Promise<RerankRunResult>` |
+| [`retrieve`](#retrieve) | Retrieve context from the store and report what it missed | `Promise<RetrievalRunResult>` |
 | [`runFlow`](#runflow) | Start a flow — operations in order | `Promise<FlowRunResult>` |
 | [`resumeFlow`](#resumeflow) | Resume a suspended flow run | `Promise<FlowRunResult>` |
 | [`registerFlowHandler`](#registerflowhandler) | Register a non-AI flow step handler (**register**) | `void` |
@@ -214,12 +215,56 @@ rerank(
 | `UnsupportedModelKindError` | The operation resolved to a non-`rerank` model, or to a provider whose adapter has no rerank implementation. |
 | `ProviderCallError` / `ProviderUnavailableError` | The provider call failed, or the provider is unavailable. |
 
-The rerank **operation** is consumer-seeded — AI Core ships the `rerank` surface and the Voyage adapter, but a consumer (e.g. cog-ingest) names its own rerank job through `ensureOperation`, the same way it names any other. Reranking is also one of the grounding dials on the future retrieval operation.
+The rerank **operation** is consumer-seeded — AI Core ships the `rerank` surface and the Voyage adapter, but a consumer (e.g. cog-ingest) names its own rerank job through `ensureOperation`, the same way it names any other. Reranking is also one of the grounding dials on the [retrieval operation](#retrieve).
 
 ```ts
 const ai = serviceRegistry.getOptional('ai-core');
 const res = await ai?.rerank('rank-candidates', { query, documents }, { userId });
 // res?.ranking[0].index — the best-matching document; res?.ranking[0].score — its relevance score.
+```
+
+---
+
+## `retrieve`
+
+Retrieve context for a query and report **what it found and the shape of what it missed**. Semantic retrieval is an operation like any other — it uses a model, it can be wrong, it must say what it did. **AI Core retrieves; Structure stores** — AI Core owns the act of finding but never the data or the columns, reaching the store only through Structure's services. The context slot is still the consumer's: an operation that already knows its context passes a context segment to `run` and skips retrieval entirely.
+
+```ts
+retrieve(
+  operationId: string,
+  input: RetrievalInput,
+  opts: RunOptions,
+): Promise<RetrievalRunResult>
+```
+
+**Parameters**
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `operationId` | `string` | Must resolve to a model of kind `embedding`. The operation carries the **grounding dials** (`retrievalBreadth`, `reranking`, `abstentionThreshold`) that configure retrieval — recorded on any operation, they only drive behaviour here. |
+| `input.query` | `string` | The natural-language query, embedded and matched against the chunk store. |
+| `input.nodeTypes` / `input.nodeIds` | `string[]` | Restrict the search to certain node types, or to chunks of specific nodes. |
+| `input.minScore` | `number` | A hard relevance floor Structure applies before results return — distinct from `abstentionThreshold`, which judges whether the *whole* retrieval is too weak. |
+| `input.expandGraph` | `boolean` | One-hop expansion over the top nodes' connections, when Structure exposes the primitive. |
+| `input.rerankOperationId` | `string` | The rerank operation used when the `reranking` dial is on. The dial on without one is a named gap, never a silent skip. |
+
+**Returns** — a `RetrievalRunResult`: `context` (matched chunks best-first), `nodes` (distinct sources, best score + chunk count), `relatedNodeIds` (graph-expanded neighbours), `notFound` (the named gaps), `provenance` (`embedded` / `matches` / `reranked` / `expanded`), plus the same `feedback` and `audit` every run carries. The result is a superset of a consumer's interim `retrieve()`, so that can become a thin wrapper (remap `chunks := context`).
+
+**How the dials drive it**
+
+- **`retrievalBreadth`** caps how many chunks are fetched, clamped to a ceiling the store can honour; when the request exceeds it the clamp is named `retrieval-breadth-capped`, and a filled budget is named `retrieval-breadth-saturated` — a truncated result is never presented as the whole set.
+- **`reranking`** (with `input.rerankOperationId`) reorders the hits by a cross-encoder through a nested rerank operation with its own ledger row, inheriting this call's sensitivity.
+- **`abstentionThreshold`** compares the **measured** best similarity: a below-threshold retrieval is flagged `abstained-weak-retrieval` **and still returned** — the caller decides what weak context is worth; it is never silently treated as "no relevant context".
+
+**Degrade, don't fail** — an unreachable or unprovisioned store, a rerank outage, or a missing graph primitive becomes a named gap in `notFound` (`retrieval-store-unavailable`, `rerank-unavailable`, `graph-expansion-unavailable` / `-degraded`), never a thrown error. A genuine width **mismatch** (the model cannot produce the installed vector width) is still a hard `RefusedError` — a wrong-width query is broken, not weak.
+
+**Audit by reference** — the ledger records node ids, chunk ids, scores and counts. The query text and the retrieved chunk content are returned to the caller only; they never enter a ledger row or a log line.
+
+```ts
+const ai = serviceRegistry.getOptional('ai-core');
+const res = await ai?.retrieve('answer-question/retrieve', { query, expandGraph: true }, { userId });
+// res?.context — best-first chunks to feed a run's context segment;
+// res?.notFound — the shape of what it missed (e.g. 'abstained-weak-retrieval').
 ```
 
 ---
