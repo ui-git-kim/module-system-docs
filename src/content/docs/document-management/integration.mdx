@@ -14,7 +14,7 @@ This is the most important page for anyone building **another** module that need
     Resolve `document-management` from the `serviceRegistry` and call its typed interface to fetch references and download streams.
   </Card>
   <Card title="React to events" icon="rocket">
-    Subscribe to the six `documents.*` action hooks this module fires when documents and providers change.
+    Subscribe to the eight `documents.*` action hooks this module fires when documents and providers change.
   </Card>
   <Card title="Extend Structure UI" icon="list-format">
     The module ships tabs, widgets, a card badge, two actions, and a sidebar section for Structure node pages — commented out until Structure is present.
@@ -49,6 +49,9 @@ export interface DocumentManagementServiceInterface {
   /** Get a readable download stream for a document's underlying file. */
   getDownloadStream(documentId: string, userId: string): Promise<Readable>;
 
+  /** Get a readable download stream by provider + path (no reference required). */
+  getDownloadStreamByPath(providerId: string, userId: string, path: string): Promise<Readable>;
+
   /** Get live file metadata from the provider for a document. */
   getFileInfo(documentId: string, userId: string): Promise<FileInfo>;
 
@@ -63,6 +66,65 @@ export interface DocumentManagementServiceInterface {
     opts?: { folder?: string; mimeType?: string }
   ): Promise<UploadResult & { providerId: string }>;
 
+  // ── Parsed artefacts — this module STORES parser output; it never parses ──
+
+  /** Store the artefact an external parser produced for a source. Deduped by source contentHash. */
+  putParsedArtefact(
+    userId: string,
+    input: {
+      source: { providerId: string; remotePath: string; documentId?: string; contentHash?: string };
+      format: string;                 // e.g. 'docling-json', 'markdown'
+      version?: number;               // monotonic ordinal per (source, format)
+      producer?: string;              // e.g. 'cog-ingest/docling'
+      content: Buffer | Readable;     // the artefact bytes to store
+      mimeType?: string;
+      target?: { providerId: string; folder?: string }; // else the DERIVED writable area
+      metadata?: Record<string, unknown>;
+    }
+  ): Promise<ParsedArtefact>;
+
+  /** Fetch the latest (or a specific format/version) parsed artefact for a source. */
+  getParsedArtefact(
+    userId: string,
+    source: { providerId: string; remotePath: string } | { documentId: string },
+    opts?: { format?: string; version?: number }
+  ): Promise<ParsedArtefact | null>;
+
+  /** List every parsed artefact stored for a source. */
+  listParsedArtefacts(
+    userId: string,
+    source: { providerId: string; remotePath: string } | { documentId: string }
+  ): Promise<ParsedArtefact[]>;
+
+  /** Stream a stored artefact's bytes (ownership-checked). */
+  getParsedArtefactStream(artefactId: string, userId: string): Promise<Readable>;
+
+  // ── Manual ingest — shares one job path with auto-ingest ──
+
+  /** Ensure a durable doc_document reference exists, then re-emit documents.document.uploaded. */
+  requestIngest(
+    userId: string,
+    input: { providerId: string; remotePath: string; fileName?: string } | { documentId: string }
+  ): Promise<{ documentId: string }>;
+
+  /** True when an ingest consumer is subscribed to documents.document.uploaded. */
+  isIngestAvailable(): boolean;
+
+  // ── Provenance — read-only; supports citations and chain-of-evidence ──
+
+  /** Resolve an ingest-engine source reference back to its document, source, and artefacts. */
+  resolveProvenance(
+    userId: string,
+    ref:
+      | { sourceType: string; sourceId: string }
+      | { providerId: string; remotePath: string }
+  ): Promise<{
+    sourceType: string;
+    document: DocumentReference | null;
+    source: { providerId: string; remotePath: string; fileName: string; contentHash: string | null };
+    artefacts: ParsedArtefact[];      // latest per format
+  }>;
+
   /** Whether the module is available (for optional detection by consumers). */
   isAvailable(): boolean;
 }
@@ -73,9 +135,17 @@ export interface DocumentManagementServiceInterface {
 | `getDocumentsForNode(nodeId, userId)` | `Promise<DocumentReference[]>` | All document references linked to a Structure node, ownership-checked against `userId`. |
 | `getDocument(documentId, userId)` | `Promise<DocumentReference \| null>` | A single reference, or `null` if it does not exist or is not owned by `userId`. |
 | `getDownloadStream(documentId, userId)` | `Promise<Readable>` | A Node `Readable` of the underlying file, streamed live from the provider. |
+| `getDownloadStreamByPath(providerId, userId, path)` | `Promise<Readable>` | A `Readable` for a provider path with no `doc_document` reference — how a job-worker consumer pulls the bytes for an uploaded file off the request path. |
 | `getFileInfo(documentId, userId)` | `Promise<FileInfo>` | Live metadata (name, size, MIME type, timestamps) fetched from the provider. |
 | `getDocumentCount(nodeId, userId)` | `Promise<number>` | The number of references linked to a node — cheaper than fetching them all. |
 | `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId }>` | Upload a file to the user's default provider. `opts.folder` overrides the landing folder (else the provider's `uploadPath`, else its root) — e.g. cog-ingest can route ingested files into a chosen folder. |
+| `putParsedArtefact(userId, input)` | `Promise<ParsedArtefact>` | **Store** the output an external parser produced for a source (this module never parses). Bytes default to a derived writable area (`DOC_ARTEFACT_PREFIX`) unless `input.target` overrides; deduped by source `contentHash`. |
+| `getParsedArtefact(userId, source, opts?)` | `Promise<ParsedArtefact \| null>` | Fetch the latest (or a given `format`/`version`) stored artefact for a source — so a consumer can re-ingest without re-parsing. |
+| `listParsedArtefacts(userId, source)` | `Promise<ParsedArtefact[]>` | Every stored artefact for a source. |
+| `getParsedArtefactStream(artefactId, userId)` | `Promise<Readable>` | Stream a stored artefact's bytes (ownership-checked). |
+| `requestIngest(userId, input)` | `Promise<{ documentId }>` | Ensure a durable reference exists (with `contentHash`), then re-emit `documents.document.uploaded` so manual ingest shares the auto-ingest job path. |
+| `isIngestAvailable()` | `boolean` | Whether an ingest consumer is subscribed to `documents.document.uploaded` (drives the **Ingest to KB** button visibility). Never names a specific consumer. |
+| `resolveProvenance(userId, ref)` | `Promise<ProvenanceResult>` | Read-only. Map an ingest-engine `sourceType`/`sourceId` (or `providerId`+`remotePath`) back to its document, source, and latest-per-format artefacts, for citations and chain-of-evidence. |
 | `isAvailable()` | `boolean` | Always `true` once registered; lets soft consumers confirm the module is present. |
 
 The two return shapes you will work with most are `DocumentReference` and `FileInfo`. Both are reproduced in full so you do not have to import them just to read this page:
@@ -179,7 +249,7 @@ export const myFeatureService = {
 
 ## Reacting to Events (Action Hooks Fired)
 
-Document Management fires six action hooks from its service as documents and providers change. Any module can subscribe with `actionRegistry.addActionAsync` and react — index a newly uploaded file, clean up derived data when a document is deleted, or refresh a cache when a provider connects.
+Document Management fires eight action hooks from its service as documents and providers change. Any module can subscribe with `actionRegistry.addActionAsync` and react — index a newly uploaded file, clean up derived data when a document is deleted, or refresh a cache when a provider connects.
 
 The exact event ids and context shapes (from `action.registration.ts` and the service) are:
 
@@ -187,8 +257,10 @@ The exact event ids and context shapes (from `action.registration.ts` and the se
 |------|---------|------------|
 | `documents.document.linked` | `{ userId, documentId, nodeId, linkType }` | A document reference is linked to a Structure node. `linkType` is `'attachment' \| 'reference' \| 'primary'`. |
 | `documents.document.unlinked` | `{ userId, documentId, nodeId }` | A document reference is unlinked from a node. |
-| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName }` | A file is uploaded to a provider through the module. |
+| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }` | A file is uploaded through the module, or manually re-emitted via `requestIngest`. Emitted as an **awaited async fan-out** (`doActionParallel`), so job-worker consumers receive it. `contentHash` is populated for streamed HTTP uploads (`null` for included-folder **Sync now**, which reads no bytes); `documentId` is set on the manual-ingest path (else `null`). |
 | `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` | A document reference (and optionally its underlying file) is deleted. |
+| `documents.document.created` | `{ userId, documentId, providerId, remotePath }` | A `doc_document` reference is created (favourite/link/tag/notes, or a cross-module `createDocument`). |
+| `documents.document.updated` | `{ userId, documentId }` | A reference's tags, notes, favourite, or status changes. |
 | `documents.provider.connected` | `{ userId, providerId, providerType }` | A storage provider is created/connected. `providerType` is `s3 \| webdav \| local`. |
 | `documents.provider.disconnected` | `{ userId, providerId }` | A storage provider is removed. |
 
@@ -615,8 +687,74 @@ export async function readNodeDocuments(nodeId: string, userId: string) {
 </Tabs>
 
 <Aside type="caution" title="Public vs. full service surface">
-`getDownloadStream`, `getDocumentsForNode`, `getDocument`, `getFileInfo`, `getDocumentCount`, `uploadToDefault`, and `isAvailable` are the **guaranteed** cross-module contract in `DocumentManagementServiceInterface`. Methods like `createDocument` exist on the concrete `documentManagementService` and are stable in practice, but if you depend on them, pin your `requiredModules` to a known version and treat them as a tighter coupling than the interface above.
+`getDownloadStream`, `getDownloadStreamByPath`, `getDocumentsForNode`, `getDocument`, `getFileInfo`, `getDocumentCount`, `uploadToDefault`, `putParsedArtefact`, `getParsedArtefact`, `listParsedArtefacts`, `getParsedArtefactStream`, `requestIngest`, `isIngestAvailable`, `resolveProvenance`, and `isAvailable` are the **guaranteed** cross-module contract in `DocumentManagementServiceInterface`. Methods like `createDocument` exist on the concrete `documentManagementService` and are stable in practice, but if you depend on them, pin your `requiredModules` to a known version and treat them as a tighter coupling than the interface above.
 </Aside>
+
+---
+
+## Parsed Artefacts & Provenance
+
+A processing module such as `cog-ingest` does more than read bytes — it **parses** a source (e.g. through a Docling sidecar) into an extraction/chunking artefact, and later needs to re-ingest, re-extract, or re-chunk **without re-running the expensive parse**. Document Management provides a durable place to keep that output, and a read-only resolver that turns an ingest source back into a citable provenance chain.
+
+<Aside type="note" title="This module stores artefacts — it never parses them">
+Document Management does **not** parse content. `putParsedArtefact` only **stores** the output your parser produced, and hands it back on demand. This keeps the connector principle intact: the module manages references, storage, and now the parsed-artefact byproducts, but content extraction stays entirely in the producing module.
+</Aside>
+
+### Storing and reusing an artefact
+
+The producer calls `putParsedArtefact` **in-process** via `serviceRegistry.get('document-management')` — there is deliberately no HTTP `PUT` for artefacts. Bytes default to a **derived writable area** (`DOC_ARTEFACT_PREFIX`, default `.derived-artefacts`) so the original source — which may sit on a read-only/evidence provider — is never written to; pass `input.target` to steer them elsewhere (e.g. a Structure-configured save location). Artefacts are deduped by the source `contentHash`, so identical source bytes reuse the existing row.
+
+```typescript
+// backend/src/features/cog-ingest/cog-ingest.service.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+
+export const cogIngestService = {
+  async ensureArtefact(userId: string, providerId: string, remotePath: string, contentHash: string) {
+    const docs = serviceRegistry.get('document-management');
+
+    // 1. Reuse the stored artefact if this exact source has already been parsed.
+    const existing = await docs.getParsedArtefact(userId, { providerId, remotePath }, { format: 'docling-json' });
+    if (existing) return existing;               // re-ingest without re-parsing
+
+    // 2. Otherwise parse once (Docling sidecar), then STORE the output here.
+    const stream = await docs.getDownloadStreamByPath(providerId, userId, remotePath);
+    const doclingJson = await this.parseWithDocling(stream);
+
+    return docs.putParsedArtefact(userId, {
+      source: { providerId, remotePath, contentHash },
+      format: 'docling-json',
+      producer: 'cog-ingest/docling',
+      content: Buffer.from(JSON.stringify(doclingJson)),
+      mimeType: 'application/json',
+    });
+  },
+};
+```
+
+### Resolving provenance for citations
+
+When assembled chat context or the Evidence Manager needs to cite a chunk, `resolveProvenance` maps the ingest engine's `sourceType`/`sourceId` contract (owned by cog-ingest) back to the underlying document, its source reference, and the latest artefact per format — all read-only.
+
+```typescript
+const provenance = await docs.resolveProvenance(userId, {
+  sourceType: 'document-management',   // or 'document' / 'file'
+  sourceId: documentId,                // a doc_document id (providerId+remotePath is also accepted)
+});
+// → { sourceType, document, source: { providerId, remotePath, fileName, contentHash }, artefacts }
+// Use `source.contentHash` + the recent-access trail for a defensible chain of evidence.
+```
+
+### HTTP routes
+
+Artefact **writes** never cross the network. These read/action routes exist for consumers and UI:
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/ingest` | Manual ingest — ensures a reference and re-emits `documents.document.uploaded` (returns `202 Accepted`). |
+| GET | `/ingest/available` | Whether an ingest consumer is installed (`isIngestAvailable`). |
+| GET | `/artefacts?documentId=\|providerId=&remotePath=` | List the parsed artefacts stored for a source. |
+| GET | `/artefacts/:id/download` | Stream a stored artefact's bytes. |
+| GET | `/provenance?sourceType=&sourceId=` | Read-only provenance resolution for citations. |
 
 ---
 
@@ -747,7 +885,7 @@ Use this when building a module that integrates with Document Management:
 
 - [ ] **Dependency declared** — `requiredModules: ['document-management']` for a hard dependency, or `getOptional` + `isAvailable()` guards for a soft one.
 - [ ] **Service access via the registry** — `serviceRegistry.get('document-management')` (or `getOptional`), never a direct feature-folder import.
-- [ ] **Public interface only where possible** — prefer the seven `DocumentManagementServiceInterface` methods; treat anything beyond them as tighter coupling.
+- [ ] **Public interface only where possible** — prefer the `DocumentManagementServiceInterface` methods; treat anything beyond them (e.g. `createDocument`) as tighter coupling.
 - [ ] **Event subscriptions** — `addActionAsync` on the `documents.*` hooks you care about, with priority 30+ (the module's own subscriptions run at 20).
 - [ ] **Provenance** — pass `computeHash: true` when creating references for evidence/audit use, and persist the returned `contentHash`.
 - [ ] **Graceful degradation** — never assume Document Management (or Structure) is present; check `isAvailable()` and handle absence.

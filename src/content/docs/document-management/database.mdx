@@ -1,13 +1,13 @@
 ---
 title: Database
-description: The five doc_ tables that back the Document Management module
+description: The eight doc_ tables that back the Document Management module
 sidebar:
   order: 3
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-Document Management ships a **self-contained** Prisma schema: five tables, all prefixed with `doc_`. The schema adds **no `@relation` directives** and never modifies the `User` model or the Structure module's tables. Foreign keys to other modules (the owning user, a Structure node) are stored as plain `String` fields with `@@index` for fast lookups.
+Document Management ships a **self-contained** Prisma schema: eight tables, all prefixed with `doc_` — `doc_storage_provider`, `doc_document`, `doc_node_link`, `doc_folder_bookmark`, `doc_recent_access`, `doc_app_settings`, `doc_included_folder`, and `doc_parsed_artefact`. The schema adds **no `@relation` directives** and never modifies the `User` model or the Structure module's tables. Foreign keys to other modules (the owning user, a Structure node) are stored as plain `String` fields with `@@index` for fast lookups.
 
 <Aside type="note" title="Connector, not storage">
 These tables hold **references, metadata, and your organisation** of files (favourites, tags, node links, audit trail). They never store file content — the bytes stay in the external storage provider. `doc_document` is a pointer to a file that lives in S3, WebDAV, or a local folder.
@@ -251,11 +251,103 @@ The policy is read via `GET /settings` (any authenticated user) and written via 
 
 ---
 
+## `doc_included_folder`
+
+Folders a user has marked as **included** — the auto-ingest scope for the **Included folders** picker (`/documents/included`). Checking a folder includes it recursively; **Sync now** (`POST /included-folders/sync`) walks these folders and fires the `documents.document.uploaded` pipeline event per file, so a consumer (cog-ingest) ingests them. Backs `GET/POST/DELETE /included-folders`.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | `String` | `@id @default(cuid())` |
+| `userId` | `String` | Owner |
+| `providerId` | `String` | References `doc_storage_provider.id` |
+| `folderPath` | `String` | Folder marked as included |
+| `recursive` | `Boolean` | `@default(true)` — include descendant folders |
+| `createdAt` | `DateTime` | `@default(now())` |
+
+```prisma
+model doc_included_folder {
+  id         String   @id @default(cuid())
+  userId     String
+  providerId String
+  folderPath String
+  recursive  Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, providerId, folderPath])
+  @@map("doc_included_folders")
+}
+```
+
+The `@@unique([userId, providerId, folderPath])` constraint means marking the same folder twice is idempotent. `addIncludedFolder` reuses the `resolveFileProvider` guard, so a user can only include folders they can actually reach.
+
+---
+
+## `doc_parsed_artefact`
+
+Stores the **output an external parser produced** for a source file — for example the JSON the cog-ingest Docling sidecar extracts. This module **never parses content itself**; it only persists the byproduct so re-ingest, re-extraction, and re-chunking never re-parse. A row points at both the original **source** (`sourceProviderId` + `sourceRemotePath`, optionally a `doc_document.id`) and the stored **artefact** (`artefactProviderId` + `artefactPath`).
+
+Artefacts default to a **derived writable area** (`DOC_ARTEFACT_PREFIX`, default `.derived-artefacts`) rather than beside the original — the original may sit on a read-only/evidence provider that rejects writes — and an explicit `target` can override that. Versioning keeps a monotonic `version` ordinal, but the **content hash is the dedup key**: identical source bytes reuse the existing artefact. On the shared app-default provider, artefact bytes are namespaced under the user's `u/<userId>/` prefix.
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | `String` | `@id @default(cuid())` |
+| `userId` | `String` | Owner |
+| `sourceProviderId` | `String` | Provider of the original source file |
+| `sourceRemotePath` | `String` | Path of the original source within its provider |
+| `documentId` | `String?` | Optional `doc_document.id` when a durable reference exists |
+| `sourceContentHash` | `String?` | SHA-256 of the source bytes — the dedup key |
+| `format` | `String` | Artefact format, e.g. `docling-json`, `markdown` |
+| `version` | `Int` | `@default(1)` — monotonic ordinal per `(source, format)` |
+| `artefactProviderId` | `String` | Provider the artefact bytes are stored on |
+| `artefactPath` | `String` | Path of the artefact within its provider |
+| `artefactHash` | `String` | SHA-256 of the artefact bytes (integrity) |
+| `sizeBytes` | `Int?` | Artefact size in bytes |
+| `mimeType` | `String?` | Artefact MIME type |
+| `producer` | `String?` | What produced it, e.g. `cog-ingest/docling` |
+| `metadata` | `Json?` | Producer metadata |
+| `createdAt` | `DateTime` | `@default(now())` |
+| `updatedAt` | `DateTime` | `@updatedAt` |
+
+```prisma
+model doc_parsed_artefact {
+  id                 String   @id @default(cuid())
+  userId             String
+  sourceProviderId   String
+  sourceRemotePath   String
+  documentId         String?
+  sourceContentHash  String?
+  format             String
+  version            Int      @default(1)
+  artefactProviderId String
+  artefactPath       String
+  artefactHash       String
+  sizeBytes          Int?
+  mimeType           String?
+  producer           String?
+  metadata           Json?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([userId, sourceProviderId, sourceRemotePath, format, version])
+  @@index([userId])
+  @@index([documentId])
+  @@index([userId, sourceProviderId, sourceRemotePath])
+  @@index([sourceContentHash])
+  @@map("doc_parsed_artefacts")
+}
+```
+
+<Aside type="note" title="Byproduct, not content">
+Storing parsed artefacts does not break the connector principle — the module still never authors or parses file content. It persists a derived byproduct that an external parser handed it, keyed to the source, so expensive parsing happens once. Producers write artefacts in-process via `serviceRegistry.get('document-management').putParsedArtefact(...)`; there is no HTTP `PUT`. See [Integration](/document-management/integration/#parsed-artefacts--provenance).
+</Aside>
+
+---
+
 ## Conventions
 
 - **Self-contained.** No `@relation` directives; foreign keys are plain `String` fields with `@@index`. This lets the module install independently without modifying other modules' tables. See the [Module Database](/module-starter/database/) guide.
 - **User-owned.** Every table carries `userId`; queries always filter by it and ownership is enforced in the service layer.
-- **Plural table names.** Each model `@@map`s to its plural snake_case table (`doc_storage_providers`, `doc_documents`, `doc_node_links`, `doc_folder_bookmarks`, `doc_recent_access`).
+- **Plural table names.** Each model `@@map`s to a snake_case table — usually pluralised (`doc_storage_providers`, `doc_documents`, `doc_node_links`, `doc_folder_bookmarks`, `doc_included_folders`, `doc_parsed_artefacts`); the singleton `doc_app_settings` and the `doc_recent_access` log keep their singular names.
 
 ## Next steps
 

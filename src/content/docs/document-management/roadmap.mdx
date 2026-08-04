@@ -19,9 +19,9 @@ The core principle constrains the roadmap. The database stores references, metad
 
 ## Known Issues
 
-V1 has shipped at release version `1.2.2`. The items below were surfaced while designing the upload → ingest pipeline (see **Next up**); they are gating prerequisites for that work rather than field-reported defects.
+V1 has shipped at release version `1.4.0`. The items below were surfaced while designing the upload → ingest pipeline (see **Next up**); they are gating prerequisites for that work rather than field-reported defects.
 
-- **The upload hook is synchronous, so async subscribers are silently skipped.** `documentManagementService.upload()` fires `documents.document.uploaded` via `actionRegistry.doAction` (sync), which never reaches `addActionAsync` consumers — and the payload carries only `{ userId, providerId, remotePath, fileName }` (no `mimeType`, `size`, or `contentHash`; `contentHash` is computed only on the reference/`createDocument` path). Any event-driven consumer — including the planned pipeline — cannot receive uploads until this becomes an awaited async fan-out (`doActionAll`) with an enriched payload. Severity: Medium.
+- **The upload hook is synchronous, so async subscribers are silently skipped — resolved (v1.2.3 + v1.4.0).** `documentManagementService.upload()` originally fired `documents.document.uploaded` via `actionRegistry.doAction` (sync), which never reached `addActionAsync` consumers, and the payload carried only `{ userId, providerId, remotePath, fileName }`. **v1.2.3** made it an awaited async fan-out (`doActionParallel`) with an enriched payload; **v1.4.0** then added a real `contentHash` for **streamed** uploads (the stream is teed through a SHA-256 passthrough) plus a `documentId` field, so the event now carries `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }`. Severity: Medium.
 - **No default-provider fallback for a brand-new user — resolved in v1.2.4 (when configured).** `uploadToDefault` now throws *"No default storage provider is set"* only when the caller has no `isDefault` provider **and** no app-wide default is set. Admins can set an app-wide shared default (with per-user isolation) that uploads fall back to — see **Next up → App-wide default storage location**. Severity: Low.
 - **WebDAV upload does not pre-create parent folders.** Uploading into a not-yet-existing WebDAV folder via `uploadToDefault` can fail; the Local and S3 paths do not hit this. Severity: Low.
 
@@ -37,7 +37,7 @@ The planned work is grouped by horizon. **Next up** is the committed near-term w
 
 ### Next up
 
-Four committed features, sequenced so the pipeline foundation lands first and the others build on it. All four are additive to the V1 connector model.
+Five committed features, sequenced so the pipeline foundation lands first and the others build on it. All five are additive to the V1 connector model.
 
 #### 1. Reusable upload → ingest pipeline
 
@@ -61,10 +61,10 @@ The shape:
 cog-ingest's `ingest(userId, { sourceId, content, contentType, … })` requires a pre-existing **source** (created once per user), and only extracts text for `pdf` / `image` / `url` / `text` content types — Word/Excel/PowerPoint must be text-extracted by the caller first. Ingestion is synchronous and LLM-bound (seconds + token cost), which is exactly why it belongs in a job worker, not the upload response. Pass a reference in the event and job payload; pull bytes once, in the worker. Production deployments that enable ingestion should run `JOBS_RUNNER=pg-boss` for durability and back-pressure.
 </Aside>
 
-Prerequisites are the two upload-hook items under **Known Issues** (sync → awaited async fan-out, and computing `contentHash` on the upload stream so the event carries it).
+Prerequisites were the two upload-hook items under **Known Issues** (sync → awaited async fan-out, and computing `contentHash` on the upload stream so the event carries it) — both now resolved, in v1.2.3 and v1.4.0 respectively.
 
-<Aside type="tip" title="Producer foundation shipped in v1.2.3">
-The producer half is live: `upload()` now emits `documents.document.uploaded` as an awaited async fan-out (`doActionParallel`) with the enriched reference payload `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash }`, and `getDownloadStreamByPath(providerId, userId, path)` is exposed on the public service interface for consumers to pull bytes. Remaining producer follow-ups: populate `contentHash` for **streamed** uploads (best-effort/null today — one of the Known Issues) and the manual "Ingest to Knowledge Base" action. The **consumer** side (subscription + job handler) is specced on the [cog-ingest roadmap](/modules/cog-ingest/roadmap/#medium-term--document-management-upload-pipeline-auto-ingest).
+<Aside type="tip" title="Producer half shipped in v1.2.3, completed in v1.4.0">
+The producer side is complete. `upload()` emits `documents.document.uploaded` as an awaited async fan-out (`doActionParallel`) with the enriched reference payload, and `getDownloadStreamByPath(providerId, userId, path)` is exposed on the public service interface for consumers to pull bytes. **v1.4.0 closed the two remaining producer follow-ups**: streamed uploads now carry a real `contentHash` (the upload stream is teed through a SHA-256 passthrough — the payload also gained a `documentId` field), and the manual **Ingest to Knowledge Base** action (`requestIngest`) re-emits the *same* event so manual and automatic ingest share one job path, guarded by `isIngestAvailable()` (`actionRegistry.hasActions('documents.document.uploaded')` — it never names cog-ingest). The **consumer** side (subscription + job handler) is specced on the [cog-ingest roadmap](/modules/cog-ingest/roadmap/#medium-term--document-management-upload-pipeline-auto-ingest).
 </Aside>
 
 #### 2. App-wide default storage location (admin-set)
@@ -93,6 +93,27 @@ A checkbox **tree** over a connected provider's folders — tri-state checkboxes
 
 <Aside type="tip" title="Shipped in v1.3.0">
 Delivered as the **Included folders** page (`/documents/included`, sidebar item): a lazily-loaded, recursive checkbox folder tree backed by a self-contained `doc_included_folder` table (`GET/POST/DELETE /included-folders`). Checking a folder marks it (recursively) as **included = auto-ingest scope**; **Sync now** (`POST /included-folders/sync`) walks the included folders and fires the `documents.document.uploaded` pipeline event per file, so a consumer (cog-ingest) ingests them — bounded at 2000 files per run (the cap is reported, never silent). `addIncludedFolder` reuses the `resolveFileProvider` guard, so a user can only include folders they can reach. Full tri-state *indeterminate* display and column sorting are follow-ups.
+</Aside>
+
+#### 5. Parsed-artefact surface, manual ingest, and provenance
+
+A processing module (cog-ingest) parses a source **once** — through a Docling sidecar — and then needs to reuse that output on every re-ingest, re-extraction, or re-chunk **without re-running the expensive parse**. This adds a durable place to **store** that parser output, a manual entry point into the pipeline, and a read-only resolver that turns an ingest source back into a citable provenance chain. It is fully additive, and the **connector principle holds**: the module stores a byproduct an external parser handed it and still never parses or authors content itself.
+
+<Aside type="tip" title="Shipped in v1.4.0">
+Three pieces landed together:
+
+- **Parsed-artefact storage.** A self-contained `doc_parsed_artefact` table plus `putParsedArtefact` / `getParsedArtefact` / `listParsedArtefacts` / `getParsedArtefactStream`. Producers call `putParsedArtefact` **in-process** via `serviceRegistry.get('document-management')` — there is deliberately **no HTTP `PUT`**. Bytes default to a **derived writable area** (`DOC_ARTEFACT_PREFIX`, default `.derived-artefacts`) so a read-only/evidence source is never written to; an explicit `target` overrides. Artefacts dedup by `sourceContentHash` and, on shared providers, live under the user's `u/<userId>/` namespace. Read routes: `GET /artefacts`, `GET /artefacts/:id/download`.
+- **Manual "Ingest to Knowledge Base".** `requestIngest` ensures a durable `doc_document` reference (with `contentHash`) exists, then re-emits the same `documents.document.uploaded` event auto-ingest consumes, so both share one job path (`POST /ingest`, `GET /ingest/available`). An **Ingest to KB** button appears — only when a consumer is installed — on the preview page, the browser preview panel, and per-row in the Structure Documents tab.
+- **Read-only provenance resolver.** `resolveProvenance(userId, ref)` maps the ingest engine's `sourceType`/`sourceId` contract back to `{ sourceType, document, source, artefacts }` (latest per format) for citations in assembled chat context and Evidence Manager chain-of-evidence (`GET /provenance`). It never writes.
+- **Erasure cascade.** On account deletion, artefact **bytes** are best-effort purged within the user's namespace before the `doc_parsed_artefact` rows are deleted in the same per-user transaction (new data category `parsed_artefacts`, classification `owned`).
+</Aside>
+
+<Aside type="caution" title="Still open after v1.4.0">
+Three follow-ups remain on this surface:
+
+- **Artefact GC / retention policy.** There is no automatic garbage collection or retention window for superseded artefact versions yet — old versions accumulate until an account is erased. A retention/GC policy (e.g. keep-latest-N per format, or a TTL) is still to be designed.
+- **Structure per-node artefact save-location.** The `target` parameter on `putParsedArtefact` is the seam for saving artefacts to a Structure-configured location, but there is **no UI** to set that per-node save location yet.
+- **cog-ingest `sourceId` / `sourceType` provenance contract.** `resolveProvenance` accepts the `sourceType: 'document-management' | 'document' | 'file'` (⇒ `sourceId` is a `doc_document` id) and `providerId`+`remotePath` forms, but nailing that contract end-to-end with cog-ingest — so every citation resolves — is still in progress.
 </Aside>
 
 ### Short-term
@@ -300,7 +321,18 @@ interface StorageAdapter {
 
 ## Completed
 
-Everything below is shipped in V1 (release version `1.2.2`). This is the foundation the roadmap above builds on.
+Everything below is shipped in V1 (release version `1.4.0`). This is the foundation the roadmap above builds on.
+
+### Reusable upload → ingest pipeline & parsed-artefact surface (releases v1.2.3 – v1.4.0)
+
+The loosely-coupled upload → ingest pipeline and its parsed-artefact byproduct store shipped across four releases, all additive to the connector model:
+
+- **Awaited async upload fan-out (v1.2.3).** `upload()` emits `documents.document.uploaded` via `doActionParallel`, and `getDownloadStreamByPath` lets a consumer pull the bytes off the request path.
+- **Streamed `contentHash` + manual ingest (v1.4.0).** Streamed uploads carry a real `contentHash` (SHA-256 passthrough) and a `documentId`; `requestIngest` re-emits the same event so the manual **Ingest to Knowledge Base** action shares the auto-ingest job path, gated by `isIngestAvailable()`.
+- **Parsed-artefact storage (v1.4.0).** `doc_parsed_artefact` + `putParsedArtefact` / `getParsedArtefact` / `listParsedArtefacts` / `getParsedArtefactStream` **store** external-parser output (default derived area via `DOC_ARTEFACT_PREFIX`, deduped by source hash, in-process only) so re-ingest never re-parses.
+- **Read-only provenance (v1.4.0).** `resolveProvenance` maps an ingest `sourceType`/`sourceId` back to its document, source, and latest-per-format artefacts for citations and chain-of-evidence.
+
+These extend the public `DocumentManagementServiceInterface` with `getDownloadStreamByPath`, `putParsedArtefact`, `getParsedArtefact`, `listParsedArtefacts`, `getParsedArtefactStream`, `requestIngest`, `isIngestAvailable`, and `resolveProvenance`, and the account-erasure handler now purges artefact bytes (within the user's namespace) and rows.
 
 ### Standards alignment (scaffold v1.18.0, release v1.2.2)
 
@@ -417,7 +449,7 @@ V1 already fires the hooks other modules need to react to. These remain stable i
 | `documents.document.updated` | `{ userId, documentId }` |
 | `documents.document.linked` | `{ userId, documentId, nodeId, linkType }` |
 | `documents.document.unlinked` | `{ userId, documentId, nodeId }` |
-| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName }` |
+| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }` (awaited async fan-out; `contentHash` populated for streamed uploads) |
 | `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` |
 | `documents.provider.connected` | `{ userId, providerId, providerType }` |
 | `documents.provider.disconnected` | `{ userId, providerId }` |
