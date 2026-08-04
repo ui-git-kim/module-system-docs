@@ -32,6 +32,8 @@ This page describes AI Core as implemented in module v1.5.0 (July 2026). The mod
 | [`registerFlowHandler`](#registerflowhandler) | Register a non-AI flow step handler (**register**) | `void` |
 | [`ensureOperation`](#ensureoperation) | Seed an operation if absent (**seed**) | `Promise` — see below |
 | [`ensureSegment`](#ensuresegment) | Seed a prompt segment if absent (**seed**) | `Promise` — see below |
+| [`ensureEvalCase`](#ensureevalcase) | Seed a golden eval case if absent (**seed**) | `Promise` — see below |
+| [`runEval`](#runeval) | Evaluate an operation offline over its golden cases | `Promise<EvalReport>` |
 | [`getCurrentUsage`](#getcurrentusage) | The billing callback — AI Core counts, billing asks | `Promise<CurrentUsage>` |
 | [`getOperationInfo`](#getoperationinfo) | Public metadata about a job | `Promise<OperationInfo>` |
 
@@ -420,6 +422,46 @@ await ai?.ensureSegment({
   name: 'Extraction method',
   content: 'Quote the source span before you record a value...',
 });
+```
+
+---
+
+## `ensureEvalCase`
+
+Seed a golden evaluation case if it does not exist — a synthetic fixture the [eval harness](#runeval) measures an operation over. Same create-if-absent, admin-edits-win semantics as `ensureOperation`. Cases are deliberately **not** user content; a case carries the input to run and the reference to score against.
+
+```ts
+ensureEvalCase(spec: {
+  id: string;
+  operationId: string;
+  label?: string | null;
+  input: { segments: ConsumerSegment[] } | { query: string; nodeTypes?: string[]; expandGraph?: boolean; rerankOperationId?: string };
+  reference?: { answer?: string; relevantNodeIds?: string[]; relevantChunkIds?: string[] } | null;
+  tags?: string[];
+}): Promise<{ created: boolean; evalCase: ai_eval_case }>
+```
+
+---
+
+## `runEval`
+
+Evaluate an operation offline over its enabled golden cases. Retrieval is an operation, extraction is an operation — and quality is measurable: `runEval` runs the **real pipeline** for each case, computes the metrics the operation is configured for (`ai_operation.evalConfig`), and reports per-metric aggregates plus every case result. It is a battery consumers may use or ignore.
+
+```ts
+runEval(operationId: string, opts: RunOptions): Promise<EvalReport>
+```
+
+**Metrics** — deterministic: `exact-match` (canonical comparison for structured output), `context-precision`, `context-recall` (retrieval, set-based). Judge-based: `faithfulness` (reuses the groundedness judge) and `answer-correctness` (a seeded correctness judge). Each metric scores `[0,1]` **or null with a named note** — a metric that cannot run (no reference, a judge outage, a case that failed) is never a silent 0 and never a pass.
+
+**Returns** — an `EvalReport`: `{ runId, operationId, cases, metrics: EvalMetricSummary[], results, persisted }`. Each metric summary states `meanScore` (nulls excluded), the passed count over the **evaluable** count, and the `unevaluable` count — a partial eval is always reported as partial, never as a clean pass. `persisted: false` says the result rows could not be written, so the `runId` is not treated as a durable handle.
+
+**Transparency & boundaries** — the harness runs the real pipeline, so a sensitive operation's terms gate applies exactly as it does live (a resolution refusal surfaces as it would on any call). `ai_eval_result` rows store scores, the underlying run's ledger id and named notes — **never content**. Judge metrics run internal (recursion-guarded) and inherit the evaluated operation's sensitivity.
+
+```ts
+const ai = serviceRegistry.getOptional('ai-core');
+const report = await ai?.runEval('extract-parties', { userId });
+// report?.metrics — per-metric mean + passed/evaluable + unevaluable;
+// report?.persisted === false means the results were not stored.
 ```
 
 ---
