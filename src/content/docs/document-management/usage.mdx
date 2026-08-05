@@ -57,7 +57,7 @@ The typical journey runs from the admin page (connect a provider) to the browser
 
 5. **Favourite and tag it**
 
-    Marking a file as a favourite (or adding tags/notes) creates a `doc_document` reference via `POST /documents` and flips `isFavourite`. The reference stores `remotePath`, `fileName`, `mimeType`, `fileSize`, a server-computed `contentHash` (SHA-256), and your `tags`/`notes`. Favourites appear under `GET /documents/favourites` and in the `RecentDocumentsWidget`.
+    Marking a file as a favourite (or adding tags/notes) creates a `doc_document` reference via `POST /documents` and flips `isFavourite`. The reference stores `remotePath`, `fileName`, `mimeType`, `fileSize`, your `tags`/`notes`, and — **only when you pass `computeHash: true`** — a server-computed `contentHash` (SHA-256, for evidence/integrity; otherwise `contentHash` is null). Favourites appear under `GET /documents/favourites` and in the `RecentDocumentsWidget`.
 
 6. **Link it to a Structure node** (optional)
 
@@ -73,7 +73,7 @@ The Structure side-effect imports in the generated `index.ts` are **commented ou
 
 ## Adding a Storage Provider
 
-Your **Document Storage** settings page at `/settings/document-storage` is where you register the external stores the module connects to (an admin governs which engines are offered — and sets the **parsed-artefact retention** policy — at `/admin/documents`). Each provider maps to one row in `doc_storage_provider` and one of three adapters.
+Your **Document Storage** settings page at `/settings/document-storage` is where you register the external stores the module connects to. An admin governs the shared policy at `/admin/documents` (`DocumentEnginesAdminPage`): which engines are offered, an app-wide **Default storage location** (a shared fallback provider plus a per-user isolation toggle, so users with no provider of their own can still upload), and the **Parsed-artefact retention** policy. Each provider maps to one row in `doc_storage_provider` and one of three adapters.
 
 <CardGrid>
   <Card title="S3 / Cloudflare R2" icon="cloud-download">
@@ -92,11 +92,12 @@ Key fields you set when creating a provider:
 | Field | Type | Purpose |
 |-------|------|---------|
 | `name` | `string` | Human-readable label shown in the sidebar |
-| `providerType` | `s3` \| `webdav` \| `local` | Which adapter backs this provider |
+| `providerType` | `s3` \| `r2` \| `webdav` \| `local` | Which adapter backs this provider (`s3` and `r2` both use the S3 adapter) |
 | `config` | object (encrypted) | Connection details + credentials — encrypted at rest, redacted in responses |
-| `isDefault` | `boolean` | Pre-selected provider in the browser |
+| `isDefault` | `boolean` | Pre-selected provider in the browser; where `POST /upload` (upload-to-default) lands |
 | `isReadOnly` | `boolean` | Injected into `createAdapter(...,{ readOnly })`; write ops throw `ReadOnlyError` at the adapter level |
 | `basePath` | `string` | Optional path prefix scoping the provider to a subtree |
+| `uploadPath` | `string` | Default destination folder for app uploads to this provider (used by upload-to-default when no folder is given) |
 
 <Aside type="note" title="Which adapters are available?">
 The install prompt (`storageAdapters`: `s3` | `webdav` | `local` | `all`, default `s3`) decides which adapter types the UI offers, exposed at runtime as the `ENABLED_ADAPTERS` constant in `document-management.config.ts`. All three adapter SDKs are **always** installed regardless of the selection, so the generated app always type-checks — only the offered set changes.
@@ -119,9 +120,44 @@ Every view, download, upload, link, and unlink is recorded in `doc_recent_access
 
 ---
 
+## Included Folders and Ingest
+
+Beyond one-off browsing, the module can feed files into a **knowledge base** through a loosely-coupled pipeline. Everything here is **inert unless a consumer (e.g. cog-ingest) is installed** — the pipeline emits the `documents.document.uploaded` event and only does work when something subscribes.
+
+### The Included folders page
+
+A **second** main-nav item — **Included folders** (`navigationRegistry` id `document-management-included`, icon `FolderTree`, order 26) — opens `IncludedFoldersPage` at `/documents/included`. It renders a lazily-loaded, recursive **checkbox folder tree** over a connected provider. Checking a folder marks it (recursively) as **included** — the auto-ingest scope — persisting a `doc_included_folder` row via `POST /included-folders` (backed by the `useIncludedFolders` / `useAddIncludedFolder` / `useRemoveIncludedFolder` hooks).
+
+**Sync now** (`POST /included-folders/sync`, the `useSyncIncludedFolders` hook) walks the included folders and fires the `documents.document.uploaded` pipeline event **per file**, so a consumer ingests the current contents. Each run is bounded at **2000 files** (the cap is reported in the `{ scanned, capped }` result, never silently applied).
+
+### Manual "Ingest to Knowledge Base"
+
+For a single file, a manual **Ingest to KB** action ensures a durable `doc_document` reference exists (with a `contentHash`) and then re-emits the *same* `documents.document.uploaded` event — so the manual and automatic paths share one job path. It is exposed by the `useRequestIngest` hook (`POST /ingest`), and the button only appears when `useIngestAvailable()` reports a consumer is installed (it appears on the preview page, the browser preview panel, and per-row in the Structure Documents tab).
+
+```tsx
+import { useIngestAvailable, useRequestIngest } from '../hooks/useDocumentManagement';
+
+function IngestButton({ documentId }: { documentId: string }) {
+  const { data } = useIngestAvailable();
+  const ingest = useRequestIngest();
+  if (!data?.available) return null;            // no knowledge base installed → hide
+  return (
+    <button onClick={() => ingest.mutate({ documentId })} disabled={ingest.isPending}>
+      Ingest to Knowledge Base
+    </button>
+  );
+}
+```
+
+<Aside type="tip" title="Parsed artefacts are stored, not re-parsed">
+When a consumer parses an ingested file (e.g. cog-ingest via a Docling sidecar), it can store the parser output back here as a **parsed artefact** so re-ingest never re-parses. That surface — `putParsedArtefact` and the read-only `resolveProvenance` resolver — is cross-module and covered in [Integration → Parsed Artefacts & Provenance](/document-management/integration/#parsed-artefacts--provenance).
+</Aside>
+
+---
+
 ## Frontend Components
 
-These components are generated into `frontend/src/features/document-management/components/` and are importable from the feature barrel. The two primary, reusable building blocks are `FileBrowser` and `FilePreview`.
+These components are generated into `frontend/src/features/document-management/components/`. The two primary, reusable building blocks are `FileBrowser` and `FilePreview`. The feature barrel (`index.ts`) re-exports only `DocumentBrowserPage` and `DocumentUpload` (the pieces meant for cross-module use); import the other components from their own modules (e.g. `../components/FilePreview`).
 
 | Component | Props | Description |
 |-----------|-------|-------------|
@@ -162,6 +198,8 @@ Two node actions are also registered (`nodeActionRegistry`): **Upload File** (id
 
 All data access goes through the TanStack Query hooks in `hooks/useDocumentManagement.ts`. Consume these from components rather than calling the service directly — the shared `QueryClient` handles caching, deduplication, background refetch, and request cancellation. Keys are namespaced with `document-management`.
 
+The hooks below are all defined in `hooks/useDocumentManagement.ts`. The feature barrel (`index.ts`) re-exports a commonly-used subset (`useProviders`, `useFolder`, `useDocuments`, `useNodeDocuments`, `useRecentDocuments`, `useFavourites`, `useUpload`, `useLinkDocument`); import the rest from the hooks module directly.
+
 | Hook | Kind | Description |
 |------|------|-------------|
 | `useProviders()` | query | List all storage providers for the user. |
@@ -170,9 +208,19 @@ All data access goes through the TanStack Query hooks in `hooks/useDocumentManag
 | `useUpdateProvider()` | mutation | Update a provider (`{ id, input }`). |
 | `useDeleteProvider()` | mutation | Delete a provider by id. |
 | `useTestProvider()` | mutation | Run a connection test; refreshes status/capabilities. |
+| `useAppSettings()` | query | Read the admin engine policy, app-wide default, and artefact-retention settings (`GET /settings`). |
+| `useUpdateAllowedAdapters()` | mutation | Admin: set which storage engines users may configure. |
+| `useUpdateAppDefault()` | mutation | Admin: set the app-wide default provider + per-user isolation. |
+| `useUpdateArtefactRetention()` | mutation | Admin: set parsed-artefact retention (`artefactKeepVersions`, `artefactMaxAgeDays`). |
+| `usePruneArtefacts()` | mutation | Admin: apply the artefact retention policy now (`POST /artefacts/prune`). |
+| `useIncludedFolders(providerId?)` | query | List the user's included (auto-ingest scope) folders. |
+| `useAddIncludedFolder()` | mutation | Include a folder (`{ providerId, folderPath, recursive? }`). |
+| `useRemoveIncludedFolder()` | mutation | Remove an included folder by id. |
+| `useSyncIncludedFolders()` | mutation | Walk included folders and fire the upload pipeline per file (`POST /included-folders/sync`). |
 | `useFolder(providerId, path, options?)` | query | List a folder's contents (browse). |
 | `useFileInfo(providerId, path)` | query | Fetch metadata for a single file. |
 | `useUpload()` | mutation | Upload a file (`{ providerId, path, file, onProgress? }`); invalidates folder + recent. |
+| `useUploadToDefault()` | mutation | Upload to the user's default provider (`{ file, folder?, onProgress? }`) — no provider picking needed. |
 | `useDocuments(options?)` | query | List document references with filters (`limit`, `cursor`, `providerId`, `status`, `isFavourite`, `tag`). |
 | `useDocument(id)` | query | Fetch a single document reference. |
 | `useRecentDocuments()` | query | Recently accessed documents. |
@@ -184,6 +232,9 @@ All data access goes through the TanStack Query hooks in `hooks/useDocumentManag
 | `useNodeDocumentCount(nodeId)` | query | Count of documents linked to a node (drives the badge). |
 | `useLinkDocument()` | mutation | Link a document to a node (`{ nodeId, input }`). |
 | `useUnlinkDocument()` | mutation | Remove a node link (`{ nodeId, documentId }`). |
+| `useIngestAvailable()` | query | Whether a knowledge-base consumer is installed (gates the **Ingest to KB** action). |
+| `useDocumentArtefacts(source)` | query | Stored parsed artefacts for a source (`{ documentId }` or `{ providerId, remotePath }`). |
+| `useRequestIngest()` | mutation | Manual **Ingest to Knowledge Base** — ensures a reference and re-emits the upload event. |
 | `useSearch(q, params?)` | query | Search across files (`providerId`, `limit`); disabled when `q` is empty. |
 | `useBookmarks(providerId?)` | query | List folder bookmarks, optionally scoped to a provider. |
 | `useCreateBookmark()` | mutation | Create a folder bookmark. |
@@ -191,7 +242,8 @@ All data access goes through the TanStack Query hooks in `hooks/useDocumentManag
 
 ```tsx
 // Example: a favourites list using two hooks
-import { useFavourites, useUpdateDocument } from '@/features/document-management';
+// (useUpdateDocument isn't in the barrel subset — import from the hooks module)
+import { useFavourites, useUpdateDocument } from '../hooks/useDocumentManagement';
 
 function FavouritesList() {
   const { data: favourites, isLoading } = useFavourites();
@@ -222,11 +274,42 @@ function FavouritesList() {
 
 ## Backend API Reference
 
-All endpoints are served under the base path **`/api/v1/document-management`** and require authentication (`requireAuth: true`). The design spec defines **22 endpoints across 5 groups**; this implementation adds **3 folder-bookmark endpoints**. Paths shown below are relative to the base path. The `*` in browse/file paths is a wildcard capturing the remote path within the provider.
+All endpoints are served under the base path **`/api/v1/document-management`** and require authentication (`requireAuth: true`). The surface has grown well beyond the original design spec's five groups; it now spans **nine groups**:
+
+- **App settings** — `GET`/`PUT /settings` (engine policy, app-wide default, artefact retention; `PUT` is admin-only)
+- **Storage providers** — provider CRUD + connection test
+- **File browsing** — browse, file metadata, preview, download, upload (per-provider **and** upload-to-default), bulk download
+- **Document references** — reference CRUD, recent, favourites
+- **Node integration** — link/unlink/list/count documents on a Structure node
+- **Search** — filename/metadata search
+- **Folder bookmarks** — bookmark CRUD
+- **Included folders** — the auto-ingest scope (list/add/remove + **Sync now**)
+- **Ingest, parsed artefacts & provenance** — manual ingest, artefact list/download, retention prune, provenance resolution
+
+Paths shown below are relative to the base path. The `*` in browse/file paths is a wildcard capturing the remote path within the provider. Specific literal routes (e.g. `/documents/recent`) are declared before parameterised ones (`/documents/:id`) so they win.
 
 <Aside type="caution" title="Credentials are never returned">
 Provider responses are produced by `toProviderResponse`, which omits the encrypted `config`. The frontend never receives long-lived credentials. For S3 previews, the client may receive a short-lived presigned URL — for preview only.
 </Aside>
+
+### App Settings (admin engine policy + retention)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/settings` | Read the engine policy, app-wide default provider, and artefact retention. Any authenticated user (so the UI knows what's offered). |
+| `PUT` | `/settings` | **Admin-only.** Set `allowedAdapters`, `defaultProviderId` / `defaultIsolateUsers`, and `artefactKeepVersions` / `artefactMaxAgeDays`. |
+
+```jsonc
+// GET /api/v1/document-management/settings → 200
+{
+  "allowedAdapters": ["s3", "webdav"],
+  "installedAdapters": ["s3", "webdav", "local"],
+  "selectableTypes": ["s3", "r2", "webdav"],
+  "defaultProviderId": "prov_01H...",
+  "defaultIsolateUsers": true,
+  "artefactRetention": { "keepVersions": 3, "maxAgeDays": null }
+}
+```
 
 ### Storage Providers
 
@@ -258,18 +341,21 @@ POST /api/v1/document-management/providers
   }
 }
 
-// Response 201 — config is redacted
+// Response 201 — config is redacted (shape = StorageProviderResponse)
 {
   "id": "prov_01H...",
   "name": "Evidence Bucket",
   "providerType": "s3",
   "isDefault": true,
   "isReadOnly": true,
-  "status": "pending",
+  "status": "connected",
   "statusMessage": null,
+  "lastCheckedAt": "2026-06-17T02:14:01.000Z",
   "basePath": null,
-  "lastCheckedAt": null,
-  "createdAt": "2026-06-17T02:14:00.000Z"
+  "uploadPath": null,
+  "capabilities": ["preview", "thumbnail"],
+  "createdAt": "2026-06-17T02:14:00.000Z",
+  "updatedAt": "2026-06-17T02:14:01.000Z"
 }
 ```
 
@@ -280,13 +366,13 @@ POST /api/v1/document-management/providers
 // Request
 POST /api/v1/document-management/providers/prov_01H.../test
 
-// Response 200
+// Response 200 — ConnectionTestResult + the derived status.
+// `capabilities` is a string ARRAY (S3 advertises ['preview','thumbnail']).
 {
-  "id": "prov_01H...",
-  "status": "connected",
-  "statusMessage": "Connected. 1,284 objects visible.",
-  "lastCheckedAt": "2026-06-17T02:15:31.000Z",
-  "capabilities": { "preview": true, "thumbnails": true, "search": false }
+  "success": true,
+  "message": "Connected",
+  "capabilities": ["preview", "thumbnail"],
+  "status": "connected"
 }
 ```
 
@@ -303,6 +389,7 @@ POST /api/v1/document-management/providers/prov_01H.../test
 | `GET` | `/preview/:providerId/*` | Preview directive — JSON `{kind:"url",url}` (presigned) or `{kind:"inline"}` |
 | `GET` | `/download/:providerId/*` | Stream the bytes (`Content-Disposition: attachment`) |
 | `POST` | `/upload/:providerId` | Upload — raw request body is the file; `?path=` names the destination |
+| `POST` | `/upload` | Upload to the user's **default** provider (no `providerId`) — raw body is the file; `?fileName=` names it, optional `?folder=` |
 | `POST` | `/bulk-download` | Body `{providerId, paths[]}` — returns a zip stream |
 
 <Tabs>
@@ -312,15 +399,18 @@ POST /api/v1/document-management/providers/prov_01H.../test
 // Request
 GET /api/v1/document-management/browse/prov_01H.../matters/2026
 
-// Response 200
+// Response 200 — a FolderContents object: { path, items, totalCount, hasMore }.
+// Each item is a FileInfo: name, path, isFolder, and optional mimeType/size/lastModified.
 {
   "path": "matters/2026",
-  "entries": [
-    { "name": "brief.pdf", "type": "file", "mimeType": "application/pdf",
-      "size": 482113, "modifiedAt": "2026-05-02T10:00:00.000Z" },
-    { "name": "exhibits", "type": "folder", "size": null,
-      "modifiedAt": "2026-05-04T08:30:00.000Z" }
-  ]
+  "items": [
+    { "name": "brief.pdf", "path": "matters/2026/brief.pdf", "isFolder": false,
+      "mimeType": "application/pdf", "size": 482113,
+      "lastModified": "2026-05-02T10:00:00.000Z" },
+    { "name": "exhibits", "path": "matters/2026/exhibits", "isFolder": true }
+  ],
+  "totalCount": 2,
+  "hasMore": false
 }
 ```
 
@@ -348,13 +438,13 @@ Content-Type: text/plain
 
 <...raw file bytes...>
 
-// Response 201
+// Response 201 — an UploadResult: { path, size, mimeType? }.
+// (contentHash is computed and carried on the documents.document.uploaded
+//  event for consumers — it is NOT part of the upload HTTP response.)
 {
   "path": "matters/2026/notes.txt",
-  "fileName": "notes.txt",
-  "mimeType": "text/plain",
   "size": 2048,
-  "contentHash": "9f86d081884c7d659a2feaa0c55ad015a..."
+  "mimeType": "text/plain"
 }
 ```
 
@@ -403,10 +493,13 @@ POST /api/v1/document-management/documents
   "fileSize": 482113,
   "isFavourite": true,
   "tags": ["matter-447", "pleadings"],
-  "notes": "Lead brief for the hearing."
+  "notes": "Lead brief for the hearing.",
+  "computeHash": true
 }
 
-// Response 201 — contentHash computed server-side
+// Response 201 — contentHash is populated ONLY because computeHash: true was
+// sent (it streams the file and hashes it server-side); omit the flag and
+// contentHash is null.
 {
   "id": "doc_01H...",
   "providerId": "prov_01H...",
@@ -430,13 +523,18 @@ POST /api/v1/document-management/documents
 // Request
 GET /api/v1/document-management/documents?isFavourite=true&limit=2
 
-// Response 200 — cursor-paginated
+// Response 200 — a DocumentListResponse: { items, nextCursor, hasMore }.
+// items are DocumentListItem (the narrow list shape). nextCursor is the id to
+// pass as ?cursor= for the next page, or null on the last page; hasMore mirrors it.
 {
   "items": [
-    { "id": "doc_01H...", "fileName": "brief.pdf", "isFavourite": true,
-      "status": "active", "tags": ["matter-447"], "providerId": "prov_01H..." }
+    { "id": "doc_01H...", "providerId": "prov_01H...", "remotePath": "matters/2026/brief.pdf",
+      "fileName": "brief.pdf", "mimeType": "application/pdf", "fileSize": 482113,
+      "isFavourite": true, "status": "active", "tags": ["matter-447"],
+      "thumbnailPath": null, "createdAt": "2026-06-17T02:20:00.000Z" }
   ],
-  "nextCursor": "doc_01G..."
+  "nextCursor": "doc_01G...",
+  "hasMore": true
 }
 ```
 
@@ -509,19 +607,23 @@ GET /api/v1/document-management/nodes/node_01H.../documents/count
 // Request
 GET /api/v1/document-management/search?q=brief&providerId=prov_01H...&limit=2
 
-// Response 200
+// Response 200 — a SearchResponse: { query, results, totalCount }.
+// Each result is a SearchResult: { providerId, file: FileInfo, score? } —
+// the file details are NESTED under `file`.
 {
   "query": "brief",
   "results": [
-    { "providerId": "prov_01H...", "path": "matters/2026/brief.pdf",
-      "fileName": "brief.pdf", "mimeType": "application/pdf", "size": 482113 }
-  ]
+    { "providerId": "prov_01H...",
+      "file": { "name": "brief.pdf", "path": "matters/2026/brief.pdf", "isFolder": false,
+        "mimeType": "application/pdf", "size": 482113 } }
+  ],
+  "totalCount": 1
 }
 ```
 
-### Folder Bookmarks (additional)
+### Folder Bookmarks
 
-These three endpoints are added by this implementation beyond the 22-endpoint design spec.
+Saved folder shortcuts, surfaced in the `ProviderSidebar`.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -569,6 +671,64 @@ GET /api/v1/document-management/bookmarks?providerId=prov_01H...
   </TabItem>
 </Tabs>
 
+### Included Folders (auto-ingest scope)
+
+The folders backing the **Included folders** picker (`/documents/included`) — the set that **Sync now** walks to feed the ingest pipeline.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/included-folders?providerId=` | List the user's included folders (optionally scoped) |
+| `POST` | `/included-folders` | Include a folder — body `{ providerId, folderPath, recursive? }` (idempotent) |
+| `POST` | `/included-folders/sync` | Walk the included folders and fire `documents.document.uploaded` per file; returns `{ scanned, capped }` (bounded at 2000 files/run) |
+| `DELETE` | `/included-folders/:id` | Remove an included folder |
+
+### Ingest, Parsed Artefacts & Provenance
+
+Manual ingest and read-only artefact/provenance access. Artefact **writes** (`putParsedArtefact`) are **in-process only** — there is deliberately no HTTP `PUT`; a producer calls the service via `serviceRegistry`. See [Integration → Parsed Artefacts & Provenance](/document-management/integration/#parsed-artefacts--provenance).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/ingest/available` | Whether an ingest consumer (knowledge base) is installed → `{ available }` |
+| `POST` | `/ingest` | Manual **Ingest to Knowledge Base** — ensures a reference and re-emits `documents.document.uploaded`; returns `202` with `{ enqueued, documentId }` |
+| `GET` | `/artefacts?documentId=\|providerId=&remotePath=` | List the parsed artefacts stored for a source |
+| `POST` | `/artefacts/prune` | **Admin-only.** Apply the retention policy (`keepVersions` + `maxAgeDays`) across all users now → `{ deletedRows, deletedBlobs }` |
+| `GET` | `/artefacts/:id/download` | Stream a stored artefact's bytes |
+| `GET` | `/provenance?documentId=` | Read-only provenance resolution (or `providerId`+`remotePath`); `404` when unresolvable |
+
+<Tabs>
+  <TabItem label="POST /ingest">
+
+```jsonc
+// Request — manual "Ingest to Knowledge Base"
+POST /api/v1/document-management/ingest
+{ "documentId": "doc_01H..." }          // or { "providerId": "...", "remotePath": "..." }
+
+// Response 202 Accepted — consumers process off the request path (in a job worker)
+{ "enqueued": true, "documentId": "doc_01H..." }
+```
+
+  </TabItem>
+  <TabItem label="GET /provenance">
+
+```jsonc
+// Request
+GET /api/v1/document-management/provenance?documentId=doc_01H...
+
+// Response 200 — a ProvenanceResult (latest artefact per format)
+{
+  "sourceType": "document-management",
+  "document": { "id": "doc_01H...", "fileName": "brief.pdf", "contentHash": "e3b0c442..." },
+  "source": { "providerId": "prov_01H...", "remotePath": "matters/2026/brief.pdf",
+    "fileName": "brief.pdf", "contentHash": "e3b0c442..." },
+  "artefacts": [
+    { "id": "art_01H...", "format": "docling-json", "version": 2, "mimeType": "application/json" }
+  ]
+}
+```
+
+  </TabItem>
+</Tabs>
+
 <Aside type="note" title="Uploads use a raw body, not multipart">
 `POST /upload/:providerId` reads the raw request body as the file and takes the destination (including filename) from `?path=`, deliberately avoiding a dependency on a specific multipart middleware. The upload size is enforced by a counting transform on the byte stream that aborts at `DOC_MAX_UPLOAD_SIZE` — not the spoofable `Content-Length` header.
 </Aside>
@@ -592,7 +752,7 @@ GET /api/v1/document-management/bookmarks?providerId=prov_01H...
 | Other | anything unrecognised | Download prompt + file icon | — |
 
 ```tsx
-import { FilePreview } from '@/features/document-management';
+import { FilePreview } from '../components/FilePreview';
 
 // FilePreview picks the renderer from the file's MIME category internally
 <FilePreview file={selectedFile} providerId={providerId} />
@@ -621,7 +781,9 @@ A provider's `status` is one of `connected`, `error`, `pending`, or `unavailable
 </CardGrid>
 
 ```tsx
-import { useFolder, useTestProvider } from '@/features/document-management';
+import { FileBrowser } from '../components/FileBrowser';
+// useTestProvider isn't in the barrel subset — import hooks from the hooks module
+import { useFolder, useTestProvider } from '../hooks/useDocumentManagement';
 
 function FolderArea({ providerId, path }: { providerId: string; path: string }) {
   const { data, error } = useFolder(providerId, path);
