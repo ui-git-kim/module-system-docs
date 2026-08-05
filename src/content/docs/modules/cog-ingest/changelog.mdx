@@ -20,6 +20,29 @@ Check your installed version with `npx cognitive-ingest info`.
 
 ---
 
+## v1.19.0 — 2026-08-05
+
+**Document Management auto-ingest (opt-in consumer)**
+
+cog-ingest can now automatically ingest files uploaded through the [Document Management](/document-management/) module. It is **opt-in per source and inert by default** — nothing happens unless a source turns it on and Document Management is installed.
+
+- **New source setting** `autoIngest.documentManagement` (`{ enabled, providerId?, pathPrefix? }`, default disabled). When Document Management emits its awaited `documents.document.uploaded` event, cog-ingest resolves the **first active source** whose `documentManagement.enabled` is true (optionally narrowed by `providerId` / `pathPrefix`) and ingests the uploaded file through that source's pipeline. If none opts in, the upload is ignored — no source is ever auto-created. cog-ingest owns and resolves the ingest `sourceId` itself; the Document Management event never carries one.
+- **Pull-on-demand, off the upload response.** The event handler is O(1): it resolves the source and enqueues a background job (`cog-ingest.ingest-file`) at priority 30 (after Document Management's own hooks), wrapped so a consumer error can never break the producer's awaited fan-out. The job handler pulls the bytes on demand via `getDownloadStreamByPath`, enforcing a 25 MB cap while streaming, then runs the standard ingest — keeping the synchronous, LLM-bound work out of the upload request.
+- **Content-type routing** from the upload's MIME, with a filename-extension fallback when the MIME is missing or generic: PDF → `pdf`, images → `image`, Office documents (DOCX/XLSX/PPTX + legacy + OpenDocument) → `office` (Docling), text/JSON → `text`. Audio/video are skipped until the Docling ASR image is deployed; unknown/binary types are skipped rather than mis-ingested as text. `mimeType` / `size` / `contentHash` / `documentId` are all treated as nullable/best-effort — Document Management forwards the raw client `Content-Type`, so a generic type (e.g. `application/octet-stream` for a real `.pdf`) is rescued by the filename extension *before* the file is downloaded.
+- **Auto-ingested files bypass the per-source input-method gate** (flagged as system ingests, exactly like RSS) and carry an `autoIngest` provenance marker (`provider`, `providerId`, `remotePath`, `documentId`, `contentHash`) on the job.
+- **UI:** the source config dialog gains an *Auto-ingest uploaded documents* switch, with optional provider-id and path-prefix filters.
+- Additive / opt-in / degrade-safe: the new config is `.optional()` and top-level, so it never affects the content-derivation stage digest — existing sources are byte-for-byte unaffected.
+
+<Aside type="note">
+Enriched event fields require newer Document Management: `documentId` and the `documentId`-based provenance API arrived in DM **v1.5.1**, and streamed-upload `contentHash` in **v1.4.0**. The consumer runs against any Document Management **≥ v1.2.3** and degrades gracefully when those fields are absent. It is **inert until a source opts in**.
+</Aside>
+
+<Aside type="caution" title="Known follow-ups (efficiency, not correctness)">
+Two bounded efficiency limitations are deferred to the live-validation pass: (1) Document Management's folder "Sync now" re-emits an upload event per file, so a re-sync re-downloads already-ingested content (the expensive engine/embedding work is still skipped by `skipUnchanged` / cross-source dedup, but the bytes are re-pulled) — a producer content-hash idempotency key will short-circuit this; (2) for async-mode sources the base64 bytes are persisted in `cog_ingest_job.input` (pre-existing behaviour shared with manual uploads), so bulk auto-ingest accumulates them — a `job.input` retention policy is the fix. Both are opt-in-only and bounded by the 25 MB per-file cap.
+</Aside>
+
+---
+
 ## v1.18.3 — 2026-08-04
 
 **Stage 2.0 — store the cleaned "Silver" content**
