@@ -20,7 +20,7 @@ Verification, password-reset and change-email messages are sent by **Neon Auth i
 - **`sendEmail(message)`** is the one entry point. It resolves the active provider, applies the `email.outbound` filter, sends, fires the `email.sent` action, and **never throws** — failures normalise to `{ sent: false, detail }` so callers treat non-delivery as data.
 - **Unconfigured = visible, not silent.** With no provider wired, the **console provider** logs the envelope (body at `debug` level) and returns `sent: false` — it never fakes success. In development this doubles as a "what would have been sent" console.
 - **Adapters are optional dependencies.** Each SDK is imported dynamically via a variable specifier (the same idiom as the [AWS KMS key provider](/getting-started/aws-kms-setup/) and [Sentry](/getting-started/error-tracking/)), so the template — and any app not sending email — type-checks and builds without any mail SDK installed.
-- **Wiring is configuration, not code.** Set the `EMAIL_*` env keys and the feature auto-wires the matching adapter at startup; a bad or incomplete config logs an error and leaves the console default active — it never crashes bootstrap.
+- **Wiring is configuration, not code.** Set the `EMAIL_*` env keys and the feature auto-wires the matching adapter at startup; a bad or incomplete config logs an error and leaves the console default active — it never crashes bootstrap. Or configure the provider from the **admin Email page** (below) — stored in the database, secret encrypted at rest, applied without a restart. **Env always wins**: when `EMAIL_PROVIDER` is set, the admin config is read-only.
 
 ## Sending email
 
@@ -80,8 +80,8 @@ Set `EMAIL_PROVIDER` + `EMAIL_FROM` (plus the provider's key) in `backend/.env`,
   </TabItem>
   <TabItem label="SMTP (Nodemailer)">
     <Steps>
-      1. `cd backend && npm install nodemailer`
-      2. Set `EMAIL_PROVIDER=smtp`, `EMAIL_FROM=...`, `SMTP_URL=smtp://user:pass@host:587` (any SMTP host — a mail provider, SES's SMTP interface, or Mailpit/MailHog in dev).
+      1. Nodemailer ships with `create-app`; an older app runs `cd backend && npm install nodemailer`.
+      2. Set `EMAIL_PROVIDER=smtp`, `EMAIL_FROM=...`, `SMTP_URL=smtp://user:pass@host:587` (any SMTP host — a mail provider, SES's SMTP interface, or Mailpit/MailHog in dev). Or skip env and configure SMTP from the admin Email page (below).
       3. Restart.
     </Steps>
   </TabItem>
@@ -89,14 +89,37 @@ Set `EMAIL_PROVIDER` + `EMAIL_FROM` (plus the provider's key) in `backend/.env`,
 
 A declared-but-broken config (key missing, SDK not installed) stays **visible**: startup logs an error, `getEmailProviderStatus()` reports `configured: true, ready: false`, and sends return `sent: false` with an actionable message naming the missing piece.
 
-## The admin Email page (v1.58.0)
+## The admin Email page
 
-The frontend gained an email feature (`frontend/src/features/email`) whose admin page — **Email**, in the admin sidebar's Platform section — surfaces the seam without touching its service-only design:
+The **Email** page (admin sidebar → Platform) configures and tests the seam without touching its service-only sending design. A provider can be wired two ways — env (above) or this page — with **env always winning**.
 
-- **Provider status** — renders the `getEmailProviderStatus()` probe (provider / declared / ready, plus the seam's own remediation detail) with env-key guidance when not ready.
-- **Test delivery** — `POST /api/v1/admin/email/test` sends a test email **to the signed-in admin's own address only** (the body carries no recipient, so the endpoint cannot be used as a relay) and renders the returned `EmailResult` verbatim — including honest non-delivery (`sent: false` + detail), since `sendEmail` never throws.
+### Configure a provider (v2.5.5)
 
-Both endpoints (`GET /api/v1/admin/email/status`, `POST /api/v1/admin/email/test`) live in the backend email feature (`email.routes.ts`, admin-gated) — the sending seam itself remains service-only. Deliberately **not** included: an outbound log viewer (the seam is stateless by design), template previews (templates are module territory), and admin editing of `EMAIL_*` env (secrets stay out of the browser); see the roadmap if demand materialises.
+Pick a provider and enter its details; the backend validates, **encrypts the secret at rest**, and wires the provider **live on save — no restart**:
+
+- **Microsoft 365 / Google** — one-click presets that pre-fill the SMTP host/port and guide you to an **app password** (Microsoft needs *Authenticated SMTP* enabled + MFA; Google needs 2-Step Verification + an App Password). Under the hood these use the SMTP path. Basic-auth SMTP is being phased out by both — **OAuth2 sign-in is [on the roadmap](/starter-template/roadmap/)** for tenants that block it.
+- **Custom SMTP** — any host: connection security (STARTTLS on 587 / implicit TLS on 465), port, username, password. **Test connection** verifies the server (Nodemailer's `verify()`) *without sending*.
+- **Resend / SendGrid** — a from address + the API key.
+- **Amazon SES** — a from address + region (SES authenticates via the AWS credential chain, so no secret is stored).
+
+The SMTP password / API key lives in the new **`EmailConfig`** singleton model, encrypted with the field-encryption primitive (`encryptField`, app-global envelope) — the **plaintext never touches the database**, and the admin API only ever reports whether a secret is *set*, never its value.
+
+<Aside type="caution" title="Secrets need a key provider">
+Storing a secret requires a ready encryption key provider — set `SECURITY_ENCRYPTION_KEY` (base64, 32 bytes) or configure [AWS KMS](/getting-started/aws-kms-setup/). Without one, the page says so and refuses to store the secret; keep it in the `EMAIL_*` env vars instead. This is the `hardened`+ posture.
+</Aside>
+
+<Aside type="note" title="Env wins">
+When `EMAIL_PROVIDER` is set in the environment, that config is authoritative and the admin form is **read-only** — the operator's env is never overridden from the browser. Unset `EMAIL_PROVIDER` (and the provider key) and restart to manage email from the UI.
+</Aside>
+
+Nodemailer is installed by `create-app` for new apps and reconciled into existing apps by `template:update` (v2.5.7, via `sync-deps` — presence-only, so a pinned version is never overridden); an app that removed it sees an actionable "install nodemailer" message on the SMTP path.
+
+### Status & test delivery
+
+- **Status** — the `getEmailProviderStatus()` probe (provider / source / ready, plus remediation detail); never sends.
+- **Test delivery** — `POST /api/v1/admin/email/test` sends a test **to the signed-in admin's own address only** (the body carries no recipient, so it cannot be used as a relay) and renders the returned `EmailResult` verbatim, including honest non-delivery.
+
+All endpoints — `GET .../email/status`, `GET`/`PUT .../email/config`, `POST .../email/test-connection`, `POST .../email/test` — are **admin-gated** and live in the backend email feature (`email.routes.ts`); the sending seam itself stays service-only. Config writes are zod-validated, refuse when the environment owns the config, and never accept or return a plaintext secret beyond the single write-only field. Deliberately **not** included: an outbound log viewer (delivery state belongs to the provider) and template previews (module territory).
 
 ## Custom adapters
 
@@ -142,4 +165,4 @@ Run `npm run template:update` — the merge brings the feature in, and `sync-env
 - **Queuing and retry** — `sendEmail` is a direct call. Durable retry arrives with the background-jobs seam (roadmap) or via your provider.
 - **Auth emails** — Neon Auth sends its own (see the note above).
 
-The seam is stateless — it stores no rows, so it registers a security manifest declaring only the `email.sent` audit event, and needs no deletion handler.
+The seam's *sending* path is stateless (no per-message rows). Its only stored state is the optional app-wide `EmailConfig` singleton (admin-set provider config, secret encrypted at rest) — app config, not account data, so it carries no `tenantId` and needs no deletion handler. Its security manifest declares the `email.sent` audit event and the encrypted `EmailConfig.secretCiphertext` field.

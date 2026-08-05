@@ -154,6 +154,7 @@ function toProviderResponse(p: StorageProvider): StorageProviderResponse {
     statusMessage: p.statusMessage,
     lastCheckedAt: p.lastCheckedAt ? p.lastCheckedAt.toISOString() : null,
     basePath: p.basePath,
+    uploadPath: p.uploadPath,
     capabilities,
     createdAt: p.createdAt.toISOString(),
     updatedAt: p.updatedAt.toISOString(),
@@ -307,7 +308,7 @@ Read-only is enforced inside the adapter, not merely hidden in the UI. Even a di
 
 ## Content Hashing for Integrity Verification
 
-When a `doc_document` reference is created, the service computes a **SHA-256 hash** of the file content server-side and stores it in `doc_document.contentHash`. This lets you later confirm a file has not been modified since it was referenced.
+Content hashing is **opt-in**. When a `doc_document` reference is created with `computeHash: true`, the service streams the file server-side, computes a **SHA-256 hash**, and stores it in `doc_document.contentHash`. Without the flag, `createDocument` leaves `contentHash: null` — most everyday references (favourite/tag/note) skip the hash to avoid a full download, and evidence/legal callers pass `computeHash: true` to record one. A stored hash lets you later confirm a file has not been modified since it was referenced.
 
 ```typescript
 // SHA-256 over a readable stream — no need to buffer the whole file in memory
@@ -321,14 +322,20 @@ export function sha256Stream(stream: Readable): Promise<string> {
 }
 ```
 
-The hash is computed during reference creation and persisted alongside the reference:
+The hash is computed during reference creation only when `computeHash` is set, and persisted alongside the reference:
 
 ```typescript
 let contentHash: string | undefined;
-// ... obtain a download stream for the file ...
-contentHash = await sha256Stream(stream);
-// ... persisted to doc_document.contentHash (or null if unavailable)
+if (input.computeHash) {
+  // ... obtain a download stream for the file ...
+  contentHash = await sha256Stream(stream);
+}
+// ... persisted to doc_document.contentHash (or null when computeHash is not set / unavailable)
 ```
+
+<Aside type="note" title="Streamed uploads are hashed inline (no opt-in needed)">
+Reference-creation hashing is opt-in, but the **upload pipeline** hashes every upload automatically. `uploadToRow` tees the upload through a SHA-256 **passthrough** (`sha256Passthrough`) as the bytes flow to the adapter — so a `contentHash` is computed without ever buffering the whole file — and carries it on the `documents.document.uploaded` event for consumers to dedupe re-uploads. A buffered upload is hashed directly; the included-folder **Sync now** scan reads no bytes, so it emits `contentHash: null`.
+</Aside>
 
 ### The Verify Integrity flow
 
@@ -385,9 +392,9 @@ model doc_recent_access {
 |----------|-------------|
 | `view` | A file is previewed |
 | `download` | A file is downloaded (single or as part of a bulk zip) |
-| `upload` | A file is uploaded to a provider |
+| `upload` | A file is uploaded to a provider (or re-emitted via manual ingest) |
 | `link` | A document is linked to a Structure node |
-| `unlink` | A document is unlinked from a node |
+| `unlink` | A defined `AccessAction` value, but **not currently written** — unlinking fires the `documents.document.unlinked` hook without adding an access-log row |
 
 Because each row records **who** (`userId`), **what** (`providerId` + `remotePath` + `fileName`), **which action**, and **when** (`accessedAt`), the table provides the access history needed for chain-of-custody evidence.
 
@@ -427,7 +434,7 @@ export class PathTraversalError extends DocumentManagementError {
 ```
 
 <Aside type="caution" title="Local adapter is development-first">
-The `LocalAdapter` is intended for development and logs a warning when `NODE_ENV === 'production'`. Prefer S3/R2 or WebDAV in production. When you do use it, the base-directory restriction is the boundary that keeps file access inside the intended folder tree.
+The `LocalAdapter` is intended for development and logs an informational message (`log.info`, not a warning) when `NODE_ENV === 'production'` — noting the files sit on the app-server filesystem and that S3/R2 or WebDAV is preferable for multi-instance deployments. When you do use it, the base-directory restriction is the boundary that keeps file access inside the intended folder tree.
 </Aside>
 
 ---
@@ -494,9 +501,9 @@ Document Management was designed with legal and evidence workflows in mind. Thre
 
 Three controls work together to establish and preserve chain of custody:
 
-1. **Integrity** — `contentHash` (SHA-256) is computed server-side at reference creation. A Verify Integrity re-hash confirms the file is byte-for-byte the file you first recorded.
+1. **Integrity** — `contentHash` (SHA-256) is computed server-side at reference creation **when the caller passes `computeHash: true`** (evidence/legal callers do). A Verify Integrity re-hash then confirms the file is byte-for-byte the file you first recorded.
 2. **Immutability** — `isReadOnly` providers reject every write at the adapter level, so evidence cannot be modified, moved, or deleted through the module.
-3. **Access history** — `doc_recent_access` logs each `view`, `download`, `upload`, `link`, and `unlink` with `userId` and `accessedAt`, providing an auditable record of who did what and when.
+3. **Access history** — `doc_recent_access` logs each `view`, `download`, `upload`, and `link` with `userId` and `accessedAt`, providing an auditable record of who did what and when.
 
 ### Data sovereignty
 
@@ -548,13 +555,16 @@ The module declares a **security manifest** (`security.registration.ts`) so the 
 
 Parsed artefacts get an extra step because they have **bytes on a storage provider**, not just metadata rows. Before the row deletion, the handler best-effort deletes the artefact **bytes** from storage (`purgeUserArtefactBlobs`), **confined to the user's `u/<userId>/` namespace** on shared providers so it can never touch another tenant's data. That purge **never throws** — a provider being unreachable does not block the account deletion — and the `doc_parsed_artefact` metadata rows are then removed inside the same transaction as the other per-user tables.
 
+The category names below are exactly those declared in the manifest's `dataCategories`:
+
 | Data category | Classification | What is erased |
 |---------------|----------------|----------------|
 | `storage_providers` | `owned` | `doc_storage_provider` rows (including encrypted `config`) |
-| `documents` | `owned` | `doc_document` references and `doc_node_link` rows |
+| `document_references` | `owned` | `doc_document` references |
+| `node_links` | `owned` | `doc_node_link` rows |
 | `folder_bookmarks` | `owned` | `doc_folder_bookmark` rows |
 | `included_folders` | `owned` | `doc_included_folder` rows |
-| `recent_access` | `owned` | `doc_recent_access` audit rows |
+| `recent_access_log` | `owned` | `doc_recent_access` audit rows |
 | `parsed_artefacts` | `owned` | `doc_parsed_artefact` rows **and** the artefact bytes under the user's namespace |
 
 <Aside type="note" title="Best-effort byte purge, guaranteed row deletion">
