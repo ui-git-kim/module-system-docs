@@ -113,14 +113,16 @@ export interface DocumentManagementServiceInterface {
 
   // ── Provenance — read-only; supports citations and chain-of-evidence ──
 
-  /** Resolve an ingest-engine source reference back to its document, source, and artefacts. */
+  /** Resolve a document back to its source + artefacts, for citations. Document-
+   *  centric: pass a documentId (or providerId + remotePath). The engine's own
+   *  sourceId never appears here. */
   resolveProvenance(
     userId: string,
     ref:
-      | { sourceType: string; sourceId: string }
+      | { documentId: string }
       | { providerId: string; remotePath: string }
   ): Promise<{
-    sourceType: string;
+    sourceType: string;               // always 'document-management'
     document: DocumentReference | null;
     source: { providerId: string; remotePath: string; fileName: string; contentHash: string | null };
     artefacts: ParsedArtefact[];      // latest per format
@@ -146,7 +148,7 @@ export interface DocumentManagementServiceInterface {
 | `getParsedArtefactStream(artefactId, userId)` | `Promise<Readable>` | Stream a stored artefact's bytes (ownership-checked). |
 | `requestIngest(userId, input)` | `Promise<{ documentId }>` | Ensure a durable reference exists (with `contentHash`), then re-emit `documents.document.uploaded` so manual ingest shares the auto-ingest job path. |
 | `isIngestAvailable()` | `boolean` | Whether an ingest consumer is subscribed to `documents.document.uploaded` (drives the **Ingest to KB** button visibility). Never names a specific consumer. |
-| `resolveProvenance(userId, ref)` | `Promise<ProvenanceResult>` | Read-only. Map an ingest-engine `sourceType`/`sourceId` (or `providerId`+`remotePath`) back to its document, source, and latest-per-format artefacts, for citations and chain-of-evidence. |
+| `resolveProvenance(userId, ref)` | `Promise<ProvenanceResult>` | Read-only. Resolve a `documentId` (or `providerId`+`remotePath`) back to its document, source, and latest-per-format artefacts, for citations and chain-of-evidence. Document-centric — the engine's own `sourceId` never appears here. |
 | `isAvailable()` | `boolean` | Always `true` once registered; lets soft consumers confirm the module is present. |
 
 The two return shapes you will work with most are `DocumentReference` and `FileInfo`. Both are reproduced in full so you do not have to import them just to read this page:
@@ -688,9 +690,9 @@ export const cogIngestService = {
     }
 
     // 1. Create a stable reference. We get a durable documentId + contentHash
-    //    to store as the ingest job's sourceId for provenance.
-    //    createDocument is part of the full service (used internally and by
-    //    the frontend service); request computeHash for an evidence trail.
+    //    to record for provenance, so a citation can resolve back to this
+    //    document via docs.resolveProvenance({ documentId }). createDocument is
+    //    part of the full service; request computeHash for an evidence trail.
     const ref = await (docs as any).createDocument(userId, {
       providerId,
       remotePath,
@@ -701,9 +703,12 @@ export const cogIngestService = {
     // 2. Later (or immediately), pull the bytes via the public interface.
     const stream = await docs.getDownloadStream(ref.id, userId);
 
-    // 3. Feed the stream into the cognitive pipeline, tagging the source.
+    // 3. Feed the stream into the cognitive pipeline. Record the Document
+    //    Management documentId for provenance — this is DISTINCT from
+    //    cog-ingest's own sourceId (which ingest *configuration*): the documentId
+    //    is what resolveProvenance resolves, the sourceId never crosses to DM.
     await this.processStream(stream, {
-      sourceId: ref.id,
+      documentId: ref.id,
       contentHash: ref.contentHash,
       mimeType: ref.mimeType,
     });
@@ -792,14 +797,13 @@ export const cogIngestService = {
 
 ### Resolving provenance for citations
 
-When assembled chat context or the Evidence Manager needs to cite a chunk, `resolveProvenance` maps the ingest engine's `sourceType`/`sourceId` contract (owned by cog-ingest) back to the underlying document, its source reference, and the latest artefact per format — all read-only.
+When assembled chat context or the Evidence Manager needs to cite a chunk, `resolveProvenance` resolves a **documentId** (the one a consumer such as cog-ingest recorded for the chunk's source) back to the underlying document, its source reference, and the latest artefact per format — all read-only.
 
 ```typescript
 const provenance = await docs.resolveProvenance(userId, {
-  sourceType: 'document-management',   // or 'document' / 'file'
-  sourceId: documentId,                // a doc_document id (providerId+remotePath is also accepted)
+  documentId,                          // a doc_document id (providerId+remotePath is also accepted)
 });
-// → { sourceType, document, source: { providerId, remotePath, fileName, contentHash }, artefacts }
+// → { sourceType: 'document-management', document, source: { providerId, remotePath, fileName, contentHash }, artefacts }
 // Use `source.contentHash` + the recent-access trail for a defensible chain of evidence.
 ```
 
@@ -813,26 +817,23 @@ Artefact **writes** never cross the network. These read/action routes exist for 
 | GET | `/ingest/available` | Whether an ingest consumer is installed (`isIngestAvailable`). |
 | GET | `/artefacts?documentId=\|providerId=&remotePath=` | List the parsed artefacts stored for a source. |
 | GET | `/artefacts/:id/download` | Stream a stored artefact's bytes. |
-| GET | `/provenance?sourceType=&sourceId=` | Read-only provenance resolution for citations. |
+| GET | `/provenance?documentId=` | Read-only provenance resolution for citations (or `providerId`+`remotePath`). |
 
-### The provenance contract (proposed — pending cog-ingest agreement)
+### The provenance contract (agreed)
 
-`resolveProvenance` only resolves reliably end-to-end if the ingest engine (cog-ingest) and Document Management agree on **what gets stamped** on every ingested entity. The proposed contract:
+The contract is **document-centric**, with a clean split of ownership:
 
-| Field | Value | Meaning |
-|-------|-------|---------|
-| `sourceType` | `'document-management'` (aliases `'document'`, `'file'`) | The chunk/entity originated from a Document Management document. |
-| `sourceId` | a `doc_document.id` | The **durable reference id** — the same id `requestIngest` and auto-ingest reference-creation return. |
+| Side | Owns | Carries for provenance |
+|------|------|------------------------|
+| Document Management | the `documentId` (a `doc_document.id`) | `resolveProvenance({ documentId })` → document + source + latest-per-format artefacts. |
+| cog-ingest | its own `sourceId` (which ingest *configuration*) — engine-side only | records the Document Management **`documentId`** for each ingested source and stamps it on derived entities/chunks, then passes it to `resolveProvenance` when a citation is requested. |
 
-Given `{ sourceType, sourceId }`, `resolveProvenance` returns the document reference, the `source` (`providerId`, `remotePath`, `fileName`, `contentHash`), and the latest parsed artefact per format — enough to render a citation ("from *fileName*, SHA-256 *hash*") and to fetch the stored parsed copy for re-extraction. A `{ providerId, remotePath }` form is accepted when no `documentId` is available.
+The `documentId` is what `requestIngest` and reference-creation (`createDocument`) return. cog-ingest's `sourceId` (a *source-configuration* id) is a separate concept that **never crosses to Document Management** — this API takes a `documentId`, not a `sourceId`.
 
-<Aside type="caution" title="Open point for cog-ingest to confirm">
-cog-ingest's `ingest(userId, { sourceId, … })` currently uses `sourceId` to mean a **source-configuration** id (which ingest *setup*), **not** a document id. For provenance to resolve, the document id has to be carried through to whatever cog-ingest stamps on derived entities. Two ways to close this, to be agreed with cog-ingest:
+Given a `documentId`, `resolveProvenance` returns the document reference, the `source` (`providerId`, `remotePath`, `fileName`, `contentHash`), and the latest parsed artefact per format — enough to render a citation ("from *fileName*, SHA-256 *hash*") and to fetch the stored parsed copy for re-extraction. A `{ providerId, remotePath }` form is accepted when no `documentId` is available.
 
-1. **cog-ingest persists the Document Management `documentId`** as the ingest job's provenance source id (kept distinct from its config `sourceId`), and stamps it on derived entities; or
-2. a dedicated `provenance: { sourceType, sourceId }` field is added to the ingest payload/job and propagated.
-
-Until one is agreed and implemented on the engine side, `resolveProvenance` is correct when called with a Document Management `documentId` (or `providerId`+`remotePath`) directly, but is **not guaranteed** to resolve cog-ingest's own stamps. This is the one remaining cross-module contract for the citation/chain-of-evidence story.
+<Aside type="note" title="Resolved in v1.5.1">
+An earlier draft of this contract had Document Management accept a `sourceType`/`sourceId` pair, which collided with cog-ingest's own `sourceId` (its ingest configuration). That is resolved: the Document Management provenance API is now purely `documentId`-based, so `sourceId` never appears on this side. cog-ingest keeps and passes the `documentId` it received when creating the reference.
 </Aside>
 
 ---
