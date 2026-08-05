@@ -21,7 +21,118 @@ Document Management V1 is a **renderer and connector**. It connects to external 
 
 ---
 
-## v1.2.1 <Badge text="Current" variant="success" /> <Badge text="18 June 2026" variant="note" />
+## v1.4.1 <Badge text="Current" variant="success" /> <Badge text="4 August 2026" variant="note" />
+
+A fix for **WebDAV streamed uploads**.
+
+### Fixed
+
+- **WebDAV uploads now stream correctly.** `WebDAVAdapter.upload` previously passed the request stream to `putFileContents(file as Buffer)`, which coerced the stream — the WebDAV client cannot compute a `Content-Length` for a `Readable`, so streamed uploads to ownCloud / Nextcloud / NAS providers failed or stored a corrupt body with size `0`. The adapter now pipes non-Buffer bodies through `createWriteStream` (keeping the `putFileContents` fast-path for Buffers) and reads the real size back via `stat`. This also lets the v1.4.0 upload-stream `contentHash` tee drain and resolve on the WebDAV path.
+
+---
+
+## v1.4.0 <Badge text="4 August 2026" variant="note" />
+
+A **parsed-artefact surface** plus the remaining **producer follow-ups** for the reusable upload → ingest pipeline: normal uploads now carry a real `contentHash`, an external parser's output can be stored for reuse, a manual **Ingest to Knowledge Base** action shares one job path with auto-ingest, and a read-only provenance resolver backs citations.
+
+### Added
+
+- **Parsed-artefact storage (`doc_parsed_artefact`).** A new self-contained table plus service methods (`putParsedArtefact`, `getParsedArtefact`, `listParsedArtefacts`, `getParsedArtefactStream`) that **store** the output an external parser (the cog-ingest Docling sidecar) produced — this module never parses content itself, so re-ingest / re-extraction / re-chunking never re-parse. Artefacts default to a **derived writable area** (`DOC_ARTEFACT_PREFIX`, default `.derived-artefacts`) so a read-only/evidence source is never written to; an explicit `target` (e.g. a Structure-configured save location) can override. They are deduped by `sourceContentHash` and, on shared providers, namespaced under `u/<userId>/`. Producers call `putParsedArtefact` in-process via `serviceRegistry.get('document-management')` — there is deliberately **no HTTP PUT** for artefacts. HTTP read routes: `GET /artefacts?documentId=|providerId=&remotePath=` (list) and `GET /artefacts/:id/download` (bytes).
+- **Manual "Ingest to Knowledge Base" action.** `requestIngest(userId, input)` ensures a durable `doc_document` reference (with `contentHash`) exists, then re-emits the same `documents.document.uploaded` event that auto-ingest consumes — so manual and automatic ingest share one job path. Guarded by `isIngestAvailable()` (`actionRegistry.hasActions('documents.document.uploaded')`; decoupled — it never names cog-ingest). HTTP: `POST /ingest` (202 Accepted), `GET /ingest/available`. An **Ingest to KB** button appears — only when a consumer is installed — on the `DocumentPreviewPage` header, in the `DocumentBrowserPage` preview panel, and as a per-row button in the Structure `NodeDocumentsTab`. New hooks: `useIngestAvailable`, `useRequestIngest`, `useDocumentArtefacts`.
+- **Read-only provenance resolver.** `resolveProvenance(userId, ref)` maps the ingest engine's `sourceType`/`sourceId` contract back to `{ sourceType, document, source: { providerId, remotePath, fileName, contentHash }, artefacts }` (latest artefact per format) for citations in assembled chat context and Evidence Manager chain-of-evidence. Read-only; never writes. HTTP: `GET /provenance?sourceType=&sourceId=…`.
+
+### Changed
+
+- **`documents.document.uploaded` now carries a real `contentHash` for streamed uploads.** `uploadToRow` (the event emitter) tees the upload stream through a SHA-256 passthrough (`sha256Passthrough`), so normal HTTP uploads emit a populated `contentHash` (previously `null`), enabling re-upload dedup by a consumer. The payload also gained a `documentId` field. New shape: `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }`. (Included-folders **Sync now** still emits `contentHash: null` — it lists metadata and reads no bytes; `documentId` is `null` on bare uploads and set on the manual-ingest path.)
+- **Public `DocumentManagementServiceInterface` gained** `putParsedArtefact`, `getParsedArtefact`, `listParsedArtefacts`, `getParsedArtefactStream`, `requestIngest`, `isIngestAvailable`, and `resolveProvenance` (alongside the existing `getDownloadStreamByPath`, `uploadToDefault`, etc.).
+
+### Security
+
+- **Erasure cascade covers parsed artefacts.** On account deletion the handler now best-effort deletes artefact **bytes** from storage (`purgeUserArtefactBlobs` — confined to the user's namespace on shared providers, never throws) *before* removing `doc_parsed_artefact` rows in the same transaction as the other per-user tables. New data category `parsed_artefacts` (classification `owned`). Each stored artefact carries an `artefactHash` (SHA-256) for integrity checks.
+
+<Aside type="caution" title="Updating from 1.3.x">
+Run `npx document-management update`, then `prisma migrate dev` to create the `doc_parsed_artefacts` table. Optionally set `DOC_ARTEFACT_PREFIX` if you want artefacts stored somewhere other than `.derived-artefacts`.
+</Aside>
+
+---
+
+## v1.3.1 <Badge text="2 August 2026" variant="note" />
+
+Frontend import migration for generated pages.
+
+### Changed
+
+- **Generated frontend imports migrated to React Router v8.** The router imports in the generated pages and route config were moved to the v8 import paths to align with the current starter template. No change to routes, endpoints, or the module's public API.
+
+---
+
+## v1.3.0 <Badge text="14 July 2026" variant="note" />
+
+First-class in-app local storage, and a CrashPlan-style included-folder picker.
+
+### Added
+
+- **First-class in-app local storage.** `LocalAdapter` is promoted from dev-only to a supported end-user option: each user's local provider is pinned server-side to a per-user root (`DOC_LOCAL_BASE_PATH/u/<userId>`) on **both** create and update — any client-supplied `basePath` is ignored, so a config change can't repoint the base — and `connect()` creates the base directory. `safeResolve` confines every operation to that root.
+- **Included folders picker + `doc_included_folder` table.** A new **Included folders** page (`/documents/included`, sidebar item) with a lazily-loaded, recursive checkbox folder tree backed by a self-contained `doc_included_folder` table (`GET/POST/DELETE /included-folders`). Checking a folder marks it (recursively) as auto-ingest scope; **Sync now** (`POST /included-folders/sync`) walks the included folders and fires the `documents.document.uploaded` pipeline event per file — bounded at 2000 files per run (the cap is reported, never silent) — so a consumer (cog-ingest) ingests them. `addIncludedFolder` reuses the `resolveFileProvider` guard, so a user can only include folders they can reach.
+
+### Security
+
+- Local-storage isolation hardened by an adversarial review, which caught and fixed an `updateProvider` re-point bypass.
+
+<Aside type="caution" title="Updating from 1.2.x">
+Run `npx document-management update`, then `prisma migrate dev` to create the `doc_included_folders` table.
+</Aside>
+
+---
+
+## v1.2.4 <Badge text="14 July 2026" variant="note" />
+
+An admin-set, app-wide default storage location — with per-user isolation.
+
+### Added
+
+- **App-wide default storage.** `doc_app_settings` gains `defaultProviderId` + `defaultIsolateUsers` (default on), an admin-gated **Default storage location** card on the engines admin page (shared-provider select + isolation toggle), and upload fallback to the shared default. Uploads now work for new users out of the box, removing the *"No default storage provider is set"* dead-end.
+
+### Security
+
+- **Per-user isolation on the shared default.** When isolation is on, each user's uploads are namespaced under `u/<userId>/` and access is confined to that namespace via a centralised `resolveFileProvider` guard (browsing the shared provider is never granted to non-owners). Hardened after an adversarial review that found and fixed three cross-tenant path-traversal vectors (a Windows/Local backslash read escape and two `fileName` write escapes); a re-review confirmed the boundary holds. **Communal mode** (`defaultIsolateUsers` off) is an explicit admin opt-out — a shared space with no per-user separation.
+
+<Aside type="caution" title="Updating from 1.2.3">
+Run `npx document-management update`, then `prisma migrate dev` to add `defaultProviderId` and `defaultIsolateUsers` to `doc_app_settings`.
+</Aside>
+
+---
+
+## v1.2.3 <Badge text="14 July 2026" variant="note" />
+
+The **producer half** of the reusable upload → ingest pipeline.
+
+### Changed
+
+- **`upload()` now emits `documents.document.uploaded` as an awaited async fan-out** (`doActionParallel`) with the enriched reference payload `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash }`, so event-driven consumers (job workers) finally receive uploads. Previously it fired synchronously and never reached `addActionAsync` subscribers. (`contentHash` was still best-effort/`null` for streamed uploads until v1.4.0.)
+
+### Added
+
+- **`getDownloadStreamByPath(providerId, userId, path)`** on the public service interface, so a consumer can pull the bytes for an uploaded reference off the request path. The **consumer** side (subscription + job handler) is specced on the cog-ingest roadmap.
+
+---
+
+## v1.2.2 <Badge text="14 July 2026" variant="note" />
+
+Standards alignment with module-system scaffold v1.18 — no change to V1 behaviour.
+
+### Changed
+
+- **Brought in line with current module-system standards.** Runtime module registration (`module.registration.ts` → the host's `moduleRegistry`, so the module appears on `/admin/modules`); a security registration (`security.registration.ts`) declaring the encrypted-`config` manifest and an account-deletion handler that erases every per-user table in one transaction; and scaffold v1.18.0 (contract v1.2.0, the `enable` / `disable` / `uninstall` / `migrate-db` commands, and a per-module migration runner — available but unused, since V1's schema needs no expand → contract migration).
+- **Structure-only template styling.** The generated UI expresses layout and shadcn semantic tokens only; typography-scale, font-weight, letter-spacing, and colour-literal classes were removed so the app's theme fully owns the visual design.
+
+### Added
+
+- **CRUD action hooks** — the service now fires `documents.document.created` and `documents.document.updated` alongside the existing link / upload / provider hooks.
+
+---
+
+## v1.2.1 <Badge text="18 June 2026" variant="note" />
 
 A **default storage provider** and **upload-to-default**.
 

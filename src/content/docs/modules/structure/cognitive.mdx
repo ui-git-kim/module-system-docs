@@ -248,7 +248,7 @@ This is the **ranked upgrade** of the `listNodes` `search` substring filter, and
 
 The remaining arms **need embeddings** and stay on the `structureEmbeddings` service (same registry entry, same guarded generation): `lexicalSearchChunks` for chunk keyword search, and `hybridSearchNodes` / `hybridSearchChunks`, which **fuse the keyword and semantic arms** and therefore require the vector column. The **caller still supplies everything an embedder would produce** — chunk keyword search takes only the query text; hybrid takes the query text *and* its embedding. Structure never calls an LLM or embedder; it owns storage and search.
 
-Chunk keyword search runs the same **GIN + `ts_rank_cd`** baseline over a trigger-maintained `structure_chunk.contentVector` column. A blank query returns `[]` (chunk lexical) or degrades cleanly to the semantic arm (hybrid).
+Chunk keyword search runs **GIN + `ts_rank_cd`** over a trigger-maintained `structure_chunk.contentVector` column, upgraded to **Lakebase BM25** (`<@>` / `to_bm25query`) when the `lakebase_bm25` index is available — the same feature-detected treatment `searchNodes` gets, applied to `lexicalSearchChunks` and the **lexical arm** of hybrid fusion (v1.33.5). A blank query returns `[]` (chunk lexical) or degrades cleanly to the semantic arm (hybrid).
 
 ```typescript
 interface StructureEmbeddingsService {
@@ -290,7 +290,7 @@ interface HybridSearchOptions {
   status?: string[];       // default ['active']
 }
 
-interface ChunkLexicalResult { chunk: StructureChunk; nodeId: string; score: number; } // score = ts_rank_cd (higher is better; not 0..1)
+interface ChunkLexicalResult { chunk: StructureChunk; nodeId: string; score: number; } // score = BM25 or ts_rank_cd (higher is better; not 0..1)
 interface HybridSearchResult  { node: StructureNode; score: number; }                  // score = fused RRF (higher is better)
 ```
 
@@ -298,7 +298,7 @@ interface HybridSearchResult  { node: StructureNode; score: number; }           
 
 ### Reciprocal rank fusion
 
-`hybridSearchNodes` / `hybridSearchChunks` run the lexical and semantic arms and fuse them **in SQL** by reciprocal rank fusion — it combines *ranks*, so the incomparable `ts_rank_cd` and cosine scales never touch:
+`hybridSearchNodes` / `hybridSearchChunks` run the lexical and semantic arms and fuse them **in SQL** by reciprocal rank fusion — it combines *ranks*, so the incomparable lexical (`ts_rank_cd` or BM25) and cosine scales never touch (and the lexical backend never changes the fused score):
 
 ```
 score = Σ_arm  weight_arm / (rrfK + rank_arm)
@@ -306,8 +306,10 @@ score = Σ_arm  weight_arm / (rrfK + rank_arm)
 
 Each arm over-fetches 3× `topK`; a node that surfaces in only one arm contributes `0` from the other. `lexicalWeight` / `semanticWeight` bias the mix (both default `1`), and `rrfK` (default `60`) flattens how much each rank position contributes. A blank query drops the lexical arm and the result is the pure semantic ranking.
 
+**Filtered-search hygiene (v1.33.6).** Every arm is always `userId`-scoped (plus optional status/type filters), so filtered queries get the treatment they need. On the **semantic arm**, when pgvector ≥ 0.8 the vector queries set `hnsw.iterative_scan = strict_order` — the HNSW scan keeps going until the filtered `LIMIT` is filled instead of post-filtering a fixed candidate set — while keeping the 3× over-fetch; `lakebase_ann` has no iterative-scan equivalent and relies on the over-fetch + `ef_search` tuning. On the **keyword arm**, BM25 queries set `lakebase_bm25.prefilter = on` so the strict `WHERE` filters run inside the bm25 scan rather than after top-K. Both are `SET LOCAL` (transaction-scoped), feature-detected, and no-ops off Lakebase / pre-0.8 pgvector.
+
 <Aside type="note" title="Lakebase (feature-detected, embeddings-tier)">
-On embeddings-enabled installs the v1.33.0 migration also provisions a **`lakebase_ann`** index for each vector column when Neon **Lakebase** is available. It is **pgvector-compatible** — the same `<=>` cosine operator, so no query change — but **storage-resident** (survives Neon scale-to-zero) and builds **50–100× faster** than HNSW. It is **feature-detected**: `CREATE EXTENSION` fails cleanly when the Lakebase preload libraries are not loaded, so non-Lakebase hosts are unaffected and **HNSW stays the automatic fallback**. `lakebase_bm25` for the keyword (text) tier **shipped in v1.33.4**: when the `lakebase_bm25` index is available, `searchNodes` ranks with **BM25** (`<@>` / `to_bm25query`, IDF + length-normalised) instead of `ts_rank_cd` — feature-detected, with a query-time fallback to **GIN + `ts_rank_cd`** if the index is ever absent, so non-Lakebase installs (and any degraded state) are unaffected.
+On embeddings-enabled installs the v1.33.0 migration also provisions a **`lakebase_ann`** index for each vector column when Neon **Lakebase** is available. It is **pgvector-compatible** — the same `<=>` cosine operator, so no query change — but **storage-resident** (survives Neon scale-to-zero) and builds **50–100× faster** than HNSW. It is **feature-detected**: `CREATE EXTENSION` fails cleanly when the Lakebase preload libraries are not loaded, so non-Lakebase hosts are unaffected and **HNSW stays the automatic fallback**. `lakebase_bm25` for the keyword (text) tier **shipped in v1.33.4** (`searchNodes`) and extended to **chunk + hybrid** search in **v1.33.5** (`lexicalSearchChunks`, `hybridSearchNodes` / `hybridSearchChunks`): when the `lakebase_bm25` index is available, keyword ranking uses **BM25** (`<@>` / `to_bm25query`, IDF + length-normalised) instead of `ts_rank_cd` — feature-detected per index (node `searchVector`, chunk `contentVector`), with a **self-healing** query-time fallback to **GIN + `ts_rank_cd`** if the index is ever absent: the fallback resets the memoised infrastructure promise, so the next call re-provisions the index and BM25 returns. Non-Lakebase installs (and any degraded state) are unaffected.
 
 **Enabling Lakebase (verified 2026-08-02).** Lakebase Search is not self-serve at the current `0.1.0-dev` preview — there is no console toggle. Enable it through the Neon **management API**: `PATCH` the project's `settings.preload_libraries.enabled_libraries` to include `lakebase_vector` and `lakebase_text`, `POST` to restart the compute, then `CREATE EXTENSION lakebase_vector CASCADE; CREATE EXTENSION lakebase_text CASCADE`. It requires Postgres 16+ and is reversible.
 

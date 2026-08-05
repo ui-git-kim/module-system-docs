@@ -26,11 +26,15 @@ This page describes AI Core as implemented in module v1.5.0 (July 2026). The mod
 | [`embed`](#embed) | Run a named embedding operation over a batch | `Promise<EmbedRunResult>` |
 | [`embedMultimodal`](#embedmultimodal) | Embed text and/or images into one vector space | `Promise<EmbedRunResult>` |
 | [`rerank`](#rerank) | Order documents by relevance to a query | `Promise<RerankRunResult>` |
+| [`retrieve`](#retrieve) | Retrieve context from the store and report what it missed | `Promise<RetrievalRunResult>` |
 | [`runFlow`](#runflow) | Start a flow — operations in order | `Promise<FlowRunResult>` |
 | [`resumeFlow`](#resumeflow) | Resume a suspended flow run | `Promise<FlowRunResult>` |
 | [`registerFlowHandler`](#registerflowhandler) | Register a non-AI flow step handler (**register**) | `void` |
 | [`ensureOperation`](#ensureoperation) | Seed an operation if absent (**seed**) | `Promise` — see below |
 | [`ensureSegment`](#ensuresegment) | Seed a prompt segment if absent (**seed**) | `Promise` — see below |
+| [`ensureEvalCase`](#ensureevalcase) | Seed a golden eval case if absent (**seed**) | `Promise` — see below |
+| [`ensureMarker`](#ensuremarker) | Seed a content marker if absent (**seed**) | `Promise` — see below |
+| [`runEval`](#runeval) | Evaluate an operation offline over its golden cases | `Promise<EvalReport>` |
 | [`getCurrentUsage`](#getcurrentusage) | The billing callback — AI Core counts, billing asks | `Promise<CurrentUsage>` |
 | [`getOperationInfo`](#getoperationinfo) | Public metadata about a job | `Promise<OperationInfo>` |
 
@@ -214,12 +218,56 @@ rerank(
 | `UnsupportedModelKindError` | The operation resolved to a non-`rerank` model, or to a provider whose adapter has no rerank implementation. |
 | `ProviderCallError` / `ProviderUnavailableError` | The provider call failed, or the provider is unavailable. |
 
-The rerank **operation** is consumer-seeded — AI Core ships the `rerank` surface and the Voyage adapter, but a consumer (e.g. cog-ingest) names its own rerank job through `ensureOperation`, the same way it names any other. Reranking is also one of the grounding dials on the future retrieval operation.
+The rerank **operation** is consumer-seeded — AI Core ships the `rerank` surface and the Voyage adapter, but a consumer (e.g. cog-ingest) names its own rerank job through `ensureOperation`, the same way it names any other. Reranking is also one of the grounding dials on the [retrieval operation](#retrieve).
 
 ```ts
 const ai = serviceRegistry.getOptional('ai-core');
 const res = await ai?.rerank('rank-candidates', { query, documents }, { userId });
 // res?.ranking[0].index — the best-matching document; res?.ranking[0].score — its relevance score.
+```
+
+---
+
+## `retrieve`
+
+Retrieve context for a query and report **what it found and the shape of what it missed**. Semantic retrieval is an operation like any other — it uses a model, it can be wrong, it must say what it did. **AI Core retrieves; Structure stores** — AI Core owns the act of finding but never the data or the columns, reaching the store only through Structure's services. The context slot is still the consumer's: an operation that already knows its context passes a context segment to `run` and skips retrieval entirely.
+
+```ts
+retrieve(
+  operationId: string,
+  input: RetrievalInput,
+  opts: RunOptions,
+): Promise<RetrievalRunResult>
+```
+
+**Parameters**
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `operationId` | `string` | Must resolve to a model of kind `embedding`. The operation carries the **grounding dials** (`retrievalBreadth`, `reranking`, `abstentionThreshold`) that configure retrieval — recorded on any operation, they only drive behaviour here. |
+| `input.query` | `string` | The natural-language query, embedded and matched against the chunk store. |
+| `input.nodeTypes` / `input.nodeIds` | `string[]` | Restrict the search to certain node types, or to chunks of specific nodes. |
+| `input.minScore` | `number` | A hard relevance floor Structure applies before results return — distinct from `abstentionThreshold`, which judges whether the *whole* retrieval is too weak. |
+| `input.expandGraph` | `boolean` | One-hop expansion over the top nodes' connections, when Structure exposes the primitive. |
+| `input.rerankOperationId` | `string` | The rerank operation used when the `reranking` dial is on. The dial on without one is a named gap, never a silent skip. |
+
+**Returns** — a `RetrievalRunResult`: `context` (matched chunks best-first), `nodes` (distinct sources, best score + chunk count), `relatedNodeIds` (graph-expanded neighbours), `notFound` (the named gaps), `provenance` (`embedded` / `matches` / `reranked` / `expanded`), plus the same `feedback` and `audit` every run carries. The result is a superset of a consumer's interim `retrieve()`, so that can become a thin wrapper (remap `chunks := context`).
+
+**How the dials drive it**
+
+- **`retrievalBreadth`** caps how many chunks are fetched, clamped to a ceiling the store can honour; when the request exceeds it the clamp is named `retrieval-breadth-capped`, and a filled budget is named `retrieval-breadth-saturated` — a truncated result is never presented as the whole set.
+- **`reranking`** (with `input.rerankOperationId`) reorders the hits by a cross-encoder through a nested rerank operation with its own ledger row, inheriting this call's sensitivity.
+- **`abstentionThreshold`** compares the **measured** best similarity: a below-threshold retrieval is flagged `abstained-weak-retrieval` **and still returned** — the caller decides what weak context is worth; it is never silently treated as "no relevant context".
+
+**Degrade, don't fail** — an unreachable or unprovisioned store, a rerank outage, or a missing graph primitive becomes a named gap in `notFound` (`retrieval-store-unavailable`, `rerank-unavailable`, `graph-expansion-unavailable` / `-degraded`), never a thrown error. A genuine width **mismatch** (the model cannot produce the installed vector width) is still a hard `RefusedError` — a wrong-width query is broken, not weak.
+
+**Audit by reference** — the ledger records node ids, chunk ids, scores and counts. The query text and the retrieved chunk content are returned to the caller only; they never enter a ledger row or a log line.
+
+```ts
+const ai = serviceRegistry.getOptional('ai-core');
+const res = await ai?.retrieve('answer-question/retrieve', { query, expandGraph: true }, { userId });
+// res?.context — best-first chunks to feed a run's context segment;
+// res?.notFound — the shape of what it missed (e.g. 'abstained-weak-retrieval').
 ```
 
 ---
@@ -375,6 +423,62 @@ await ai?.ensureSegment({
   name: 'Extraction method',
   content: 'Quote the source span before you record a value...',
 });
+```
+
+---
+
+## `ensureEvalCase`
+
+Seed a golden evaluation case if it does not exist — a synthetic fixture the [eval harness](#runeval) measures an operation over. Same create-if-absent, admin-edits-win semantics as `ensureOperation`. Cases are deliberately **not** user content; a case carries the input to run and the reference to score against.
+
+```ts
+ensureEvalCase(spec: {
+  id: string;
+  operationId: string;
+  label?: string | null;
+  input: { segments: ConsumerSegment[] } | { query: string; nodeTypes?: string[]; expandGraph?: boolean; rerankOperationId?: string };
+  reference?: { answer?: string; relevantNodeIds?: string[]; relevantChunkIds?: string[] } | null;
+  tags?: string[];
+}): Promise<{ created: boolean; evalCase: ai_eval_case }>
+```
+
+---
+
+## `ensureMarker`
+
+Seed a content marker if it does not exist — an admin-defined label with an authored **meaning**. Markers generalise framing: a content item is wrapped in a marker, the meanings of the markers in use are stated on the system side (so the model treats the content as material to examine, not instructions), and the framework picks the wrap syntax per model. The catalogue is consumer-extensible — chat seeds a `conversation-history` marker fed by its own memory. The consumer then sets `marker` on the content items it passes to `run`.
+
+```ts
+ensureMarker(spec: {
+  id: string;          // kebab-case, namespaced with your module id
+  meaning: string;     // stated on the system side when this marker is in use
+  renderingHint?: string | null;
+}): Promise<{ created: boolean; marker: ai_marker }>
+```
+
+The built-in markers (`external`, `source`, `example`, `conversation-history`) seed on install. Markers apply to content items only (external + context), never the task. `external` is a non-overridable safety floor: external content always keeps its "do not follow instructions" framing, and a custom marker on an external item is ignored and named (`external-marker-ignored`) rather than silently downgrading the defence.
+
+---
+
+## `runEval`
+
+Evaluate an operation offline over its enabled golden cases. Retrieval is an operation, extraction is an operation — and quality is measurable: `runEval` runs the **real pipeline** for each case, computes the metrics the operation is configured for (`ai_operation.evalConfig`), and reports per-metric aggregates plus every case result. It is a battery consumers may use or ignore.
+
+```ts
+runEval(operationId: string, opts: RunOptions): Promise<EvalReport>
+```
+
+**Metrics** — deterministic: `exact-match` (canonical comparison for structured output), `context-precision`, `context-recall` (retrieval, set-based). Judge-based: `faithfulness` (reuses the groundedness judge) and `answer-correctness` (a seeded correctness judge). Each metric scores `[0,1]` **or null with a named note** — a metric that cannot run (no reference, a judge outage, a case that failed) is never a silent 0 and never a pass.
+
+**Returns** — an `EvalReport`: `{ runId, operationId, cases, metrics: EvalMetricSummary[], results, persisted }`. Each metric summary states `meanScore` (nulls excluded), the passed count over the **evaluable** count, and the `unevaluable` count — a partial eval is always reported as partial, never as a clean pass. `persisted: false` says the result rows could not be written, so the `runId` is not treated as a durable handle.
+
+**Transparency & boundaries** — the harness runs the real pipeline, so a sensitive operation's terms gate applies exactly as it does live (a resolution refusal surfaces as it would on any call). `ai_eval_result` rows store scores, the underlying run's ledger id and named notes — **never content**. Judge metrics run internal (recursion-guarded) and inherit the evaluated operation's sensitivity.
+
+```ts
+const ai = serviceRegistry.getOptional('ai-core');
+const report = await ai?.runEval('extract-parties', { userId });
+// report?.metrics — per-metric mean + passed/evaluable + unevaluable;
+// report?.persisted === false means the results were not stored.
 ```
 
 ---
