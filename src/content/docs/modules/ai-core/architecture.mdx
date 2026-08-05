@@ -1,7 +1,7 @@
 ---
 title: Architecture
 description: How AI Core fits together — the three levels, the resolution pipeline, the request lifecycle, and where the provider SDK boundary sits
-lastUpdated: 2026-07-24
+lastUpdated: 2026-08-05
 sidebar:
   order: 1
 ---
@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
 This is the page to read first. AI Core is shared AI infrastructure: a consumer names a job — *"extract-entities"* — and everything under that name (which model runs it, how the prompt is built, which rules brake it, what shape comes back) is resolved from database records the admin can edit. This page is the map. It shows the three levels the system is built from, the one line consumers call, what happens end to end when they call it, and where the provider SDK is walled off.
 
-<Aside type="note" title="Implemented in v1.5.0 — first live call pending">
-AI Core is implemented as of module v1.5.0 (July 2026): it installs into a real app, type-checks clean there, and its admin page renders and serves records at runtime. The one gate not yet proven is a first live provider call. Retrieval, the semantic cache, and groundedness-scorer implementations are **not** built — they are medium-term work, marked planned where they come up and tracked on the [Roadmap](/modules/ai-core/roadmap/).
+<Aside type="note" title="Current as of v1.15.0">
+AI Core is implemented as of module v1.15.0 (August 2026): it installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers. Retrieval (v1.13.0) and groundedness scoring (v1.12.0) are now **built**, joined by the evaluation harness (v1.14.0) and markers (v1.15.0). The semantic cache and a re-embedding migration remain medium-term work — marked planned where they come up and tracked on the [Roadmap](/modules/ai-core/roadmap/).
 </Aside>
 
 ---
@@ -23,7 +23,8 @@ Everything in AI Core is one of three things. The bottom level is a set of **lib
 ```
 LIBRARIES              the batteries — every one a database record, admin-editable
   ├─ models            provider · pinned model id · framework · parameter rules · terms
-  ├─ prompt segments   voice · method · discipline text · schema instructions · framing
+  ├─ prompt segments   voice · method · discipline text · schema instructions
+  ├─ markers           content framing / meanings — external is a non-overridable safety floor
   ├─ frameworks        per model: segment order + wrapping syntax (structure only)
   ├─ disciplines       method rules — how the AI must work — with tier + authority
   ├─ guardrail checks  the enforcement half of a discipline
@@ -73,7 +74,7 @@ Here is what `run()` does, end to end, for a language operation. The order is th
 
 2. **Re-validate the resolved discipline set** — on every call, not only at write time. An authority-hierarchy violation, or a `hard` rule with no live check, refuses here rather than running in a degraded shape nobody asked for. (Why this is checked at resolution time and not at boot is the section below.)
 
-3. **Load the prompt library and assemble.** Segment rows, discipline rows, and the model's framework are read; a missing or disabled authored segment refuses rather than silently changing the prompt. The assembler sorts segments by the framework's declared order, wraps each in the framework's syntax, and injects a **computed date anchor** built from this exact moment and the model's knowledge cutoff — rebuilt every call, never persisted. When the input carries external content, the **framing segment is included automatically**, whether or not the operation selected it: no operation supplies it, so no operation can omit it.
+3. **Load the prompt library and assemble.** Segment rows, discipline rows, and the model's framework are read; a missing or disabled authored segment refuses rather than silently changing the prompt. The assembler sorts segments by the framework's declared order, wraps each in the framework's syntax, and injects a **computed date anchor** built from this exact moment and the model's knowledge cutoff — rebuilt every call, never persisted. When the input carries external content, the **external framing marker is applied automatically** — generated from the marker catalogue, not supplied by any operation, so no operation can omit it (and `external` is a non-overridable safety floor).
 
 4. **Validate parameters — tighten-only.** Dials become provider parameters only through mappings the model record declares; AI Core never invents a temperature the record did not specify. Out-of-range values clamp to the model's bounds (or reject, when the rule says reject), and a caller `maxOutputTokens` may lower the configured cap but never raise it. Every change is recorded as a parameter transform — a silently corrected parameter is a lie about what ran.
 
@@ -115,18 +116,18 @@ AI Core owns a provider interface — `ProviderAdapter`, `GenerateRequest`, `Gen
 
 ## Where things live
 
-AI Core's schema is 13 self-contained `ai_` tables, split by what they are for. Configuration is app-level and admin-managed; the data a run produces is tenant-scoped.
+AI Core's schema is 16 self-contained `ai_` tables, split by what they are for. Configuration is app-level and admin-managed; the data a run produces is tenant-scoped.
 
 <CardGrid>
   <Card title="Config tables — app-level" icon="setting">
-    The libraries and their compositions: `ai_provider`, `ai_provider_terms_option`, `ai_model`, `ai_prompt_framework`, `ai_prompt_segment`, `ai_discipline`, `ai_guardrail_check`, `ai_preset`, `ai_operation`, `ai_flow`. No owner columns — these are the app's shared configuration, seeded at install and edited in the admin.
+    The libraries and their compositions: `ai_provider`, `ai_provider_terms_option`, `ai_model`, `ai_prompt_framework`, `ai_marker`, `ai_prompt_segment`, `ai_discipline`, `ai_guardrail_check`, `ai_preset`, `ai_operation`, `ai_flow`, `ai_eval_case`. No owner columns — these are the app's shared configuration, seeded at install and edited in the admin.
   </Card>
   <Card title="Data tables — tenant-scoped" icon="document">
     What a run leaves behind: `ai_flow_run`, `ai_usage_ledger`, `ai_review_item`. Each carries `tenantId` (the isolation key) and `userId` (the actor). The ledger holds references, versions, and counts — never content.
   </Card>
 </CardGrid>
 
-The full table-by-table breakdown, the indexes, and why the ledger carries no content columns is the [Data Model](/modules/ai-core/data-model/).
+The sixteenth table, `ai_eval_result`, sits off to the side of that split: an append-only evaluation-results table with no owner columns (its inputs are synthetic fixtures, not subject data) that stores scores, references and named gaps, never content. The full table-by-table breakdown, the indexes, and why the ledger carries no content columns is the [Data Model](/modules/ai-core/data-model/).
 
 ---
 
