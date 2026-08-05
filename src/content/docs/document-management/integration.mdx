@@ -79,6 +79,7 @@ export interface DocumentManagementServiceInterface {
       content: Buffer | Readable;     // the artefact bytes to store
       mimeType?: string;
       target?: { providerId: string; folder?: string }; // else the DERIVED writable area
+      nodeId?: string;                // Structure node → its admin-set save-location folder (path prefix)
       metadata?: Record<string, unknown>;
     }
   ): Promise<ParsedArtefact>;
@@ -609,6 +610,60 @@ If your module wants to deep-link to a document, route to `/documents/preview/:d
 
 ---
 
+## Reusable Upload Component
+
+Beyond the backend service, Document Management exports a ready-made **`DocumentUpload`** React component, so any module that depends on it gets a consistent upload experience without re-implementing file handling. Import it from the feature barrel:
+
+```tsx
+import { DocumentUpload, type DocumentUploadResult } from '@/features/document-management';
+
+function AttachEvidence() {
+  return (
+    <DocumentUpload
+      folder="evidence"
+      label="Attach evidence"
+      accept="application/pdf"
+      onUploaded={(result: DocumentUploadResult) => {
+        // result: { path, providerId, size, mimeType }
+        console.log('stored at', result.path, 'on', result.providerId);
+      }}
+    />
+  );
+}
+```
+
+It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports the stored file's `{ path, providerId, size, mimeType }` when the upload completes.
+
+| Prop | Type | Description |
+|------|------|-------------|
+| `providerId` | `string?` | Target provider. **Omit** to upload to the user's default provider (via `uploadToDefault`). |
+| `folder` | `string?` | Destination folder within the provider. |
+| `label` | `string?` | Trigger button label. |
+| `accept` | `string?` | `accept` attribute forwarded to the file input (MIME/extension filter). |
+| `variant` | `string?` | shadcn button variant. |
+| `size` | `string?` | shadcn button size. |
+| `className` | `string?` | Extra classes for the trigger. |
+| `disabled` | `boolean?` | Disable the control. |
+| `onUploaded` | `(result: DocumentUploadResult) => void` | Called with `{ path, providerId, size, mimeType }` after a successful upload. |
+
+`DocumentUploadProps` and `DocumentUploadResult` are exported from the same barrel.
+
+<Aside type="caution" title="Declare the dependency — this is a compile-time coupling">
+Unlike the backend service (resolved at **runtime** via `serviceRegistry`, so absence degrades gracefully), the component is a direct `@/features/document-management` import resolved at **build time**. A consuming module must therefore declare a version-pinned dependency in its `module.ts`, and the build cannot succeed if Document Management is absent — it is a **hard** frontend coupling:
+
+```typescript
+export const moduleDefinition: ModuleDefinition = {
+  id: 'my-feature',
+  name: 'My Feature',
+  version: '1.0.0',
+  depends: { 'document-management': '^1.5.0' },
+  // ...
+};
+```
+</Aside>
+
+---
+
 ## Worked Example: Requesting a Reference and Download Stream
 
 A common pattern for processing modules such as `cog-ingest` or `ai-chat` is: create a **stable document reference** (which gives you a durable `documentId` to record as a source), then later fetch the **download stream** to read the bytes. Creating the reference also computes a SHA-256 `contentHash` for integrity, which is exactly what an evidence or provenance trail wants.
@@ -731,6 +786,10 @@ export const cogIngestService = {
 };
 ```
 
+<Aside type="note" title="Per-node save location (Structure)">
+`putParsedArtefact` input also accepts an optional **`nodeId`**. When Structure is installed and an admin has set the per-node **save location** field (`document-management.artefact_save_location`, registered via `structureRegistry.register` with `editableBy: 'admin'`), a producer that knows which node it is ingesting into — cog-ingest — passes `nodeId`, and that node's configured folder becomes the artefact path prefix (still namespace-guarded on shared providers). With no Structure, or no folder configured, artefacts fall back to the derived `DOC_ARTEFACT_PREFIX` default. This is the ergonomic seam that `input.target` left open — you set the location once per node rather than passing an explicit `target` on every call.
+</Aside>
+
 ### Resolving provenance for citations
 
 When assembled chat context or the Evidence Manager needs to cite a chunk, `resolveProvenance` maps the ingest engine's `sourceType`/`sourceId` contract (owned by cog-ingest) back to the underlying document, its source reference, and the latest artefact per format — all read-only.
@@ -755,6 +814,26 @@ Artefact **writes** never cross the network. These read/action routes exist for 
 | GET | `/artefacts?documentId=\|providerId=&remotePath=` | List the parsed artefacts stored for a source. |
 | GET | `/artefacts/:id/download` | Stream a stored artefact's bytes. |
 | GET | `/provenance?sourceType=&sourceId=` | Read-only provenance resolution for citations. |
+
+### The provenance contract (proposed — pending cog-ingest agreement)
+
+`resolveProvenance` only resolves reliably end-to-end if the ingest engine (cog-ingest) and Document Management agree on **what gets stamped** on every ingested entity. The proposed contract:
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| `sourceType` | `'document-management'` (aliases `'document'`, `'file'`) | The chunk/entity originated from a Document Management document. |
+| `sourceId` | a `doc_document.id` | The **durable reference id** — the same id `requestIngest` and auto-ingest reference-creation return. |
+
+Given `{ sourceType, sourceId }`, `resolveProvenance` returns the document reference, the `source` (`providerId`, `remotePath`, `fileName`, `contentHash`), and the latest parsed artefact per format — enough to render a citation ("from *fileName*, SHA-256 *hash*") and to fetch the stored parsed copy for re-extraction. A `{ providerId, remotePath }` form is accepted when no `documentId` is available.
+
+<Aside type="caution" title="Open point for cog-ingest to confirm">
+cog-ingest's `ingest(userId, { sourceId, … })` currently uses `sourceId` to mean a **source-configuration** id (which ingest *setup*), **not** a document id. For provenance to resolve, the document id has to be carried through to whatever cog-ingest stamps on derived entities. Two ways to close this, to be agreed with cog-ingest:
+
+1. **cog-ingest persists the Document Management `documentId`** as the ingest job's provenance source id (kept distinct from its config `sourceId`), and stamps it on derived entities; or
+2. a dedicated `provenance: { sourceType, sourceId }` field is added to the ingest payload/job and propagated.
+
+Until one is agreed and implemented on the engine side, `resolveProvenance` is correct when called with a Document Management `documentId` (or `providerId`+`remotePath`) directly, but is **not guaranteed** to resolve cog-ingest's own stamps. This is the one remaining cross-module contract for the citation/chain-of-evidence story.
+</Aside>
 
 ---
 
