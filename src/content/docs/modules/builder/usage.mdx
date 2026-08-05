@@ -121,7 +121,7 @@ The `foundry:global-css` message sends a complete CSS string (not individual var
 |-----------|------|---------|
 | `ProjectBlocksTab` | `components/structure/ProjectBlocksTab.tsx` | Blocks tab for project node detail pages |
 | `ProjectBlocksWidget` | `components/structure/ProjectBlocksWidget.tsx` | Blocks summary widget for project overview |
-| `ProjectRegistryTab` | `components/structure/ProjectRegistryTab.tsx` | Registry config tab showing `components.json` snippet |
+| `ProjectRegistryTab` | `components/structure/ProjectRegistryTab.tsx` | Registry tab: public/private visibility `Switch`, token generate/reveal/rotate/revoke UI, and the `components.json` + install snippets. See [Private Registries](/modules/builder/private-registries/) for the full token/visibility flow. |
 | `ProjectBlocksBadge` | `components/structure/ProjectBlocksBadge.tsx` | Block count badge on project cards |
 
 ### Settings Components
@@ -265,6 +265,22 @@ const {
 } = useProjectBlocks(projectId);
 ```
 
+### `useProjectComponentSet`
+
+Fetches and manages a project's pinned component snapshot — the versioned shadcn sources the preview compiles against. See [per-project component snapshots](/modules/builder/integration/#per-project-component-snapshots).
+
+```typescript
+import { useProjectComponentSet } from '@/features/builder/hooks/useProjectComponentSet';
+
+const {
+  set,          // ProjectComponentSet | null (the pinned snapshot + pending diff)
+  isLoading,    // boolean
+  sync,         // ({ style, names? }) => Promise — create/replace the snapshot
+  checkUpdates, // () => Promise — diff latest sources vs current (stores pending)
+  promote,      // () => Promise — apply the pending update
+} = useProjectComponentSet(projectId);
+```
+
 ### `useBlocksLibrary`
 
 Powers the Blocks Library page — fetching, filtering, and searching blocks across all scopes.
@@ -366,6 +382,19 @@ All endpoints are under `/api/v1/builder` and require authentication unless note
 | `POST` | `/components/import` | Bulk import components from array |
 | `POST` | `/components/import-json` | Import from `shadcn-components.json` format |
 
+### Component Sources & Global Set
+
+The global set is the app-wide fallback snapshot the preview compiles for global/system blocks (and when no project is selected); the source routes keep the pristine component folder in sync with the upstream shadcn registry. All the write routes are admin only.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/components/global-set` | The app-wide fallback component snapshot |
+| `POST` | `/components/global-set/sync` | Sync the global fallback set from the current palette |
+| `POST` | `/components/sync-pristine` | Incrementally add palette components missing from the pristine folder |
+| `POST` | `/components/source-updates/check` | Diff synced pristine sources against the latest registry; returns slugs with updates |
+| `GET` | `/components/:type/source-diff` | Current vs latest pristine source for a component |
+| `POST` | `/components/:type/source-promote` | Write the latest registry source into the component's pristine file |
+
 ### Config
 
 | Method | Path | Description |
@@ -418,13 +447,14 @@ All endpoints are under `/api/v1/builder` and require authentication unless note
 | `PUT` | `/collections/:id` | Update a collection |
 | `DELETE` | `/collections/:id` | Delete a collection |
 
-### Handle Check
+### Registry Handle
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/check-handle?handle=xxx` | Check if a registry handle is available |
+| `PUT` | `/handle` | Claim (or change) the caller's registry handle — `409` if already taken |
 
-Handle format: lowercase, 3–30 characters, letters/numbers/hyphens only, cannot start or end with a hyphen.
+Handle format: lowercase, 3–30 characters, letters/numbers/hyphens only, cannot start or end with a hyphen. A denylist of reserved names (`www`, `api`, `app`, `admin`, `registry`, `r`, and other infrastructure subdomains) is rejected on both routes.
 
 ### Shadcn Registry Proxy
 
@@ -437,6 +467,30 @@ Handle format: lowercase, 3–30 characters, letters/numbers/hyphens only, canno
 | `PUT` | `/shadcn/builder-style` | Set builder style (persists the key only — re-sync separately) |
 | `GET` | `/shadcn/icon-library` | Get current icon library |
 | `PUT` | `/shadcn/icon-library` | Set icon library |
+
+### Per-Project Component Snapshots
+
+Each project can pin its own versioned shadcn sources — the snapshot the preview compiles against. These routes are ownership-guarded (`403` if you don't own the project).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/projects/:projectId/component-set` | The project's pinned component snapshot |
+| `POST` | `/projects/:projectId/component-set/sync` | Sync (create/replace) the snapshot for a style |
+| `POST` | `/projects/:projectId/component-set/check-updates` | Diff latest sources vs current (stores a pending diff) |
+| `POST` | `/projects/:projectId/component-set/promote` | Promote the pending update |
+
+### Registry Token & Visibility
+
+Per-project private-registry management. All routes are ownership-guarded (`404` if you don't own the project).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/projects/:nodeId/registry/token` | Mint or rotate the registry token — returns the plaintext once |
+| `GET` | `/projects/:nodeId/registry/token` | Reveal the token so the owner can re-copy it |
+| `DELETE` | `/projects/:nodeId/registry/token` | Revoke the registry token |
+| `PATCH` | `/projects/:nodeId/registry/visibility` | Set `{ visibility: 'public' \| 'private' }` |
+
+See [Private Registries](/modules/builder/private-registries/) for the full token/visibility flow.
 
 ---
 
@@ -465,23 +519,29 @@ http://localhost:3001/r/my-project/hero-section.json?handle=myhandle
 
 ### Private Projects
 
-If a project has `visibility: 'private'` in its data, requests must include a Bearer token matching the project's `registrytoken`:
+If a project's registry is set to `visibility: 'private'`, every `/r` request must present a Bearer token:
 
 ```bash
 curl -H "Authorization: Bearer <token>" \
   https://handle.usefoundryui.app/r/private-project/my-block.json
 ```
 
+The token is minted on the project's **Registry** tab and stored **encrypted at rest** on the project node's `data.registryToken` field — sealed with `encryptField` (AES-256-GCM) as `{ __sealed: … }`, never in plaintext. The `/r` route decrypts it with the owner as tenant and does a constant-time compare; a missing, undecryptable, or mismatched token is a uniform `401`. (A legacy plaintext `registrytoken` key is still honoured on read, but replaced by the sealed form on the next mint.)
+
+See [Private Registries](/modules/builder/private-registries/) for the full token and visibility flow.
+
 ### Installing Blocks
 
+The install namespace is the **project slug** (`@my-project`), not your user handle — each project is its own namespace, so installing from two of your projects never collides.
+
 <Tabs>
-  <TabItem label="With Registry Config">
-    Add the registry to your consumer app's `components.json`:
+  <TabItem label="Public registry">
+    Add the registry to your consumer app's `components.json`, keyed on the project slug:
 
     ```json
     {
       "registries": {
-        "@myhandle": "https://myhandle.usefoundryui.app/r/my-project/{name}.json"
+        "@my-project": "https://myhandle.usefoundryui.app/r/my-project/{name}.json"
       }
     }
     ```
@@ -489,14 +549,42 @@ curl -H "Authorization: Bearer <token>" \
     Then install blocks by name:
 
     ```bash
-    npx shadcn@latest add @myhandle/hero-section
+    npx shadcn@latest add @my-project/hero-section
+    ```
+  </TabItem>
+  <TabItem label="Private registry">
+    A private registry needs the bearer header, so use the **object form**:
+
+    ```json
+    {
+      "registries": {
+        "@my-project": {
+          "url": "https://myhandle.usefoundryui.app/r/my-project/{name}.json",
+          "headers": { "Authorization": "Bearer ${FOUNDRY_REGISTRY_TOKEN}" }
+        }
+      }
+    }
+    ```
+
+    Add the token you minted in the Registry tab to your consumer app's `.env.local`:
+
+    ```bash
+    FOUNDRY_REGISTRY_TOKEN=<the token you minted in the Registry tab>
+    ```
+
+    Then install as usual — the CLI reads the token from the environment:
+
+    ```bash
+    npx shadcn@latest add @my-project/hero-section
     ```
   </TabItem>
   <TabItem label="Direct URL">
-    Install directly without configuring `components.json`:
+    Install directly without configuring `components.json` (public registries only — a direct URL can't carry a bearer token):
 
     ```bash
     npx shadcn@latest add https://myhandle.usefoundryui.app/r/my-project/hero-section.json
     ```
   </TabItem>
 </Tabs>
+
+See [Private Registries](/modules/builder/private-registries/) for the full token and visibility flow.

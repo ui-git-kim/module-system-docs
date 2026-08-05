@@ -90,6 +90,16 @@ declare module '../../config/service.registry.js' {
 | `setIconLibrary(library)` | `string` | Set icon library |
 | `findUserByHandle(handle)` | `{ id: string } \| null` | Resolve a registry handle to a user id (indexed lookup via the `registry_handle` table, self-heals legacy `preferences`-only handles) |
 | `setUserHandle(userId, handle)` | `'ok' \| 'taken'` | Claim or change the caller's registry handle. `registry_handle` is the uniqueness authority; returns `'taken'` on conflict (the `PUT /handle` route maps that to 409) |
+| `userOwnsProject(userId, projectId)` | `boolean` | Ownership guard shared by the block + registry routes (true when the user owns the project node) |
+| `mintRegistryToken(userId, projectId)` | `string \| null` | Generate/rotate the project's registry token; returns the plaintext **once** (`null` if not owner) |
+| `revealRegistryToken(userId, projectId)` | `string \| null` | Decrypt and return the stored token so the owner can re-copy it (`null` if absent or not owner) |
+| `revokeRegistryToken(userId, projectId)` | `boolean` | Remove the project's registry token (`false` if not owner) |
+| `setRegistryVisibility(userId, projectId, visibility)` | `boolean` | Set `data.visibility` (`'public' \| 'private'`); `false` if not owner |
+| `decryptStoredRegistryToken(projectData, ownerUserId)` | `string \| null` | Pure decrypt used by the `/r` hot path; `null` when absent or undecryptable |
+
+<Aside type="note">
+The registry token/visibility methods are covered in full — routes, encryption, and hooks — in [Private Registries](/modules/builder/private-registries/).
+</Aside>
 
 <Aside type="note">
 Block scoping is done through the `getBlocks(userId, filters?)` argument, not dedicated methods. `getBlocksByProject`, `getGlobalBlocks`, `getSystemBlocks`, `getBlocksByCollection`, `checkHandle` and `claimHandle` are **frontend** API-client wrappers (`builderService` in `services/builder.service.ts`), not backend service methods — calling them on `serviceRegistry.get('builder')` would fail. At the backend, handle availability is `findUserByHandle` (surfaced by `GET /check-handle`) and claiming is `setUserHandle` (behind `PUT /handle`).
@@ -156,8 +166,10 @@ The builder uses filter hooks on both frontend and backend to allow companion mo
 
 Adds `metadata.builder.blockCount` to structure node API responses. This powers the block count badge on project cards without requiring a separate API call.
 
+The enrichment is **scoped to the configured `projectNodeType`** — only nodes of the builder's project node type are counted, since blocks attach to projects (the node type is read from `builder_config`, briefly cached, and an unset config falls through to counting every node). It is also **omitted when the count is zero**: a node with no blocks is returned untouched, with no `metadata.builder` key at all.
+
 ```typescript
-// What the filter adds to each node response:
+// What the filter adds to a project node that HAS blocks:
 {
   ...node,
   metadata: {
@@ -170,7 +182,7 @@ Adds `metadata.builder.blockCount` to structure node API responses. This powers 
 ```
 
 <Aside type="tip">
-Other modules can read this enriched metadata to make decisions. For example, a reporting module could use `metadata.builder.blockCount` to show project statistics.
+Other modules can read this enriched metadata to make decisions — for example, a reporting module could use `metadata.builder.blockCount` to show project statistics. Because the key is omitted when there are no blocks, **consumers must treat an absent `metadata.builder.blockCount` as zero**, not as "unknown".
 </Aside>
 
 ### Frontend Filters
@@ -229,25 +241,27 @@ Enriches the `components.json` snippet shown on the project's Registry tab. By d
 // How the builder applies the filter (inside ProjectRegistryTab):
 const componentsJsonSnippet = useMemo(() => {
   const baseConfig: Record<string, unknown> = {
-    registries: { [`@${handle}`]: registryEntry },
+    // Namespace is keyed on the project SLUG, not the user handle.
+    registries: { [`@${node.slug}`]: registryEntry },
   };
 
   const enriched = filterRegistry.apply(
     'builder.registry.componentsJson',
     baseConfig,
-    { handle, registryUrl, nodeId: node.id }
+    { handle, slug: node.slug, registryUrl, nodeId: node.id }
   );
 
   return JSON.stringify(enriched, null, 2);
-}, [handle, registryUrl, registryToken, node.id]);
+}, [handle, registryUrl, isPrivate, node.slug, node.id]);
 ```
 
 **Filter signature:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `value` | `Record<string, unknown>` | Base config object with `registries` key |
+| `value` | `Record<string, unknown>` | Base config object with `registries` key (keyed on `@${node.slug}`) |
 | `context.handle` | `string` | User's registry handle |
+| `context.slug` | `string` | Project slug — the per-project registry namespace source |
 | `context.registryUrl` | `string` | Full registry base URL |
 | `context.nodeId` | `string` | Current project node ID |
 
@@ -277,7 +291,7 @@ filterRegistry.register(
 ```
 
 <Aside type="note">
-The base config is always present — companion modules should spread it into their return value (typically at the end) so the `registries` key is preserved.
+The base config is always present — companion modules should spread it into their return value (typically at the end) so the `registries` key is preserved. See [Private Registries](/modules/builder/private-registries/) for the full token/visibility flow.
 </Aside>
 
 ---
@@ -313,7 +327,7 @@ interface DeletedContext {
 
 ### Hooks the Builder Fires
 
-The builder fires 10 CRUD action hooks from its backend service via `actionRegistry.doActionAll()`. Companion modules can subscribe to these hooks to react to builder lifecycle events — for example, updating analytics, triggering notifications, or syncing external systems.
+The builder fires 13 CRUD and registry action hooks from its backend service via `actionRegistry.doActionAll()`. Companion modules can subscribe to these hooks to react to builder lifecycle events — for example, updating analytics, triggering notifications, or syncing external systems.
 
 #### Native Component Hooks
 
@@ -351,6 +365,16 @@ These are app-wide catalogue events (the `native_component` table has no `userId
 The `block` and `collection` objects in context are the full database row after the operation. For delete hooks, only the ID is provided since the record no longer exists.
 </Aside>
 
+#### Registry Hooks
+
+Fired after a project's registry token or visibility is written. See [Private Registries](/modules/builder/private-registries/) for the full token/visibility flow.
+
+| Hook | Fired When | Context |
+|------|-----------|---------|
+| `builder.registryToken.minted` | A registry token is generated or rotated | `{ userId, projectId }` |
+| `builder.registryToken.revoked` | A registry token is removed | `{ userId, projectId }` |
+| `builder.registryVisibility.changed` | A registry is switched public↔private | `{ userId, projectId, visibility }` |
+
 #### Subscribing to Builder Hooks
 
 ```typescript
@@ -369,7 +393,7 @@ actionRegistry.addActionAsync(
 );
 ```
 
-All 10 hooks follow the same pattern — use `actionRegistry.addActionAsync()` with the hook name and a unique registration ID.
+All 13 hooks follow the same pattern — use `actionRegistry.addActionAsync()` with the hook name and a unique registration ID.
 
 ---
 
@@ -402,8 +426,10 @@ Two tabs are registered for project node detail pages:
 **Registry Tab** (`builder-registry`)
 - Shows the `components.json` configuration snippet for shadcn CLI
 - Displays the project's registry URL, install commands, and available blocks
-- Shows private registry token management (if configured)
+- Provides the public↔private visibility toggle and the full token lifecycle (generate/rotate, reveal, revoke)
 - Order: 46
+
+See [Private Registries](/modules/builder/private-registries/) for the full token/visibility flow.
 
 ### Node Widget Registry
 
