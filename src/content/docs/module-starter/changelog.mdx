@@ -17,7 +17,7 @@ A new command or template on its own is a **patch**, not a minor. If you're reac
 
 <Aside type="tip">
 The module starter has **two version numbers**:
-- **Scaffold version** (`VERSION` file) — Infrastructure version (currently 1.31.10)
+- **Scaffold version** (`VERSION` file) — Infrastructure version (currently 1.31.11)
 - **Module version** (`package.json`) — Your module's version
 </Aside>
 
@@ -26,6 +26,29 @@ The cross-repo arc this changelog tracked is complete. The host enforces `depend
 </Aside>
 
 ---
+
+## Scaffold v1.31.11
+
+**Schema-drift reconcile — a prompted, additive-only heal + `migrate-db --repair`**
+
+v1.31.9 made the schema apply drift-immune, but it is *delta-from-snapshot*: it only knows what an update changed, so it cannot heal drift that **already accumulated** — a column that reached `schema.prisma` and the Prisma client but never the database (a prior migrate that failed silently, or history inherited from before the drift-immune apply). That surfaces as a runtime **500 ("column does not exist")**. This adds a reconcile that detects and heals it.
+
+**How it works** (`reconcileModuleSchemaDrift`):
+1. `prisma migrate diff --from-config-datasource --to-schema <schema> --script` — introspects the **live database** and diffs it against the module's models.
+2. Filter to statements that touch **only this module's tables** (`@@map` targets resolved to the physical table names) **and** are **additive** — `CREATE TABLE` / `ALTER … ADD` / `CREATE INDEX` / `CREATE TYPE` / `ALTER TYPE … ADD VALUE`. **Every `DROP` and `ALTER COLUMN` is discarded.** The additive whitelist is the load-bearing safety property: a vector module's HNSW indexes live *on its own tables*, so scope alone would not exclude a `DROP INDEX` for them — the whitelist does. The heal can **never** drop or rewrite a column.
+3. Apply the survivors with `prisma db execute` — raw SQL, **history-independent** (never `migrate deploy`, which balks on an inconsistent migration history).
+
+**When it runs:** every `init`/`update` DB step, and on demand via **`npx <module> migrate-db --repair`**.
+- **Interactive:** detects drift, prints the exact additive statements, and **prompts** before applying.
+- **`--force`:** applies unattended.
+- **CI / no-TTY:** report-only + the repair command (never unattended SQL against a live DB).
+- Honours `--dry-run` and `--skip-schema`; warn-only throughout. Self-correcting: each run diffs the live DB, so a partial apply just leaves less for the next run (no "already exists" on re-run).
+
+<Aside type="caution">
+The heal applies standard Prisma DDL. On a large, busy table `CREATE INDEX` (non-`CONCURRENTLY`) takes a write lock and `ADD COLUMN` with a volatile default rewrites the table — the same as any migration. Review the printed statements before applying on production, or run `migrate-db --repair --dry-run` first.
+</Aside>
+
+Not runtime-tested in the module-starter (no DB): the filter is unit-tested (no `DROP` / `ALTER COLUMN` ever survives realistic drifty output — HNSW `DROP INDEX`, `ALTER COLUMN`, `DROP TABLE`, sibling-module additive, `@@map`) and adversarially reviewed (the core never-DROP property confirmed sound). Validate on a drifty app — e.g. **doc-management**, whose models use `@@map` (physical names like `doc_documents`), so the physical-name resolution is essential there.
 
 ## Scaffold v1.31.10
 
