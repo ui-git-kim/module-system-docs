@@ -64,6 +64,7 @@ src/content/docs/
 │   ├── breadcrumbs.mdx
 │   ├── theme.mdx
 │   ├── icon-picker.mdx
+│   ├── colour-picker.mdx
 │   ├── style-system.mdx
 │   ├── shadcn-components.mdx     # shadcn component catalogue (verified list + links)
 │   ├── data-fetching.mdx
