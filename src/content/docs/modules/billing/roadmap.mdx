@@ -41,6 +41,20 @@ A four-dimension audit (standards / production / performance / security) of the 
 - **Severity:** Low (single-instance deployments are the norm for this product)
 - **Workaround:** Run a single backend instance, or back the dedupe with a durable store (see Planned).
 
+### Stripe errors leak untranslated on two member reads + the owner write path
+
+- **Description:** `stripeToAppError` / `stripeToWriteError` normalise Stripe's HTTP status so the browser never sees a raw Stripe 401/404/429 — the module's stated invariant (backend `index.ts` ~L737). But `getPaymentMethod` (~L1641) and `getInvoices` (~L1706), both **member reads**, call Stripe with no translation, and the owner write path — `getOrCreateStripeCustomer` (~L1106), `createCheckoutSession` (~L1178), `createPortalSession`'s session create (~L1329) — skips `stripeToWriteError`. On a rotated/invalid key or a Stripe outage, `GET /payment-method` and `GET /invoices` surface Stripe's 401 to the browser; the shared `@/lib/api` client typically treats a 401 as an expired session and **logs the member out**.
+- **Where:** backend `index.ts` — `getPaymentMethod`, `getInvoices`, `getOrCreateStripeCustomer`, `createCheckoutSession`, `createPortalSession`.
+- **Severity:** Moderate (found 2026-08-07)
+- **Fix:** wrap the Stripe calls in try/catch and rethrow via `stripeToAppError` (member reads) / `stripeToWriteError` (owner writes), matching `getPlanDetails`/`getPlanCards` and the existing write paths. Do **not** wrap the inner flow-data retrieve in `createPortalSession` (it deliberately degrades).
+
+### An active plan can silently vanish once a Stripe account exceeds 100 prices
+
+- **Description:** prices are versioned and never deleted (each amount change archives the old), so an account's total price count grows without bound. `getPlanCards` (~L3262), `syncPortalConfiguration` (~L3176) and `listPlans` (~L2615) call `prices.list({ limit: 100 })` with **no `active` filter** and a **single** 100-item page. Once total prices exceed 100, an active price carrying a needed `lookup_key` can fall off page 1 — `getPlanCards` then drops that plan from the customer cards (`plans.filter(p => p.prices.length > 0)`) and the portal omits it, silently. `getCatalogueReadOnly` already paginates 5 pages, proving the asymmetry.
+- **Where:** backend `index.ts` — `getPlanCards`, `syncPortalConfiguration` (pass `active: true`); `listPlans` (paginate like `getCatalogueReadOnly`).
+- **Severity:** Moderate (found 2026-08-07 — low likelihood, needs 100+ prices on one account, but silent and revenue-affecting)
+- **Fix:** pass `active: true` to the `getPlanCards` / `syncPortalConfiguration` list calls (both use only live prices; also shrinks the payload); paginate `listPlans` with `starting_after`. Optionally warn on `has_more`.
+
 ---
 
 ## Planned Improvements
@@ -70,9 +84,20 @@ A four-dimension audit (standards / production / performance / security) of the 
 - `billingService.deleteStripeCustomerForTenant(tenantId)` exists but nothing calls it. Add a deliberate, confirmed owner action (likely on `/admin/billing` in a danger section) that deletes the Stripe Customer — removing invoices from Stripe — for "delete everything" requests, distinct from the default deletion path that retains tax records.
 - *Context:* two-mode deletion is the agreed design: default = cancel + retain records ('preserved'); full erasure = explicit second action.
 
-**`onUninstall` lifecycle hook**
-- Offer a data export and optionally cancel the live Stripe subscription when the module is uninstalled from an app, so an uninstall can't silently leave a paying subscription running.
-- *Context:* scaffold `lifecycle.onUninstall` is available; mirror the deletion handler's cancel logic.
+**Meta-audit 2026-08-07 — minor hardening (v2.3.x)**
+A four-dimension meta-audit (module v2.3.0) confirmed 12 findings via adversarial verification — **0 critical, 2 moderate** (see Known Issues), **10 minor**; the security dimension surfaced nothing. The minors, to batch when convenient:
+- **Cache the member `getPlanCards` price list** (short TTL like `catalogueCache`) — `GET /plans` currently hits Stripe live on every request while every sibling read is cached. *(perf, backend ~L3262)*
+- **Extract the duplicated `FRONTEND_URL` dev fallback** (`'http://localhost:5173'` in `createCheckoutSession` + `createPortalSession`) to one constant. *(standards, backend ~L1185/1293)*
+- **Make the monotonic webhook guard atomic** — the `lastEventAt` read (~L1454) and upsert (~L1495) are a non-atomic TOCTOU, so a concurrent same-tenant delivery can let a stale event win; use a conditional `updateMany` (WHERE `lastEventAt IS NULL OR < eventCreatedAt`) or a row-locked transaction. *(production, backend)*
+- **Collapse `recordWebhookDelivery` to one `updateMany`** (currently `findFirst`+`update`; the connected row is app-wide unique in single-owner installs). *(perf, backend ~L2064)*
+- **Skip the per-plan portal sync during `copyCatalogueToLive`** — run `syncPortalConfiguration` once after the loop, not once per plan. *(perf, backend ~L3148)*
+- **`PlanCards` should use `<Note>`** for its loading/error/empty states instead of hand-rolled `border-dashed` divs (the only three in the frontend; compose-primitives rule). *(standards, frontend ~L1289)*
+- **Fix the checkout success-poll teardown** — the param-clear effect at 5s flips `checkoutSuccess` and tears down the 20s/10-attempt sync poll early; drive the poll off a mount-captured flag so a slow (>5s) webhook is still bridged. *(production, frontend ~L1795)*
+- **Add `onError` UI to the admin archive/import/rebuild (+publish) mutations** — they define only `onSuccess`, so a failed action silently re-enables the button with no message. *(production, frontend ~L3244)*
+- **Validate price amounts in `PlanEditor`** — `canSave` currently lets a $0 enabled interval publish a free recurring price into Stripe (no guard at any layer); require `unitAmount > 0`. *(production, frontend ~L2828)*
+- **Set `staleTime` / `refetchOnWindowFocus:false` on the admin live-Stripe-backed queries** so an alt-tab doesn't re-probe Stripe. *(perf, frontend ~L3464)*
+
+*(The `onUninstall` lifecycle hook shipped in v2.3.0 — see Completed — but as a warnings-only manual-cleanup hook: the CLI can't reach the app DB or Stripe, so it deliberately never cancels subscriptions or exports data, unlike the original plan here.)*
 
 **Adopt the `migrations` array for any breaking schema change**
 - If the model-prefix rename (or the next re-key) goes ahead, ship it via the scaffold v1.18 per-module migration runner (`npx billing migrate-db`) with expand → backfill → contract steps rather than asking apps to hand-migrate.
@@ -97,6 +122,7 @@ Most recent first. Items moved here from the sections above as they ship.
 
 | Item | Version | Date |
 |------|---------|------|
+| **`onUninstall` + `onPrepareDatabase` lifecycle hooks + data-safe model rename** — `onUninstall` prints a billing-specific manual-cleanup warning on `npx billing uninstall` (active subs keep billing after the webhook route goes; delete the orphaned webhook endpoint; Customer/invoice records retained for tax) — **warnings-only**, since the CLI can't load the host's ESM-TypeScript-source Prisma client. Model `Subscription` → `BillingSubscription` (+ enum `SubscriptionStatus` → `BillingSubscriptionStatus`) via `@@map`, keeping the physical table/type names, so `prisma migrate diff` on an existing install is **empty** (proven against `veradai`) — datamodel-only, no data moves; `onPrepareDatabase` migrates single-file hosts in place with a verify-or-leave-untouched gate. Host type-check clean (0 billing errors). Closes the generic-PascalCase-names Known Issue | v2.3.0 | 2026-08-07 |
 | **Standards-alignment audit + scaffold update 1.18.2 → 1.31.10** — merged 96 commits of scaffold infra (auto-restore of deleted scaffold files, `module-contract.ts` sync, `conformance:check`/`contract:*` scripts, commander/esbuild bumps). Cleared a docs-submodule fetch blocker. Rebuilt `CLAUDE.md` with `SCAFFOLD:START/END` markers from the canonical template — fixing the stale `SettingsComponents` path (that Known Issue is now closed). Module code was already aligned (react-router v8 done, headers/`.js`/registries/self-contained schema all current); generated templates unchanged, so no host impact. Passes `conformance:check` | v2.2.2 | 2026-08-06 |
 | **Action + filter hooks** — 5 subscription-lifecycle action hooks (`billing.subscription.updated/canceled`, `billing.payment.failed/recovered`, `billing.trial.will_end`) fired fire-and-forget after commit, plus the `billing.entitlements` filter; stable `BILLING_HOOKS` catalogue + context types re-exported from the barrel. Host-verified (0 billing errors in `veradai`) | v2.2.0 | 2026-07-24 |
 | **Plan authoring + Stripe provisioning** — author plans on `/admin/billing`, publish to Stripe (`lookup_key` price identity, `transfer_lookup_key` versioning, archive-never-delete), `409` price-change confirmation with affected-subscriber count, import, copy-to-live, Portal configuration sync, `-1` unlimited limits, server-side trial resolution | v2.0.0 | 2026-07-23 |
