@@ -88,7 +88,7 @@ When a module registers a node type with `moduleId` set, the system tracks owner
 
 ## Database Schema
 
-Structure creates eight tables in your database, plus a ninth (`structure_chunk`) when embeddings are enabled.
+Structure creates nine tables in your database, plus a tenth (`structure_chunk`) when embeddings are enabled.
 
 ### structure_node
 
@@ -113,7 +113,8 @@ The universal entity table — every node is stored here.
 | `toNodeId` | String? | Target node for connections |
 | `connectionType` | String? | Connection relationship label |
 | `status` | String | `active` / `archived` / `deleted` |
-| `stage` | String? | Current stage slug (null if no stage configured) |
+| `stage` | String? | Current stage slug (null if no stage configured) — column mapped to `workflowState` |
+| `classification` | String? | Per-node classification override (null = inherit the node type's governance default) |
 | `isFavorite` | Boolean | Marked as favourite |
 | `isPublished` | Boolean | Publishing workflow state |
 | `publishedSlug` | String? | Public URL slug |
@@ -122,8 +123,10 @@ The universal entity table — every node is stored here.
 | `embedding` | vector? | Embedding vector (opt-in — only when embeddings enabled) |
 | `embeddingText` | String? | Exact text that was embedded, used for staleness checks (opt-in — only when embeddings enabled) |
 | `embeddingModel` | String? | Model that produced the embedding; `null` means the node needs embedding (opt-in — only when embeddings enabled) |
+| `searchVector` | tsvector? | Always-on full-text search vector over name + description + data values; trigger-maintained and GIN-indexed (created by the module migration, not opt-in) |
 | `createdAt` | DateTime | Creation timestamp |
 | `updatedAt` | DateTime | Last update timestamp |
+| `observedAt` | DateTime? | Bi-temporal — when the fact was true in the world, distinct from `createdAt`; nullable, populated by the cognitive engine, for time-scoped filters only (never a ranking signal) |
 
 <Aside type="note" title="Self-referential relations">
 The schema uses multiple self-referential `@relation` directives to disambiguate `parentId`, `fromNodeId`, and `toNodeId` foreign keys. This is required by Prisma when a model references itself through multiple fields.
@@ -151,10 +154,15 @@ Configuration for each node type.
 | `builtInFieldConfig` | JSON | Merge templates / `editableBy` for built-in name, description, and slug fields |
 | `conditionalColor` | JSON | Colour rules based on a field value |
 | `permissions` | JSON | Node-level create / edit / archive / delete overrides |
+| `primaryScope` | JSON | Primary-node scope — `{ isPrimary?, scopedTypes? }` for the header scope selector |
+| `governance` | JSON | Governance — `{ classification?: { levels?, default? } }` for data classification |
+| `fieldTemplateIds` | JSON | `string[]` — attached shared field-template ids (`structure_field_template`) |
 | `navigation` | JSON | Navigation config |
-| `stageConfig` | JSON | StageConfig — stages, groups, transitions, defaultStage |
+| `labels` | JSON | Admin label overrides (the `getLabel` keys — see `NodeTypeLabels`) |
+| `stageConfig` | JSON | StageConfig — stages, groups, transitions, defaultStage — column mapped to `workflowConfig` |
 | `contextHints` | String? | Free-text hints for AI context assembly, returned by `GET /nodes/:id/context` |
 | `contextConfig` | JSON | Context provider config — `includeAncestors`, `ancestorDepth`, `includeConnections`, `includeChildCounts` |
+| `aiFields` | JSON | AI Core prompt-assembly config — `{ promptSegments?, outputExamples? }` (storage-only; consumed by AI Core) |
 | `groupSlug` | String? | References `structure_node_type_group.slug` for sidebar grouping |
 | `cardTemplateId` | String? | FK → structure_template for card view |
 | `listItemTemplateId` | String? | FK → structure_template for list view |
@@ -248,7 +256,8 @@ Configuration for typed connections between nodes. Controls which node types can
 | `bidirectional` | Boolean | If true, A→B and B→A are the same pair — a `unique` type then allows only one connection per unordered pair, in either direction (default true). Traversal is undirected regardless. |
 | `maxConnections` | Int? | Max connections of this type per node (null = unlimited) |
 | `isUnique` | Boolean | One connection per pair only (default false) |
-| `fields` | JSON | `ConnectionTypeField[]` — data fields on connections |
+| `fields` | JSON | `NodeTypeField[]` — data fields on connections (same rich field system as node types) |
+| `fieldTemplateIds` | JSON | `string[]` — attached shared field-template ids (`structure_field_template`) |
 | `isSystem` | Boolean | Protected from user editing |
 | `isEnabled` | Boolean | Whether the type is active |
 | `sortOrder` | Int | Display order (default 50) |
@@ -271,6 +280,25 @@ Per-user API keys for the public, key-authed [REST API](/modules/structure/publi
 | `createdAt` | DateTime | Creation timestamp |
 | `updatedAt` | DateTime | Last update timestamp |
 
+### structure_function
+
+Admin-defined named-expression library for the `formula` field type (tier 2 of the formula function library). Each row is a reusable named expression — parameters plus a safe-eval body — callable from formula fields and from other functions. Dev-registered code functions (math, similarity) live in a separate frontend registry, not here. Self-contained: `userId` is a plain FK (`null` = system/dev-seeded).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | String | CUID primary key |
+| `userId` | String? | Owning scope (null = system/dev-seeded) |
+| `name` | String | Callable identifier (unique per scope) |
+| `params` | JSON | `string[]` — ordered parameter names |
+| `expression` | String | The safe-eval expression body |
+| `description` | String? | Description |
+| `category` | String? | Grouping label for the admin UI |
+| `createdBy` | String? | Plain FK to user id (audit only) |
+| `createdAt` | DateTime | Creation timestamp |
+| `updatedAt` | DateTime | Last update timestamp |
+
+A `@@unique([userId, name])` keeps function names unique per scope; `@@index([category])` supports the admin grouping. The table is mapped to `structure_functions` in the database.
+
 ### structure_chunk (opt-in)
 
 Created **only when embeddings are enabled** (added by the chunk-storage module migration, not the base schema). A dedicated pgvector table holding per-node text chunks and their embedding vectors for chunk-level semantic search. See [Cognitive Foundations](/modules/structure/cognitive/) for its columns and the chunk search service.
@@ -279,7 +307,8 @@ Created **only when embeddings are enabled** (added by the chunk-storage module 
 
 If your code queries these tables directly (outside of Prisma), note two things:
 
-- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`). Use the plural names in raw SQL.
+- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`, `structure_functions`). Use the plural names in raw SQL.
+- **`@map`-ed columns.** Two Prisma fields map to differently-named database columns (kept for historical reasons, no data move): `structure_node.stage` → column `workflowState`, and `structure_node_type.stageConfig` → column `workflowConfig`. Raw SQL must use the `workflowState` / `workflowConfig` column names.
 - **Unique constraints on `structure_node`.** Beyond the primary key, there are two compound uniques that the API surfaces as `400` errors:
   - `@@unique([userId, slug])` — a user can't have two nodes with the same slug
   - `@@unique([userId, parentId, name])` — a user can't have two siblings with the same name under the same parent
@@ -556,15 +585,23 @@ interface NodeTypeField {
 ```typescript
 interface NodeTypeLabels {
   addNew?: string;
+  addNewShort?: string;
   editItem?: string;
+  viewItem?: string;
   deleteItem?: string;
+  searchItems?: string;
+  filterItems?: string;
+  notFound?: string;
+  notFoundInTrash?: string;
+  emptyState?: string;
+  parentItem?: string;
+  allItems?: string;
   archiveAction?: string;
   restoreAction?: string;
-  listTitle?: string;
-  emptyState?: string;
-  searchPlaceholder?: string;
-  createFirst?: string;
-  confirmDelete?: string;
+  publishAction?: string;
+  unpublishAction?: string;
+  favoriteAction?: string;
+  unfavoriteAction?: string;
 }
 ```
 
@@ -621,21 +658,16 @@ interface ConnectionTypeConfig {
   bidirectional?: boolean;     // default true
   maxConnections?: number;     // per node (null = unlimited)
   unique?: boolean;            // one per pair only
-  fields?: ConnectionTypeField[];
+  fields?: NodeTypeField[];    // same rich field system as node types
+  fieldTemplateIds?: string[]; // attached shared field-template ids (structure_field_template)
   isSystem?: boolean;
   isEnabled?: boolean;
   sortOrder?: number;
 }
 
-interface ConnectionTypeField {
-  id: string;
-  type: string;
-  label: string;
-  description?: string;
-  required?: boolean;
-  defaultValue?: unknown;
-  options?: Array<{ value: string; label: string }>;
-}
+// Connection fields use the full NodeTypeField shape (see Fields above).
+// `ConnectionTypeField` is retained only as a @deprecated alias of NodeTypeField.
+type ConnectionTypeField = NodeTypeField;
 ```
 
 ---
@@ -708,8 +740,10 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 | POST | `/types` | Create type (admin only) |
 | PATCH | `/types/:slug` | Update type (admin only) |
 | DELETE | `/types/:slug` | Delete type (admin only, fails if nodes exist) |
-| GET | `/types/export` | Export all types + connection types as JSON (admin only) |
+| GET | `/types/export` | Export **node types only** as JSON (admin only) |
 | POST | `/types/import` | Import types from JSON — `merge` or `replace` mode (admin only) |
+
+The `/types/export` endpoint returns node types alone (`{ version, exportedAt, nodeTypes }`). The bundled configuration export — connection types, groups, and field templates alongside node types — is a **frontend admin-UI feature** (the App Structure page's **Export** button), assembled client-side, not this endpoint.
 
 Since v1.18.0, the list and get responses include two additive keys: `superClasses` (the raw parent slugs) and a read-only `resolved` block (`fields`, `features`, `ancestors`) with inheritance applied. See [Type Hierarchy](/modules/structure/type-hierarchy/).
 
@@ -899,7 +933,7 @@ This removes generated files and the schema block. You will need to manually cle
 
 - [Usage](/modules/structure/usage/) — Admin page, pages, components, and hooks
 - [Cognitive Foundations](/modules/structure/cognitive/) — Embeddings, semantic search, connection provenance, and node type proposals
-- [Field Types Reference](/modules/structure/fields/) — All 21 built-in field types with configuration and examples
+- [Field Types Reference](/modules/structure/fields/) — All 22 built-in field types with configuration and examples
 - [Merge Fields & Conditional Logic](/modules/structure/merge-fields/) — Auto-compute field values and control visibility
 - [Integration](/modules/structure/integration/) — How other modules extend Structure
 - [Registries Guide](/modules/structure/registries-guide/) — Comprehensive reference for all 10 registries, module fields, and hooks

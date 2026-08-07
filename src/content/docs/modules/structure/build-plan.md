@@ -2,7 +2,7 @@
 title: Build Plan (Veradai-Driven)
 description: Phased implementation plan for the current veradai-driven structure work, grounded with file:line insertion points.
 sidebar:
-  order: 12
+  order: 13
 ---
 
 The current veradai-driven build plan, grounded against the structure code on 2026-07-26. Each phase is self-contained; do them in order (later phases assume earlier config patterns). Companion to the [Roadmap](/modules/structure/roadmap/)'s "Veradai-Driven Build Sequence" section.

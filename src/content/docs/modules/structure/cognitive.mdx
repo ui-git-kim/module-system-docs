@@ -76,6 +76,13 @@ interface StructureEmbeddingsService {
     userId: string,
     options?: FindSimilarOptions
   ): Promise<SemanticSearchResult[]>;
+
+  /** Cosine similarity in [0,1] between two specific nodes — computed in-DB, the vectors never leave */
+  nodeSimilarity(
+    nodeA: string,
+    nodeB: string,
+    userId: string
+  ): Promise<number | null>;
 }
 
 interface SemanticSearchOptions {
@@ -98,11 +105,12 @@ interface SemanticSearchResult {
 
 Method semantics:
 
-- **`setNodeEmbedding`** validates the vector dimension and that every value is finite, writes via a parameterised raw `UPDATE`, throws `NotFoundError` when the node doesn't exist, and fires `structure.node.embeddingUpdated`.
+- **`setNodeEmbedding`** validates the vector dimension and that every value is finite, and rejects a blank `embeddingText` or an `embeddingModel` that is missing or longer than 100 characters (both `BadRequestError`). It writes via a parameterised raw `UPDATE`, throws `NotFoundError` when the node doesn't exist, and fires `structure.node.embeddingUpdated`.
 - **`clearNodeEmbedding`** nulls all three columns and fires the same hook with `embeddingModel: null`.
 - **`listNodesNeedingEmbedding`** returns active nodes with `embeddingModel IS NULL`, oldest first (`limit` defaults to 100, max 500). When `nodeTypes` is omitted, it resolves the node types whose `features.cognitiveIngest.enabled` is `true` — see [features.cognitiveIngest](#featurescognitiveingest).
 - **`semanticSearchNodes`** requires `userId` scoping, uses the cosine operator (`<=>`), over-fetches 2× `topK` and tunes `hnsw.ef_search` per query (shared-table recall), then converts distance to score and applies `minScore`.
 - **`findSimilarNodes`** joins target against source inside the database, so the stored vector is never round-tripped. Throws `NotFoundError` if the node doesn't exist; returns `[]` if it has no embedding yet.
+- **`nodeSimilarity`** returns the cosine similarity in `[0,1]` between two owned nodes' embeddings, computed in-DB like `findSimilarNodes` (the vectors never leave the database). Returns `null` when either node is missing, not owned by `userId`, or has no embedding yet, and `1` when both ids are the same. It powers the formula field's `semanticSimilarity(a, b)` function — see [Formula fields](/modules/structure/fields/).
 
 ### Discovery
 
@@ -211,7 +219,7 @@ interface ChunkSearchResult {
 Method semantics:
 
 - **`replaceNodeChunks`** verifies node ownership, then in one transaction deletes the node's existing chunks and inserts the new spans with `embeddingModel: null`. `chunkIndex` defaults to array order. Returns the created `{ id, chunkIndex }` so the caller can embed each; fires `structure.node.chunksReplaced`. Passing `[]` clears a node's chunks.
-- **`setChunkEmbedding`** validates the vector dimension, writes via parameterised raw `UPDATE`, throws `NotFoundError` when the chunk doesn't exist, and fires `structure.chunk.embeddingUpdated`.
+- **`setChunkEmbedding`** validates the vector dimension and rejects an `embeddingModel` that is missing or longer than 100 characters (`BadRequestError`) — a chunk has no separate `embeddingText`, as its `content` is the embedded text. It writes via parameterised raw `UPDATE`, throws `NotFoundError` when the chunk doesn't exist, and fires `structure.chunk.embeddingUpdated`.
 - **`semanticSearchChunks`** uses the cosine operator (`<=>`) and **joins `structure_nodes`** so the source node's `status` (default `['active']`) and optional `nodeTypes` filter apply — a chunk of an archived or deleted node never surfaces. Over-fetches 2× `topK`, tunes `hnsw.ef_search` per query, converts distance to score, applies `minScore`.
 - **`listChunksNeedingEmbedding` / `getNodeChunks` / `deleteNodeChunks`** are Prisma-backed reads/deletes, all `userId`-scoped.
 
