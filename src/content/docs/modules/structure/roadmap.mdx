@@ -227,6 +227,39 @@ Improvements to make Structure easier and more powerful for other modules to int
 
 ## Known Issues
 
+### 2026-08-07 meta audit — one critical + thirteen moderate
+
+**Priority:** Open — not yet fixed. A four-dimension audit (standards / production / performance / security) of v1.33.15, run by eight per-file-area agents with adversarial synthesis and per-finding verification against the live template source: **28 findings (1 critical, 13 moderate, 14 minor)**. The 14 minors are under [Planned Improvements](#planned-improvements). File:line are approximate (shipped template strings).
+
+**🔴 Critical — Security**
+
+- **Public API `GET /:type/:id` returns decrypted secrets** (`backend/index.ts` ~L2753). The handler returns `getNode(id, userId)` verbatim (only `children` stripped), and `getNode` unseals `secret`-type fields to plaintext — so a **read-scoped** API key can read stored credentials/tokens of any exposed node. The `/:type/schema` and list paths keep secrets sealed; only this by-id path leaks. Fix: resolve `getFieldDefs(type, userId)` and delete every `secret`-type key from `data` before responding, or add a non-unsealing public read path.
+
+**🟡 Moderate — Security**
+
+- **`duplicateNode` persists secret overrides in plaintext at rest** (~L4489) — client `dataOverrides` are spread into the new node's data and saved without `sealSecretFields`. Route them through `sealSecretFields` (idempotent on already-sealed envelopes).
+- **`updateNode` leaks plaintext secrets to action-hook listeners** (~L4250) — `doActionAll('structure.node.updated', { changes: input })` carries the unsealed `input`; `createNode` passes only the sealed node, showing the asymmetry is unintended. Redact `secret`-type keys from `changes`.
+- **Formula string-length cap is bypassable** (`frontend/registrations.ts` ~L564; guard at `frontend/index.ts` ~L4931) — `MAX_STRING_LENGTH` is enforced only in the `+` operator, not in string dev-functions (`concat`/`replace`/`upper`/`substr`). An admin function `dup(x)=concat(x,x)` nested ~30× builds a multi-GB string within the step/depth budgets → tab OOM for anyone rendering the field. Enforce the cap centrally in `evalCall` after `dev.fn(...)`. *(Regression from v1.33.15 — the cap shipped on `+` only.)*
+- **`structure_function` missing from the security manifest** (`backend/registrations.ts` ~L223) — no `dataCategories` entry and no deletion handler, so account/tenant erasure orphans user-owned function rows. Add `{ name: 'structure_functions', classification: 'owned' }` + a `deleteMany({ where: { userId } })` handler (log `audit: true`).
+
+**🟡 Moderate — Production**
+
+- **Empty-array data filter 500s `listNodes`** (~L3707) — `in` / `not_in` emit `IN ()` / `NOT IN ()` for an empty array (Postgres syntax error); `dataFilterSchema` only checks `Array.isArray`, not length. Guard empty arrays (or add `.min(1)`).
+- **`resolveTemplateAsync` corrupts merge output on `$` patterns** (`frontend/index.ts` ~L4290 + 6 sibling sites) — `result.replace(token, resolved)` treats a dynamic value containing `$$` / `$&` / `` $` `` / `$'` as a replacement pattern. Use a function replacer: `.replace(token[0], () => resolved)`.
+- **`useCurrentScope` subscribe-after-hydrate race** (`frontend/index.ts` ~L5174) — a warm settings cache lets `hydrate()` notify before the subscriber registers, so the persisted primary scope silently fails to restore. Resync `setScopeIdState(store.getScopeId())` after subscribing.
+- **Phone placeholder precedence bug** (`frontend/components.ts` ~L2067) — `field.placeholder ?? cfg?.format === 'international' ? A : B` parses as `(placeholder ?? bool) ? A : B`, so a configured placeholder is silently discarded. Parenthesise the ternary.
+- **`NodeListPage` has no pagination** (`frontend/pages.ts` ~L145) — no `page`/`limit` sent and no pager rendered; the backend defaults `limit=50`, so items 51+ of any node type are unreachable and search/filter only see page 1. Add page state + a pager from `data.total/totalPages`.
+- **Edit toggle is dead for single-tab / sidebar node types** (`frontend/pages.ts` ~L478, L484) — `isEditing` is forwarded only in the tabs-layout branch; the common Info-only and sidebar layouts never receive it, so their Edit button does nothing. Forward `isEditing` in both branches.
+- **`workflowConfig: {}` crashes the node-type form** (`frontend/pages.ts` ~L4875) — the `?? {…}` fallback only fires on null/undefined, but the column default is `{}`, so `wfConfig.states` is `undefined` and `addWorkflowState` throws a `TypeError`. Normalise `states`/`groups`/`defaultState`.
+
+**🟡 Moderate — Performance**
+
+- **`bulkCreateNodes` N+1 on secret sealing** (`backend/index.ts` ~L4867) — `sealSecretFields` runs two full-table queries (`node_type` + `field_template`) per row; cog-ingest can drive hundreds. Hoist a per-type field-def cache and pass `preloadedDefs`.
+
+**🟡 Moderate — Standards**
+
+- **`NodeSelector` clear affordance isn't keyboard/SR accessible** (`frontend/components.ts` ~L1054) — a bare `<X>` SVG with `onClick`; no focus, role, aria-label, or key handler. Use a real ghost icon `<Button aria-label="Clear selection">`.
+
 ### 2026-08-01 documentation accuracy audit — 54 findings across 12 pages
 
 **Priority:** ✅ Resolved (docs-only — no module version bump)
@@ -340,6 +373,32 @@ The `field-group` field renderer emits two **over-escaped** template expressions
 ---
 
 ## Planned Improvements
+
+### 2026-08-07 meta audit — minor sweep (14)
+
+**Priority:** Low — the 14 minor findings from the 2026-08-07 four-dimension audit (the critical + moderates are under [Known Issues](#known-issues)).
+
+**Security**
+- `structure_field_templates` missing from `dataCategories` (`backend/registrations.ts` ~L58) — the deletion handler exists (~L153) but the owned table isn't declared in the manifest inventory. Add the entry.
+
+**Production**
+- `NODE_COLUMN_NAMES` omits `observedAt` (`backend/index.ts` ~L327) — semantic / similar / hybrid search rows return `observedAt: undefined`, losing the temporal relevance signal. Add the column.
+- `NodeChildrenTab` is unpaginated and shows the capped page size as the total (`frontend/pages.ts` ~L706, L751). Paginate the children query and show `data.total`.
+- `useNodeTypes` reports `isLoading` alongside already-seeded data (`frontend/index.ts` ~L2980) — the admin page shows a full loading screen despite seeded types. `isLoading: query.isLoading && !seeded`.
+- `NodeSelector` ignores `useNodes` loading (`frontend/components.ts` ~L1076) — a false "No nodes found." flashes during debounced search. Show a searching state and suppress the empty message until settled.
+- Date renderer has a dead try/catch (`frontend/components.ts` ~L2313) — a bad value renders the literal "Invalid Date" instead of the raw fallback. Guard with `isNaN(d.getTime())`.
+- `NodeFieldSetEditor.addField` derives ids from `field_${length+1}` (`frontend/pages.ts` ~L3521) — collides with a surviving field id after a delete, so edits/removals affect both. Derive from the max existing suffix, or append a random suffix.
+
+**Performance**
+- `listNodes` doesn't clamp `limit`/`page` in-service (`backend/index.ts` ~L3997) — `serviceRegistry` callers bypass the HTTP zod cap, allowing an unbounded `take` (or negative `skip`). Clamp to `[1,100]` and `page ≥ 1`.
+- `resolveTemplateAsync` derefs node references serially (`frontend/index.ts` ~L4269) — N sequential round-trips on a cold cache for multi-reference templates. Pre-warm distinct ids with one `Promise.all`.
+- Redundant bare `@@index([userId])` (`schema.ts` — node_type / group / template / field_template / connection_type / function, plus both indexes on `structure_chunk`) — leftmost-prefix duplicates of existing composites, contradicting the schema's own documented rule and taxing writes. Drop them.
+
+**Standards**
+- Template & field-template mutation logs lack `{ audit: true }` (`backend/index.ts` ~L6642+) — unlike every other admin-config mutation; field templates can carry secret fields. Add the marker.
+- Icon-only buttons lack `aria-label` (`frontend/components.ts` ~L215, L229, L541, L557, L370, L1904) — favourite, more-menu, and secret show/hide announce as unlabeled. Add labels.
+- `NodeSelector` declares `showColor?` but never reads it (`frontend/components.ts` ~L945) — dead API implying a capability that doesn't exist. Remove or honour it.
+- Sticky-header aesthetic opacity (`frontend/pages.ts` ~L187) — `bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60` is §7-banned opacity-on-token and inert (nothing scrolls behind it). Use solid `bg-background`.
 
 ### Lexical, hybrid, and graph search — deferred refinements
 
