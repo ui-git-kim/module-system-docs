@@ -1,30 +1,32 @@
 ---
 title: Data Model
-description: The sixteen ai_ tables — what each holds, and the config-versus-data split
-lastUpdated: 2026-08-07
+description: The twenty ai_ tables — what each holds, and the config-versus-data split
+lastUpdated: 2026-08-08
 sidebar:
   order: 11
 ---
 
 import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
-Everything AI Core ships is a database record. Models, prompt frameworks and segments, markers, disciplines and their checks, presets, operations, flows and evaluation cases are not hardcoded — they are rows in sixteen `ai_` tables, seeded at install and edited in the admin. This page is the reference for those tables: what each holds, and the line that runs down the middle of the schema.
+Everything AI Core ships is a database record. Models, prompt frameworks, markers, segments, approaches, disciplines and their guardrails, presets, operations and their composition, flows and evaluation cases are not hardcoded — they are rows in twenty `ai_` tables, seeded at install and edited in the admin. This page is the reference for those tables: what each holds, and the line that runs down the middle of the schema.
 
 That line is **config versus data**:
 
 <CardGrid>
-  <Card title="Config tables (12)" icon="setting">
-    App-level, admin-managed, seeded as a starting palette. **No owner columns** — they are not anyone's personal data. `ai_provider`, `ai_provider_terms_option`, `ai_model`, `ai_prompt_framework`, `ai_marker`, `ai_prompt_segment`, `ai_discipline`, `ai_guardrail_check`, `ai_preset`, `ai_operation`, `ai_flow`, `ai_eval_case`.
+  <Card title="Config tables (16)" icon="setting">
+    App-level, admin-managed, seeded as a starting palette. **No `tenantId`** — they are not anyone's personal data. `ai_provider`, `ai_provider_terms_option`, `ai_model`, `ai_prompt_framework`, `ai_marker`, `ai_prompt_segment`, `ai_approach`, `ai_discipline`, `ai_guardrail`, `ai_operation_segment`, `ai_segment_approach`, `ai_segment_discipline`, `ai_preset`, `ai_operation`, `ai_flow`, `ai_eval_case`. (Four carry a nullable authorship `userId` for a future per-user builder — always `null` on seeded rows, never a tenant-isolation key.)
   </Card>
   <Card title="Data tables (3)" icon="document">
     Tenant-scoped runtime records. Every row carries `tenantId` + `userId`, is declared tenant-owned to the security registry, and is erased by the account-deletion cascade. `ai_flow_run`, `ai_usage_ledger`, `ai_review_item`.
   </Card>
 </CardGrid>
 
-The sixteenth table, **`ai_eval_result`**, sits off to the side of that line: it is an append-only *results* table with **no owner columns** — its inputs are synthetic evaluation fixtures, not a subject's data — so, like the config tables, it is absent from the security registry, and, like the ledger, it stores scores, references and named gaps but **never content**. It is described with the evaluation tables below.
+The twentieth table, **`ai_eval_result`**, sits off to the side of that line: it is an append-only *results* table with **no owner columns** — its inputs are synthetic evaluation fixtures, not a subject's data — so, like the config tables, it is absent from the security registry, and, like the ledger, it stores scores, references and named gaps but **never content**. It is described with the evaluation tables below.
 
-<Aside type="note" title="Implemented and live as of v1.15.0">
-This page describes the schema as implemented in module v1.15.0 (August 2026). The module installs into a real app, type-checks clean there, its admin page renders and serves these records, and every consumer surface built on this schema — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and marker-aware assembly — has been exercised end-to-end against live providers. Retrieval (v1.13.0) added **no** table — a retrieval operation is an embedding `ai_operation` carrying grounding dials. Groundedness scoring (v1.12.0) reuses `ai_guardrail_check` + a seeded judge `ai_operation`. The evaluation harness (v1.14.0) added `ai_eval_case` + `ai_eval_result` and the `ai_operation.evalConfig` column; markers (v1.15.0) added `ai_marker`. The semantic cache and a re-embedding migration remain planned and carry no table yet; see the [Roadmap](/modules/ai-core/roadmap/).
+<Aside type="note" title="Implemented as of v1.22.0 (Prompt Model v2)">
+This page describes the schema as implemented in module v1.22.0 (August 2026), the **Prompt Model v2** rework: *everything in a prompt is a segment*. An operation composes ordered segments through `ai_operation_segment`; the two "how" slots — `approaches` and `disciplines` — relate their members in through join tables (`ai_segment_approach`, `ai_segment_discipline`) rather than carrying text. The unmeasured "how" (`ai_approach`) and the measured "how" (`ai_discipline`, which owns one-or-more `ai_guardrail` records — the table renamed from `ai_guardrail_check`) are now their own records. `ai_operation` gained `systemWide` (its segments fold into every run — the system prompt is itself an operation) and dropped the `disciplineIds`/`segmentKeys` JSON columns; composition is relational now. `enabled` was removed from the composed records (membership in a segment's list *is* the on/off switch); `important` moved onto the join row. Retrieval (v1.13.0) added **no** table — a retrieval operation is an embedding `ai_operation` carrying grounding dials. Groundedness scoring reuses a guardrail + a seeded scorer `ai_operation` (there is no first-class "judge"). The evaluation harness (v1.14.0) added `ai_eval_case` + `ai_eval_result` and the `ai_operation.evalConfig` column; markers (v1.15.0) added `ai_marker`.
+
+Upgrading a **populated** v1 install is a clean break: the reshaped tables (segments, disciplines, guardrails, operations) are reset to the v2 built-ins by the module's `onPrepareDatabase` hook — custom, non-seeded rows in those tables are **not** preserved, so export via the Config tab first; markers, eval cases, and the model/provider/preset/flow/ledger tables keep their shape. It requires scaffold ≥ 1.31.14. The semantic cache and a re-embedding migration remain planned and carry no table yet; see the [Roadmap](/modules/ai-core/roadmap/).
 </Aside>
 
 ---
@@ -35,9 +37,9 @@ The whole schema follows the same handful of rules, so a reader can predict a ta
 
 - **`ai_` prefix, singular model, plural table.** Model names are snake_case singular (`ai_model`) and `@@map` to a plural physical table (`ai_models`). The prefix keeps the module's tables self-evidently its own.
 - **No `@relation` directives.** Every cross-table reference is a plain string key with an `@@index`, never a Prisma relation. The schema is **self-contained** — it can be reasoned about, migrated and deleted without reaching into another module's models. `ai_model.providerId` names `ai_provider.id`; the database does not enforce the join, the code does.
-- **Ids are either a slug or a `cuid()`.** Where the id *is* the name — providers, terms options, disciplines, checks, operations, flows — it is a human-meaningful slug (`anthropic`, `ai-core/no-silent-truncation`, `extract-entities`). Where the row is just an instance — models, frameworks, segments, presets, and all three data tables — the id is a generated `cuid()`, and the human key lives in a separate `@unique` column (`name` or `key`).
-- **`seeded` marks provenance.** Ten of the twelve config tables carry a `seeded Boolean @default(false)`. Rows planted by AI Core's install migrations set it to `true`, so — in the schema comment's words — every value shows *"shipped default vs deliberate choice"*. Seeded rows are a **starting palette, not enforced state**: the seed migrations use `ON CONFLICT DO NOTHING`, and admin edits always win. (`ai_provider` and `ai_flow` are the two config tables with no `seeded` column; `ai_eval_result` is not a config table and carries no `seeded` column either.)
-- **Owner columns mark subject data.** The three data tables carry `tenantId` (isolation key) and `userId` (actor). The config tables carry neither, which is precisely why they are absent from the security registry — they are app configuration, not a person's data.
+- **Ids are either a slug or a `cuid()`.** Where the id *is* the name — providers, terms options, markers, disciplines, guardrails, operations, flows — it is a human-meaningful slug (`anthropic`, `ai-core/no-silent-truncation`, `extract-entities`). A discipline is the clearest case: **its `id` *is* its key** (there is no separate key column). Where the row is just an instance — models, frameworks, segments, approaches, presets, the three composition join tables, and all three data tables — the id is a generated `cuid()`, and the human key lives in a separate `@unique` column (`name` or `key`).
+- **`seeded` marks provenance.** Eleven of the sixteen config tables carry a `seeded Boolean @default(false)`. Rows planted by AI Core's install migrations set it to `true`, so — in the schema comment's words — every value shows *"shipped default vs deliberate choice"*. Seeded rows are a **starting palette, not enforced state**: the seed migrations use `ON CONFLICT DO NOTHING`, and admin edits always win. (`ai_provider`, `ai_flow`, and the three composition join tables — `ai_operation_segment`, `ai_segment_approach`, `ai_segment_discipline` — carry no `seeded` column; `ai_eval_result` is not a config table and carries no `seeded` column either.)
+- **The tenant key marks subject data.** The three data tables carry `tenantId` (isolation key) and `userId` (actor). The config tables carry **no `tenantId`**, which is precisely why they are absent from the security registry — they are app configuration, not a person's data. Four of them (`ai_prompt_segment`, `ai_approach`, `ai_discipline`, `ai_operation`) do carry a *nullable* `userId`, but that is an authorship pointer laying the foundation for a future per-user builder — it is `null` on every seeded row and is never a tenant-isolation key, so it brings nothing into the security registry.
 
 For how those records are seeded at install versus registered as code, see [Developer Workflow](/modules/ai-core/developer-workflow/); for what an admin does with them, see [Configuration](/modules/ai-core/configuration/).
 
@@ -117,37 +119,89 @@ The `segmentOrder` lists a `"markers"` slot — that slot is **generated from th
 A marker is the **semantic** axis (what a content item is); injection defence is a separate **security** axis carried by the per-item `injectionRisk` boolean on the consumer segment — set by the app from the item's provenance, never by the end user, and applied to context items only. `injectionRisk` is a **runtime field, not a database column**: there is no `injectionRisk` on `ai_marker` and no Prisma schema change. When any context item is flagged, the run states a configurable injection-risk notice on the system side; a `true` flag raises the odds the model resists an embedded instruction, but is never a guarantee the content is safe. The former non-overridable `"external"` floor (the `external` type, marker, and reserved prefix) was **removed in v1.18.0** — defence is now driven by the correctly-flagged item, not by a segment type. See [Prompt Assembly](/modules/ai-core/prompt-assembly/).
 </Aside>
 
-**`ai_prompt_segment`** → `@@map("ai_prompt_segments")` — a reusable section of prompt text (a *library* segment; the user's runtime message is a consumer segment and is never stored here).
+**`ai_prompt_segment`** → `@@map("ai_prompt_segments")` — **the universal unit of a prompt.** Since Prompt Model v2 everything is a segment: an operation composes an ordered set of them (via `ai_operation_segment`). A segment declares only *what kind of slot* it is (`slotType`) — the framework owns order and wrapping per model. The two "how" slots (`approaches`, `disciplines`) carry no text of their own; they pull their members from related `ai_approach` / `ai_discipline` records through join tables. The other slots carry their words in `content`. (This is a *library* segment; the user's runtime message is a consumer segment and is never stored here.)
 
 | Column | What it holds |
 |---|---|
-| `key` | `@unique`, kebab-case — `"voice-plain"` |
-| `type` | `"voice"` · `"approach"` · `"discipline-text"` · `"schema-instruction"` · `"markers-preamble"` · `"injection-notice"`. (The `"framing"` type was **removed in v1.17.0** — markers replaced it. In v1.18.0 `"method"` was renamed `"approach"`, and the configurable `"markers-preamble"` and `"injection-notice"` record types were added so no framing prose lives in code — they render inside the `"markers"` slot.) |
-| `content` | `@db.Text` — the words |
+| `key` | `@unique`, kebab-case, stable — `"objective-extract-entities"` |
+| `slotType` | `"approaches"` · `"disciplines"` · `"objective"` · `"context"` · `"examples"` · `"format"` · `"edge-cases"` (extensible). The old `type` column and its `"role"` (system/user) split are **gone** — the system/user boundary is *derived* at assembly from `systemWide` and the slots |
+| `name` | display name |
+| `content` | `@db.Text?` — the words for a "what" slot; **`null`** for `approaches`/`disciplines` slots (their content comes from the related records) |
+| `contentSource` | `"static"` uses the `content` field; `"context"` is populated by the context engine at call time (foundation) |
+| `injectionRisk` | `Boolean` — the **security** axis: could this content contain hidden instructions to resist (Phase A/B defence applies). Independent of `marker` |
+| `marker` | nullable — `ai_marker.id` that frames or heads this segment |
+| `userId` | nullable — `null` = app/module; a future per-user builder sets it |
 | `version` | bumped on edit; the ledger records which version ran |
+| `seeded` | provenance, as elsewhere |
 
-### Disciplines and guardrail checks
+There is **no `enabled` column** on a segment (nor on approaches, disciplines or guardrails): *membership* in an operation's or a slot's list is the on/off switch.
 
-**`ai_discipline`** → `@@map("ai_disciplines")` — a rule about *how* the AI must go about an operation.
+### Approaches, disciplines and guardrails
 
-| Column | What it holds |
-|---|---|
-| `id` | kebab-case, module-namespaced — `"ai-core/no-silent-truncation"` |
-| `tier` | `"hard"` · `"default"` · `"guideline"` — about overridability, not severity |
-| `authority` | `"ai-core"` · `"app"` · `"user"` — lower levels are additive-only |
-| `checkId` | nullable pointer into `ai_guardrail_check` — a hard rule with no check is a request, not a brake |
-| `rationale` | `@db.Text`, required on `hard` (enforced at write time) |
-| `body` | `@db.Text` — the rule, and where it prohibits, what to do instead |
+A prompt's "how" is two kinds of record. An **approach** is an *unmeasured* how (expertise, persona, reasoning, tone). A **discipline** is a *measured* how — a rule that owns one-or-more guardrails. Having a guardrail is the only difference between the two.
 
-**`ai_guardrail_check`** → `@@map("ai_guardrail_checks")` — the check that a discipline was followed. `@@index([disciplineId])`.
+**`ai_approach`** → `@@map("ai_approaches")` — an unmeasured "how", related into an `approaches` segment. New in Prompt Model v2.
 
 | Column | What it holds |
 |---|---|
-| `disciplineId` | `ai_discipline.id` — the join key. Rules and checks version independently |
-| `kind` | `"deterministic"` · `"classifier"` · `"grounding"`. `deterministic` (source-verification) and `grounding` (a nested judge scoring support) both **execute** as of v1.12.0; `classifier` is declared but not yet implemented |
-| `config` | `Json`, e.g. `{ "builtin": "coverage-reported" }` for a deterministic check, or a source-verification / grounding config — read defensively at run time |
+| `key` | `@unique`, kebab-case — `"reasoning-think-step-by-step"` |
+| `name` | display name |
+| `promptText` | `@db.Text` — the "how" text (used when `contentSource = "static"`) |
+| `contentSource` | `"static"` · `"context"` — a context-fed approach (e.g. a user-personalised assistant) is filled at call time |
+| `flavour` | nullable — `"expertise"` · `"persona"` · `"reasoning"` · … — orders approaches within the `approaches` segment |
+| `userId` | nullable — `null` = app/module |
+| `version` / `seeded` | edit version; provenance |
 
-The write-time and resolution-time enforcement of the `tier` / `authority` / `checkId` relationship is the subject of [Usage → Disciplines & Guardrails](/modules/ai-core/usage/#disciplines--guardrails); this table is only where the rule and its check are stored.
+**`ai_discipline`** → `@@map("ai_disciplines")` — a *measured* rule about how the AI must go about an operation, paired with one-or-more guardrails. Slimmed in v2: **no `tier`, no `authority` hierarchy, no `appliesTo`/`rationale`/`checkId`**.
+
+| Column | What it holds |
+|---|---|
+| `id` | kebab-case, module-namespaced — `"ai-core/every-assertion-sourced"`. **The `id` *is* the key** — there is no separate key column |
+| `name` | display name |
+| `promptText` | `@db.Text` — the rule, and where it prohibits, what to do instead (this is the old `body`, renamed) |
+| `flavour` | nullable — `"constraint"` · … — orders disciplines within the `disciplines` segment |
+| `userId` | nullable — `null` = app/module |
+| `version` / `seeded` | edit version; provenance |
+
+**`ai_guardrail`** → `@@map("ai_guardrails")` — the check that proves a discipline held. Its own table (renamed from `ai_guardrail_check`), and a discipline may own **one or many**. `@@index([disciplineId])`.
+
+| Column | What it holds |
+|---|---|
+| `id` | kebab-case guardrail id |
+| `disciplineId` | `ai_discipline.id` — the discipline this guardrail measures. Rules and guardrails version independently |
+| `kind` | `"deterministic"` (runs in code) · `"model-scored"` (calls a **scorer operation** named in `config.scorerOperation` — there is no first-class "judge"; the old groundedness/correctness judges are ordinary `ai_operation` rows) |
+| `config` | `Json` — a deterministic builtin config, or the `{ scorerOperation, … }` of a model-scored guardrail — read defensively at run time |
+| `promptText` | `@db.Text?` — optional: what the model is told will be checked, rendered with the discipline |
+| `version` / `seeded` | edit version; provenance |
+
+The set of disciplines an operation resolves is validated **at write time** (`records.upsertSegment`, when a segment's disciplines list changes) **and at resolution time** (every `aiCore.run`, which refuses loudly). The violation kinds are `unknown-discipline`, `discipline-without-guardrail` and `guardrail-scorer-missing`. That enforcement is the subject of [Usage → Disciplines & Guardrails](/modules/ai-core/usage/#disciplines--guardrails); these tables are only where the rules and their guardrails are stored.
+
+### Composition
+
+Which segments an operation uses, and which approaches/disciplines a slot lists, are relations — plain FK fields with `@@index`, no `@relation`. None carries an owner column or a `seeded` column.
+
+**`ai_operation_segment`** → `@@map("ai_operation_segments")` — an operation's ordered segments. `@@unique([operationId, segmentId])`.
+
+| Column | What it holds |
+|---|---|
+| `operationId` / `segmentId` | `ai_operation.id` and the `ai_prompt_segment.id` it composes in |
+| `sortOrder` | the segment's position within this operation |
+
+**`ai_segment_approach`** → `@@map("ai_segment_approaches")` — the members of an `approaches` segment. `@@unique([segmentId, approachId])`.
+
+| Column | What it holds |
+|---|---|
+| `segmentId` / `approachId` | an `ai_prompt_segment.id` of `slotType "approaches"` and the `ai_approach.id` it lists |
+| `sortOrder` | the member's position within the segment |
+| `important` | restate this member at the prompt tail (recency, under a seeded `key-rules` marker). **Lives on the join row, not the record** — the same approach can matter differently in different segments |
+
+**`ai_segment_discipline`** → `@@map("ai_segment_disciplines")` — the members of a `disciplines` segment. `@@unique([segmentId, disciplineId])`.
+
+| Column | What it holds |
+|---|---|
+| `segmentId` / `disciplineId` | an `ai_prompt_segment.id` of `slotType "disciplines"` and the `ai_discipline.id` it lists |
+| `sortOrder` | the member's position within the segment |
+| `important` | per-membership restatement at the prompt tail (recency), exactly as for approaches |
 
 ### Presets, operations and flows
 
@@ -165,12 +219,15 @@ The write-time and resolution-time enforcement of the `tier` / `authority` / `ch
 | `id` | the public job name — `"extract-entities"` |
 | `modelId` | `ai_model.id` (cuid) — resolution happens here; consumers never name models |
 | `presetId` / `dials` | a preset, plus per-operation dial overrides on it |
-| `disciplineIds` / `segmentKeys` | `Json` arrays — which disciplines apply, and the ordered library segments |
 | `schema` | `Json` — the shape of the answer. Guarantees shape, never truth |
 | `cache` | `Json?` — prompt-caching policy `{ instructions?, context?, ttl? }`; `null` = no caching. Anthropic-only, honoured at run time (v1.9.0) |
-| `evalConfig` | `Json?` — evaluation config `{ metrics: [{ metric, threshold, judgeOperation? }] }`; `null` = no evals configured. Admin-managed, run offline by `runEval` over this operation's `ai_eval_case` rows (v1.14.0) |
+| `evalConfig` | `Json?` — evaluation config `{ metrics: [{ metric, threshold }] }`; `null` = no evals configured. Admin-managed, run offline by `runEval` over this operation's `ai_eval_case` rows (v1.14.0) |
 | `sensitivity` | `"normal"` · `"sensitive"` — may tighten the app floor, never relax it |
+| `systemWide` | `Boolean` — when `true`, this operation's segments fold into **every** run's prompt (the system prompt is itself an operation). Skipped on an internal/scorer run so a judge prompt stays clean. `@@index([systemWide])` |
 | `userModelChoice` / `userModelAllowList` | admin-granted model choice, default off, with a named allow-list |
+| `userId` | nullable — `null` = app/module; a future per-user builder sets it |
+
+Composition is **relational** in v2: which segments an operation uses lives in `ai_operation_segment` (segments then own their approaches and disciplines through the join tables). The old `disciplineIds` and `segmentKeys` JSON columns were **dropped**.
 
 **`ai_flow`** → `@@map("ai_flows")` — operations in order. No `seeded` column.
 
@@ -253,7 +310,7 @@ Tenant-scoped runtime records. Every row carries `tenantId` (isolation key) and 
 
 The config-versus-data line is not a naming convention that hopes to be respected — it is enforced by which registry each table is declared to, and how each is created.
 
-- **Config tables are seeded, then admin-owned.** They arrive through the install seed migrations (`ON CONFLICT DO NOTHING`, byte-stable, append-only) as a palette, and from then on the admin's edits win. Because they have no owner columns, they are absent from the security registry and untouched by account deletion. See [Developer Workflow](/modules/ai-core/developer-workflow/) for the migration discipline.
+- **Config tables are seeded, then admin-owned.** They arrive through the install seed migrations (`ON CONFLICT DO NOTHING`, byte-stable, append-only) as a palette, and from then on the admin's edits win. Because they carry no `tenantId`, they are absent from the security registry and untouched by account deletion — a nullable authorship `userId` on a few of them is not a tenant-isolation key and changes nothing here. See [Developer Workflow](/modules/ai-core/developer-workflow/) for the migration discipline.
 - **Data tables are tenant-owned, then erased.** Their `ownedModels` declaration gives every query a tenant boundary, and a registered deletion handler hard-deletes all three (`ai_usage_ledger`, `ai_review_item`, `ai_flow_run`) in one transaction when a subject is erased. The ledger's no-content rule is what makes that erasure complete rather than partial.
 
 The result is a schema that is defensible in two directions at once: an admin can change what the AI does app-wide by editing config rows, and a subject can be forgotten entirely by deleting their data rows — without either action touching the other.

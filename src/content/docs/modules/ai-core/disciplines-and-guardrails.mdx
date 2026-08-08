@@ -1,21 +1,21 @@
 ---
 title: Disciplines & Guardrails
-description: Rules as records, their checks, and where the authority hierarchy is actually enforced
-lastUpdated: 2026-08-07
+description: Rules as records, the guardrails that measure them, and the one gate enforced at write time and again on every call
+lastUpdated: 2026-08-08
 sidebar:
   order: 9
 ---
 
 import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
 
-A **discipline** is a rule about *how* the AI must go about an operation — the method, never the knowledge. *"Quote the source before you conclude." "Say when you don't know."* A **guardrail** is the check that the rule was followed. The **brake is both halves**: a rule with no check is not a brake, it is a request. This page is the deep dive on that pair — how a rule is stored, how its check is stored, and the one thing that is easy to get wrong and load-bearing when you do: **where the authority hierarchy is actually enforced.**
+A **discipline** is a rule about *how* the AI must go about an operation — the method, never the knowledge. *"Verify each extracted item against the source." "Report what you covered and what you didn't."* A **guardrail** is the check that proves the rule held. The **brake is both halves**: a rule with no guardrail is not a brake, it is a request. That single invariant is what separates a *discipline* (a **measured** how) from an *approach* (an **unmeasured** how — expertise, persona, reasoning, tone). This page is the deep dive on that pair — how a rule is stored, how its guardrail is stored, and the one thing that is load-bearing when you get it wrong: **the single gate that re-checks the pairing at write time and again on every call.**
 
-The two sides live in two files, and that separation is deliberate. The rule is a database record. The check is a database record too — but the *implementation* of the most absolute checks is code. The design's whole thesis reduces to four words:
+The rule is a database record. Its guardrail is a database record too — but the *implementation* of the guardrail is either code (a deterministic built-in) or another operation (a model-scored scorer). The design's whole thesis reduces to four words:
 
 > **Prose asks; code holds.**
 
-<Aside type="note" title="Current as of v1.15.0">
-The discipline and guardrail machinery described here is implemented in module v1.15.0 (August 2026): the CRUD service, the write-time integrity rules, the resolution-time re-validation, the deterministic source-verification check and the **grounding** check (a nested judge scoring support, v1.12.0) all ship and have been exercised end-to-end against live providers. Still marked *planned* below: a seed-integrity CI lint and the `classifier` check kind — tracked on the [Roadmap](/modules/ai-core/roadmap/).
+<Aside type="note" title="Current as of v1.22.0">
+The discipline and guardrail machinery described here is the **Prompt Model v2** shape (v1.22.0, August 2026): the CRUD service, the write-time integrity rules, the resolution-time re-validation, the two deterministic built-ins (`coverage-reported`, `feedback-present`), the deterministic `source-verification` built-in and the model-scored **groundedness** guardrail all ship and have been exercised end-to-end against live providers. There is no `tier`, no `authority` hierarchy, and no `enabled` flag on these records any more — v2 removed all three. A few `config-io` **replace-mode** edge cases remain on the [Roadmap](/modules/ai-core/roadmap/); the resolver still refuses at run time in every one of them.
 </Aside>
 
 ---
@@ -30,101 +30,78 @@ Neither is the brake alone:
   <Card title="Discipline — the rule" icon="pencil">
     An authored record. Says how the operation must proceed, and — where it prohibits something — what to do instead. A prohibition with no named alternative gets taken anyway under pressure.
   </Card>
-  <Card title="Guardrail check — the verification" icon="approve-check">
-    A separate record that names the rule it enforces and points at an implementation. Deterministic code, a classifier, or a grounding scorer. Without it, the rule is merely written down.
+  <Card title="Guardrail — the verification" icon="approve-check">
+    A separate record that names the discipline it measures and points at an implementation: deterministic code, or a model-scored scorer operation. Without at least one, the rule is merely written down — an approach, not a discipline.
   </Card>
 </CardGrid>
 
-Every serious system in the field keeps the authored rule and its enforcement in different places and binds them loosely, and nobody has closed that seam. AI Core does not close it either — it **manages** the gap and makes its two permanent failure modes *detectable*:
+Every serious system in the field keeps the authored rule and its enforcement in different places and binds them loosely, and nobody has closed that seam. AI Core does not close it either — it **manages** the gap and refuses the two states that would let it rot:
 
-- **Orphaned check** — a check pointing at a rule that was renamed or deleted.
-- **Unreferenced rule** — a rule with no check. The "merely asked for" rule.
+- **Orphaned guardrail** — a guardrail naming a discipline that does not exist. Refused at write time (`upsertGuardrail` — "an orphaned guardrail measures nothing").
+- **Unguarded discipline** — a discipline with no guardrail. The "merely asked for" rule. `validateDisciplineSet` reports `discipline-without-guardrail`, so it can never resolve into a run.
 
-The service refuses the writes that would create these at the moments it can (below), and a CI lint over the *seeded* rules and checks that would catch the rest before ship is **planned** — see the [Roadmap](/modules/ai-core/roadmap/).
+The two are enforced by the same gate that guards everything else on this page, described below.
 
 ---
 
-## A discipline is a record — the six-field envelope
+## A discipline is a record — and it is slim
 
-Disciplines are authored records, never code: written, structured, editable, single-source. AI Core seeds good generic ones; apps author their own; both live in the same table with the same shape. Each is **a small machine-readable envelope wrapping human-readable prose** — six fields, and no more.
+Disciplines are authored records, never code: written, structured, editable, single-source. AI Core seeds good generic ones; apps author their own; both live in the same table with the same shape. v2 stripped the record down to what a measured rule actually needs — no `tier`, no `authority`, no `appliesTo`, no `rationale`, no `checkId` pointer. Overridability is no longer a field on the rule; **membership in a segment's disciplines list is the on/off switch**, so there is nothing to "enable".
 
 | Field | Stored as | Purpose |
 |---|---|---|
-| **id** | `id` | Kebab-case, module-namespaced, e.g. `ai-core/no-silent-truncation`. The join key. Not updatable — the identity. |
-| **tier** | `tier` | `hard` · `default` · `guideline`. About overridability, not severity. |
-| **applies-to** | `appliesTo` | Scope or condition list, including runtime state. Empty means always-on. |
-| **authority** | `authority` | `ai-core` · `app` · `user`. Structural, additive-only. Not updatable — moving a rule between levels is a *different* rule. |
-| **version** | `version` | Independently versioned from its check. Bumps only on a substantive edit, so the ledger can tell an edited rule from the one that ran yesterday. |
-| **check** | `checkId` | Nullable pointer to a check record — **not the check itself.** |
+| **id** | `id` | Kebab-case, module-namespaced, e.g. `ai-core/no-silent-truncation`. The join key and the identity — **not updatable.** Giving a rule a new id is not an edit, it is a different rule. |
+| **name** | `name` | Human title, e.g. *"No silent truncation"*. |
+| **promptText** | `promptText` | The rule, and — where it prohibits — what to do instead. Emitted into the prompt at assembly time. |
+| **flavour** | `flavour` | Optional grouping/ordering hint (e.g. `constraint`) used when ordering disciplines within a disciplines segment. |
+| **userId** | `userId` | `null` = app/module. A future per-user builder sets it. |
+| **version** | `version` | Bumps only on a substantive edit (name, prompt or flavour), so the ledger can tell an edited rule from the one that ran yesterday. |
+| **seeded** | `seeded` | `true` for AI Core's built-ins — round-trips through config export/import and marks a row the `replace` importer never deletes. |
 
-The **prose body** (`body`) is the rule, and — where it prohibits — what to do instead. `rationale` is required on `hard` and optional everywhere else. That is the complete surface: no free-text severity score (it collapses into tier), no priority integer beyond tier plus order, no tag taxonomy nobody queries, no author field distinct from `authority`.
+There is no free-text severity, no priority integer, no tag taxonomy, and no authority level. The `id` carries the namespace; the segment a discipline is listed in decides whether it applies.
 
-<Aside type="tip" title="Bodies are prompt content">
-Rule bodies and rationales are emitted into the prompt at assembly time, so the service treats them as prompt content: its logs carry ids, tiers, authorities and versions only — **never the prose.** For how a discipline's body is wrapped and ordered into the prompt, see [Prompt Assembly](/modules/ai-core/prompt-assembly/).
+<Aside type="tip" title="Prompts are prompt content">
+A discipline's `promptText` (and a guardrail's optional `promptText`) is emitted into the prompt at assembly time, so the service treats it as prompt content: its logs carry ids, kinds and versions only — **never the prose.** For how a discipline's body is wrapped and ordered into the prompt, and how a per-membership `important` flag restates a rule at the tail under the seeded `key-rules` marker, see [Prompt Assembly](/modules/ai-core/prompt-assembly/).
 </Aside>
 
 ### The seeded set
 
-AI Core seeds its disciplines through install migrations (`ON CONFLICT DO NOTHING`, so an admin edit is never clobbered), in three groups. The **always-relevant core** — the hard set is small, front-loaded, and every hard member carries a rationale *and* a live check:
+AI Core seeds its disciplines through install migrations (`ON CONFLICT DO NOTHING`, so an admin edit is never clobbered). In v2 every seeded discipline carries a guardrail — that is the invariant — and the always-relevant pair fold into runs through the standard disciplines segment:
 
-| id | tier | check | The rule it names |
-|---|---|---|---|
-| `ai-core/no-silent-truncation` | `hard` | `check-coverage-reported` | Never shorten, sample or skip input without reporting what was left out. |
-| `ai-core/report-coverage` | `hard` | `check-feedback-present` | Every operation reports what it processed and what it did not, or says no independent count exists. |
-| `ai-core/abstain-over-invent` | `hard` | `check-feedback-present` | When the material does not support an answer, abstain and name the gap — never fill it with a plausible value. |
-| `ai-core/say-when-unsure` | `default` | *(none)* | Where confidence is materially limited, say so alongside the claim. |
-| `ai-core/quote-source-before-conclusion` | `guideline` | *(none)* | Prefer quoting the supporting passage before stating a conclusion drawn from it. |
-
-Three hard, one default, one guideline — comfortably inside the single-digit hard budget. Note the loose join: `abstain-over-invent` and `report-coverage` both point their `checkId` at `check-feedback-present`. Several disciplines may share one check; a check names one discipline back, and the two need not be the same. What resolution requires is only that an enabled hard rule's pointer resolves to an *enabled* check — covered below.
-
-Two **opt-in guardrail** disciplines (v1.12.0) an operation adds when it wants the executable check to run: `ai-core/verify-extraction-against-source` (→ `check-source-verification`) and `ai-core/ground-claims` (→ `check-groundedness`).
-
-Three **behavioural defaults** (v1.20.0) — overridable, and measured offline via a seeded reference operation and its golden set (the `runEval` harness) rather than a per-call judge:
-
-| id | tier | The rule it names |
+| id | Guardrail (kind) | The rule it names |
 |---|---|---|
-| `ai-core/no-sycophancy` | `default` | Judge the substance, not the source — do not agree, praise or soften a claim because the user expects it; ask when genuinely ambiguous. |
-| `ai-core/refusal-boundary` | `default` | A minimal safety floor (serious harm, or defeating controls *in order to cause* such harm), written to avoid over-refusing good-faith professional/security work. |
-| `ai-core/ask-dont-guess` | `default` | On a missing *decisive* input, ask (interactive) or name what is missing and abstain (batch) — never fabricate a default. |
+| `ai-core/no-silent-truncation` | `guardrail-coverage-reported` (deterministic) | Never shorten, sample or skip input without reporting exactly what was left out. |
+| `ai-core/report-coverage` | `guardrail-feedback-present` (deterministic) | Every operation reports what it processed and what it did not, or says no independent count exists. |
+| `ai-core/verify-extraction-against-source` | `guardrail-source-verification` (deterministic) | For an extraction, verify each returned item against the source and report coverage. |
+| `ai-core/ground-claims` | `guardrail-groundedness` (model-scored) | Score how well the output is grounded in its sources and abstain when support falls below the threshold. |
 
-Every seeded discipline is **opt-in**: an operation applies one by listing it in its `disciplineIds` (and the seeded `approach-default` anchor by listing it in `segmentKeys`). There is no universal auto-application — a brand-new operation with an empty `disciplineIds` gets none of them, so a consumer chooses its defaults deliberately.
+A discipline may own **one or many** guardrails — the `>= 1` count is the invariant, not exactly one. The last two are opt-in per operation (an operation reaches them only by composing the extraction / grounding disciplines segment).
 
----
-
-## Tiers are about overridability, not severity
-
-| Tier | Who can override |
-|---|---|
-| `hard` | nobody |
-| `default` | a higher authority level |
-| `guideline` | implicitly steerable |
-
-Severity is the wrong axis: it is continuous and contestable, everything feels severe to its author, and that is the documented collapse mode — RFC 2119 needed a second RFC in 2017 because authors had made everything a MUST.
-
-So `hard` is made **expensive to declare.** The service enforces this at write time:
-
-- **Rationale is mandatory on every `hard` rule** — a hard rule with no stated reason for existing is refused, drafted or enabled.
-- **The always-on hard set is meant to stay in single digits.** Past a threshold of ten enabled hard rules, every discipline write logs an audited tier-inflation warning. It is not a refusal — growth can be legitimate — but the drift is made loud rather than left to be discovered.
+<Aside type="note" title="The behavioural defaults are approaches now">
+The v1 behavioural rules — `no-sycophancy`, `refusal-boundary`, `ask-dont-guess`, `say-when-unsure`, `abstain-over-invent` — carried no guardrail, so in v2 they are seeded as **approaches** (unmeasured hows), not disciplines. A record without a guardrail is an approach by definition; only a rule you can *measure* earns the word "discipline". They live in the standard approaches segment — see [Prompt Model](/modules/ai-core/prompt-model/).
+</Aside>
 
 ---
 
-## Checks are their own records
+## Guardrails are their own records
 
-A guardrail check is a separate record. It names the discipline `id` it enforces (the join key of the brake), declares a `kind`, and carries a `config`:
+A guardrail is a separate record — the table `ai_guardrail` (renamed from the v1 `ai_guardrail_check`). It names the discipline `id` it measures, declares a `kind`, and carries a `config`:
 
 | Field | Purpose |
 |---|---|
-| `id` | Kebab-case check id. |
-| `disciplineId` | The discipline this check enforces. An orphaned check — one naming a discipline that does not exist — is refused. |
-| `kind` | `deterministic` · `classifier` · `grounding`. |
-| `config` | Implementation config. For a deterministic built-in, `{ builtin: '...' }` names the runtime function. |
-| `enabled` | A disabled check cannot back an enabled hard rule. |
+| `id` | Kebab-case guardrail id. |
+| `disciplineId` | The discipline this guardrail measures — the join key of the brake. A guardrail naming a discipline that does not exist is refused at write time. |
+| `kind` | `deterministic` (runs in code) · `model-scored` (calls a scorer operation). |
+| `config` | Implementation config. For a deterministic built-in, `{ builtin: '...' }` names the runtime function; for a model-scored one, `{ scorerOperation: '...', threshold, onFail }`. |
+| `promptText` | Optional: what the model is told will be checked, rendered alongside the discipline. |
+| `version` | Bumps when the guardrail's own substance (target discipline, kind, config or rubric prompt) moves. |
+| `seeded` | `true` for built-ins. |
 
-Rules and checks **version independently** — that is exactly why `check` is a pointer, not an embedded body. A check's `version` bumps when its own substance (target, kind or config) moves; the discipline's `version` bumps on its own edits. The ledger records both, so a run is explicable against the precise rule *and* the precise check that were in force.
+Rules and guardrails **version independently** — that is exactly why the guardrail is a separate record, not an embedded body. A guardrail's `version` bumps when its own substance moves; the discipline's `version` bumps on its own edits. The ledger records both, so a run is explicable against the precise rule *and* the precise guardrail that were in force.
 
-### The two built-in deterministic checks
+### The deterministic built-ins
 
-`deterministic` checks name a runtime implementation that lives in the run engine (`run/run.ts`) via `config.builtin`. The rule is a database record; the brake is code. Two ship, both referenced by seeded check rows, and **both run on every language call** — they are cheap, universal, and enforce the one rule regardless of configuration:
+`deterministic` guardrails name a runtime implementation that lives in the run engine (`run/run.ts`) via `config.builtin`. The rule is a database record; the brake is code. Two run on **every language call** — they are cheap, universal, and enforce the one rule regardless of configuration:
 
 <CardGrid>
   <Card title="coverage-reported" icon="warning">
@@ -135,107 +112,100 @@ Rules and checks **version independently** — that is exactly why `check` is a 
   </Card>
 </CardGrid>
 
-The `grounding` kind **shipped in v1.12.0** — a groundedness scorer that runs a nested judge and produces a measured support score the abstention threshold compares against, alongside a deterministic `source-verification` builtin. Both are opt-in per operation through a seeded discipline. The `classifier` kind remains declared but unimplemented (a check AI Core cannot run is named in feedback, never a silent pass). See the [Roadmap](/modules/ai-core/roadmap/) and the groundedness discussion in [Usage](/modules/ai-core/usage/).
+A third deterministic built-in, `source-verification`, is opt-in for extraction operations: it verifies each returned item against the source (config carries `itemsPath` and `matchMode`) and reports coverage — where the source has no independent count, completeness is reported as *unverified* rather than assumed. Backs `ai-core/verify-extraction-against-source`.
+
+### The model-scored guardrail
+
+A `model-scored` guardrail names a **scorer operation** in `config.scorerOperation` and calls it. There is no first-class "judge" concept in v2 — a scorer is an ordinary operation, subject to the same resolution and composition as any other. The seeded **groundedness** guardrail is the example:
+
+```json
+{
+  "builtin": "groundedness",
+  "scorerOperation": "ai-core/groundedness-judge",
+  "threshold": 0.7,
+  "onFail": "abstain"
+}
+```
+
+It runs the named scorer operation, produces a measured support score, and drives the abstention threshold from that measured figure rather than trusting the model to grade its own confidence. `ai-core/groundedness-judge` is a seeded operation like any other; because a scorer run is internal, a `systemWide` operation's segments are **skipped** for it, so the judge prompt stays clean. Backs `ai-core/ground-claims`. A guardrail whose scorer operation is missing or disabled surfaces as `guardrail-scorer-missing` (below), never a silent pass.
 
 ---
 
-## Where enforcement actually sits
+## The one gate: `validateDisciplineSet`
 
-This is the load-bearing correction. Authority runs `ai-core` → `app` → `user`, and lower levels are **additive-only**: they may narrow scope by authoring a *new* rule, never widen, edit or delete a level above. This is the registry system's own ethos — downstream extends, never edits upstream — but the enforcement point is not where a code registry would put it.
+This is the load-bearing part. There is exactly **one** function that decides whether a set of disciplines is coherent — `validateDisciplineSet(ids)` — and it is called at **two** moments so the two enforcement points cannot drift apart.
 
-> **The July 2026 finding:** registration-time rejection is *unsound* for code registries. Registration is an ESM side-effect, ordered by file position, so a rule can register before the rule it conflicts with — the check runs against a set that isn't complete yet. A code registry cannot hold a sound enforcement point.
+> **The July 2026 finding held:** an ESM code registry cannot host a sound enforcement point, because registration is a file-ordered side-effect and a rule can register before the rule it conflicts with. **A database table can** — every rule and every guardrail already exists in one table at the moment of a write, so there is no ordering problem to lose to. v2 keeps that lesson and drops everything the old authority hierarchy layered on top of it: the gate now checks the one thing that still matters — that each named discipline exists and is actually a brake.
 
-**A database table can.** Every rule and every check already exists in one table at the moment of a write, so there is no ordering problem to lose to. AI Core therefore leans on **records, not code registration**, for disciplines — and enforces the hierarchy *twice*, at two moments, through **one function**.
+`validateDisciplineSet` returns machine-readable kebab violations so either caller can name the exact problem:
 
-### At write time — the admin CRUD refuses violations transactionally
+| Violation | Meaning |
+|---|---|
+| `unknown-discipline:<id>` | The set references a discipline that does not exist. |
+| `discipline-without-guardrail:<id>` | A referenced discipline owns no guardrail — a rule that was never turned into a brake. |
+| `guardrail-scorer-missing:<id>` | A model-scored guardrail on that discipline names a scorer operation that is missing or disabled. |
 
-Every create, update and delete validates the resulting record inside a transaction. The refusals are not warnings:
+### At write time — the disciplines list is validated on change
 
-- **Authority cannot be out-ranked or out-written.** The acting authority a runtime write may claim is typed `'app' | 'user'` — deliberately narrower than the stored values. **`ai-core` authority exists only in seed data**; no HTTP caller can claim the top of the hierarchy. An `app`-authority write may not create a rule *above* `app`, and may not edit or delete an `ai-core` rule at all. It narrows a higher rule only by authoring a new one.
-- **`hard` must be enforceable to be enabled.** Enabling a hard rule whose `checkId` is null, missing, or points at a *disabled* check is refused outright. A disabled hard rule may be *drafted* without a live check — it is the act of enabling that demands enforcement.
-- **A check cannot be pulled out from under a live hard rule.** Disabling or deleting a check that an enabled hard discipline relies on is refused, naming every reliant rule.
-- **A referenced discipline cannot be deleted.** Deleting a discipline still pointed at by an enabled check or an enabled operation is refused, naming every referrer — because deleting underneath them is precisely how you manufacture an orphaned check or a silently narrowed operation.
+The gate fires when a **disciplines segment's membership changes** (`records.upsertSegment`, on the disciplines slot). Adding a discipline to a segment is what turns it on, so that is the moment to check the resulting set holds. The related CRUD refusals guard the surrounding records:
 
-Because of the enable-ordering, authoring a hard rule from scratch is a deliberate three-step sequence — which is the write-time integrity model made visible:
+- **A guardrail must name an existing discipline.** `upsertGuardrail` refuses an orphaned guardrail — one whose `disciplineId` resolves to nothing — because it measures nothing.
+- **A referenced discipline cannot be deleted.** `deleteDiscipline` is refused while any segment still carries it via `ai_segment_discipline`, naming every referring segment and the enabled operations that compose them — deleting underneath a live composition would silently narrow those operations. Once unreferenced, its guardrails cascade-delete with the row.
+- **Removing the last guardrail is allowed but loud.** `deleteGuardrail` is never refused, but if it strips a discipline's *last* guardrail it logs an audited warning: that discipline now has no brake and will fail `validateDisciplineSet` until it gains another.
+
+Authoring a new discipline and its guardrail is therefore a short, ordered sequence — the guardrail write requires the discipline to already exist:
 
 <Steps>
 
-1. **Draft the discipline disabled.** A hard rule needs a rationale even when disabled, but may name a not-yet-existent check while it is off.
+1. **Create the discipline.** No `tier`, no `authority`, no `enabled` — just the rule.
 
    ```ts
    import { disciplinesService } from './disciplines.service.js';
 
-   await disciplinesService.createDiscipline(
-     {
-       id: 'my-app/cite-policy-clause',
-       tier: 'hard',
-       appliesTo: [],
-       authority: 'app',
-       checkId: 'check-cite-policy-clause',
-       rationale:
-         'A conclusion about a policy that does not quote the clause it rests on cannot be audited.',
-       body:
-         'Quote the clause before stating a conclusion about it. If no clause supports the conclusion, say so instead of concluding.',
-       enabled: false,
-     },
-     'app', // actingAuthority — the HTTP API acts at most at 'app'
-   );
-   ```
-
-2. **Create the check.** It must name an existing discipline, so the draft above has to come first.
-
-   ```ts
-   await disciplinesService.upsertCheck({
-     id: 'check-cite-policy-clause',
-     disciplineId: 'my-app/cite-policy-clause',
-     kind: 'deterministic',
-     config: { builtin: 'coverage-reported' },
-     enabled: true,
+   await disciplinesService.createDiscipline({
+     id: 'my-app/cite-policy-clause',
+     name: 'Cite the policy clause',
+     promptText:
+       'Quote the clause before stating a conclusion about it. If no clause supports the conclusion, say so instead of concluding.',
+     flavour: 'constraint',
    });
    ```
 
-3. **Enable the rule.** Now the check exists and is live, so the integrity gate passes.
+2. **Attach a guardrail.** It must name the discipline above, so the discipline has to exist first. Without at least one guardrail the record is an approach, not a discipline.
 
    ```ts
-   await disciplinesService.updateDiscipline(
-     'my-app/cite-policy-clause',
-     { enabled: true },
-     'app',
-   );
+   await disciplinesService.upsertGuardrail({
+     id: 'guardrail-cite-policy-clause',
+     disciplineId: 'my-app/cite-policy-clause',
+     kind: 'deterministic',
+     config: { builtin: 'source-verification', itemsPath: 'clauses', matchMode: 'normalized' },
+   });
    ```
+
+3. **List it in a disciplines segment.** Membership is the switch — adding it to a segment's disciplines list is what turns it on, and that write runs `validateDisciplineSet` over the resulting set. See [Prompt Model](/modules/ai-core/prompt-model/) for the segment API.
 
 </Steps>
 
 ### At resolution time — every call re-validates
 
-Write-time checks guard the admin surface, but records change between writes, so the hierarchy has to hold again at the moment of use. `aiCore.run` re-validates the operation's resolved discipline set on **every call** and refuses loudly — a `discipline-integrity-violation` — rather than running in a degraded shape nobody asked for. The resolver validates the set as it resolves the operation, and the run engine re-checks the resolved set before it assembles a prompt.
+Write-time checks guard the admin surface, but records change between writes, so the pairing has to hold again at the moment of use. `aiCore.run` resolves the disciplines reached through the operation's segments (including any `systemWide` operation's segments folded in) and calls the **same** `validateDisciplineSet` on **every call**. A violation refuses loudly — a `discipline-integrity-violation` — rather than running in a degraded shape nobody asked for.
 
-Critically, both moments call the **same** function, `validateDisciplineSet(ids)`, so the two enforcement points cannot drift apart. It returns machine-readable kebab violations so either caller can name the exact problem:
-
-| Violation | Meaning |
-|---|---|
-| `unknown-discipline:<id>` | The operation references a rule that does not exist. |
-| `discipline-disabled:<id>` | A referenced rule is disabled. |
-| `hard-rule-without-check:<id>` | An enabled hard member has a null `checkId`. |
-| `hard-check-missing:<id>` | Its check id resolves to nothing. |
-| `hard-check-disabled:<id>` | Its check exists but is disabled. |
-
-This is stronger than the startup-barrier fallback the design originally reached for: a violation is refused at the exact moment it is attempted — a raced admin write cannot cause a silent bad run — not discovered at the next restart.
+Because both moments call one function, a raced admin write cannot cause a silent bad run: the resolver re-checks the resolved set before it assembles a prompt, and refuses at the exact moment the bad set would be used — not at the next restart.
 
 ---
 
-## The two failure modes are detectable, not prevented
+## The seam is managed, not closed
 
-Nobody closes the seam between the authored rule and its enforcement, so the two permanent failure modes cannot be *prevented* — only detected. The runtime does catch the important cases: `hard-rule-without-check` and the missing/disabled-check violations mean an unreferenced *hard* rule can never resolve, and the CRUD refusals stop most orphaning at the source. But a `default` or `guideline` rule may legitimately run unchecked, and a check deleted out from under a non-hard rule is logged rather than refused — its pointer simply dangles.
+Nobody closes the seam between the authored rule and its enforcement, so AI Core does not claim to prevent every gap — it makes each one loud at the moment it would matter. The strong cases *are* refused: an unguarded discipline can never resolve into a run (`discipline-without-guardrail`), an orphaned guardrail is refused at write, a referenced discipline cannot be deleted, and a model-scored guardrail whose scorer is gone refuses rather than passing silently. The one deliberately-permitted gap — deleting a discipline's last guardrail — is allowed but logged loudly, and caught at the next resolution.
 
-Catching *those* before they ship — a lint over the seeded rules and checks for orphaned checks and unreferenced rules — is **planned**, not built. It is tracked on the [Roadmap](/modules/ai-core/roadmap/).
+A few `config-io` **replace-mode** edge cases remain — a scorer operation or an eval case orphaned by a self-inconsistent hand-authored replace, and create-path provenance under a transient database failure. They are narrow, low-severity, and the resolver still refuses at run time in every one; they are tracked on the [Roadmap](/modules/ai-core/roadmap/).
 
 ---
 
 ## Related
 
-- **[Prompt Model](/modules/ai-core/prompt-model/)** — where the discipline↔guardrail pairing sits in the settled two-layer prompt taxonomy, and why seeding a discipline always means seeding its guardrail.
-- **[Prompt Assembly](/modules/ai-core/prompt-assembly/)** — how a discipline's body is wrapped and ordered into the prompt sent to the model.
-- **[Registering & Seeding](/modules/ai-core/registering-and-seeding/)** — the mechanics of an app authoring its own disciplines and checks, and the register-vs-seed distinction.
-- **[Data Model](/modules/ai-core/data-model/)** — the full `ai_discipline` and `ai_guardrail_check` table shapes.
+- **[Prompt Model](/modules/ai-core/prompt-model/)** — where the discipline↔guardrail pairing sits in the v2 segment model, how approaches and disciplines are the lists inside their segments, and why seeding a discipline always means seeding its guardrail.
+- **[Prompt Assembly](/modules/ai-core/prompt-assembly/)** — how a discipline's body is wrapped and ordered into the prompt, and how a per-membership `important` flag restates it at the tail.
+- **[Registering & Seeding](/modules/ai-core/registering-and-seeding/)** — the mechanics of an app authoring its own disciplines and guardrails.
+- **[Data Model](/modules/ai-core/data-model/)** — the full `ai_discipline` and `ai_guardrail` table shapes.
 - **[Usage](/modules/ai-core/usage/)** — where disciplines and guardrails sit in the wider design, alongside schema, feedback and flows.
