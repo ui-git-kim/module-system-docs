@@ -164,6 +164,10 @@ export default defineConfig({
                   label: "Icon Picker",
                   slug: "starter-template/icon-picker",
                 },
+                {
+                  label: "Colour Picker",
+                  slug: "starter-template/colour-picker",
+                },
               ],
             },
             {

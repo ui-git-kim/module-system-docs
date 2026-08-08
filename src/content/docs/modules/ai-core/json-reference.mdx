@@ -1,0 +1,196 @@
+---
+title: JSON Import & Export
+description: Set up an app's whole prompting from one model-agnostic JSON — import (merge/replace) and export markers, segments, presets, disciplines, checks, operations, flows and eval cases
+sidebar:
+  order: 6.5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+AI Core's admin page supports full JSON import and export of an app's **prompting configuration** — markers, prompt segments, presets, disciplines and their guardrail checks, operations, flows and evaluation cases. Use it to back up your setup, migrate between environments, share a prompting design between apps, or seed a fresh install from one file.
+
+The config is deliberately **model-agnostic**. It never names a model. An operation carries the model *requirements* it needs (a language model, or an embedding model of a given width); the actual model is a database record the admin binds in the **Operations** tab. That keeps the file portable — the same config runs against whatever model palette a target install has enabled.
+
+---
+
+## Overview
+
+The **Export config** and **Import config** controls live in the admin page's **Config** tab (AI Core → Config).
+
+- **Export** downloads a single JSON file containing every prompting record, each tagged with its provenance (`seeded` — a shipped default vs an admin-authored record).
+- **Import** accepts any combination — only the sections present in the JSON are processed. An absent array is left untouched; the rest are applied.
+- **Two import modes:** **Merge** (add new, update existing) and **Replace** (the same, then delete records the config omits — never a seeded one).
+- **Import is per-item.** A malformed or refused record is reported, and the rest still apply. The result is a report saying exactly what was created, updated, deleted and skipped, with reasons.
+
+<Aside type="caution" title="Replace mode deletes omitted records">
+In **Replace** mode, any existing **non-seeded** record of an entity type present in the import that the import does **not** contain is deleted (its FK/authority delete guards still apply — a record still referenced by an enabled operation, or an `ai-core`-authority discipline, is a **named skip**, never force-deleted). **Seeded records are never deleted** — the shipped behavioural defaults, the judges and the seeded markers are AI Core's equivalent of "system" records. An **absent** array (one you leave out of the file) triggers **no** deletion for that entity; an **empty** array (`[]`) means "there should be none — delete the rest". Use **Merge** for incremental updates.
+</Aside>
+
+<Aside type="note" title="Merge updates existing records">
+Merge is Structure-parity: it upserts every record in the config, **updating existing records** — including ones an admin has edited — to the config's values. It never deletes. Every create and update is itemised in the import report, so an overwrite is visible, never silent. If you want to protect hand-tuned records, keep them out of the config file you import.
+</Aside>
+
+---
+
+## Complete export format
+
+When you click **Export config**, the downloaded JSON follows this shape:
+
+```json
+{
+  "version": "1.0",
+  "exportedAt": "2026-08-07T10:30:00.000Z",
+  "markers":     [ /* Marker objects */ ],
+  "segments":    [ /* Segment objects */ ],
+  "presets":     [ /* Preset objects */ ],
+  "disciplines": [ /* Discipline objects */ ],
+  "checks":      [ /* GuardrailCheck objects */ ],
+  "operations":  [ /* Operation objects */ ],
+  "flows":       [ /* Flow objects */ ],
+  "evalCases":   [ /* EvalCase objects */ ]
+}
+```
+
+`version` is `"1.0"` for the current format and `exportedAt` is an ISO timestamp. Every entity array is optional on import — you can import a file with only `markers`, only `operations`, or any combination. Unknown fields are ignored, so an exported file re-imports cleanly.
+
+What the export deliberately **omits**: surrogate database ids where a natural key exists (segments export by `key`, presets by `name`), the `createdAt`/`updatedAt`/`version` audit columns, an operation's bound model id, and anything that is runtime content rather than an authored config record. What it **includes**: each record's `seeded` flag, so provenance round-trips.
+
+---
+
+## Entity reference
+
+### Marker
+
+```json
+{ "id": "source", "meaning": "Stored or retrieved material to draw on...", "renderingHint": null, "enabled": true, "seeded": true }
+```
+
+Matched by `id`. `meaning` is the text stated to the model when this marker is in use; `renderingHint` is an optional tag-prefix hint the framework may honour. `injectionRisk` is **not** here — that is a per-call, app-set flag on a content item, never a stored config value.
+
+### Segment
+
+```json
+{ "key": "voice-plain-language", "type": "voice", "name": "Plain language", "content": "Write clearly...", "enabled": true, "seeded": false }
+```
+
+Matched by `key`. `type` is one of `voice`, `approach`, `discipline-text`, `schema-instruction`, `markers-preamble`, `injection-notice`.
+
+### Preset
+
+```json
+{ "name": "balanced", "dials": { "effort": "medium", "outputRichness": "standard" }, "seeded": false }
+```
+
+Matched by `name`. `dials` is the dial bundle (see [Configuration](/modules/ai-core/configuration/)).
+
+### Discipline
+
+```json
+{ "id": "my-app/cite-policy", "tier": "default", "authority": "app", "appliesTo": [],
+  "checkId": null, "rationale": null, "body": "Quote the clause you rely on.", "enabled": true, "seeded": false }
+```
+
+Matched by `id`. `tier` is `hard | default | guideline`; `authority` is `ai-core | app | user`. Import acts with **`app`** authority, so it can create `app`/`user` disciplines but **cannot edit or create an `ai-core`-authority discipline** — those are the foundation seeds and such a record is reported as a named skip. A `hard` discipline requires a `rationale` and an enabled check.
+
+### Guardrail check
+
+```json
+{ "id": "cite-policy-check", "disciplineId": "my-app/cite-policy", "kind": "deterministic", "config": {}, "enabled": true, "seeded": false }
+```
+
+Matched by `id`. `kind` is `deterministic | classifier | grounding`. Disciplines and checks are imported together in a three-step pass so their mutual references resolve: hard disciplines are created disabled, their checks are created, then the disciplines are enabled.
+
+### Operation
+
+```json
+{
+  "id": "extract-entities",
+  "description": "Pull named organisations from a document",
+  "requirements": { "kind": "language" },
+  "presetName": "balanced",
+  "disciplineIds": ["ai-core/no-sycophancy"],
+  "segmentKeys": ["voice-plain-language"],
+  "schema": { "type": "object", "properties": { "entities": { "type": "array" } } },
+  "dials": {},
+  "cache": null,
+  "evalConfig": null,
+  "sensitivity": "normal",
+  "enabled": true,
+  "seeded": false
+}
+```
+
+Matched by `id` (the public job name). **`requirements` replaces a model** — `{ kind: "language" | "embedding" | "rerank", dimensions?, multimodal?, needsImageInput? }`. The preset is referenced by its portable `presetName`, not a database id.
+
+<Aside type="note" title="Operations bind a model on import">
+On **create**, an operation's `requirements` auto-select a local model (the same resolution `ensureOperation` uses); if no enabled model matches, the operation is **skipped and named** so you can enable or bind a model, then re-import. On **update**, the operation's existing model binding is **left untouched** — config never overwrites the model you chose in the Operations tab; only the prompt composition changes. Either way, set the exact model in the **Operations** tab.
+</Aside>
+
+### Flow
+
+```json
+{ "id": "review-then-summarise", "name": "Review then summarise", "description": null,
+  "steps": [ { "kind": "operation", "operationId": "review" }, { "kind": "operation", "operationId": "summarise" } ],
+  "enabled": true }
+```
+
+Matched by `id`. Flows carry no `seeded` flag (AI Core ships none), so under **Replace** any flow the config omits is deletable.
+
+### Eval case
+
+```json
+{ "id": "my-app/extract-1", "operationId": "extract-entities", "label": "basic",
+  "input": { "segments": [ { "type": "task", "content": "..." } ] },
+  "reference": { "answer": "..." }, "tags": [], "enabled": true, "seeded": false }
+```
+
+Matched by `id`. An eval case has no other natural key, so a **stable `id` is required** — a case without one is skipped and named.
+
+---
+
+## Import modes and semantics
+
+<Steps>
+
+1. **Merge (default, safe).** For every record in the config: create it if missing, update it if it exists (matched by the natural key above). Nothing is deleted. Every create and update is itemised in the report.
+
+2. **Replace.** The same upsert pass, then — for each entity type the config carries — delete the non-seeded records that the config omits. Seeded records are never deleted. Deletes reuse the same guards the admin CRUD uses; a record still referenced by an enabled operation, or an `ai-core`-authority discipline, is a named skip.
+
+</Steps>
+
+**Provenance and round-trips.** Each record's `seeded` flag is restored from the config on import, so `export → import → export` is stable (bar the `exportedAt` timestamp). A re-import of unchanged content does not churn versions or flip provenance.
+
+**Dependency order.** Records are imported roots-first — markers, segments, presets, then disciplines + checks, then operations (which reference presets, disciplines and segments), then flows (which reference operations), then eval cases. Deletes under Replace run leaf-first, the reverse, so a referenced record is only removed after its referrers.
+
+---
+
+## The import report
+
+The import returns a per-entity report — the same detail the Config tab renders:
+
+```json
+{
+  "mode": "merge",
+  "entities": [
+    { "entity": "markers", "created": 2, "updated": 1, "deleted": 0, "skipped": [], "notes": [] },
+    { "entity": "operations", "created": 1, "updated": 0, "deleted": 0,
+      "skipped": [ { "id": "summarise", "reason": "No enabled model satisfies the requirements..." } ],
+      "notes": [ "operation \"extract-entities\" bound to a model auto-selected from its requirements — change it in the Operations tab if needed" ] }
+  ]
+}
+```
+
+`skipped` names every record that did **not** apply and why; `notes` are advisories about records that did (an auto-bound model, a preset that could not be resolved). A partial import states exactly what did and did not apply — it is never presented as a clean pass.
+
+---
+
+## API surface
+
+The Config tab calls two admin routes (both `requireAdmin`):
+
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/ai-core/admin/config/export` | Serialise the current records to the config JSON |
+| `POST` | `/api/v1/ai-core/admin/config/import?mode=merge\|replace` | Apply a config (body = the JSON), returning the import report |
+
+The mode is a query parameter; the request body is the config JSON exactly as exported. See the [Service API](/modules/ai-core/service-api/) for the consumer surface (`aiCore.run`, `ensureOperation`, and the other seeding helpers) that this config layer sits alongside.
