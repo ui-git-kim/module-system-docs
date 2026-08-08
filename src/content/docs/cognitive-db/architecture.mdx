@@ -106,6 +106,35 @@ Entity types and relationship types are **not** hardcoded string unions. They ar
 
 The engine ships a **base ontology** (`src/ontology/base-ontology.ts`) and the consuming application supplies its own concept and relationship types through `initConfig()`. Growing the ontology for a new domain is a configuration change, never an engine code change — this is the *generic, not app-specific* principle in force.
 
+The ontology definitions and the concrete instances that point at them via `instanceOf` form one **semantic knowledge graph** — a typed layer sitting above the data it classifies:
+
+```text
++---------------------------------------------------------------------------+
+|                       SEMANTIC KNOWLEDGE GRAPH                             |
+|  +---------------------------------------------------------------------+  |
+|  |  ONTOLOGY GRAPH (isOntology = true — concepts & relationship types) |  |
+|  |  [Entity]                                                           |  |
+|  |     |-- [Person] -- [FamilyMember]                                  |  |
+|  |     |-- [Place]   [Colour]                                          |  |
+|  |     |-- [Emotion] -- [Love], [Concern]                              |  |
+|  |     +-- [CognitiveProcess] -- [Memory], [Decision], [Question]      |  |
+|  |  relationship types:  loves: Person -> Entity                       |  |
+|  |                       triggers: Entity -> Memory                     |  |
+|  |                       owns: Entity -> Entity                         |  |
+|  |                       explained_by: Entity -> Entity (meta)          |  |
+|  +---------------------------------------------------------------------+  |
+|                          | instanceOf (explicit typing)                   |
+|  +-----------------------+---------------------------------------------+  |
+|  |  INSTANCE GRAPH (isOntology = false — data + discovered connections)|  |
+|  |  [Kim] --loves--> [purple] --triggers--> [memory:grandmother:garden]|  |
+|  |                                                 | about             |  |
+|  |                        [grandmother] --owns--> [garden]             |  |
+|  |  meta-connection:                                                   |  |
+|  |  [loves:kim:purple] --explained_by--> [loves:kim:grandmother]       |  |
+|  +---------------------------------------------------------------------+  |
++---------------------------------------------------------------------------+
+```
+
 ## Connections as first-class, versioned nodes
 
 Because a connection is a node (`nodeType = 'connection'`), it is far more than an edge in a lookup table.
@@ -113,6 +142,88 @@ Because a connection is a node (`nodeType = 'connection'`), it is far more than 
 - It carries its own `strength`, `confidence` and full version history — a connection can be strengthened, weakened or superseded over time with a recorded reason, exactly like an entity.
 - It can have **its own connections**. A connection between two nodes can be linked to the reasoning that justified it — a *meta-connection*. This is how the engine models **N-way** relationships that a rigid two-node edge table could never express (a gap explicitly called out when the old multi-table schema was retired).
 - It can have its own `embedding` and `metadata`, so connections are themselves discoverable and searchable.
+
+## Deep perception: a worked example
+
+Perception is graded — it extracts far more than the named entities. Given the single sentence *"I love purple, it reminds me of my grandmother's garden"*, the engine works down seven levels of depth:
+
+| Level | What's extracted | From the example |
+|---|---|---|
+| **1 — Explicit** | Directly stated entities | purple, grandmother, garden |
+| **2 — Implicit** | Must exist given context | the grandmother has/had a garden |
+| **3 — Inferred** | Reasonable conclusions | purple things (flowers?) in the garden |
+| **4 — Emotional** | Feelings and their targets | love → purple, love → grandmother |
+| **5 — Cognitive** | Mental processes | a memory triggered by a colour |
+| **6 — Meta** | Connections about connections | love of purple *explained by* the grandmother association |
+| **7 — Questions** | What's unknown but relevant | Is the grandmother still alive? Where was the garden? |
+
+Each of those becomes a row in `cog_node` — the same shape throughout, distinguished by `nodeType` / `subType` and typed against the ontology via `instanceOf`:
+
+```yaml
+# CONTENT NODE — the raw input plus its perceived summary
+- id: content-001
+  nodeType: content
+  rawContent: "I love purple, it reminds me of my grandmother's garden"
+
+# ENTITY NODES — nodeType 'entity', refined by subType, typed via instanceOf
+- id: entity-purple
+  nodeType: entity
+  subType: colour
+  instanceOf: Colour
+- id: entity-grandmother
+  nodeType: entity
+  subType: person
+  instanceOf: Person.FamilyMember
+- id: entity-garden
+  nodeType: entity
+  subType: place
+  instanceOf: Place
+
+# COGNITIVE PROCESS — a memory, triggered by the colour
+- id: memory-grandmother-garden
+  nodeType: entity
+  subType: memory
+  instanceOf: CognitiveProcess.Memory
+  data: { trigger: "purple" }
+
+# CONNECTION NODES — relationships are first-class nodes
+- id: conn-001            # stated in the input
+  nodeType: connection
+  fromNodeId: self
+  toNodeId: entity-purple
+  connectionType: loves
+  strength: 0.9
+  sourceType: extraction
+- id: conn-003            # inferred: loving the colour hints at loving her
+  nodeType: connection
+  fromNodeId: self
+  toNodeId: entity-grandmother
+  connectionType: loves
+  sourceType: inference
+  confidence: 0.8
+- id: conn-004            # inferred from "grandmother's garden"
+  nodeType: connection
+  fromNodeId: entity-grandmother
+  toNodeId: entity-garden
+  connectionType: owns
+  sourceType: inference
+  changeReason: "Possessive 'grandmother's garden' implies ownership"
+
+# META-CONNECTION — a connection whose endpoints are themselves connections
+- id: meta-001
+  nodeType: connection
+  fromNodeId: conn-001    # loves purple …
+  toNodeId: conn-003      # … explained by loving the grandmother
+  connectionType: explained_by
+
+# QUESTION NODE — an open question the engine keeps for later
+- id: question-001
+  nodeType: question
+  instanceOf: CognitiveProcess.Question
+  data: { question: "Is the grandmother still alive?", priority: low }
+```
+
+This is what *build at ingest, not retrieval* buys: the inference, the meta-connection and the open question are all discovered and persisted **now**, so a later query traverses them instead of re-deriving them.
 
 ## Versioning & provenance
 
@@ -137,6 +248,51 @@ Versioning is **atomic** — `previousVersion`/`supersededBy` form linked chains
 Not every node is embedded. The `shouldEmbed` flag keeps the pgvector index focused on things worth searching semantically — content, entities, patterns and questions are embedded; ontology and purely structural nodes are found by *type*, not by semantics, so they are left out. This avoids diluting the vector index with schema metadata.
 
 Search built on this index is **filtered semantic search** (embeddings scoped by `nodeType`, `userId`, status and similar). It is referred to as "hybrid" search in the codebase, but note it is currently a filtered semantic search only — a lexical/keyword blend is **not yet built**.
+
+## Query-time reconstruction
+
+Because connections are discovered and persisted at ingest, a query does not *search for* meaning — it **traverses** a graph that already holds it. A "what do I feel strongly about?" query reconstructs its answer from the pre-built structure rather than re-analysing raw content:
+
+<Steps>
+
+1. **Entry points** — semantic search seeds the query with the most relevant nodes.
+
+2. **Ontology expansion** — the matched `Emotion` concept expands to its subclasses (`Love`, `Concern`, `Fear`, …) so every kind of feeling is in scope.
+
+3. **Traverse connections** — follow the emotion connections (`loves`, `fears`, `concerned_about`, …) out to their targets.
+
+4. **Expand context** — pull the surrounding subgraph a hop or two out, including meta-connections.
+
+5. **Reconstruct** — assemble the targets, their explanations and any open questions into a narrative answer.
+
+</Steps>
+
+```typescript
+// Conceptual — illustrates the traversal shape, not the exact v1.0.0 API.
+async function queryFeelings(userId: string) {
+  // 1. Entry points via semantic search
+  const seeds = await semanticSearch({ query: 'feelings emotions love concern', userId, topK: 100 });
+
+  // 2. Ontology expansion: "feelings" -> Emotion and all its subclasses
+  const emotionTypes = await getSubClasses('Emotion');        // [Love, Concern, Fear, …]
+
+  // 3-4. Find emotion connections, traverse to targets, then expand the surrounding context
+  const connections = await findConnections({ connectionTypes: emotionTypes, userId });
+  const context = await expandSubgraph({ seedNodes: connections.map(c => c.toNodeId), maxDepth: 2 });
+
+  // 5. Reconstruct a narrative answer from the pre-built graph
+  return {
+    directAnswers: [
+      { entity: 'purple', emotion: 'love', strength: 0.9, via: 'colour preference' },
+      { entity: 'grandmother', emotion: 'love', strength: 0.8, via: 'family' },
+    ],
+    relatedContext: [
+      { node: "grandmother's garden", connection: 'explains love of purple' },
+    ],
+    openQuestions: ['Is the grandmother still alive?'],
+  };
+}
+```
 
 ## Working memory: tracked, not owned
 

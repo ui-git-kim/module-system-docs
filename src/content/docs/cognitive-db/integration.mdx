@@ -60,7 +60,7 @@ initConfig({
 
   // 3. Embeddings — functions the app supplies (model name is for tracking only)
   embedding: {
-    model: 'voyage-3',       // recorded on each node for provenance
+    model: 'voyage-3.5',     // recorded on each node for provenance
     dimensions: 1024,        // MUST match your vector column width
     embed,                   // (text) => Promise<EmbeddingResult>   — required
     embedBatch,              // optional batch variant
@@ -92,8 +92,24 @@ Note that `llm.model` is a **pre-configured `LanguageModel`** — you build the 
 The keys the engine hands back through helpers (`getConfig`, `isFeatureEnabled`, `getEmbeddingDimensions`, `getPrismaClient`) are all read from this one config object. If you call a service before `initConfig()`, you get a clear `CognitiveDB: Not initialized` error.
 
 <Aside type="caution" title="Dimensions must match">
-`embedding.dimensions` must equal the width of your `vector(N)` column and your model's actual output. A mismatch fails at query time, not at config time. `voyage-3` is 1024; `text-embedding-3-small` is 1536; `text-embedding-3-large` is 3072.
+`embedding.dimensions` must equal the width of your `vector(N)` column and your model's actual output. A mismatch fails at query time, not at config time. `voyage-3.5` is 1024; `text-embedding-3-small` is 1536; `text-embedding-3-large` is 3072.
 </Aside>
+
+### Feature flags
+
+Perception is modular. The optional `features` block on `initConfig()` toggles which extraction passes run — omit it to accept the defaults, or switch individual passes off to trade depth for cost.
+
+```typescript
+features: {
+  entityExtraction: true,       // extract entities from content
+  relationshipDiscovery: true,  // discover relationships between entities
+  patterns: true,               // detect behavioural patterns
+  proactive: true,              // proactive insights (contradictions, gaps, …)
+  understanding: false,         // deeper whole-content understanding
+},
+```
+
+Each flag maps to a field on `FeaturesConfig`; all are optional booleans.
 
 ### The no-content-duplication contract: `sourceId` + `sourceType`
 
@@ -152,6 +168,66 @@ Setting `mode: 'standalone'` requires a `connectionString`, but the standalone c
 All engine tables are prefixed **`cog_`** (`cog_node`, `cog_working_memory_event`, `cog_processing_log`) so they never collide with your app's tables when they share a database. The prefix is configurable via `database.tablePrefix` but defaults to — and is expected to stay — `cog_`.
 
 A related design habit worth adopting: **new configuration goes into existing JSON columns wherever possible, to avoid schema migrations.** The engine's per-node `data` and `metadata` JSON fields, and the consuming module's `config` JSON on its source records, are where new options land — so shipping a new capability rarely means an `ALTER TABLE`. See the [Cog Ingest configuration page](/modules/cog-ingest/configuration/) for how the module leans on this.
+
+### Direct LLM and embedding access
+
+Most apps only touch `IngestService` and `SearchService`, but the engine also re-exports the low-level primitives it uses internally, so you can reach the same configured LLM and embedding functions directly.
+
+```typescript
+import { generate, extract, llm } from 'cognitive-db';
+import { z } from 'zod';
+
+// Free-form generation against your configured model
+const summary = await generate('Summarise this: …', {
+  system: 'You are a helpful assistant',
+  temperature: 0.5,
+});
+
+// Structured extraction with a Zod schema — output is coerced to the schema
+const data = await extract(
+  z.object({
+    people: z.array(z.string()),
+    places: z.array(z.string()),
+    sentiment: z.enum(['positive', 'negative', 'neutral']),
+  }),
+  'Kim visited Melbourne with Sarah. It was a great trip!',
+  { system: 'Extract entities and sentiment' },
+);
+
+// The same two calls are also available under the `llm` namespace
+const text = await llm.generate('Hello');
+```
+
+Embeddings are exposed the same way, wrapping the functions you supplied in `initConfig()`:
+
+```typescript
+import { embed, embedBatch, embedQuery } from 'cognitive-db';
+
+const one   = await embed('Some text to embed');       // EmbeddingResult
+const many  = await embedBatch(['Text 1', 'Text 2']);  // BatchEmbeddingResult
+const query = await embedQuery('search query');        // query-side variant
+```
+
+<Aside type="note" title="Chunking is not the engine's job">
+Long content is summarised before the node-level embedding — the engine never embeds truncated raw text. Per-chunk vectors for full-document retrieval are produced upstream by the ingesting module (Cog Ingest's splitter → Structure chunk store), not by the engine.
+</Aside>
+
+### Type exports
+
+Every public type is exported from the package root for `import type` use:
+
+```typescript
+import type {
+  // Config
+  CognitiveDBConfig, LLMConfig, EmbeddingConfig, DatabaseConfig, FeaturesConfig,
+  // Nodes
+  Node, ContentNode, EntityNode, ConnectionNode, PatternNode,
+  // Results
+  EmbeddingResult, BatchEmbeddingResult, SearchResult, IngestResult,
+  // Options
+  GenerateOptions, ExtractOptions, SearchOptions,
+} from 'cognitive-db';
+```
 
 ---
 
@@ -231,6 +307,18 @@ npm link cognitive-db
 ```
 
 As noted above, the Cog Ingest lifecycle hook detects this symlink and skips its vendored install, so the linked checkout wins.
+
+---
+
+## Troubleshooting
+
+Three errors account for almost every failed integration.
+
+**`CognitiveDB: Not initialized`** — a service was constructed or called before `initConfig()` ran. Call `initConfig()` once at app startup, before any `IngestService` / `SearchService` / repository is used.
+
+**`embedding.model is required`** — the `embedding.model` field is mandatory (it is recorded on every node for provenance). Add it alongside `dimensions` and your `embed` function.
+
+**Type errors on `llm.model`** — `llm.model` must be a Vercel AI SDK `LanguageModel`: the object returned by a provider factory (`createAnthropic(...)('claude-sonnet-4-20250514')`), not a provider name or an API-key string.
 
 ---
 
