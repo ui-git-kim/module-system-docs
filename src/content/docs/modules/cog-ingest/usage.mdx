@@ -17,13 +17,13 @@ This page covers how to use Cog Ingest after installation — the UI pages, API 
 
 The main page where users submit content for processing. It includes:
 
-- **Content type tabs** — switch between Text, URL, Image, and PDF input
+- **Content type tabs** — switch between Text, URL, Image, PDF, Office, Audio, Transcript, and RSS input (which tabs appear depends on the source's enabled input methods)
 - **Source selector** — choose from admin-configured ingest sources
 - **Dynamic context fields** — if the selected source has configured context fields, they appear between the source selector and the content input. Each field renders with a type-appropriate UI component (text input, textarea, select dropdown, multiselect toggle badges, date picker, number input, switch, or comma-separated tags input). Required fields must be filled before submission. Default values from the source config are applied when the source is selected. (v1.5.0)
 - **Stats row** — total jobs, nodes created, connections found, tokens used
 - **Recent jobs** — list of recent ingestion jobs with status badges
 
-Users select a source, fill in any context fields, choose a content type, and submit. For text and URL inputs, the form uses the standard mutation hook. For image and PDF uploads, it uses `FormData` with the file upload service method. Context field values are sent as `contextFields` in the request body.
+Users select a source, fill in any context fields, choose a content type, and submit. For text and URL inputs, the form uses the standard mutation hook. For file uploads (image, PDF, Office, audio/video recording, and transcript files), it uses `FormData` with the file upload service method. Context field values are sent as `contextFields` in the request body.
 
 ### Job Detail Page (`/cog-ingest/jobs/:id`)
 
@@ -117,6 +117,18 @@ interface IngestJobListOptions {
 }
 ```
 
+### RSS Feed Management (`useCogIngestRss.ts`)
+
+| Hook | Type | Purpose |
+|------|------|---------|
+| `useRssEntries(sourceId)` | Query | Fetches tracked feed entries for a source |
+| `useRssStats(sourceId)` | Query | Fetches feed entry stats (detected, ingested, skipped) |
+| `usePollRssSource()` | Mutation | Triggers a poll cycle for a feed source; invalidates `rss` queries |
+| `useIngestRssEntry()` | Mutation | Ingests a single reviewed feed entry |
+| `useSkipRssEntry()` | Mutation | Marks a feed entry as skipped |
+| `useBulkIngestRssEntries()` | Mutation | Ingests multiple feed entries at once |
+| `useBulkSkipRssEntries()` | Mutation | Skips multiple feed entries at once |
+
 ---
 
 ## Frontend Service
@@ -141,6 +153,14 @@ The API service (`services/cog-ingest.service.ts`) wraps all backend endpoints u
 | `updateEngineConfig(key, value)` | `PUT /config/:key` | Update a config section |
 | `importConfig(config)` | `POST /config/import` | Import config from JSON |
 | `exportConfig()` | `GET /config/export` | Export config as JSON |
+| `getRssEntries(sourceId)` | `GET /rss/sources/:id/entries` | List tracked feed entries |
+| `getRssStats(sourceId)` | `GET /rss/sources/:id/stats` | Feed entry stats |
+| `pollRssSource(sourceId)` | `POST /rss/sources/:id/poll` | Trigger a feed poll cycle |
+| `ingestRssEntry(entryId)` | `POST /rss/entries/:id/ingest` | Ingest one feed entry |
+| `skipRssEntry(entryId)` | `POST /rss/entries/:id/skip` | Skip one feed entry |
+| `bulkIngestRssEntries(ids)` | `POST /rss/entries/bulk-ingest` | Ingest multiple entries |
+| `bulkSkipRssEntries(ids)` | `POST /rss/entries/bulk-skip` | Skip multiple entries |
+| `testScrape(input)` | `POST /test-scrape` | Test CSS-selector field scraping against a URL |
 
 All endpoints are prefixed with `/api/v1/cog-ingest`.
 
@@ -240,7 +260,7 @@ Mappings link ingest sources to Structure node types. The POST endpoint upserts 
     |-------|------|----------|---------|
     | `sourceId` | `string` | Yes | — |
     | `content` | `string` | Yes | — |
-    | `contentType` | `'text' \| 'url' \| 'image' \| 'pdf'` | No | `'text'` |
+    | `contentType` | `'text' \| 'url' \| 'image' \| 'pdf' \| 'office' \| 'recording'` | No | `'text'` |
     | `title` | `string` | No | — |
     | `tags` | `string[]` | No | `[]` |
     | `context` | `string` | No | — |
@@ -250,6 +270,8 @@ Mappings link ingest sources to Structure node types. The POST endpoint upserts 
     | `imageData` | `string` (base64) | For images | — |
     | `imageMimeType` | `string` | For images | — |
     | `pdfData` | `string` (base64) | For PDFs | — |
+    | `fileData` | `string` (base64) | For office/recording | — |
+    | `fileMimeType` | `string` | For office/recording | — |
     | `includeVisualDescription` | `boolean` | No | — |
 
     **Response:** `201` with `{ job, result }`
@@ -276,11 +298,14 @@ Mappings link ingest sources to Structure node types. The POST endpoint upserts 
     Content-Type: multipart/form-data
     ```
 
-    Upload a file as the `file` field. Supported types:
-    - Images: JPEG, PNG, GIF, WebP (max 20 MB)
-    - PDFs: application/pdf (max 20 MB)
+    Upload a file as the `file` field (max 25 MB). Supported types:
+    - Images: JPEG, PNG, GIF, WebP
+    - PDFs: application/pdf
+    - Office documents: DOCX, XLSX, PPTX (and legacy DOC/XLS/PPT + OpenDocument ODT/ODS/ODP) — extracted via the Docling sidecar
+    - Audio/video recordings: transcribed via Docling ASR
+    - Transcript/subtitle files: `.txt`, `.md`, `.vtt`, `.srt` (cue markers stripped, ingested as text)
 
-    The route auto-detects the content type from the MIME type and converts to base64 for processing.
+    The route auto-detects the content type from the MIME type (with a filename-extension fallback) and converts binary uploads to base64 for processing.
   </TabItem>
 </Tabs>
 
@@ -343,6 +368,34 @@ GET /api/v1/cog-ingest/nodes/:nodeId/ingested
 ```
 
 Returns up to 50 completed ingest jobs associated with a Structure node, ordered by most recent.
+
+### Retrieval
+
+```
+POST /api/v1/cog-ingest/retrieve
+```
+
+Semantic/hybrid retrieval over the per-chunk vectors written during ingest (Stage-3 preview). Prefers Structure's hybrid (dense vector + BM25 lexical) search, falling back to vector-only. Body: `{ query, topK?, minScore?, nodeTypes?, expandGraph?, mode? }`. See [Service Registry → Retrieve](/modules/cog-ingest/integration/#retrieve-stage-3-preview).
+
+### RSS Feed Management
+
+```
+GET  /api/v1/cog-ingest/rss/sources/:id/entries   — List tracked feed entries
+GET  /api/v1/cog-ingest/rss/sources/:id/stats      — Feed entry stats
+POST /api/v1/cog-ingest/rss/sources/:id/poll       — Trigger a poll cycle
+POST /api/v1/cog-ingest/rss/entries/:id/ingest     — Ingest a reviewed entry
+POST /api/v1/cog-ingest/rss/entries/:id/skip       — Skip an entry
+POST /api/v1/cog-ingest/rss/entries/bulk-ingest    — Ingest multiple entries
+POST /api/v1/cog-ingest/rss/entries/bulk-skip      — Skip multiple entries
+```
+
+### Field-Scrape Test
+
+```
+POST /api/v1/cog-ingest/test-scrape
+```
+
+Tests a source's CSS-selector field-scraping rules against a URL without ingesting — used by the Acquisition tab.
 
 ---
 
@@ -419,19 +472,32 @@ The module exports all types from `types/index.ts`. Key interfaces:
 
 ```typescript
 // Content types
-type ContentType = 'text' | 'url' | 'image' | 'pdf';
+type ContentType = 'text' | 'url' | 'image' | 'pdf' | 'office' | 'recording';
 
-// Source configuration (v1.5.0) — stored in IngestSource.config
+// Source configuration — stored in IngestSource.config
 interface SourceConfigJson {
-  contextFields: ContextField[];
-  extraction?: ExtractionFocus;
+  input: InputConfig;                       // required — enabled input methods + per-type validation
+  acquisition?: AcquisitionConfig;
+  preprocessing?: PreprocessingConfig;
+  contentHandling?: ContentHandlingConfig;  // chunking, cleaning, dedup, quarantine, QA, provenance
+  autoIngest?: AutoIngestConfig;
+  processingMode?: 'default' | 'sync' | 'async';
+  rss?: RssConfig;
+  contextFields: ContextField[];            // required
+  aiContextFieldKeys?: string[];
+  entityTypes?: EntityTypeDefinition[];
+  relationshipTypes?: RelationshipTypeDefinition[];
+  outputSchema?: OutputSchema;
+  extractionFeatures?: ExtractionFeatures;
   prompts?: SourcePromptOverrides;
-  autoTags: AutoTagRule[];
+  postIngest?: ActionsConfig;
+  integrity?: ContentIntegrityConfig;
+  autoTags: AutoTagRule[];                  // required
   ui?: SourceUIConfig;
-  validation?: SourceValidationConfig;
 }
 
 interface ContextField {
+  enabled: boolean;   // gates whether the field renders on the ingest form (defaults true)
   key: string;
   label: string;
   description?: string;
@@ -464,7 +530,7 @@ interface IngestJob {
   id: string;
   userId: string;
   sourceId: string;
-  status: 'queued' | 'processing' | 'completed' | 'failed';
+  status: 'queued' | 'processing' | 'completed' | 'failed' | 'skipped' | 'quarantined';
   title: string | null;
   input: Record<string, unknown>;
   result: Record<string, unknown> | null;
@@ -473,6 +539,7 @@ interface IngestJob {
   connectionsFound: number;
   durationMs: number;
   error: string | null;
+  provenance: ContentProvenance | null;
   structureNodeId: string | null;
   createdAt: string;
   updatedAt: string;

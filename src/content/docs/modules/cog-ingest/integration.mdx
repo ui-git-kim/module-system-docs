@@ -1,7 +1,7 @@
 ---
 title: Integration
 description: How other modules depend on and integrate with Cog Ingest
-lastUpdated: 2026-08-01
+lastUpdated: 2026-08-09
 sidebar:
   order: 3
 ---
@@ -16,7 +16,7 @@ Cog Ingest fires action hooks when content is ingested, sources change, or worki
 
 <CardGrid>
   <Card title="React to Ingest Events" icon="rocket">
-    Listen to 14 action hooks — run logic when content is ingested, sources change, config is updated, visual extraction completes, or working memory changes.
+    Listen to 18 action hooks — run logic when content is ingested (including skipped and quarantined outcomes), sources change, config is updated, visual extraction completes, or working memory changes.
   </Card>
   <Card title="Transform the Pipeline" icon="list-format">
     Apply filters before and after ingestion to modify input or enrich results.
@@ -48,25 +48,27 @@ If your module depends on Cog Ingest, declare it in your `module.ts`:
 ```typescript
 export const moduleDefinition: ModuleDefinition = {
   id: 'my-analysis',
-  requiredModules: ['cog-ingest'],
+  depends: { 'cog-ingest': '*' },  // or a real range, e.g. '>=1.21.0'
   // ...
 };
 ```
 
-The init script verifies Cog Ingest exists in both frontend and backend feature directories before proceeding.
+The init script verifies Cog Ingest exists in both frontend and backend feature directories before proceeding. (The legacy `requiredModules: ['cog-ingest']` array still works but is deprecated in favour of the `depends` map.)
 
 ---
 
 ## Action Hooks
 
-Cog Ingest fires **16 action hooks** that other modules can listen to. Every hook fires via `doActionAll`, so listeners registered with `addAction` (sync) **and** `addActionAsync` (async) both run. The eleven ingest/config/RSS hooks are awaited (`await actionRegistry.doActionAll()`) in the backend; the five working-memory hooks fire through a catch-guarded fire-and-forget helper so a failing listener can't break the chat hot path. Before v1.12.2 the ingest/config hooks used `doAction()`, which silently skipped async listeners.
+Cog Ingest fires **18 action hooks** that other modules can listen to. Every hook fires via `doActionAll`, so listeners registered with `addAction` (sync) **and** `addActionAsync` (async) both run. The thirteen ingest/config/RSS hooks are awaited (`await actionRegistry.doActionAll()`) in the backend; the five working-memory hooks fire through a catch-guarded fire-and-forget helper so a failing listener can't break the chat hot path. Before v1.12.2 the ingest/config hooks used `doAction()`, which silently skipped async listeners.
 
 ### Hook Reference
 
 | Hook | Fired When | Context Shape |
 |------|-----------|---------------|
 | `cog-ingest.ingest.completed` | An ingest job finishes successfully | `{ userId, job, result, source }` |
-| `cog-ingest.ingest.failed` | An ingest job fails | `{ userId, jobId, error, source }` |
+| `cog-ingest.ingest.failed` | An ingest job fails | `{ userId, jobId, error, source }` (`source` is `null` when a queued job fails pre-validation) |
+| `cog-ingest.ingest.skipped` | Content is unchanged under the current pipeline stage, so the engine is skipped (change-detection gate) | `{ userId, job, priorJobId, source }` |
+| `cog-ingest.ingest.quarantined` | A deterministic dedup/quality gate trips; content is not processed and the job lands in the `quarantined` terminal state | `{ userId, job, quarantine, source }` |
 | `cog-ingest.source.created` | An admin creates a new ingest source | `{ userId, source }` |
 | `cog-ingest.source.updated` | An admin updates an ingest source | `{ userId, source }` |
 | `cog-ingest.source.deleted` | An admin deletes an ingest source | `{ userId, sourceId }` |
@@ -134,6 +136,7 @@ interface IngestFailedContext {
   userId: string;
   jobId: string;
   error: string;
+  // `source` is null when a queued job fails pre-validation (e.g. its source was deleted before the worker ran)
   source: {
     id: string;
     slug: string;
@@ -141,7 +144,7 @@ interface IngestFailedContext {
     sourceType: string;
     processingLevel: string;
     ontologyGrowthMode: string;
-  };
+  } | null;
 }
 
 // cog-ingest.source.created / cog-ingest.source.updated
@@ -210,11 +213,11 @@ Cog Ingest itself listens to one Structure hook:
 
 Internally, the RSS poller also subscribes (async) to the module's own `cog-ingest.source.created` / `source.updated` / `source.deleted` hooks to start, reconfigure, or stop feed polling as sources change — no app restart required.
 
-<Aside type="caution" title="Node-delete retention is not account deletion">
-The handler above deliberately **retains** ingest jobs when a Structure node is deleted — that "no cascade delete" policy is scoped to *node* deletion only. Account/tenant erasure is a separate concern, and two gaps are tracked as backlog:
+<Aside type="note" title="Node-delete retention is not account deletion">
+The handler above deliberately **retains** ingest jobs when a Structure node is deleted — that "no cascade delete" policy is scoped to *node* deletion only. Account/tenant erasure is a separate concern, handled by the module's `security.registration.ts`:
 
-- Cog Ingest does **not** yet ship a `security.registration.ts` manifest or an **account-deletion handler**, so it does not currently participate in the foundation's [deletion cascade](/starter-template/security-feature/#deletion-cascade). See the security back-port item on the [Starter Template Roadmap](/starter-template/roadmap/).
-- **Account deletion must purge ingest jobs regardless of the node-delete retain policy.** Retaining jobs when a node is removed is fine; retaining a deleted user's ingest jobs is not. When the manifest lands, register an `owned` deletion handler that hard-deletes the subject's `cog_ingest_*` rows.
+- Cog Ingest ships a `security.registration.ts` manifest (`securityRegistry.register` declaring the module's data categories) **and** an `owned` account-erasure deletion handler that hard-deletes the subject's `cog_ingest_source` / `cog_ingest_job` / `cog_ingest_config` / `cog_ingest_mapping` / `cog_ingest_rss_entry` rows plus the engine's `cog_node` / `cog_working_memory_event` / `cog_processing_log` / `cog_intelligence_*` rows — so it **participates** in the foundation's [deletion cascade](/starter-template/security-feature/#deletion-cascade).
+- Node deletion and account deletion are therefore intentionally different: a removed Structure node leaves its ingest history intact, while account erasure purges all of the user's cog-ingest and engine data.
 </Aside>
 
 ---
@@ -344,7 +347,7 @@ const { job, result } = await ingestService.ingest(userId, {
 
 ### Retrieve (Stage-3 preview)
 
-`retrieve()` (added in v1.15.0, with a matching `POST /retrieve` route) is an interim semantic-retrieval entry point over the per-chunk vectors written during ingest. It embeds the query (AI Core `cog-ingest/embed-query`), runs Structure's `semanticSearchChunks`, collapses duplicate parent nodes (keeping the best score and a chunk count per node), optionally expands one hop over connections (`getNodeConnections`), and returns a degrade-safe result. `options` is optional and forward-compatible: `{ topK?, minScore?, nodeTypes?, expandGraph? }`.
+`retrieve()` (added in v1.15.0, with a matching `POST /retrieve` route) is an interim retrieval entry point over the per-chunk vectors written during ingest. It embeds the query (AI Core `cog-ingest/embed-query`), then — from v1.20.0 — prefers Structure v1.33's `hybridSearchChunks` (dense vector **+** BM25 lexical, reciprocal-rank-fused) and falls back to vector-only `semanticSearchChunks` on older Structure installs or when `mode: 'semantic'` is passed. It collapses duplicate parent nodes (keeping the best score and a chunk count per node), optionally expands one hop over connections (`getNodeConnections`), and returns a degrade-safe result. `options` is optional and forward-compatible: `{ topK?, minScore?, nodeTypes?, expandGraph?, mode? }` (`mode?: 'hybrid' | 'semantic'`; `minScore` applies only on the vector-only path — RRF fusion has no cosine floor).
 
 ```typescript
 interface RetrieveResult {
@@ -354,7 +357,7 @@ interface RetrieveResult {
   // duplicate parents collapsed — best score + chunk count per node
   nodes: Array<{ nodeId: string; bestScore: number; chunkCount: number }>;
   relatedNodeIds: string[];  // one-hop connection expansion, when requested
-  provenance: { embedded: boolean; chunkMatches: number; expanded: boolean };
+  provenance: { embedded: boolean; chunkMatches: number; expanded: boolean; retrieval: 'hybrid' | 'semantic' | 'none' };
   notFound: string[];        // reason codes, e.g. 'structure-embeddings-disabled',
                              // 'query-embedding-unavailable', 'no-matching-chunks'
 }
@@ -448,7 +451,7 @@ import type {
   ContentType,
   SourceConfigJson,
   ContextField,
-  ExtractionFocus,
+  ExtractionFeatures,
   AutoTagRule,
   SourceUIConfig,
   SourcePromptOverrides,
