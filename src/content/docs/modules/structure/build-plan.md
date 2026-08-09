@@ -161,24 +161,24 @@ One shared validator over the resolved field set, run on every write path.
 ### S1.3 — Node-type permission enforcement + `inputScope` (**M**)
 Make the config-only `permissions` block real, and add `inputScope`.
 
-- **Config:** extend `permissions.{create,edit,archive,delete}` to the `'anyone' | 'admin' | 'system'` tier (`frontend/index.ts:340`); add `inputScope: 'system' | 'admin' | 'user'` via the [12-mirror-site pattern](#adding-a-per-node-type-config-object--the-12-mirror-sites).
+- **Config:** extend `permissions.{create,edit,archive,delete}` to the `'anyone' | 'admin' | 'system'` tier (`frontend/index.ts:340`); add two node-type fields — `inputScope: 'system' | 'admin' | 'user'` (who *creates*) and `global: boolean` (shared + scope-exempt) — via the [12-mirror-site pattern](#adding-a-per-node-type-config-object--the-12-mirror-sites). *(The "this one field is AI-written only" case stays field-level `editableBy: 'system'`.)*
 - **Enforce in the service methods** (not routes — `serviceRegistry.register` at `:104` and the public API bypass route middleware): thread `isAdmin` into `createNode` (`:4178`), `duplicateNode` (`:4613`), `bulkCreateNodes` (`:4993`), `moveNode` (`:4538`), `archiveNode` (`:4803`), `deleteNode` (`:4473`), `restoreNode` (`:4823`) + the bulk variants (`:5112`), exactly as `updateNode` already takes `options.isAdmin` (`:4296`). Load the node-type `permissions` the way `updateNode` loads `builtInFieldConfig`.
 - **Routes:** add `attachRole` (`:1630`, currently only on PATCH) to every node-write route so `req.user.role` is present; public API passes `isAdmin:false` (as PATCH already does at `:2864`).
-- **UI:** add the missing `permissions` + `inputScope` editor to `NodeTypeForm` (block is already in form state, no editor); add archive/delete client gates to match `pages.ts:177/814`.
+- **UI:** add the missing `permissions` + `inputScope` + `global` editor to `NodeTypeForm` (block is already in form state, no editor); add archive/delete client gates to match `pages.ts:177/814`.
 
-### S1.4 — Shared / reference nodes via nullable owner (**L**, D2)
-- **Schema:** make `structure_node.userId` nullable (`schema.ts:30`); `null` = shared/global. Rework the userId-prefixed uniques (`@@unique([userId, slug])`, `@@unique([userId, parentId, name])`, `:133-134`) with **partial unique indexes** for null-owner rows (raw SQL in `migrations.ts`, since Prisma can't express partial uniques).
-- **Reads:** visibility predicates become `{ OR: [{ userId }, { userId: null }] }` (the idiom type lookups already use, e.g. `:4247`); **writes** stay strict `{ userId }`.
-- **Connectable-to-shared:** relax the `createConnection` target-endpoint ownership check (`:6241-6248`) to accept a null-owner node; source stays caller-owned; `fromTypes`/`toTypes` still gate (`:6268-6278`).
+### S1.4 — Shared / reference (`global`) nodes via nullable owner (**L**, D2)
+- **Schema:** make `structure_node.userId` nullable (`schema.ts:30`); `null` = a shared row, written only for `global`-type nodes. Rework the userId-prefixed uniques (`@@unique([userId, slug])`, `@@unique([userId, parentId, name])`, `:133-134`) with **partial unique indexes** for null-owner rows (raw SQL in `migrations.ts`, since Prisma can't express partial uniques).
+- **Reads:** visibility predicates become `{ OR: [{ userId }, { userId: null }] }` (the idiom type lookups already use, e.g. `:4247`); **writes** stay strict `{ userId }` (only an admin/system provisions `global` rows).
+- **Connectable-to-shared:** relax the `createConnection` target-endpoint ownership check (`:6241-6248`) to accept a null-owner `global` node; source stays caller-owned; `fromTypes`/`toTypes` still gate (`:6268-6278`).
 - **Cascade:** the account-deletion handler (`backend/registrations.ts:95`) already deletes only `where:{userId}`, so null-owner rows are spared — keep the unscoped-refusal guard.
 
 ### S1.5 — Enforced scoping / `rootNodeId` (**L**, D6)
 - **Schema:** add `rootNodeId String?` to `structure_node` (hierarchy block `:45-51`) + `@@index([userId, rootNodeId])` and `@@index([userId, nodeType, rootNodeId])`. Backfill from `path[0]` (migration).
-- **Maintenance:** in `calculatePath`/`createNode`, `rootNodeId = parent.rootNodeId ?? parent.id` (a root sets its own id). In `moveNode` (`:4538`), recompute `rootNodeId` for the node **and every descendant** in the same transaction (piggyback `updateDescendantPaths`).
-- **Config:** `primaryScope.isolation: 'filter' | 'enforced'` (`schema.ts:243`; extend the type at `frontend/index.ts:312`).
+- **Maintenance:** in `calculatePath`/`createNode`, `rootNodeId = parent.rootNodeId ?? parent.id` (a root sets its own id). In `moveNode` (`:4538`), recompute `rootNodeId` for the node **and every descendant** in the same transaction (piggyback `updateDescendantPaths`). A move that **crosses** an `enforced` space boundary is rejected **unless** the moved node's type sets `rules.allowCrossSpaceMove` — then it is permitted and the `structure.node.moved` payload carries old/new `rootNodeId` for audit (D3).
+- **Config:** `primaryScope.isolation: 'filter' | 'enforced'` (`schema.ts:243`; extend the type at `frontend/index.ts:312`), plus an admin-set per-node-type `rules.allowCrossSpaceMove` (default false).
 - **Request scope:** a validated `scopeRootId` param (validate: exists, owned, `isPrimary`, `enforced`) — never trust the client store. `enforced` + missing/invalid scope → fail closed.
 - **Read surfaces (inject `where.rootNodeId`):** `listNodes` (`:3930`), `getNode` (`:4135`), `searchNodes` (`:6516`), `getTree` (`:4954`), `getNodeConnections` (`:6370`), `listConnections` (`:6600`), `expandGraph` (`:6437`), `getNodeContext` (`:6778`), `dataFilters` (`:4031`), both public-API reads (`:2715`, `:2740+`), and `moveNode`/`duplicateNode` targets.
-- **Connection joint rule (Decision A):** reject cross-root connections unless one endpoint is a shared/`system`-scope type — in `createConnection` (`:6241-6278`), `bulkCreateConnections`, and `expandGraph`.
+- **Connection joint rule (Decision A):** reject cross-space connections unless one endpoint is a `global` type — in `createConnection` (`:6241-6278`), `bulkCreateConnections`, and `expandGraph`.
 - **Cross-module:** add `rootNodeId` to node lifecycle payloads (`structure.node.created` `:4286`, `.updated` `:4420`, `.moved` `:4607`) and connection payloads (`:6752`) — consumed by cog-ingest and document-management.
 
 ### S1.6 — Node revision history + restore + `auditEvents` contract (**L**, D8)
