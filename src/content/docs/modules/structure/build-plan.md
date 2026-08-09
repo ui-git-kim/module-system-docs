@@ -136,3 +136,73 @@ Use `workflowConfig` (full, has an admin editor) or `contextConfig` (stored, no 
 4. Field UX (collapse + repeater fix) — **S** (the repeater fix alone is a one-line high-value bug fix).
 5. Merge-field exposure — **L**, spec with useFoundry; rescopes custom layouts.
 6. Shared field templates across node types — **L**, UX design first (candidate; section above).
+
+---
+
+# Generic Platform Hardening — Stages 1–3 (2026-08-09)
+
+The next build sequence, from the 2026-08-09 gap-analysis audit. Framing and the standing calls live in [Design Decisions](/modules/structure/decisions/); this section is the grounded, phase-by-phase plan. It is **generic** — Structure is the admin-configurable architecture, not any one app's domain.
+
+> **The dominant audit finding:** the field/type **definition** layer is already rich; what's missing is **server-side enforcement** and a few platform features. The write path validates only the request envelope (`data` is `z.record(z.string(), z.unknown())`, `backend/index.ts:7566`) — every value contract (required / pattern / min-max / enum / coercion / computed correctness / node-type permissions) is currently enforced only in the React `NodeForm` and accepted verbatim by the server. cog-ingest writes into Structure through the same service, so the write path must be safe for **both** human and programmatic writers.
+
+## Stage 1 — write-path integrity + the two new requirements
+
+### S1.1 — Server-side field validation (**M–L**)
+One shared validator over the resolved field set, run on every write path.
+
+- **Where:** a new `validateNodeData(fields, data, { partial })` helper beside `getFieldDefs` (`backend/index.ts:3074`, which already resolves own + `superClass`-inherited + shared-template fields — the single source of truth). Enforce `required` / `requiredWhen`, `validation.pattern` / `min` / `max`, `select`/`multiselect` enum membership (from `options[]`), and type coercion per field `type`. Evaluate `visibleWhen` server-side and skip hidden fields (mirror `getMissingRequiredFields`, `frontend/components.ts:783`).
+- **Call sites:** `createNode` (`:4178`, after the `beforeCreate` filter and before persist), `updateNode` (`:4292`, `partial` — validate only supplied keys), `bulkCreateNodes` (`:4993`, per row, hoist the resolved defs once per type), and the public-API write paths (`:2826` POST / `:2846` PATCH).
+- **Programmatic writers:** skip validation only for `editableBy:'system'` fields written by trusted service callers (cog-ingest's graph-derived values) — reuse the `editableBy` classification already read at `:4346-4367`.
+- **Decision D9:** application-layer only (no DB CHECK / `pg_jsonschema`).
+
+### S1.2 — Computed-value server trust (**M**)
+`formula` (`calcConfig`) and `computedTemplate` values are client-computed and accepted verbatim (`frontend/index.ts:580`; no server evaluation). Port the safe evaluator (`utils/formula.ts`, already React-free) and the merge-field resolver (`utils/merge-fields.ts`) to the backend and, on write, **recompute** computed/formula fields server-side (or reject client-supplied values for them). Fold into the S1.1 validation pass in `createNode`/`updateNode`.
+
+### S1.3 — Node-type permission enforcement + `inputScope` (**M**)
+Make the config-only `permissions` block real, and add `inputScope`.
+
+- **Config:** extend `permissions.{create,edit,archive,delete}` to the `'anyone' | 'admin' | 'system'` tier (`frontend/index.ts:340`); add `inputScope: 'system' | 'admin' | 'user'` via the [12-mirror-site pattern](#adding-a-per-node-type-config-object--the-12-mirror-sites).
+- **Enforce in the service methods** (not routes — `serviceRegistry.register` at `:104` and the public API bypass route middleware): thread `isAdmin` into `createNode` (`:4178`), `duplicateNode` (`:4613`), `bulkCreateNodes` (`:4993`), `moveNode` (`:4538`), `archiveNode` (`:4803`), `deleteNode` (`:4473`), `restoreNode` (`:4823`) + the bulk variants (`:5112`), exactly as `updateNode` already takes `options.isAdmin` (`:4296`). Load the node-type `permissions` the way `updateNode` loads `builtInFieldConfig`.
+- **Routes:** add `attachRole` (`:1630`, currently only on PATCH) to every node-write route so `req.user.role` is present; public API passes `isAdmin:false` (as PATCH already does at `:2864`).
+- **UI:** add the missing `permissions` + `inputScope` editor to `NodeTypeForm` (block is already in form state, no editor); add archive/delete client gates to match `pages.ts:177/814`.
+
+### S1.4 — Shared / reference nodes via nullable owner (**L**, D2)
+- **Schema:** make `structure_node.userId` nullable (`schema.ts:30`); `null` = shared/global. Rework the userId-prefixed uniques (`@@unique([userId, slug])`, `@@unique([userId, parentId, name])`, `:133-134`) with **partial unique indexes** for null-owner rows (raw SQL in `migrations.ts`, since Prisma can't express partial uniques).
+- **Reads:** visibility predicates become `{ OR: [{ userId }, { userId: null }] }` (the idiom type lookups already use, e.g. `:4247`); **writes** stay strict `{ userId }`.
+- **Connectable-to-shared:** relax the `createConnection` target-endpoint ownership check (`:6241-6248`) to accept a null-owner node; source stays caller-owned; `fromTypes`/`toTypes` still gate (`:6268-6278`).
+- **Cascade:** the account-deletion handler (`backend/registrations.ts:95`) already deletes only `where:{userId}`, so null-owner rows are spared — keep the unscoped-refusal guard.
+
+### S1.5 — Enforced scoping / `rootNodeId` (**L**, D6)
+- **Schema:** add `rootNodeId String?` to `structure_node` (hierarchy block `:45-51`) + `@@index([userId, rootNodeId])` and `@@index([userId, nodeType, rootNodeId])`. Backfill from `path[0]` (migration).
+- **Maintenance:** in `calculatePath`/`createNode`, `rootNodeId = parent.rootNodeId ?? parent.id` (a root sets its own id). In `moveNode` (`:4538`), recompute `rootNodeId` for the node **and every descendant** in the same transaction (piggyback `updateDescendantPaths`).
+- **Config:** `primaryScope.isolation: 'filter' | 'enforced'` (`schema.ts:243`; extend the type at `frontend/index.ts:312`).
+- **Request scope:** a validated `scopeRootId` param (validate: exists, owned, `isPrimary`, `enforced`) — never trust the client store. `enforced` + missing/invalid scope → fail closed.
+- **Read surfaces (inject `where.rootNodeId`):** `listNodes` (`:3930`), `getNode` (`:4135`), `searchNodes` (`:6516`), `getTree` (`:4954`), `getNodeConnections` (`:6370`), `listConnections` (`:6600`), `expandGraph` (`:6437`), `getNodeContext` (`:6778`), `dataFilters` (`:4031`), both public-API reads (`:2715`, `:2740+`), and `moveNode`/`duplicateNode` targets.
+- **Connection joint rule (Decision A):** reject cross-root connections unless one endpoint is a shared/`system`-scope type — in `createConnection` (`:6241-6278`), `bulkCreateConnections`, and `expandGraph`.
+- **Cross-module:** add `rootNodeId` to node lifecycle payloads (`structure.node.created` `:4286`, `.updated` `:4420`, `.moved` `:4607`) and connection payloads (`:6752`) — consumed by cog-ingest and document-management.
+
+### S1.6 — Node revision history + restore + `auditEvents` contract (**L**, D8)
+- **Schema:** new self-contained `structure_node_revision` table (`{ id, userId, nodeId, revision, data snapshot (name/description/data/stage/classification), changedBy, createdAt }`, `@@index([userId, nodeId, revision])`). **Node-record only** — no file bytes, no hash chain (document-management owns file versioning/hashing).
+- **Write:** in `updateNode` (`:4420`), snapshot prior state before the in-place mutation; add `getNodeRevisions` + `restoreNodeRevision` service methods + routes; fire `structure.node.revisionCreated` / `.reverted`.
+- **Audit contract:** declare the already-fired lifecycle events in the security manifest's `auditEvents` (`backend/registrations.ts` — currently absent), aligned to the starter's Typed Hook Catalogue, so a consuming audit module has a formal contract instead of hard-coded strings.
+- **Erasure + manifest:** add `structure_node_revisions` to `dataCategories` + a deletion handler.
+
+## Stage 2 — make it a real platform (raised priorities)
+
+### S2.1 — Config env-promotion (**L**)
+Server-side, **atomic** full-bundle export/import covering node types **+ connection types + groups + field templates + functions** (today `exportNodeTypes`/`importNodeTypes` are node-types-only at `:5809`/`:5871`; `connectionTypes` is accepted in the schema but silently ignored; the rest ride a client-side best-effort loop at `pages.ts:2283`). Add a diff/dry-run preview and per-definition versioning so admin-built structures promote dev→staging→prod reliably. *("Will bite downstream app teams immediately.")*
+
+### S2.2 — Node-instance import/export (CSV/JSON) (**M**)
+Generic bulk instance-data management (distinct from config): import a CSV/JSON of node instances with field mapping + per-row validation (reuse S1.1) + error reporting; export a node list. On Structure's own "Under Consideration" list; currently absent.
+
+### S2.3 — jsonb + path indexing at scale (**M**)
+`dataFilters` emits `"data"->>field` with **no GIN on `data`** (`migrations.ts:28` documents the seq-scan); add a GIN (`jsonb_path_ops`) or functional indexes on hot fields. Path-prefix `LIKE 'x%'` may not use the btree `path` index on default-collation Postgres — the `rootNodeId` equality index (S1.5) is the durable fix for scoped reads.
+
+### S2.4 — Retention / purge (**S–M**)
+Soft-deleted nodes (`status='deleted'`) live forever (`:4499`); add admin-configurable retention/purge for trashed nodes and old revisions (mirror document-management's artefact-retention pattern).
+
+## Stage 3 / Roadmap — future & breadth
+
+- **Blueprints / starter-packs** — a first-class "stamp out a whole node-type + connection set" primitive (a CRM pack, a PM pack). **Deferred to the roadmap** — relevant if the module system is distributed to third parties; a hand-authored JSON bundle is the interim.
+- Outbound **webhooks** (H12 — not owned by Notifications, which deliberately excludes webhooks), saved **full views** (columns + sort, beyond filter presets), **slug** auto-derive + `publishedSlug` serving, **i18n** labels, **sibling drag-reorder** UI (the `/reorder` endpoint + hook exist, unused on node lists), bulk-**update**/bulk-**move** endpoints.
+- One-off infra: **adopt scaffold v1.31.14** (self-heal migrations + `scaffold:update` fetch fixes).

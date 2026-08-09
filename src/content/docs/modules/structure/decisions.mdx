@@ -1,0 +1,89 @@
+---
+title: Design Decisions
+description: Standing design decisions for the Structure module — the generic-platform-hardening plan, the two new requirements (input scope and enforced scoping), and the open questions awaiting a call.
+sidebar:
+  order: 14
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This page records the **standing design decisions** behind the current generic-platform-hardening work, produced from the 2026-08-09 gap-analysis audit. It is the companion to the phase-by-phase [Build Plan](/modules/structure/build-plan/) (grounded insertion points) and the [Roadmap](/modules/structure/roadmap/) (sequencing).
+
+## Framing: Structure is a generic module
+
+Structure is the **admin-configurable architecture** an app is built from — the data model and organisation, not any one app's domain. The audit that seeded this plan was written against a legal "Evidence Manager" lens; that lens has been **stripped**. Every decision below is generic and app-neutral. veradai (formerly "Evidence Manager") is *one consuming app*, not the target.
+
+The plan sits inside a small module ecosystem, and the boundaries matter for what Structure should and shouldn't build:
+
+| Module | Owns |
+|--------|------|
+| **Structure** | Hierarchy/organisation, the field/type system, **enforced scoping** (workspaces), **input scope** (data provenance), server-side write-path validation, **node-record** revisions, the audit-event contract. |
+| **Document Management** | File upload/storage/dispatch; file chain-of-custody — read-only providers, SHA-256 `contentHash`, recent-access log, `resolveProvenance`, file versioning (V2). |
+| **cog-ingest** | Ingests data → runs the engine → **stores the output back into Structure** (via `serviceRegistry`, into `editableBy:'system'` fields). |
+
+<Aside type="caution" title="Do not duplicate document-management">
+Tamper-evident hashing and chain-of-custody for **files** already live in document-management. Structure provides generic **node-record** revisions + an audit-event contract; a consuming app composes chain-of-custody from both. Structure never hashes file bytes.
+</Aside>
+
+## Audit summary (2026-08-09)
+
+A nine-agent audit verified every gap-analysis item against `src/templates/**`. The headline: the **field/schema layer the research called the "biggest gap" is already built and rich** (`NodeTypeField`, `nodeFieldTypeRegistry`, shared field templates, groups, node-ref deref, `superClasses` DAG). The real gaps are narrower:
+
+- **Server-side field validation** — `data` is persisted as an open `z.record(z.string(), z.unknown())`; no server enforcement of required / pattern / min-max / enum / type on any write path (direct API, bulk, public API, cog-ingest). *Confirmed gap.*
+- **Computed-value trust** — `formula` / `computedTemplate` are client-computed and server-accepted (spoofable). *Confirmed gap.*
+- **Node-type permissions** (`create/edit/archive/delete`) — configured and UI-gated, but **never read on any write path**. *UI-only.*
+- **Node revision history** — no revisions table anywhere; only soft-delete restore. *Confirmed gap.*
+- **Config env-promotion** — server-side import/export is node-types-only; the full bundle is client-side best-effort, not atomic. *Partial.*
+- **Node-instance import/export (CSV/JSON)** — absent.
+- **jsonb / path indexing** — `dataFilters` seq-scans (no GIN on `data`); path-prefix `LIKE` may not use the btree index on default-collation Postgres.
+
+Already-strong (verified): hierarchy storage + server-enforced rules, field `editableBy` (server-enforced), `skipHooks` (never bypasses validation), soft-delete + cascade, saved filter presets, column config, keyword/hybrid search, and the parking-space boundary (embeddings/rendering/forms/search-ranking correctly delegated).
+
+## Decision A — Node input scope (data provenance)
+
+Node types need a clear provenance model: some are **system / shared-reference** data (taxonomies, categories, lookups) provided to users and read-only to them; some are **admin-managed**; some are **user content**. Today every `structure_node.userId` is required, so shared rows cannot exist.
+
+**Decided:**
+
+- A new node-type field **`inputScope: 'system' | 'admin' | 'user'`** (default `'user'`), layered over the existing `permissions` block, which is extended to the **`'anyone' | 'admin' | 'system'`** tier (mirroring field `editableBy`).
+- **Enforcement moves server-side, in the service methods** (not routes) — `serviceRegistry` callers and the public API both bypass route middleware. `isAdmin` is threaded into every node write method exactly as `updateNode` already receives `options.isAdmin`, resolved via `attachRole`.
+- **Shared/global rows are stored as a blank (null) owner** — `structure_node.userId` becomes nullable; `null` = shared. Read predicates become `OR(userId, null)`; **write** predicates stay strict `{ userId }`. This mirrors the pattern **cog-ingest already uses** for shared ontology (*"null userId: shared system/ontology infrastructure … prevents cascading its deletion"*), and the account-deletion cascade already spares null-owner rows.
+- **Read-only-but-connectable:** the `createConnection` both-endpoints-owned guard is relaxed so the **target** may be a shared node (source stays caller-owned; the connection row is owned by the caller). Shared/`system`-scope types are therefore the natural **scope-exempt reference types** for Decision B's connection carve-out.
+
+<Aside type="note" title="Tenancy">
+The product model is **solo (single-user-per-tenant)**: `tenantId === userId`. Shared (null-owner) nodes are therefore app-wide. The design is built *tenantId-ready* — if multi-tenancy is ever added, `tenantId set + userId null` = tenant-wide and `both null` = platform-wide — but no `tenantId`/RLS is built now.
+</Aside>
+
+## Decision B — Enforced scoping (generic workspaces)
+
+Any app can mark a **root node type** (project, client, workspace, account, campaign — or matter) as an **isolation boundary** so its subtree's data never leaks across sibling roots. Today's `primaryScope` does this as *client-side convenience only*: `listNodes` applies a client-supplied `pathPrefix`, every other read surface ignores scope, and the client store can never be a security source of truth.
+
+**Decided:**
+
+- Config gains **`primaryScope.isolation: 'filter' | 'enforced'`**. `'filter'` keeps today's soft behaviour; `'enforced'` makes the boundary mandatory, server-side, and **fail-closed** (absent/invalid scope denies rather than returning all roots).
+- Enforcement uses a denormalised **`rootNodeId` column** on `structure_node`, maintained wherever `path` is (create/move, cascaded to descendants), indexed `@@index([userId, rootNodeId])`. Equality predicates are index-friendly and reach surfaces path-prefix can't — connections (which have no path), the graph CTE, and raw-SQL search.
+- The active scope reaches the server as a **validated `scopeRootId`** (query param/header) — checked each request (exists, owned, `isPrimary`, `enforced`) — never a trusted client value.
+- **Every read surface** is scoped: `listNodes`, `getNode`, `searchNodes`, `getTree`, `getNodeConnections`, `listConnections`, `expandGraph`, `getNodeContext`, `dataFilters`/jsonb-search, merge-field deref, both public-API reads, and `moveNode`/`duplicateNode` targets.
+- **Connection joint rule (with Decision A):** a connection across two `enforced` roots is rejected **unless** one endpoint is a shared/`system`-scope reference type. Applied in `createConnection`, `bulkCreateConnections`, and `expandGraph` traversal.
+- **Cross-module contract:** `rootNodeId` is added to node and connection **lifecycle-event payloads**, so **cog-ingest** (which stores output into Structure) and **document-management** (which subscribes to `structure.node.deleted/archived/moved`) inherit the scope without re-deriving it from `path`.
+
+## Open questions (awaiting a call)
+
+These do **not** block Stage 1 from starting; they are recorded here and default as noted.
+
+- **D3 — cross-scope *move* policy.** Moving a node/subtree between two `enforced` roots: **default = forbid**; the alternative is admin-only + audited.
+- **D4 — admin "see-all" cross-scope mode.** Whether an elevated mode that reads across all roots should exist and whether every such read is audited. *Undecided.*
+- **D7 — scope-exempt marker.** Whether "shared reference type" is expressed purely by `inputScope: 'system'` (the leaning) or a separate explicit flag. Both `createConnection` and `expandGraph` must read one canonical source.
+
+## Settled parameters
+
+| # | Decision | Choice |
+|---|----------|--------|
+| D1 | Global scope semantics | App-wide today (`tenantId === userId`); nullable-owner extends to tenant-wide later. |
+| D2 | Shared-node storage | **Nullable (blank) owner** — the cog-ingest house pattern. |
+| D5 | Input-scope shape | New **`inputScope`** node-type field + extended `permissions` tier. |
+| D6 | Isolation config | **`primaryScope.isolation` enum** (`filter` or `enforced`), no new column. |
+| D8 | Node revisions | **Build in Stage 1** (generic history + restore; no tamper-evident hash chain). |
+| D9 | Validation mechanism | **Application-layer** validator (over resolved `getFieldDefs`); DB CHECK/`pg_jsonschema` not adopted. |
+| D10 | Tenancy | **userId-keyed** (solo product model); built tenantId-ready, tenantId not built. |
+| — | Blueprints / starter-packs | **Roadmap / future** (relevant if the module system is distributed). |
