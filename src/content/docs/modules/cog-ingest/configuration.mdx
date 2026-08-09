@@ -14,84 +14,47 @@ This page covers everything you configure when installing and running Cog Ingest
 
 ## Init Prompts
 
-During `npx cognitive-ingest init`, you answer four questions. Your answers determine which dependencies are installed, which environment variables are required, and how the config template is generated.
+During `npx cognitive-ingest init`, you answer two questions. Model and provider choice is **not** among them — from v1.21.9 that lives entirely in [AI Core](/modules/ai-core/).
 
 | Prompt | Options | Default | Effect |
 |--------|---------|---------|--------|
-| **LLM provider** | Anthropic (Claude), OpenAI (GPT) | Anthropic | Installs `@ai-sdk/anthropic` or `@ai-sdk/openai`; sets the model in config |
-| **Embedding provider** | Voyage AI, OpenAI | Voyage AI | Installs `voyageai` or uses OpenAI SDK; configures embed functions |
-| **Embedding dimensions** | 512, 1024, 2048 | 1024 | Sets `vector(N)` column size in schema; affects accuracy vs speed |
+| **Embedding dimensions** | 512, 1024, 2048 | 1024 | Sets `vector(N)` column size in schema; the width AI Core must match; affects accuracy vs speed |
 | **Default processing level** | Minimal, Standard, Deep | Standard | Default depth for new ingest sources |
 
 <Aside type="note">
-These prompt answers are stored as template variables (`{{llmProvider}}`, `{{embeddingProvider}}`, `{{embeddingDimensions}}`, `{{defaultProcessingLevel}}`) and baked into the generated config file at install time. These become the **static defaults**. From v1.4.0, you can override most settings at runtime via the admin UI — see [Runtime Configuration](#runtime-configuration-admin-ui) below.
+These prompt answers are stored as template variables (`{{embeddingDimensions}}`, `{{defaultProcessingLevel}}`) and baked into the generated config at install time. **From v1.21.9, all model and provider choice lives in [AI Core](/modules/ai-core/)** — this module reaches every language model and embedding through an injected AI Core adapter, never a provider SDK. See [AI Core — the Model Gateway](#ai-core--the-model-gateway) below.
 </Aside>
 
 ---
 
 ## Environment Variables
 
-All environment variables are backend-only. Which ones are required depends on your prompt answers.
+The only environment variable this module reads is the optional Docling sidecar URL — from v1.21.9 there are **no provider API keys here**. [AI Core](/modules/ai-core/) owns model access and holds its own provider credentials (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `VOYAGE_API_KEY`, … are configured in the AI Core module, not here).
 
 | Variable | Required When | Description |
 |----------|--------------|-------------|
-| `ANTHROPIC_API_KEY` | LLM provider = Anthropic | API key for Claude models |
-| `OPENAI_API_KEY` | LLM provider = OpenAI, **or** Embedding provider = OpenAI | API key for GPT and/or OpenAI embeddings |
-| `VOYAGE_API_KEY` | Embedding provider = Voyage AI | API key for Voyage embeddings |
 | `DOCLING_SERVE_URL` | Optional (v1.15.0) | Base URL of a running `docling-serve` sidecar for Office and audio/video acquisition. Unset = inert (built-in processors used). See [Deploying the Docling Sidecar](#deploying-the-docling-sidecar) |
 
-### Common Configurations
+### Provider Credentials Live in AI Core
 
-<Tabs>
-  <TabItem label="Anthropic + Voyage (default)">
-    ```env
-    # backend/.env
-    ANTHROPIC_API_KEY=sk-ant-...
-    VOYAGE_API_KEY=pa-...
-    ```
-  </TabItem>
-  <TabItem label="OpenAI + OpenAI">
-    ```env
-    # backend/.env
-    OPENAI_API_KEY=sk-...
-    ```
-  </TabItem>
-  <TabItem label="Anthropic + OpenAI">
-    ```env
-    # backend/.env
-    ANTHROPIC_API_KEY=sk-ant-...
-    OPENAI_API_KEY=sk-...
-    ```
-  </TabItem>
-</Tabs>
+cog-ingest holds no provider keys. Configure your LLM and embedding providers (and their API keys) in the **[AI Core](/modules/ai-core/)** module's admin — cog-ingest reaches every model through AI Core's operations. The only backend variable here is the optional `DOCLING_SERVE_URL`.
 
 ---
 
-## Provider Setup
+## AI Core — the Model Gateway
 
-### Anthropic (Claude)
+From **v1.21.9**, cog-ingest makes no direct provider calls. Every language-model and embedding call — the module's own (vision, parse-QA, contextual chunking, chunk/query embeddings) **and** the vendored cognitive-db engine's (perception, entity/concept extraction, inference, summaries, node embeddings) — routes through the **[AI Core](/modules/ai-core/)** module via an injected adapter (`buildAiAdapter`). AI Core owns the provider SDKs, model selection, prompts, dials, and the usage ledger.
 
-1. Create an account at [console.anthropic.com](https://console.anthropic.com)
-2. Generate an API key under **API Keys**
-3. Add it to `backend/.env` as `ANTHROPIC_API_KEY`
+**What this means for setup:**
 
-The module uses `claude-sonnet-4-20250514` by default. To change the model, edit the `llmModel` assignment in `cog-ingest.config.ts`.
+1. Install the **AI Core** module and enable a language model and an embedding model in its admin. cog-ingest declares `depends: { 'ai-core': '>=1.15.0' }`.
+2. The embedding model must match the app's baked width (the **Embedding dimensions** init prompt) — AI Core selects a matching-width model or refuses at seed time.
+3. The **engine's** operations must exist in AI Core: `cognitive-db/extract-entities` (+ the `-with-proposals` growth variant), `-extract-concepts`, `-infer-implicit`, `-summarise`, `-embed-document`, `-embed-query`. Import them from the engine's operations catalogue (`cognitive-db/docs/ai-core-operations.json`).
+4. cog-ingest's **own** operations (`cog-ingest/analyse-image`, `-embed-document`, `-parse-qa`, …) are seeded automatically at boot.
 
-### OpenAI (GPT)
-
-1. Create an account at [platform.openai.com](https://platform.openai.com)
-2. Generate an API key under **API Keys**
-3. Add it to `backend/.env` as `OPENAI_API_KEY`
-
-The module uses `gpt-4o` for LLM and `text-embedding-3-small` or `text-embedding-3-large` for embeddings (depending on dimensions).
-
-### Voyage AI (Embeddings)
-
-1. Create an account at [dash.voyageai.com](https://dash.voyageai.com)
-2. Generate an API key
-3. Add it to `backend/.env` as `VOYAGE_API_KEY`
-
-The module uses `voyage-3` for dimensions ≤ 1024 and `voyage-3-lite` for larger dimensions.
+<Aside type="caution" title="AI Core is a hard dependency (v1.21.9)">
+Before v1.21.9 the module bundled provider SDKs (`@ai-sdk/anthropic`, `voyageai`, …) and fell back to them when AI Core was absent. That fallback is gone — model access is AI Core's alone. **Until the engine ops above and an embedding model are configured in AI Core, ingestion runs but produces no graph** (the engine's extraction and all embeddings hard-fail). An app without AI Core can still acquire and store raw content, but not build intelligence from it.
+</Aside>
 
 ---
 
@@ -537,13 +500,12 @@ URL screenshot capture uses Puppeteer, which is a **default backend dependency**
 
 ## Config File Reference
 
-The config file initialises cognitive-db with your app's Prisma client and provider settings. It is generated at `backend/src/features/cog-ingest/cog-ingest.config.ts` and runs as a side-effect import from the feature barrel file.
+The config file initialises cognitive-db with your app's Prisma client and the injected **AI Core adapter** (`buildAiAdapter`) — it holds no provider SDKs. It is generated at `backend/src/features/cog-ingest/cog-ingest.config.ts` and runs as a side-effect import from the feature barrel file.
 
 ```typescript
 // Key exports from cog-ingest.config.ts
-export const llmModel;             // AI SDK model instance
 export const cogIngestConfig;      // Runtime settings object
-export async function initCogIngest();    // Initialises cognitive-db (loads DB overrides)
+export async function initCogIngest();    // Initialises cognitive-db with the AI Core adapter (loads DB overrides)
 export async function reinitialiseEngine(); // Re-applies config at runtime
 ```
 
@@ -552,7 +514,7 @@ The `initCogIngest()` function is called during backend startup via the `hasInit
 1. Loads static defaults from the config file
 2. Queries `cog_ingest_config` for runtime overrides
 3. Merges overrides on top of defaults
-4. Configures cognitive-db with database, LLM, embedding, and features
+4. Configures cognitive-db with the database, the injected AI Core adapter (`ai: buildAiAdapter(...)`), and feature flags
 5. Logs which sections are using overrides vs defaults
 6. Seeds the `working-memory` Structure node type if it doesn't already exist
 
