@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features, known issues, and future direction for AI Core
-lastUpdated: 2026-08-08
+lastUpdated: 2026-08-09
 sidebar:
   order: 15
 ---
@@ -23,6 +23,59 @@ This roadmap reflects current plans and may change based on feedback and require
 ## Known Issues
 
 The six issues recorded here from the July 2026 alignment audit all lived in the **legacy template surface**, and all were **resolved by deletion** — v1.1.0 replaced that surface wholesale (see the [Changelog](/modules/ai-core/changelog/)). These are the current known issues.
+
+### Performance Audit — August 2026
+
+A full performance audit of the **generated** code (v1.22.2, every template) ran a parallel finder pass with adversarial verification: 53 candidates, **46 confirmed, 7 refuted**. The three "unbounded list render" scares were refuted — the usage ledger, review queue and eval-results lists are all already capped server-side (50 / 200 / 1000 rows via `clampLimit` + zod), so the frontend never receives the whole table (a *functional* "load older" gap remains, tracked under Review-Queue UI Polish, not a perf bug). The one critical and the confirmed moderate items are recorded here; the best-practice remainder is under [Performance — best-practice cleanups](#performance--best-practice-cleanups-august-2026-audit).
+
+#### `getCurrentUsage` scans the whole ledger (billing callback)
+
+**Severity:** High (Critical) — the only finding that scales badly
+**Where:** `ledger.service.ts` → `getCurrentUsage()` (the billing callback, design §15)
+
+`getCurrentUsage` issues an unbounded `findMany` over every `ai_usage_ledger` row for the tenant (or since a date) and sums tokens in JS. The `where` is well indexed; the cost is transferring and iterating an ever-growing row set on every call — O(rows). This is the function handed to billing's `requireLimit`, so it runs on/near the hot path, and its latency and memory grow with the tenant's accumulated usage. The code comment already flags the DB aggregate as "a later optimisation". **Fix:** aggregate in the database — a raw-SQL `SUM((usage->>'inputTokens')::bigint) … GROUP BY operationId` (no schema change; the usage JSON keys are `inputTokens`/`outputTokens`), or add numeric `inputTokens`/`outputTokens` columns populated in `record()` and use `prisma.aggregate` / `groupBy`.
+
+#### Resolve/assemble issues ~7 serialised DB round trips per run
+
+**Severity:** Moderate
+**Where:** `run/run.ts` (≈986, 1065, 1513/2498), `run/resolver.ts` (266), `records.service.ts` `getSegmentCompositionForOperation` (1149)
+
+Every `aiCore.run()` resolves the operation graph as a deep chain of independent, sequentially-awaited Prisma calls: approaches/disciplines/guardrails (986) run one after another though none feeds the next; markers/framing/framework (1065) are three more serial round trips though they depend only on `input.segments` and could hoist above the segment load; `getSegmentCompositionForOperation` awaits `ownLinks` then the independent `systemOps` (1149); and the resolver reloads the guardrail table a second time (266) after `validateDisciplineSet` already fetched the same rows. The review-queue write (1513) is awaited before returning though the response never uses it. Each is a few ms on a same-region DB but tens of ms on a remote/pooled Postgres, on 100% of runs. **Fix:** collapse the independent reads into two `Promise.all` waves, reuse the guardrail rows validation already loaded, and make the review-item write fire-and-forget with a retained `.catch`.
+
+#### Growable tables miss an ordering index
+
+**Severity:** Moderate
+**Where:** `schema.ts` — `ai_usage_ledger`, `ai_eval_result` (and, lower, `ai_review_item`)
+
+The admin usage view (`listUsage`) and eval-results view sort the fastest-growing tables by `createdAt` with no supporting index. `ai_usage_ledger` is indexed on `(tenantId)`, `(tenantId,createdAt)`, `(operationId)` — none serves a global or `operationId`-only `ORDER BY createdAt`, so an unfiltered/`operationId` call becomes a seq-scan + top-N heapsort over the whole ledger; `ai_eval_result` (indexed on `(runId)`, `(operationId)` only) full-scans + sorts when called with no filter. Output is capped (≤200 / ≤1000) but the scan/sort work is O(table). **Fix:** add `@@index([operationId, createdAt])` and `@@index([createdAt])` to `ai_usage_ledger`, `@@index([operationId, createdAt])` (and/or `([createdAt])`) to `ai_eval_result`, and `@@index([status, createdAt])` to `ai_review_item`; add explicit `select`s so the JSON columns aren't shipped to list views.
+
+#### config-io import doubles write round trips
+
+**Severity:** Moderate (admin cold path, scales with config size)
+**Where:** `config-io.service.ts` → `restoreSeeded` (244), used by every import pass
+
+Every imported record is written twice — the upsert, then a separate `update` just to stamp `seeded` provenance — run sequentially in per-item loops, so a full-config import does ~2× the write round trips it needs. **Fix:** fold the provenance flag into the upsert payload (extend the records/disciplines upsert inputs to accept `seeded`), preserving the count-before-stamp reporting by deriving counts from the upsert result.
+
+#### Eval harness runs golden cases strictly sequentially
+
+**Severity:** Moderate (offline admin path)
+**Where:** `eval/eval.ts` → `runEval()` (224)
+
+Each golden case awaits a real model/retrieval call one after another, and each judge metric within a case awaits a further model call, all sequential — wall-clock ≈ the sum of every case's and every metric's latency. 50 cases × 2 judge metrics ≈ 150 sequential model calls (minutes). **Fix:** drive the cases through a bounded concurrency pool (e.g. 4–8 in flight) so wall-clock ≈ total work ÷ pool size while respecting provider rate limits.
+
+#### Admin tabs refetch on every revisit (no `staleTime`)
+
+**Severity:** Moderate (network waste, not UI jank)
+**Where:** `hooks/useAiCore.ts` (all read hooks), `pages/AiCoreAdminPage.tsx` (74)
+
+No query hook sets `staleTime` or `refetchOnWindowFocus`, and Radix `TabsContent` unmounts inactive tabs, so every tab revisit remounts and background-refetches that tab's whole query set — including the effectively-immutable terms-options catalogue. **Fix:** set a sensible `staleTime` (30–60 s, longer for terms-options) and `refetchOnWindowFocus: false` on the reference-data reads; keep the volatile reads (usage, review-items, eval-results) fresh with a short `staleTime`. (Depends partly on the host app's root QueryClient defaults, which the module can't see — so set it per hook.)
+
+#### Operations editor re-renders the whole table per keystroke; list unpaginated
+
+**Severity:** Moderate (bites once operations grow — they carry a `userId`, so user-authored ops accumulate)
+**Where:** `pages/tabs/OperationsTab.tsx` (form state 780, table 944)
+
+The operation editor's `form` state lives at the tab root, and the operations `<Table>` (unmemoised inline rows) renders unconditionally, so every keystroke in the editor reconciles every row. The list is also rendered in full with no pagination/virtualisation. **Fix:** extract the editor into a dialog component holding local state (the in-file `TestRunDialog` already shows the pattern), and paginate or virtualise the rows.
 
 ### ~~First Live Provider Call Not Yet Made~~ (made in v1.7.0)
 
@@ -160,6 +213,17 @@ The review-queue table and its feed from abstentions and low-confidence outcomes
 #### User Model-Choice UI
 
 The API capability shipped in v1.1.0 — model choice is admin-granted per operation with an allow-list, default off, and a user-selected model outside the allow-list is refused. There is no user-facing UI for making the choice yet.
+
+#### Performance — best-practice cleanups (August 2026 audit)
+
+The audit's minor findings — no current user impact, worth doing as the catalogues grow. Grouped:
+
+- **Backend over-fetch / redundant queries (admin cold path):** add `select`s to `listModels` / `listOperations` / `listSegments` (the last reads segments twice — `select` only `id` on the first pass); replace `updateGuardrail`'s list-and-find with a `findUnique`; drop the pre-read in `updateReviewItem` (map Prisma `P2025`); collapse `refreshCapabilities`' per-model stale-flag loop into one `updateMany`; parallelise the remaining independent reads (`resolver.ts` 248, `disciplines.ts` 431, `eval.ts` 207, `config-io.ts` 354 / 865 / 1185 — the last is a per-guardrail `count()` in a delete loop, collapsible to one `groupBy`).
+- **Hot-path micro-work:** memoise the per-operation zod validator (`adapters.ts` 386) instead of recompiling it every structured run; hoist `markerPrefixes` and the `anyInjectionRisk` scan in the assembler (each computed twice per assembly); thread already-fetched capabilities into `resolveEmbeddingTargetWidth` (`run.ts` 2224); parallelise the bounded graph-expansion and multi-check loops (`run.ts` 2382, 690) with `Promise.allSettled`.
+- **Schema index hygiene:** reverse-lookup FK indexes for the "is this in use?" delete checks — `@@index([modelId])` / `@@index([presetId])` on `ai_operation`, `@@index([frameworkId])` on `ai_model`; and `select` only list columns for the heavy `@db.Text`/`Json` catalogue fields. (Boolean flag columns need no index while the catalogues stay small.)
+- **Frontend re-render hygiene (admin, low-traffic):** extract the dialog form state in `DisciplinesTab` and `PromptsTab` into child components (as `MarkersTab` already does); memoise `guardrailsFor` + `sorted` (`DisciplinesTab`) and `providerName` (`ModelsTab`) into `useMemo` maps; make the `ConfigTab` import textarea uncontrolled; paginate the models and golden-cases tables if those grow.
+
+The **operation-graph cache** — caching the resolved segments / disciplines / markers / framework per `operationId`, version-stamped and invalidated on admin writes — is a larger architectural item, distinct from the response-level [Semantic Cache](#semantic-cache) above: it caches the *prompt-config records*, not model outputs. It removes the ~7 per-run reference reads entirely, but the two `Promise.all` waves and the ledger aggregate under Known Issues deliver most of the win far more cheaply, so it is lower priority.
 
 ### Long-Term / Open Questions
 
