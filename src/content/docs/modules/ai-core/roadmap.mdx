@@ -28,6 +28,10 @@ The six issues recorded here from the July 2026 alignment audit all lived in the
 
 A full performance audit of the **generated** code (v1.22.2, every template) ran a parallel finder pass with adversarial verification: 53 candidates, **46 confirmed, 7 refuted**. The three "unbounded list render" scares were refuted — the usage ledger, review queue and eval-results lists are all already capped server-side (50 / 200 / 1000 rows via `clampLimit` + zod), so the frontend never receives the whole table (a *functional* "load older" gap remains, tracked under Review-Queue UI Polish, not a perf bug). The one critical and the confirmed moderate items are recorded here; the best-practice remainder is under [Performance — best-practice cleanups](#performance--best-practice-cleanups-august-2026-audit).
 
+<Aside type="tip" title="Mostly resolved in v1.22.3">
+Shipped in **v1.22.3** (behaviour-preserving; generated-code type-correctness still to be confirmed by a live install): the critical `getCurrentUsage` DB aggregate; the run/resolve round-trip collapse (two `Promise.all` waves, guardrail-row reuse, fire-and-forget review write); all the growable-table ordering and FK indexes; the eval bounded-concurrency pool; the admin query `staleTime` / `refetchOnWindowFocus`; the `guardrailsFor` / `providerName` per-render maps; and the config-io / controller cold-path parallelisations. **Still open:** the config-io `restoreSeeded` double-write (a broad rewrite of the import-provenance path — see below), and the frontend interactive refactors (operations-editor state extraction, and list pagination / virtualisation) — deferred until they can be exercised with the admin app running, which a module repo cannot do. The zod-validator memo rides with the in-progress `providers/adapters.ts` embedding-coverage work.
+</Aside>
+
 #### `getCurrentUsage` scans the whole ledger (billing callback)
 
 **Severity:** High (Critical) — the only finding that scales badly
@@ -216,7 +220,14 @@ The API capability shipped in v1.1.0 — model choice is admin-granted per opera
 
 #### Performance — best-practice cleanups (August 2026 audit)
 
-The audit's minor findings — no current user impact, worth doing as the catalogues grow. Grouped:
+The audit's minor findings — no current user impact, worth doing as the catalogues grow. **Most shipped in v1.22.3** — the independent-read parallelisations (`disciplines`/`eval`/`config-io`), the `refreshCapabilities` `updateMany`, the guardrail PK getter, the `updateReviewItem` P2025 map, the FK indexes, the hot-path graph-expansion/multi-check overlaps, and the frontend derived-map memoisations. What remains deferred (with reasons):
+
+- **`select`-narrowing on public list reads** (`listModels`, `listOperations`, `listUsage`, `listReviewItems`, and the `@db.Text`/`Json` catalogue lists): each changes a return-type / DTO contract the admin editor and config export read off, for a verified-zero-impact payload trim on a small curated set. Needs a deliberate list-vs-detail DTO split, not a blind `select`.
+- **Assembler micro-hoists** (`markerPrefixes`, the `anyInjectionRisk` scan): computed twice per assembly, but each is microsecond in-memory work and the only fix threads a value through the assembler's fixed dispatch signature — churn without measurable gain.
+- **`resolveOperation` branch overlap** (model branch vs discipline branch): single-digit-ms saving on a path dominated by the model call, and a naive `Promise.all` would reorder which refusal surfaces first, changing the designed ordered-refusal semantics.
+- **The zod-validator memo** (`providers/adapters.ts`): rides with the in-progress embedding-coverage work in that file.
+
+Grouped (the original catalogue, for reference):
 
 - **Backend over-fetch / redundant queries (admin cold path):** add `select`s to `listModels` / `listOperations` / `listSegments` (the last reads segments twice — `select` only `id` on the first pass); replace `updateGuardrail`'s list-and-find with a `findUnique`; drop the pre-read in `updateReviewItem` (map Prisma `P2025`); collapse `refreshCapabilities`' per-model stale-flag loop into one `updateMany`; parallelise the remaining independent reads (`resolver.ts` 248, `disciplines.ts` 431, `eval.ts` 207, `config-io.ts` 354 / 865 / 1185 — the last is a per-guardrail `count()` in a delete loop, collapsible to one `groupBy`).
 - **Hot-path micro-work:** memoise the per-operation zod validator (`adapters.ts` 386) instead of recompiling it every structured run; hoist `markerPrefixes` and the `anyInjectionRisk` scan in the assembler (each computed twice per assembly); thread already-fetched capabilities into `resolveEmbeddingTargetWidth` (`run.ts` 2224); parallelise the bounded graph-expansion and multi-check loops (`run.ts` 2382, 690) with `Promise.allSettled`.
@@ -266,6 +277,10 @@ A lightweight loop over the eval harness that prunes disciplines which don't ear
 ## Completed
 
 Items that have been done.
+
+### v1.22.3 — Performance Pass (August 2026)
+
+Acted on the August 2026 [performance audit](#performance-audit--august-2026). The one **critical** finding — the billing callback `getCurrentUsage` loading and summing the entire tenant ledger in JS — now aggregates in the database (`SUM(...) GROUP BY operationId`), turning O(rows) into O(operations). The per-`run()` hot path dropped from a ~7-deep serial DB chain to two `Promise.all` waves, `validateDisciplineSet` now hands its guardrail rows to the resolver (no second query), and the secondary review-queue write no longer blocks the response. Growable tables gained ordering indexes (`ai_usage_ledger`, `ai_eval_result`, `ai_review_item`) plus reverse-lookup FK indexes (`ai_operation.modelId`/`presetId`, `ai_model.frameworkId`) — a schema change, so existing installs pick them up on `npx ai-core update`. The offline eval harness runs cases through a bounded concurrency pool; the admin page sets `staleTime` / `refetchOnWindowFocus` so tab revisits serve from cache instead of a refetch storm; and several cold-path reads (config-io export/import, controller edit handlers) were parallelised or de-duplicated. Behaviour-preserving throughout; the changes are `tsc`-clean at the template layer, with live-install verification of the generated code as the remaining gate. Deferred (see the audit section): the config-io provenance double-write, the frontend interactive refactors (editor state extraction, list pagination), and a set of zero-impact `select`/hoist micro-cleanups. See the [Changelog](/modules/ai-core/changelog/).
 
 ### v1.22.0 — Prompt Model v2 (August 2026)
 
