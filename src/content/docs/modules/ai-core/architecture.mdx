@@ -1,7 +1,7 @@
 ---
 title: Architecture
 description: How AI Core fits together — the three levels, the resolution pipeline, the request lifecycle, and where the provider SDK boundary sits
-lastUpdated: 2026-08-07
+lastUpdated: 2026-08-09
 sidebar:
   order: 1
 ---
@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
 This is the page to read first. AI Core is shared AI infrastructure: a consumer names a job — *"extract-entities"* — and everything under that name (which model runs it, how the prompt is built, which rules brake it, what shape comes back) is resolved from database records the admin can edit. This page is the map. It shows the three levels the system is built from, the one line consumers call, what happens end to end when they call it, and where the provider SDK is walled off.
 
-<Aside type="note" title="Current as of v1.18.0">
-AI Core is implemented as of module v1.18.0 (August 2026): it installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers. Retrieval (v1.13.0) and groundedness scoring (v1.12.0) are now **built**, joined by the evaluation harness (v1.14.0), markers (v1.15.0) and the taxonomy rework — semantic markers split from a per-item `injectionRisk` flag (v1.18.0). The semantic cache and a re-embedding migration remain medium-term work — marked planned where they come up and tracked on the [Roadmap](/modules/ai-core/roadmap/).
+<Aside type="note" title="Current as of v1.23.0">
+AI Core is implemented as of module v1.23.0 (August 2026): it installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers. Retrieval (v1.13.0) and groundedness scoring (v1.12.0) are now **built**, joined by the evaluation harness (v1.14.0), markers (v1.15.0) and the taxonomy rework — semantic markers split from a per-item `injectionRisk` flag (v1.18.0). The semantic cache and a re-embedding migration remain medium-term work — marked planned where they come up and tracked on the [Roadmap](/modules/ai-core/roadmap/).
 </Aside>
 
 ---
@@ -23,17 +23,17 @@ Everything in AI Core is one of three things. The bottom level is a set of **lib
 ```
 LIBRARIES              the batteries — every one a database record, admin-editable
   ├─ models            provider · pinned model id · framework · parameter rules · terms
-  ├─ prompt segments   voice · approach · discipline text · schema instructions · markers-preamble · injection-notice
+  ├─ prompt segments   objective · context · examples · format · edge-cases · markers-preamble · injection-notice
   ├─ markers           content markers + meanings (purely semantic); injection risk is a separate per-item flag
   ├─ frameworks        per model: segment order + wrapping syntax (structure only)
-  ├─ disciplines       method rules — how the AI must work — with tier + authority
-  ├─ guardrail checks  the enforcement half of a discipline
-  ├─ presets           named dial bundles
+  ├─ approaches        the unmeasured how — expertise · persona · reasoning · tone (voice is an approach flavour)
+  ├─ disciplines       method rules — how the AI must work
+  ├─ guardrails        the enforcement half of a discipline
   └─ terms options     published data-handling arrangements a provider offers
         │
         ▼   an OPERATION selects from each
 OPERATION              the named job — "extract-entities"
-        resolves to → one model · dials or a preset · disciplines · segment keys
+        resolves to → one model · dials · disciplines · segment keys
                        · a schema · a sensitivity level · optional user model choice
         │
         ▼   a FLOW puts operations in order
@@ -72,9 +72,9 @@ Here is what `run()` does, end to end, for a language operation. The order is th
 
 1. **Resolve the operation.** `resolveOperation` loads the operation record, applies the **sensitivity gate** (sensitive content may not route to an endpoint whose zero-retention terms are not recorded as in force), honours admin-granted **user model choice** against its allow-list, and selects and checks the model, its provider, and its API-key availability. Out of it comes the resolved model id, dials, discipline ids, segment keys, schema, and the terms in force. An unknown job name is a plain 404; an operation that exists but cannot run under its declared constraints refuses, named.
 
-2. **Re-validate the resolved discipline set** — on every call, not only at write time. An authority-hierarchy violation, or a `hard` rule with no live check, refuses here rather than running in a degraded shape nobody asked for. (Why this is checked at resolution time and not at boot is the section below.)
+2. **Re-validate the resolved discipline set** — on every call, not only at write time. An unknown discipline, a discipline with no guardrail, or a model-scored guardrail whose scorer operation is missing or disabled refuses here rather than running in a degraded shape nobody asked for (`validateDisciplineSet`, re-run every call). (Why this is checked at resolution time and not at boot is the section below.)
 
-3. **Load the prompt library and assemble.** Segment rows, discipline rows, and the model's framework are read; a missing or disabled authored segment refuses rather than silently changing the prompt. The assembler sorts segments by the framework's declared order, wraps each in the framework's syntax, and injects a **computed date anchor** built from this exact moment and the model's knowledge cutoff — rebuilt every call, never persisted. When a content item carries a marker, its meaning is stated automatically in the generated `markers` slot, and when any context item is flagged `injectionRisk` the **injection-risk notice** is added — both generated from library records (`markers-preamble`, `injection-notice`), not supplied by any operation, so no operation can omit them.
+3. **Load the prompt library and assemble.** Segment rows, discipline rows, and the model's framework are read; a missing authored segment refuses rather than silently changing the prompt. The assembler sorts segments by the framework's declared order, wraps each in the framework's syntax, and injects a **computed date anchor** built from this exact moment and the model's knowledge cutoff — rebuilt every call, never persisted. When a content item carries a marker, its meaning is stated automatically in the generated `markers` slot, and when any context item is flagged `injectionRisk` the **injection-risk notice** is added — both generated from library records (`markers-preamble`, `injection-notice`), not supplied by any operation, so no operation can omit them.
 
 4. **Validate parameters — tighten-only.** Dials become provider parameters only through mappings the model record declares; AI Core never invents a temperature the record did not specify. Out-of-range values clamp to the model's bounds (or reject, when the rule says reject), and a caller `maxOutputTokens` may lower the configured cap but never raise it. Every change is recorded as a parameter transform — a silently corrected parameter is a lie about what ran.
 
@@ -94,15 +94,15 @@ Embeddings run a thinner version of the same pipeline — no prompt, no dials, n
 
 ## Records, not registrations
 
-AI Core leans on **seeded database records** for its domain — models, operations, disciplines, checks — rather than code registration, and the reason is an enforcement one.
+AI Core leans on **seeded database records** for its domain — models, operations, disciplines, guardrails — rather than code registration, and the reason is an enforcement one.
 
-A code registry is populated by import-time side effects, ordered by file position, first-registration-wins. That makes registration-time rejection **unsound**: a rule can register before the rule it conflicts with, so at the moment of any one registration the registry cannot yet see the whole set. A database table has no such ordering problem — every rule and every check already exists in one table at the moment of a write. So the discipline authority hierarchy is enforced twice, both times soundly: **at write time**, admin CRUD refuses a violation transactionally (an `app`-authority write cannot edit, delete, or outrank an `ai-core` rule; a `hard` rule with no live check cannot be enabled); and **at resolution time**, `run()` re-validates the resolved set on every call and refuses an invalid one. A violation is refused the moment it is attempted, not discovered at the next restart.
+A code registry is populated by import-time side effects, ordered by file position, first-registration-wins. That makes registration-time rejection **unsound**: a rule can register before the rule it conflicts with, so at the moment of any one registration the registry cannot yet see the whole set. A database table has no such ordering problem — every discipline and every guardrail already exists in one table at the moment of a write. So discipline integrity is enforced twice, both times soundly: **at write time**, admin CRUD refuses a violation transactionally (a discipline is only a brake once it carries a guardrail, so a discipline with no guardrail — or a model-scored guardrail whose scorer operation is missing — is refused, and referential guards refuse a delete that would orphan a live reference); and **at resolution time**, `run()` re-validates the resolved set on every call and refuses an invalid one. A violation is refused the moment it is attempted, not discovered at the next restart.
 
 This is the line to keep straight, and the whole architecture rests on it:
 
 > **Register = behaviour that runs; seed = data that persists.**
 
-AI Core still *registers* code where code is what belongs there — it plugs itself into the starter's service, route, admin-page, and security registries at boot. It *seeds* its domain — providers, models, frameworks, disciplines, checks, terms options — as records at install, and consumers seed their own operations and segments the same way. The mechanics of each — `ensureOperation`, `ensureSegment`, `registerFlowHandler`, event subscription, and exactly what is registered versus seeded — are [Registering & Seeding](/modules/ai-core/registering-and-seeding/).
+AI Core still *registers* code where code is what belongs there — it plugs itself into the starter's service, route, admin-page, and security registries at boot. It *seeds* its domain — providers, models, frameworks, disciplines, guardrails, terms options — as records at install, and consumers seed their own operations and segments the same way. The mechanics of each — `ensureOperation`, `ensureSegment`, `registerFlowHandler`, event subscription, and exactly what is registered versus seeded — are [Registering & Seeding](/modules/ai-core/registering-and-seeding/).
 
 ---
 
@@ -116,18 +116,18 @@ AI Core owns a provider interface — `ProviderAdapter`, `GenerateRequest`, `Gen
 
 ## Where things live
 
-AI Core's schema is 16 self-contained `ai_` tables, split by what they are for. Configuration is app-level and admin-managed; the data a run produces is tenant-scoped.
+AI Core's schema is 19 self-contained `ai_` tables, split by what they are for. Configuration is app-level and admin-managed; the data a run produces is tenant-scoped.
 
 <CardGrid>
   <Card title="Config tables — app-level" icon="setting">
-    The libraries and their compositions: `ai_provider`, `ai_provider_terms_option`, `ai_model`, `ai_prompt_framework`, `ai_marker`, `ai_prompt_segment`, `ai_discipline`, `ai_guardrail_check`, `ai_preset`, `ai_operation`, `ai_flow`, `ai_eval_case`. No owner columns — these are the app's shared configuration, seeded at install and edited in the admin.
+    The libraries and their compositions: `ai_provider`, `ai_provider_terms_option`, `ai_model`, `ai_prompt_framework`, `ai_marker`, `ai_prompt_segment`, `ai_approach`, `ai_discipline`, `ai_guardrail`, `ai_operation_segment`, `ai_segment_approach`, `ai_segment_discipline`, `ai_operation`, `ai_flow`, `ai_eval_case`. No owner columns — these are the app's shared configuration, seeded at install and edited in the admin.
   </Card>
   <Card title="Data tables — tenant-scoped" icon="document">
     What a run leaves behind: `ai_flow_run`, `ai_usage_ledger`, `ai_review_item`. Each carries `tenantId` (the isolation key) and `userId` (the actor). The ledger holds references, versions, and counts — never content.
   </Card>
 </CardGrid>
 
-The sixteenth table, `ai_eval_result`, sits off to the side of that split: an append-only evaluation-results table with no owner columns (its inputs are synthetic fixtures, not subject data) that stores scores, references and named gaps, never content. The full table-by-table breakdown, the indexes, and why the ledger carries no content columns is the [Data Model](/modules/ai-core/data-model/).
+The nineteenth table, `ai_eval_result`, sits off to the side of that split: an append-only evaluation-results table with no owner columns (its inputs are synthetic fixtures, not subject data) that stores scores, references and named gaps, never content. The full table-by-table breakdown, the indexes, and why the ledger carries no content columns is the [Data Model](/modules/ai-core/data-model/).
 
 ---
 

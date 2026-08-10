@@ -1,7 +1,7 @@
 ---
 title: Service API
 description: The full aiCoreService surface a consumer programs against, method by method
-lastUpdated: 2026-08-07
+lastUpdated: 2026-08-09
 sidebar:
   order: 6
 ---
@@ -12,8 +12,8 @@ This is the reference for `aiCoreService` — the single object AI Core register
 
 > **Consumers name jobs, never models.** No model id string appears anywhere in this surface.
 
-<Aside type="note" title="Current as of v1.18.0">
-This page describes AI Core as implemented in module v1.18.0 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and every method here — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and the `ensure*` seed helpers — has been exercised end-to-end against live providers. The semantic cache and a re-embedding migration remain planned; where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+<Aside type="note" title="Current as of v1.23.0">
+This page describes AI Core as implemented in module v1.23.0 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and every method here — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and the `ensure*` seed helpers — has been exercised end-to-end against live providers. The semantic cache and a re-embedding migration remain planned; where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
 </Aside>
 
 ---
@@ -95,11 +95,11 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 `RefusedError` carries a machine-readable `reason` and a `detail` object naming which constraint failed. Verified reasons `run` can raise, from resolution and from the run engine:
 
 - `operation-disabled` — the operation record is disabled.
-- `discipline-integrity-violation` — the resolved discipline set violates the authority hierarchy. Re-validated on **every** call, not only at write time.
+- `discipline-integrity-violation` — the resolved discipline set failed guardrail-integrity validation: a discipline with no live guardrail, or a model-scored guardrail whose scorer operation is missing. Re-validated on **every** call, not only at write time.
 - `model-choice-not-granted` / `model-not-in-allow-list` — a `userSelectedModelRecordId` was passed to an operation that does not grant user model choice, or the model is not in its allow-list.
 - `no-available-model` — the resolved model or its provider is missing, disabled, or has no key (`detail.failed` names which).
 - `no-model-under-acceptable-terms` — the sensitivity gate: the operation handles sensitive content but the model's provider is not under recorded zero-retention terms. Unrecorded terms are refused, not assumed compliant.
-- `preset-missing` / `invalid-operation-schema` — a dangling preset reference, or an operation schema that is not a supported object schema.
+- `invalid-operation-schema` — an operation schema that is not a supported object schema.
 - `prompt-segment-unavailable` — the operation references prompt segments that are missing or disabled (a silently dropped segment would change behaviour with no record).
 - `malformed-framework-record` — the resolved model's prompt framework record is malformed.
 - `model-lacks-image-input` — media was attached but the model's **fetched** capabilities say it does not accept image input. An unknown capability proceeds; only a known-false one refuses.
@@ -377,7 +377,7 @@ ai?.registerFlowHandler('cog-ingest/dedupe', async (state, previous) => {
 ensureOperation(spec: EnsureOperationSpec): Promise<{ created: boolean; operation: ai_operation }>
 ```
 
-**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` requirements object (`kind`, optional `needsImageInput`, optional `dimensions` for a required embedding width), and the optional operation shape (`description`, `presetId`, `dials`, `disciplineIds`, `segmentKeys`, `schema`, `cache`, `sensitivity`). `cache` is a prompt-caching policy (`{ instructions?, context?, ttl? }`) — a create-time default the admin owns thereafter.
+**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` requirements object (`kind`, optional `needsImageInput`, optional `dimensions` for a required embedding width, optional `multimodal` for image-capable embedding), and the optional operation shape (`description`, `dials`, `segmentKeys`, `systemWide`, `schema`, `cache`, `evalConfig`, `sensitivity`). `systemWide` folds this operation's segments into every run's prompt. `cache` is a prompt-caching policy (`{ instructions?, context?, ttl? }`) — a create-time default the admin owns thereafter.
 
 **Returns** — `{ created, operation }`. `created` is `false` when the operation already existed (returned untouched) and `true` when it was seeded. The seeded row carries `seeded: true` so its provenance is visible in the admin.
 
@@ -410,7 +410,7 @@ await ai?.ensureOperation({
 ensureSegment(spec: EnsureSegmentSpec): Promise<{ created: boolean; segment: ai_prompt_segment }>
 ```
 
-**Parameters** — an [`EnsureSegmentSpec`](/modules/ai-core/registering-and-seeding/#ensuresegment--ensuresegmentspec): `key` (kebab-case, namespaced with the consumer module id), `type` (`voice` · `approach` · `discipline-text` · `schema-instruction` · `markers-preamble` · `injection-notice`), `name`, and `content`.
+**Parameters** — an [`EnsureSegmentSpec`](/modules/ai-core/registering-and-seeding/#ensuresegment--ensuresegmentspec): `key` (kebab-case, namespaced with the consumer module id), `slotType` (`approaches` · `disciplines` · `objective` · `context` · `examples` · `format` · `edge-cases`), `name`, optional `content` (the segment text; the `approaches` and `disciplines` slots carry their members instead of prose), `contentSource` (`static` · `context`), `injectionRisk`, `marker`, and — for the member slots — `approaches` (an array of `{ key, important? }`) or `disciplines` (an array of `{ id, important? }`).
 
 **Returns** — `{ created, segment }`, with the same `created` semantics as `ensureOperation`. Seeded segments carry `seeded: true`.
 
@@ -419,8 +419,8 @@ The full mechanics of both `ensure*` methods — idempotency, provenance, when t
 ```ts
 await ai?.ensureSegment({
   key: 'cog-ingest/method-extraction',
-  type: 'approach',
-  name: 'Extraction approach',
+  slotType: 'objective',
+  name: 'Extraction objective',
   content: 'Quote the source span before you record a value...',
 });
 ```
@@ -536,7 +536,7 @@ Every failure is loud, named and mapped. The base class carries an HTTP `status`
 | `BadRequestError` | 400 | `bad_request` | — | Invalid input — bad body, unknown ids, malformed schema, a rejected parameter. |
 | `NotFoundError` | 404 | `not_found` | — | A referenced record does not exist. |
 | `RefusedError` | 409 | `refused` | `reason: string`, `detail: Record<string, unknown>` | The operation exists but could not run under its declared constraints. Never falls back silently to a compliant-looking alternative. |
-| `IntegrityError` | 422 | `integrity_violation` | — | A write (or a seed) would leave the record graph lying — an authority-hierarchy breach, a hard discipline with no rationale or check, no model for a requirement. |
+| `IntegrityError` | 422 | `integrity_violation` | — | A write (or a seed) would leave the record graph inconsistent — a discipline with no live guardrail, or no enabled model satisfying an operation's requirements. |
 | `UnsupportedModelKindError` | 501 | `unsupported_model_kind` | — | The resolved model's kind has no adapter implementation in this version. |
 | `ProviderUnavailableError` | 503 | `provider_unavailable` | — | The provider has no API key configured or is disabled. |
 | `ProviderCallError` | 502 | `provider_call_failed` | `providerId`, `retryable`, `providerStatus?` | The upstream provider call failed; `retryable` says whether a retry is sensible. |
@@ -633,6 +633,7 @@ interface Feedback {
   missing: string[];       // named gaps — what the operation could not do or find
   confidence: number | null;
   threshold: number | null;
+  groundedness: number | null;   // measured external-support score abstention compares against
   coverage: { unit: string; covered: number; total: number | null } | null;
   ref: string | null;      // ledger entry id — the audit reference for this exact call
 }
@@ -641,6 +642,7 @@ interface Feedback {
 - **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `abstained-below-threshold`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `markers-preamble-unavailable`, and so on.
 - **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line). It can also carry a gap that is not itself a `reason` — for example `prompt-cache-unsupported`, named when an operation configured to cache resolves to a provider that cannot honour it (the call runs uncached rather than pretending otherwise).
 - **`confidence` / `threshold`** — reported when known, even when the run passes. `confidence` is read from a top-level `confidence` field on structured output; abstention fires when it falls below `threshold` (the operation's `abstentionThreshold` dial).
+- **`groundedness`** — the **measured** external-support score (in `[0,1]`) from a grounding guardrail: how well the output is supported by its sources, computed outside the model's own say-so. This is what abstention compares against when present; `confidence` is the weaker fallback used only when no grounding check ran (`null` here). It is an input to feedback, never a certificate that the output is true.
 - **`coverage`** — `total: null` is itself a statement: no independent count of the whole exists, and inventing one is exactly what the module forbids.
 - **`ref`** — the ledger id for this call. The stored copy carries `ref: null` because the row is its own reference; the copy returned to you gets the id.
 
