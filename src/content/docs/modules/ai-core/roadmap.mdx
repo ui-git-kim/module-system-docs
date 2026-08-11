@@ -193,7 +193,9 @@ Per-user terminology (preferred / avoided terms) plus style and detail, register
 
 #### input-data / context split, and contextual-time
 
-Two smaller refinements. Distinguish **input-data** — the new data the user brings this call — from **context** — what the app already knows — on a *new vs known* line (trust is carried by the item's marker, not a separate type). And grow the date anchor into **contextual-time** by adding *time since the last message*, so a reply after an overnight gap does not read as though no time passed.
+Two smaller refinements. Distinguish **input-data** — the new data the user brings this call — from **context** — what the app already knows — on a *new vs known* line (trust is carried by the item's marker, not a separate type). And grow the date anchor into **contextual-time** by adding *time since the last message*, so a reply five days after the last one does not read as though it were the same day.
+
+**Contextual-time — wanted now.** The date anchor is already computed per call from *now* plus the model's knowledge cutoff and rendered into the date-context segment; contextual-time adds the *elapsed gap since the previous message*. AI Core stays **conversation-stateless** — it holds no message history (conversations belong to the app or the chat module) — so the caller supplies the last-message timestamp on the call (a `RunOptions` field, e.g. `lastMessageAt`); AI Core computes and phrases the gap and never persists it. This pairs naturally with the [Tools](#tools) work, since a model that can both see the real elapsed time and look things up is the difference between a stateless completion and an assistant.
 
 ### Consumer requirements — cog-ingest (Stage-1 live + Stage-2)
 
@@ -231,6 +233,19 @@ A generic, portable harness that measures an operation's quality offline over a 
 #### ~~Groundedness Scorers~~ (shipped — v1.12.0)
 
 **Done** as part of guardrail-check execution (above). A `grounding` check runs a nested judge (claim decomposition + entailment) and produces a measured score in `[0,1]` that the abstention threshold compares against and that lands in the new `feedback.groundedness` — an input to feedback, never a certificate the output is true. Pluggable per operation via the check's `config`. The provider-native-citation and dedicated-grounding-service implementations remain open as alternative scorer types.
+
+#### Tools
+
+The run engine is **single-shot** today — the generate request carries instructions / input / parameters / schema / attachments / cache, and the model cannot call out mid-generation (see [Providers & Adapters](/modules/ai-core/providers-and-adapters/)). **Tools** add that: the model may invoke a named capability — **web search first** — and the run continues with the result. It stays inside every existing principle.
+
+- **Web search first.** The one most AI apps need — answer a question about something past the model's training cutoff by looking it up. Ship the **provider-native** search tool (Anthropic / OpenAI / Google each host one) before any general framework: least surface, the model decides when to search.
+- **A tool is a record, opted into per operation.** A new `ai_tool` catalogue (seeded, admin-editable) plus an `ai_operation_tool` join — an operation declares which tools it may use, resolved like disciplines and dials. The consumer surface is unchanged: still `aiCore.run('answer-question', …)`, never a tool name in code. Two kinds: **provider-native** (provider-hosted, e.g. `web_search`) and **function** (an app-declared tool whose *declaration* is a seeded record and whose *execute* handler is **registered as code** — the same seed-data / register-behaviour split flows already use).
+- **The SDK stays in the adapter.** The generate request gains `tools?` + `toolChoice?`; the result gains a normalised tool-call / step trace. The adapter translates the resolved tool set into the AI SDK's `tools` and runs the agentic loop (`stopWhen`), bounded by a **step cap expressed as a dial** — "dials promise work, not speed": each extra step is another model call. Nothing about tools leaks past the adapter layer.
+- **The sensitivity gate extends to tool egress — the crux.** A web search sends the query (and possibly context) to a third party under *that tool's* terms. So a tool carries its own recorded data-handling terms, and the resolver's sensitivity gate covers them: a `sensitive` operation may use only tools whose zero-retention terms are attested, else it **refuses loudly** — a new `no-tool-under-acceptable-terms` reason mirroring `no-model-under-acceptable-terms`. Because the gate is opt-in per operation, a `normal` operation searches freely and a `sensitive` one refuses until the tool's terms are recorded. No new gating concept — the same gate, one more axis.
+- **Transparency, ledger, abstention — the rules unchanged, applied.** The run reports which tools ran and (for search) what it found and the shape of what it missed, exactly as `retrieve()` does; the ledger records tool calls **by reference** (tool name, call count — never the query or the results content); and if a question needs post-cutoff information the operation cannot get (tool absent or gated off), it **abstains and names the gap** rather than answering from stale training data. A tool the model wanted but was denied is reported, never silent.
+- **Phasing.** (1) provider-native web search behind the per-operation opt-in + terms gate; (2) the general function-tool + agentic-loop framework; (3) a small built-in catalogue (URL fetch, code execution) as demand appears. Structured-output-plus-tools and streaming are open questions for the design — some providers can't combine schema output with tools, and the module is non-streaming today.
+
+A fuller design sketch — the exact request/result shapes, the `ai_tool` / `ai_operation_tool` records, and how the gate / ledger / feedback extend — was worked through alongside this entry.
 
 #### Semantic Cache
 
