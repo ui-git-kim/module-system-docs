@@ -13,15 +13,17 @@ Structure's admin page supports full JSON import and export of node type configu
 
 ## Overview
 
-The **Import** and **Export** buttons sit in the admin page header (App Structure > top tab row).
+The **Import** and **Export** buttons sit in the admin page header (App Structure > top tab row). Since v1.33.34 both go through a single atomic endpoint (`GET`/`POST /config/import`).
 
-- **Export** downloads a single JSON file containing all node types, connection types, groups, and field templates
-- **Import** accepts any combination — only the sections present in the JSON are processed
-- **Import order:** groups first, then node types, then connection types (so node types can reference groups, and connection types can reference node types)
-- **Two import modes:** Merge (add new, update existing) and Replace (delete node types not in the import)
+- **Export** downloads a single JSON file containing all field templates, groups, node types, connection types, and functions
+- **Import** accepts any combination — only the categories present in the JSON are processed; a category you omit is left untouched
+- **Atomic:** the whole bundle is applied in one server-side transaction. If any row is invalid the entire import is rejected and **nothing is written** — you get the rejection reason, not a half-applied import
+- **Import order:** field templates → groups → node types → connection types → functions (so later categories can reference earlier ones)
+- **Two import modes:** Merge (add new, update existing) and Replace (additionally prune stale rows — see below)
+- **Result summary:** after a successful import the dialog reports **created / updated / deleted per category**
 
-<Aside type="caution" title="Replace mode deletes missing node types">
-In **Replace** mode, any existing **non-system node type** that is not present in the import JSON will be deleted. System types (`isSystem`) and pending node-type proposals are never deleted, regardless of mode. Connection types and groups are always merge-only — they are created or updated, never deleted. Replace is useful for full node-type sync but destructive if your import is incomplete. Use **Merge** mode for incremental updates.
+<Aside type="caution" title="Replace mode prunes stale rows in every present category">
+In **Replace** mode, for **each category present in the bundle**, existing rows not in the import are deleted — field templates, groups, node types, connection types, and functions. A category **absent** from the bundle is left completely untouched, so a partial bundle never wipes what it omits. System node types (`isSystem`) and pending proposals are never deleted, and connection types spare `isSystem` rows. Replace is useful for full config sync but destructive if a present category's array is incomplete. Use **Merge** mode for incremental updates.
 </Aside>
 
 ---
@@ -37,19 +39,22 @@ When you click **Export**, the downloaded JSON follows this structure:
   "fieldTemplates": [
     { /* ... shared field-set objects ... */ }
   ],
+  "groups": [
+    { /* ... Group objects ... */ }
+  ],
   "nodeTypes": [
     { /* ... NodeType objects ... */ }
   ],
   "connectionTypes": [
     { /* ... ConnectionType objects ... */ }
   ],
-  "groups": [
-    { /* ... Group objects ... */ }
+  "functions": [
+    { /* ... Function objects (formula named expressions) ... */ }
   ]
 }
 ```
 
-A real export contains `version`, `exportedAt` (an ISO timestamp), `fieldTemplates`, `nodeTypes`, `connectionTypes`, and `groups`. The exporter does not write a top-level `description` — `description` is only an optional field you may add to an import file. All four arrays are optional on import. You can import a file with only `nodeTypes`, only `fieldTemplates`, or any combination. The `version` field is `"1.0"` for the current format.
+A real export contains `version`, `exportedAt` (an ISO timestamp), and the five category arrays: `fieldTemplates`, `groups`, `nodeTypes`, `connectionTypes`, and `functions`. The exporter does not write a top-level `description`. All five arrays are optional on import — you can import a file with only `nodeTypes`, only `functions`, or any combination. The `version` field is `"1.0"` for the current format.
 
 ---
 
@@ -213,7 +218,7 @@ Each node type property explained:
 | `conditionalColor` | `object` | Change a node's colour based on a field value (`field`, `rules`, `fallback`). |
 | `permissions` | `object` | Node-level permission overrides for `create`, `edit`, `archive`, and `delete` (each `'anyone'` or `'admin'`). |
 
-`labels`, `integrations`, `templateOverrides`, `isSystem`, and `isEnabled` also round-trip on export and import even though they are not shown in the example above.
+`labels`, `integrations`, `templateOverrides`, `isSystem`, `isEnabled`, and the four component-template links (`cardTemplateId`, `listItemTemplateId`, `detailHeaderTemplateId`, `overviewTemplateId`) also round-trip on export and import even though they are not shown in the example above (component-template links were added to the export/import in v1.33.34).
 
 **superClasses** — a type can declare multiple parents (the type graph is a DAG):
 
@@ -411,6 +416,30 @@ Field templates are **reusable field sets** — define a group of fields once, t
 
 ---
 
+## Function JSON
+
+Functions are **admin-defined named expressions** (tier 2 of the [formula field](/modules/structure/fields/)'s function library) — reusable calculations a formula field can call by name. Including them in the bundle keeps a config self-contained: a node type whose formula field calls `budgetVariance(...)` needs that function to exist in the target environment (functions round-trip in the config bundle since v1.33.34).
+
+```json
+{
+  "name": "budgetVariance",
+  "params": ["actual", "planned"],
+  "expression": "actual - planned",
+  "description": "How far over or under the planned figure",
+  "category": "finance"
+}
+```
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `name` | `string` | -- | **Required.** Unique identifier (a valid identifier). Functions key on `name`, not a slug — a rename creates a new function. |
+| `params` | `string[]` | `[]` | Parameter names (each a valid identifier, max 20). |
+| `expression` | `string` | -- | **Required.** The formula expression body (max 4000 characters). |
+| `description` | `string` | -- | Optional description. |
+| `category` | `string` | -- | Optional grouping label for the Functions admin tab. |
+
+---
+
 ## Fields Array Format
 
 Both node types and connection types use the same field format. Each field in the `fields` array follows this structure:
@@ -525,13 +554,13 @@ This is the safe default for incremental updates.
 
 ### Replace Mode
 
-Replace mode only affects **node types**:
+Replace mode applies to **every category present in the bundle** (since v1.33.34):
 
-- **New node types** are created
-- **Existing node types** are updated
-- **Missing node types** (in the database but not in the import) are deleted — but only **non-system** types
+- **New rows** (key not found) are created
+- **Existing rows** (key matches) are updated
+- **Missing rows** (in the database but not in the import) are deleted
 
-System types (`isSystem`) and pending node-type proposals are never deleted, even in Replace mode. Connection types and groups are always merge-only — created or updated, never deleted — even in Replace mode.
+The delete is scoped per category: node types spare `isSystem` types and pending proposals; connection types spare `isSystem` rows; field templates, groups, and functions delete the importer's own stale rows. A category **absent** from the bundle is skipped entirely — its rows are never touched, so a partial bundle in Replace mode does not wipe what it omits.
 
 <Aside type="caution" title="Deleting node types that have data">
 Deleting a node type does not check for existing nodes — there is no foreign-key constraint linking a node to its type. A node type is removed silently, and any existing nodes keep an orphaned `nodeType` slug. Reassign or delete those nodes yourself if you do not want them orphaned.
@@ -539,16 +568,17 @@ Deleting a node type does not check for existing nodes — there is no foreign-k
 
 ### Processing Order
 
-Import processes items in this order:
+Import processes categories in this order, all inside one transaction:
 
 1. **Field templates** — so node and connection types can reference them via `fieldTemplateIds` (references are resolved by slug or exported id to the target app's ids)
 2. **Groups** — so that node types can reference them via `groupSlug`
 3. **Node types** — so that connection types can reference them via `fromTypes` / `toTypes`
 4. **Connection types**
+5. **Functions**
 
 ### Validation
 
-The import is lenient — unknown fields are ignored rather than causing errors. The system provides detailed per-item error reporting if any item fails validation. Node-type import does not check slug format; it only rejects a missing or empty `slug`, `name`, or `namePlural`.
+The import is **atomic**: the whole bundle is validated and applied in one transaction. Unknown fields are ignored, but a row that fails validation — a bad field-template / connection-type / function shape, a missing required key, a `superClass` cycle or orphan, or a reserved `origin` connection field — **rejects the entire import**. Nothing is written, and the dialog shows the reason. This replaces the old client-orchestrated flow that could half-apply an import and report "N items failed" without saying which. Node-type shape validation stays lenient (it only requires `slug`, `name`, `namePlural`).
 
 ---
 
