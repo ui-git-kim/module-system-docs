@@ -155,8 +155,8 @@ One shared validator over the resolved field set, run on every write path.
 - **Programmatic writers:** skip validation only for `editableBy:'system'` fields written by trusted service callers (cog-ingest's graph-derived values) — reuse the `editableBy` classification already read at `:4346-4367`.
 - **Decision D9:** application-layer only (no DB CHECK / `pg_jsonschema`).
 
-### S1.2 — Computed-value server trust (**M**)
-`formula` (`calcConfig`) and `computedTemplate` values are client-computed and accepted verbatim (`frontend/index.ts:580`; no server evaluation). Port the safe evaluator (`utils/formula.ts`, already React-free) and the merge-field resolver (`utils/merge-fields.ts`) to the backend and, on write, **recompute** computed/formula fields server-side (or reject client-supplied values for them). Fold into the S1.1 validation pass in `createNode`/`updateNode`.
+### S1.2 — Computed-value server trust — ❌ REMOVED (2026-08-09)
+Dropped from the plan. It was purely anti-spoofing (recomputing `formula` / `computedTemplate` server-side so an *untrusted* caller can't submit a fake value). veradai is **solo**, and its only external surface is the **API-key-authed** public REST API — the user's own keys — so there is **no untrusted writer** to spoof anything. A faithful server-recompute would also mean re-implementing the ~500-line evaluator + the frontend-registry-coupled merge resolver on the backend, risking divergence from the client values that drive cards and formulas. The formula (v1.33.15) and merge-field (v1.28.0) features are untouched and keep working client-side. Revisit only if an app ever adds genuine multi-user or an *unauthenticated* write surface.
 
 ### S1.3 — Node-type permission enforcement + `inputScope` (**M**)
 Make the config-only `permissions` block real, and add `inputScope`.
