@@ -168,6 +168,10 @@ export default defineConfig({
                   label: "Colour Picker",
                   slug: "starter-template/colour-picker",
                 },
+                {
+                  label: "Typography",
+                  slug: "starter-template/typography",
+                },
               ],
             },
             {
