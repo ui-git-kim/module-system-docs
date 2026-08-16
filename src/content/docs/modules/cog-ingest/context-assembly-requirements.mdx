@@ -1,0 +1,140 @@
+---
+title: Context Assembly Requirements
+description: What ai-core's context-assembly engine needs from Structure (the store) and Cog Ingest (the producer) — and how it degrades when the cognitive stack is absent.
+lastUpdated: 2026-08-16
+sidebar:
+  order: 7
+---
+
+import { Aside, Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
+
+ai-core is building a **curated, deterministic context-assembly engine** — a human-in-the-loop pipeline that turns already-retrieved knowledge into ordered, budgeted, provenance-marked prompt segments: `retrieve → select → order → budget → dedupe → mark → emit`. Several of the signals that pipeline needs are **produced at ingest or exposed by the store**, not by ai-core. This page is the contract: what ai-core needs, where each piece should live, and how it behaves when a producer is absent.
+
+It is written from ai-core's side as a **proposal**. The final "db-engine vs Structure" allocation is the ingest/store owners' call — but the invariants below are not negotiable, because they follow from ai-core's dependency rules.
+
+---
+
+## The load-bearing boundary
+
+<Aside type="danger" title="ai-core talks only to Structure">
+ai-core's `depends` is **empty** by design (it is the foundation; nothing may make it depend on a consumer). At runtime it reaches the store through **Structure's services only** — `semanticSearchChunks`, `hybridSearchChunks`, `getNodeConnections`, `getCognitiveCapabilities` — and it never imports `cognitive-db` or `cog-ingest`.
+</Aside>
+
+Two consequences drive everything on this page:
+
+1. **The retrieval + storage contract is Structure's.** Anything ai-core reads at runtime must be a field Structure stores and a method Structure exposes. If a capability isn't on Structure's surface, ai-core can't use it — no matter which module computes it.
+2. **A `Structure + ai-core` install (no cognitive stack) must work.** Cog Ingest — and the `cognitive-db` engine it bundles — is the **primary producer** that populates Structure's fields at ingest, but it is **optional**. When it is absent, either the app populates Structure another way, or the signal is simply missing — and ai-core **degrades and reports** (it never fabricates a missing signal).
+
+<CardGrid>
+  <Card title="Structure — the store" icon="seti:db">
+    Owns the content/chunk rows, the search SQL (semantic, lexical/BM25, hybrid RRF), spans, `observedAt`, connection provenance, and the topK caps. **This is the contract ai-core depends on.**
+  </Card>
+  <Card title="Cog Ingest — the producer" icon="seti:pipeline">
+    Chunks content, computes per-chunk signals, and **writes them into Structure**. Optional. Bundles the `cognitive-db` engine.
+  </Card>
+  <Card title="cognitive-db — the engine" icon="seti:crystal">
+    Perception, extraction, discovery and ranking maths. Writes into Structure in "structure-storage mode". Optional; never on ai-core's runtime path.
+  </Card>
+  <Card title="ai-core — the consumer" icon="seti:clock">
+    Retrieves from Structure, curates deterministically, assembles the prompt, and reports coverage/gaps. Depends on Structure only.
+  </Card>
+</CardGrid>
+
+<Aside type="tip" title="The immediate win: ai-core is under-consuming Structure">
+ai-core currently calls `semanticSearchChunks` + `getNodeConnections` only. But **Structure already ships hybrid lexical+semantic search with SQL-side Reciprocal Rank Fusion** (`hybridSearchChunks` / `hybridSearchNodes` / `lexicalSearchChunks`), already **returns chunk spans on every hit** (in `chunk.metadata`), and already **enforces a topK cap**. So the first improvement needs **no new storage and no ingest change at all** — ai-core switches to `hybridSearchChunks` and reads `chunk.metadata`.
+</Aside>
+
+---
+
+## The needs, by owner
+
+Ten signals the context engine wants, grouped by who has to do the work. `(a)–(j)` labels are stable references used across the ai-core roadmap and the Structure/cognitive-db docs.
+
+### Group 1 — Already in Structure; ai-core just consumes
+
+No new work in the store or the producer — this is pure ai-core wiring.
+
+| Need | Where it lives | ai-core action |
+|------|----------------|----------------|
+| **(f) Chunk spans** (char offsets) | `structure_chunk.metadata` (produced by the ingest splitter), returned on every hit | Read `chunk.metadata` for exact-quote verification and granularity-widening |
+| **(g) Semantic + lexical + RRF fusion** | `hybridSearchChunks` / `lexicalSearchChunks` (BM25 or `ts_rank_cd`, RRF in SQL) | Call the **hybrid** method (pass query text *and* the vector ai-core already embeds) instead of semantic-only |
+| **(j) Per-hit provenance** | `nodeId` + `score` on every result | Already consumed |
+| **(d) Freshness stamp** | `structure_node.observedAt` (valid-time; **filter-only, never a decay/ranking signal**) | Use for time-scoped filters; render as relative time (see caveat under Group 3 — it must actually be *populated*) |
+
+### Group 2 — Small Structure extensions
+
+Contract additions ai-core needs the **store** to expose. These belong in Structure's schema/API even though the engine may populate them.
+
+| Need | Ask on Structure |
+|------|------------------|
+| **(i) Surface the topK ceiling** | Add a `limits` block to `getCognitiveCapabilities()` (the cap `MAX_TOP_K` is enforced internally but not readable) so ai-core's breadth clamp is cap-aware rather than hard-coded |
+| **(h) Bi-temporal edge validity + provenance projection** | Provenance (`NodeConnection.origin` = explicit/discovered/active) and supersede (`status`) already exist. Add an explicit **`[validFrom, validTo)` interval** on the edge, and **project `observedAt` / `origin` / `status` onto the `NodeConnection` / `getNodeContext` DTO** so a fact can be rendered *with its validity* |
+
+### Group 3 — Producer signals (Cog Ingest writes these into Structure)
+
+Computed once at ingest and stored beside the content, so assembly stays cheap and deterministic. When Cog Ingest is not installed, these are **absent** — and ai-core degrades and reports (see below).
+
+| Need | Producer action | Storage |
+|------|-----------------|---------|
+| **(a) Per-chunk summary rung** | Generate a short summary per chunk at ingest (the node-level summary already exists via `description`) — enables **budget downgrade to a shorter rung without a runtime LLM call** | `structure_chunk.metadata.summary` (open JSON — **no schema migration**) |
+| **(b) Per-chunk importance / salience** | Greenfield. Compute at chunk time (the producer is the only place that sees the whole document) | `structure_chunk.metadata.importance` |
+| **(c) Per-chunk content hash** | The document-level `sha256` change-gate exists; add a **per-chunk** hash for retrieval-set dedupe | `structure_chunk.metadata.contentHash` |
+| **(d) Populate `observedAt`** | The column exists and is never-decay-safe — but the pipeline must actually **stamp** it at ingest | `structure_node.observedAt` |
+
+<Aside title="A granularity ladder, not a runtime summariser">
+The highest-value idea from the design work: store **`title` / `summary` / `content` rungs** per item at *ingest*, so ai-core's budget step is a **rung-selector** — give each item the richest rung that fits, degrade under pressure, and report which rung it used. This is compression **without a hot-path model call**, and it is cache-stable. Node rungs already exist (`name` / `description` / `data.content`); the only new work is the **per-chunk** summary rung `(a)`.
+</Aside>
+
+### Group 4 — ai-core-owned (read-time, not ingest)
+
+| Need | Why it's ai-core's |
+|------|--------------------|
+| **(e) Verbalization** (node/edge → a model-readable fact sentence carrying its validity + provenance) | This is a **prompt-shaping transform** — ai-core's job at assembly time. It must **not** be frozen at ingest, because an edge's validity is mutable (later edges supersede it). Structure supplies the structured inputs (fact + `observedAt` + `origin` + node id via `getNodeContext`); ai-core renders the sentence deterministically |
+
+---
+
+## The degradation contract
+
+Because a `Structure + ai-core`-only install is a supported configuration, **every producer signal is optional and its absence must be reported, never hidden**:
+
+- No per-chunk **summary rung** → ai-core falls back to the node summary or the full content, and names `no-summary-rung` in the run's coverage.
+- No **importance** signal → ordering falls back to relevance + recency, and says so.
+- No **hybrid** method available → semantic-only, with a named retrieval gap.
+- `observedAt` **unpopulated** → no relative-time anchor for that item, reported rather than invented.
+
+This is the module's core rule applied to context: *the system may do less than it was asked; it may not let anyone believe otherwise.*
+
+---
+
+## Two implementation notes for ai-core's side
+
+<Tabs>
+  <TabItem label="Ranking maths (don't rebuild silently)">
+
+`cognitive-db`'s `retrieval/` domain already implements `rrfFuse`, `mmrSelect`, `dedupe` and `budgetAssemble` as **pure, storage-free functions** that honour the never-decay invariant. ai-core **cannot import them** (that would give it a dependency on the engine). Two clean options:
+
+1. ai-core calls Structure's **SQL-side hybrid RRF** for the fuse step and re-implements MMR / budget / dedupe itself (small pure maths), treating `cognitive-db`'s functions as the **reference semantics** to match; or
+2. these primitives are lifted into a **dependency-free shared package** both modules import.
+
+Either way, ai-core should **not** silently rebuild RRF when Structure already computes it, and must match the never-decay rule.
+
+  </TabItem>
+  <TabItem label="Merge fields (match Structure's grammar)">
+
+Structure already ships a **single-brace `{token}`** merge-field system — `getMergeFieldSchema()` → `MergeFieldToken[]`, `resolveTemplateAsync`, with `{field}`, `{group[key=value].target}`, and `{ref->field}` dereference. ai-core's context merge-fields should **match this grammar** for ecosystem consistency (ai-core's `{{ }}` is reserved for build-time scaffold placeholders). Reuse the pattern — resolver, token-schema surface, and the "insert field" affordance — rather than inventing a second grammar.
+
+  </TabItem>
+</Tabs>
+
+---
+
+## Where each ask should be tracked
+
+- **Structure-side** (Group 1 is done; Group 2 extensions; the `observedAt`-on-connection projection for `(e)`): cross-reference into [Structure](/modules/structure/) — it owns the schema fields, the search surface, and `getCognitiveCapabilities`.
+- **Engine-side** (populating edge validity/provenance at discovery and supersession): [cognitive-db](/cognitive-db/).
+- **Producer signals** (Group 3 — per-chunk summary/importance/hash, stamping `observedAt`): this module, [Cog Ingest](/modules/cog-ingest/engine/).
+- **Consumer-side** (curation, rung-selection, ordering blend, dedupe, verbalization render, merge-field resolver, budgeting, degradation reporting): ai-core, under its roadmap's *Context Assembly — the context engine* entry.
+
+<Aside type="note">
+The single invariant ai-core needs the ingest/store layer to preserve: **the contract surface is Structure, a `Structure + ai-core` install works, and every absent signal is reported rather than faked.** Everything else — which of Cog Ingest or the cognitive-db engine computes a given signal — is the cognitive stack's own call.
+</Aside>
