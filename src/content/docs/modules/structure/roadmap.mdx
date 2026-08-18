@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features and future direction for the Structure module
-lastUpdated: 2026-08-02
+lastUpdated: 2026-08-18
 sidebar:
   order: 11
 ---
@@ -294,6 +294,46 @@ Improvements to make Structure easier and more powerful for other modules to int
 
 ## Known Issues
 
+### 2026-08-18 performance audit — six critical + twenty-two moderate
+
+**Priority:** Open — nothing fixed yet; fixes are queued in six groups (A typing-path, B bundle/code-split, C list & tree scale, D backend queries, E bulk + public API, F cache hygiene), ordered by user-felt impact. An eight-dimension performance audit of v1.34.19's **generated output** (React rendering / list rendering / data fetching / backend queries / route handlers / bundle & registries / memory / hot-path utilities), run by eight per-dimension agents with a dedup pass and adversarial per-finding verification against the live template source: **41 raw → 34 confirmed (6 critical, 22 moderate, 6 minor)**. The 6 minors are under [Planned Improvements](#planned-improvements). File:line refs are template-source lines.
+
+**🔴 Critical**
+
+- **Field-filter inputs fire an uncancelled `listNodes` request per keystroke** (`frontend/pages.ts` ~L573) — the main search box is debounced (300 ms) but the per-field filters are not: each keystroke rebuilds `dataFilters` → new `useNodes` queryKey → an immediate JSONB-filtered `GET /nodes`, with no abort signal forwarded (superseded requests run to completion server-side) and no `placeholderData`, so the list flashes to a spinner per keystroke. Fix: debounce `fieldFilters` like search, and forward TanStack's abort signal through `structureService.listNodes`.
+- **`listNodes` search scans every owned row with `jsonb_each_text`** (`backend/index.ts` ~L4719) — the raw pre-query filters only by `userId` (ignoring the request's nodeType/status filters), detoasts every row's `data` and runs `ILIKE '%term%'` over every value — unindexable — while the trigger-maintained GIN **`searchVector`** (built from exactly name + description + data string values) sits unused on this path; ≤5,000 matched ids then round-trip back as `IN (...)` into both the count and page queries. Fix: `"searchVector" @@ websearch_to_tsquery(...)` (or fold the predicate into the main queries so it inherits the other filters).
+- **Entire lucide-react icon library ships in the initial bundle** (`frontend/registrations.ts` ~L118, + 7 sibling sites: `NodeIcon`, `NodeWidgetWrapper`, `QuickCreateDropdown`, `IconPicker`, `CardPreview`, `NodeDetailPage`, `NodeTypesAdminPage`) — `import * as LucideIcons` + dynamic `[iconName]` access defeats tree-shaking, and the side-effect registration pins all ~1,500 icons (~150–300 KB gzipped) into the entry chunk. Fix: one shared resolver using `lucide-react/dynamic` (`DynamicIcon`, per-icon lazy chunks) or a curated static map, replacing all eight sites.
+- **~6,600 lines of admin-only UI + `@dnd-kit` eagerly loaded at boot** (`frontend/registrations.ts` ~L639) — the admin-pages registration statically imports `NodeTypesAdminPage` (→ `NodeTypeForm` + `FieldSetEditor` + Field Templates/Functions pages + `CardPreview` + the module's only @dnd-kit usage) and the registry holds the live reference for every user, admin or not; the settings-page and five tab registrations are equally eager while `routes.config.tsx` beside them already demonstrates `lazy()`. Fix: register `lazy(() => import(…))` components (React.lazy satisfies the registry's ComponentType contract).
+- **Every field serialises the whole form blob twice per keystroke** (`frontend/components.ts` ~L1732/L1783) — `useResolvedTemplate` / `useResolvedFormula` are called for every field and both stringify the full form-data bag even when the field has no `computedTemplate`/`calcConfig`; `NodeInfoTab`'s inline per-field `allData` spread (`frontend/pages.ts` ~L1170) and the field-group branch's per-sub-field `{ ...allData, ...item }` defeat the `[data]` memo — repeater cost is quadratic in row count. Fix: gate the `dataKey` stringify on the feature being present, hoist `allData` to one `useMemo`, one spread per repeater row, and `memo()` `NodeFieldRenderer`.
+- **Tree view renders up to 5,000 rows with no virtualisation or row memo** (`frontend/components.ts` ~L1441) — every arrow-key move, expand toggle, and (undebounced) tree-search keystroke re-renders **all** visible rows; a flat type puts every node at root, and persisted `treeExpanded` rehydrates large expansions. Fix: window the already-flat `visible` array (e.g. `@tanstack/react-virtual`), extract a `memo()`'d row, debounce tree search 300 ms.
+
+**🟡 Moderate — frontend rendering & data fetching**
+
+- `NodeInfoTab` keystrokes re-render + re-stringify all field editors (`frontend/pages.ts` ~L1170) — hoist `allData`, memo the renderer, stable handlers.
+- `NodeTypeForm`'s single root `formData` state re-renders the whole active tab per key; `mergeTokens` + the inherited-fields BFS recompute per character (`frontend/pages.ts` ~L5913) — memo the field cards/sections, or onBlur commits.
+- Add Connection dialog state lives in `NodeConnectionsTab`, so dialog keystrokes re-render every connection badge (per-badge `find()` + field formatting) (`frontend/pages.ts` ~L1560) — extract the dialog into a child component.
+- `useNodes` lacks `placeholderData: keepPreviousData` — every pagination/filter/sort change drops the list to a full-pane spinner (`frontend/index.ts` ~L2612).
+- All 13 node mutations invalidate all 7 structure query prefixes — a favourite toggle refires node/path/children/connections/context (3–6 round trips for a one-bit flip) (`frontend/index.ts` ~L2848) — scope invalidation per mutation; `setQueryData` for favourite.
+- `NodeSelector` fetches its 50-node option list on mount, before the popover ever opens — one request per selector instance (header `ScopeSelector` + every node-reference field) (`frontend/components.ts` ~L1123) — gate the query on `open`.
+- The barrel statically re-exports the lazily-routed pages, so the route code split is silently dead — the whole Structure frontend loads at boot (`frontend/registrations.ts` ~L380) — drop the two page re-exports.
+- `NodeGrid`/`NodeList` per-node click-handler caches are never pruned and pin first-seen node objects across the never-remounting `:nodeType` route — MBs of dead node versions per browsing session, plus stale nodes passed to `onSelect` after refetch (`frontend/components.ts` ~L1526/L1595).
+- Card merge-template deref fetches referenced nodes per card, bypassing React Query — a 100-card grid with a `{ref->field}` title template fires 100–200 undeduped requests (`frontend/index.ts` ~L4416) — route `defaultFetchNode` through `queryClient.fetchQuery`.
+- `semanticSimilarity` is registered as an uncached backend call and `useResolvedFormula` re-fires it on **any** form keystroke (its effect keys on a stringify of the whole blob) (`frontend/registrations.ts` ~L607) — module-scope result cache keyed on the id pair.
+
+**🟡 Moderate — backend**
+
+- The node-type table is re-scanned up to 7× inside one request (`loadEnforcedScopes` / `unreadableTypesFor` / `getFieldDefs` / `loadTypeGraph` each do their own findMany); a `GET /nodes/:id/context` pays ~8–12 sequential config round trips (`backend/index.ts` ~L3584) — thread one per-request type snapshot through the helpers (the `preloadedDefs` pattern, extended).
+- `dataSortField` fetches **all** matching rows' full `data` blobs and sorts in JS on every page view — page 2 of a 5,000-row table re-transfers all 5,000 blobs (`backend/index.ts` ~L4765) — sort in SQL with a guarded cast, or select only the sort key.
+- `getNode` includes **all** active children as full rows on every detail read; `getNodeChildren` / `getNodeDescendants` are fully unbounded full-row fetches (`backend/index.ts` ~L4849/L5737/L5762) — add `take` + select-narrowing.
+- Bulk archive/delete/restore loop the single-node method — 3–6 queries plus a transaction per id, so a 200-node delete issues ~1,200+ sequential statements (`backend/index.ts` ~L5995) — prefetch validation in two `IN` queries + grouped `updateMany`, keeping per-id error reporting.
+- `bulkCreateNodes` repeats the parent findFirst, path lookup, and `MAX(sortOrder)` aggregate per row (~2,000 queries for a 500-row batch) (`backend/index.ts` ~L5916) — a per-parent `Map` of `{ exists, path, nextSortOrder }`.
+- `duplicateNode` inserts descendants (and connections) one-by-one inside a single interactive transaction — P2028 default-timeout risk at ~500+ descendants (`backend/index.ts` ~L5503) — build the row arrays (already computed in memory) and `createMany`.
+- The public schema endpoint rebuilds the entire type graph once per referenced type, sequentially (~4N+4 queries for N node-reference targets) (`backend/index.ts` ~L2906) — load the graph once, resolve refs locally.
+- Public `GET`/`PATCH /:type/:id` hydrate every child row (full `data` blobs) then discard them (`delete publicNode.children`); PATCH loads the full node just to compare `nodeType` (`backend/index.ts` ~L2946/L3000) — a `getNode` skip-children option + a select-narrowed type check.
+- Every public API request re-resolves the full node-type config (~5–6 sequential config queries before any data query; `GET /:type/:id` re-runs `getFieldDefs` on top) (`backend/index.ts` ~L2807) — short-TTL type-graph cache invalidated by the type/field-template mutation paths.
+
+**Re-confirmed, already tracked** (not duplicated here — see the deferred-performance entries under Planned Improvements): the `getTree` full-row fetch (hotter now the tree view actually renders, v1.33.26+) and the unbounded `dataFilters` id pre-query (`SELECT "id"` with no LIMIT, folded back as a giant `IN`).
+
 ### 2026-08-07 meta audit — one critical + thirteen moderate
 
 **Priority:** ✅ Resolved (v1.33.16) — all 28 findings fixed and host-validated (backend + frontend, 0 structure errors; the formula 57-case suite passes on the generated file). A four-dimension audit (standards / production / performance / security) of v1.33.15, run by eight per-file-area agents with adversarial synthesis and per-finding verification against the live template source: **28 findings (1 critical, 13 moderate, 14 minor)**. The 14 minors are under [Planned Improvements](#planned-improvements). File:line are approximate (shipped template strings). Detail retained below for provenance.
@@ -457,6 +497,17 @@ The `field-group` field renderer emits two **over-escaped** template expressions
 ---
 
 ## Planned Improvements
+
+### 2026-08-18 performance audit — minor sweep (6)
+
+**Priority:** Open — the six minor findings from the 2026-08-18 performance audit (the criticals + moderates are under [Known Issues](#known-issues)). Best-practice fixes with no visible impact today.
+
+- **Settings PATCH on every tree chevron toggle** (`frontend/pages.ts` ~L104) — `saveSettings` is called *inside* the `setExpandedIds` updater (double-fired in dev StrictMode), one unthrottled network write per click with last-write-wins on the shared settings blob. Move it out of the updater and debounce persistence.
+- **`structure_settings.treeExpanded` never prunes deleted-node ids** (`frontend/pages.ts` ~L109) — nothing (frontend or backend) removes ids of since-deleted nodes, and each toggle re-uploads the full all-types map. Intersect with the fetched tree's live ids at save time.
+- **Node-type drag-reorder fires one PATCH per type** (`frontend/index.ts` ~L3274) — a drop among 30 types = 30 parallel requests (only the invalidation is batched). Add a batch endpoint (e.g. `POST /types/reorder`) mirroring `reorderNodes`.
+- **Detail page fetches all detailHeader templates when the type assigns none** (`frontend/pages.ts` ~L835) — `useTemplates('detailHeader')` runs unconditionally to read one boolean from an unset config. Gate with an `enabled` flag on `Boolean(detailHeaderTemplateId)`.
+- **Connection listings hydrate two full endpoint rows per connection** (`backend/index.ts` ~L7432, also `listConnections` ~L7772) — `include: { fromNode, toNode }` with no select ships both endpoints' `data`/`settings`/`metadata` blobs when consumers render name/icon/type. Select-narrow the include (keep `rootNodeId`/`userId` for the scope/ownership filters). *(The unbounded half of this was fixed in v1.19.0 — the width half remained.)*
+- **Boot-time nav prime double-fetches and fires when logged out** (`frontend/registrations.ts` ~L256) — `primeStructureNavigation` bypasses TanStack Query so the first `useNodeTypes` mount re-issues the same request, and on anonymous pages the 401 backoff fires up to 8 doomed requests. Seed the query cache on prime success; skip the initial attempt when unauthenticated.
 
 ### 2026-08-07 meta audit — minor sweep (14)
 
