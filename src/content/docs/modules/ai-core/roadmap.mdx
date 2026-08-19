@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features, known issues, and future direction for AI Core
-lastUpdated: 2026-08-18
+lastUpdated: 2026-08-19
 sidebar:
   order: 15
 ---
@@ -101,6 +101,88 @@ No query hook sets `staleTime` or `refetchOnWindowFocus`, and Radix `TabsContent
 
 The operation editor's `form` state lives at the tab root, and the operations `<Table>` (unmemoised inline rows) renders unconditionally, so every keystroke in the editor reconciles every row. The list is also rendered in full with no pagination/virtualisation. **Fix:** extract the editor into a dialog component holding local state (the in-file `TestRunDialog` already shows the pattern), and paginate or virtualise the rows.
 
+### Meta Audit — August 2026 (four dimensions)
+
+A whole-module health audit of the **generated** code (v1.37.0 — all 44 templates materialised to their 31,625 generated lines and read as shipped code) across four dimensions: standards and conventions, production readiness, performance, security. A parallel finder fleet with per-finding adversarial verification raised **102 candidates, confirmed 83, refuted 21**.
+
+The module's own gates were all green going in — `type-check`, `check:templates`, `conformance:check`, `parity:check` and `build` all pass — and a mechanical sweep of the generated output found **zero** `console.*`, zero backend relative imports missing `.js`, zero `@/` aliases in backend, zero Rule-7 typography/colour/shadow/opacity breaches across all eleven admin tabs, zero real `any`, zero `doAction` (36 `doActionAll`), zero `@relation`, zero hand-built query keys, no second `QueryClient`, and every one of the eighteen admin queries carrying a shared `staleTime` constant. Every admin route is `requireAdmin`-gated, `resumeFlow` enforces tenant ownership, the sensitivity gate correctly refuses on *unrecorded* terms rather than only on `false`, and the ledger's raw SQL is parameterised through `Prisma.sql`. `npm audit` reports one low-severity advisory, dev-only and transitive (esbuild via tsup), nothing that ships.
+
+The five criticals and the confirmed moderates are recorded below; the minor findings are under [Meta audit — minor findings](#meta-audit--minor-findings-august-2026).
+
+#### The caller's `maxOutputTokens` cap never reaches the provider, but the ledger says it did
+
+**Severity:** High (Critical) — the only finding that both wastes money and falsifies the audit trail
+**Where:** `run/run.ts` → `runOperation` (cap applied at 1382, provider call at 1433)
+
+The per-call tighten-only cap is written into a rebuilt `parametersSent` object, but `adapter.generate(...)` is still passed `parameters: validated.parameters` — the untouched original. That is the only `adapter.generate` call in the file, and `providers/adapters.ts` forwards `req.parameters.maxOutputTokens` verbatim, so nothing re-applies the cap downstream. Meanwhile the ledger row, the returned `RunAudit` and a recorded `ParameterTransform` (`rule: 'caller-cap-tighten-only'`) all assert the capped value was sent. An operation configured at 4000 with a caller passing `opts.maxOutputTokens = 500` calls the provider at 4000, bills at 4000, and permanently records 500. The only per-call cost lever is inert, and it contradicts the invariant stated a few lines above it in the same file — "a silently corrected parameter is a lie about what ran". **Fix:** pass `parametersSent` to the adapter.
+
+#### The account-deletion handler can run an unscoped `deleteMany`
+
+**Severity:** High (Critical) — cross-tenant data destruction
+**Where:** `security.registration.ts` → the `ai-core.user-data` deletion handler
+
+`const tenantId = ctx.subject.tenantId;` goes straight into three `deleteMany` calls with no presence check. Prisma treats `where: { tenantId: undefined }` as *no filter*, so a subject arriving without a resolvable `tenantId` erases `ai_usage_ledger`, `ai_review_item` and `ai_flow_run` **for every tenant in the app**. Conformance **C9** mandates resolving the owner id and throwing (`refusing unscoped deleteMany`), and the module-starter's own scaffold shows the guard. It slipped through because `check-conformance.cjs` implements C2, C5, C6, C10, C13, C15, C17, C18 and C26 — **C8 and C9 are not among the automated checks**. Four independent audit agents found it separately. **Fix:** resolve the id defensively and throw before the transaction. The missing C8/C9 checks are worth raising upstream with module-starter.
+
+#### A merge import silently resets operation fields it was told to leave alone
+
+**Severity:** High (Critical) — silent config loss through the documented-safe import mode
+**Where:** `config-io.service.ts` → `applyOperation` inside `importOperations`
+
+`applyOperation` coerces absent operation fields to hard defaults instead of passing `undefined` through, contradicting the contract stated in the same file — "an absent field leaves the stored one alone… The same leave-as-is-when-absent rule holds for every field below". A **merge** import — the mode whose whole promise is *update and report, never delete* — therefore wipes `dials`, `segmentKeys`, `inputItems` and their neighbours on any operation whose config entry omits them. **Fix:** pass those fields through unchanged when the config omits them.
+
+#### `deleteOperation` leaves dangling operation-to-operation pointers
+
+**Severity:** High (Critical) — strands the system prompt, and the schema cannot catch it
+**Where:** `records.service.ts` → `deleteOperation`; `upsertOperation`
+
+An operation is deleted without clearing the two operation-to-operation pointers other operations hold on it (`systemPromptOperationId`, `contextOperationId`). There is no FK and no cascade — by design, the schema is self-contained — and the reverse-lookup indexes exist but are never queried on the delete path; `deleteOperation` refuses only when an **enabled flow** names the operation. `upsertOperation` compounds it by writing both pointers with no existence check, while refusing the write for every *other* cross-record reference (`modelId`, `segmentKeys`, `toolIds`, approach keys, discipline ids). This is the admin half of [A deleted system-prompt operation removes the system prompt silently](#a-deleted-system-prompt-operation-removes-the-system-prompt-silently), now traced to both write sites. **Fix:** check referrers before the delete transaction and either refuse (as `deleteModel` / `deleteFramework` / `deleteInputType` already do) or null the pointers inside the same transaction; validate both pointers in `upsertOperation`.
+
+#### Saving an operation leaves its own segments stale for five minutes
+
+**Severity:** High (Critical) — the admin sees their edit revert
+**Where:** `hooks/useAiCore.ts` → `useCreateOperation` / `useUpdateOperation` / `useDeleteOperation`
+
+Saving an operation writes its private per-op segments (`op.<id>.approaches` / `.disciplines` / `.objective`) server-side, but the mutations invalidate only the `operations` key — never `segments`. `useSegments` carries `staleTime: 5 * 60_000` and `refetchOnWindowFocus: false`, so reopening the same operation inside five minutes shows the **pre-save** approaches and disciplines. The likeliest reading is that the save failed. **Fix:** invalidate both keys through the factory in all three mutations. `useDeleteSegment` and `useUpdateSegment` have the mirror-image gap and should invalidate `operations`.
+
+#### Confirmed moderates
+
+Grouped by area. Each is evidenced against the generated code and survived adversarial verification.
+
+**Security**
+
+- **Provider error text is echoed to the HTTP caller.** `sendError` forwards `err.message` verbatim, and `ProviderCallError.message` carries the raw upstream SDK text — the exact string the module deliberately strips from its logs and its ledger — on `POST /run`, which any authenticated user may call (`controller.ts` 102, `adapters.ts` 245).
+- **Runtime request bodies have no upper bounds.** Every runtime schema bounds arrays and strings from below but never above, so any authenticated non-admin can post unbounded embed values, rerank documents, run segments and base64 media straight through to a paid provider (`validation.ts` 601).
+- **Callers can set `injectionRisk`, `origin` and `verification` on their own segments.** `consumerSegmentSchema` accepts all three from the request body on the non-admin `POST /run/:operationId`, though the schema's own comment says `injectionRisk` is set by the module (`validation.ts` 554).
+- **Flow working memory reaches the prompt untrusted and unfenced.** Flow state — seeded from caller-supplied JSON and from consumer handler output — is injected into every operation step as a plain context segment with no `marker`, `injectionRisk` or `origin`, unlike every other ingested channel in the module; the gap is not even named in feedback (`flows.ts` 183).
+- **`userSelectable` is not enforced at run time.** The model-choices listing endpoint filters on it; `resolveOperation` checks only `userModelChoice` and allow-list membership (`resolver.ts` 498).
+- **The caller cap is applied after the ceilings are enforced.** `validateParameters` is the only place the declared `maxOutputTokens.max` and the model's capability ceiling are applied, and the caller value lands after it — so with no configured cap it is clamped against nothing (`run.ts` 1377).
+
+**Production readiness**
+
+- **`runRetrieval` throws where its own docblock promises degradation.** The Structure capabilities probe and the chunk search are unguarded, while the identical probe inside `assembleContext` is wrapped and the gap named (`run.ts` 3449).
+- **The system-prompt fold can resolve to nothing and run silently.** Flipping the `enabled` switch on the only seeded system-wide operation reaches it, and the explicit-pointer branch never checks `enabled`/`systemWide` where the default lookup does (`records.service.ts` 1393–1394).
+- **A config import can store an invalid `slotType`.** `importSegments` casts straight to `SlotType` and `upsertSegment` never validates it — only the admin route's zod enum does, which an import bypasses. The assembler matches slots by equality, so the segment silently never renders (`config-io.service.ts` 1231).
+- **`resumeFlow` has a read-then-write race.** The suspended check and the status update are separate statements, so two concurrent resumes — a client retry after a timeout being the realistic trigger — both proceed (`flows.ts` 379).
+- **No timeout on model-catalogue calls.** Up to 20 sequential provider pages plus the multi-megabyte models.dev catalogue run inside one admin refresh request with no abort signal (`model-listing.ts` 46).
+- **A tool the provider cannot host is dropped with a server log only** — no `ProviderWarning`, no `feedback.missing` entry — so the run reports `degraded: false` (`adapters.ts` 709).
+- **Caller `memory` / `session` are accepted then dropped unnamed** unless a context operation happens to read them (`run.ts` 1293).
+- **Operations cannot be deleted from the admin.** `OperationsTab.tsx` carries no delete affordance and `useDeleteOperation` has no consumer, though `DELETE /admin/operations/:id` exists and every other record type has one.
+- **Destructive admin actions have no confirmation step.** Every Delete button fires its mutation straight from `onClick`, and the "Replace (also remove omitted)" config import — which deletes every non-seeded operation, segment and discipline absent from the document — runs on a single click.
+- **Numeric model fields accept anything.** They are plain text inputs passed to `Number()` unvalidated, so "200k" or "1,536" becomes `NaN` and serialises to `null`.
+- **Save errors show the axios message, not the API reason** — "Request failed with status code 400" rather than the zod field errors or the discipline-hierarchy refusal, though the file already defines a helper that reads the response body.
+- **A stranded System Prompt pointer falls back to the placeholder** in the picker, so the editor displays a value the operation does not hold.
+
+**Standards**
+
+- **Action-hook payloads omit `userId`.** None of the ~28 `doActionAll` payloads in `records.service.ts`, nor the shared helper in `disciplines.service.ts`, nor either review-item emission carries actor identity, which C19 requires.
+- **The config envelope breaches C22/C23.** It is `{ version, exportedAt, <entity arrays> }` — no `moduleId`, no `counts`, no `data` wrapper — and `importConfig` validates only the version. `moduleId` appears **zero** times in the 2,007-line file, so any document claiming `version: "2.0"` is accepted; in replace mode that deletes the app's non-seeded prompting configuration.
+- **Editor titles are bare `<h2>` elements** rather than the `<Heading>` primitive Rule 7 requires, across the disciplines, approaches, markers and tools editors.
+- **The date anchor states no timezone.** `isoDate()` is `toISOString().slice(0, 10)`, so the "single time anchor everything relative is computed against" names the wrong day for part of every day east of UTC.
+
+**Performance**
+
+- **`resolveOperation` resolves the full segment composition and re-validates the discipline set before loading the model record**, doing that work for every operation kind though both are only read on the language path (`resolver.ts` 453).
+
 ### ~~First Live Provider Call Not Yet Made~~ (made in v1.7.0)
 
 **Resolved:** 2026-08-01 (v1.7.0)
@@ -181,13 +263,59 @@ Anthropic and Google both advise putting long material **above** the instruction
 
 An operation that selects a system prompt stores that choice as an operation id. Nothing enforces that the target still exists: `deleteOperation` refuses only when an **enabled flow** names the operation, so a system-prompt operation (or a Context builder) can be deleted while other operations still point at it. On the next run the composition query takes the "an explicit system prompt was chosen" branch, finds no rows, and the run proceeds with **no system prompt at all** — not even the default fallback — and says nothing. A dangling Context-builder pointer is better behaved: the run names `context-builder-unavailable`.
 
-Two fixes belong together: refuse (or name) the delete while another operation still selects it, the way a segment delete is refused while an operation composes it; and make the composition fall back to the default system prompt *and* name the gap when the selected operation cannot be found. The v1.37.0 config import already closes its own half of this — it writes null and names the shortfall rather than importing a dangling pointer — but the admin UI path remains.
+Two fixes belong together: refuse (or name) the delete while another operation still selects it, the way a segment delete is refused while an operation composes it; and make the composition fall back to the default system prompt *and* name the gap when the selected operation cannot be found. The v1.37.0 config import already closes its own half of this — it writes null and names the shortfall rather than importing a dangling pointer — but the admin UI path remains. The [August 2026 meta audit](#deleteoperation-leaves-dangling-operation-to-operation-pointers) traced the admin half to its two write sites (`deleteOperation` checks only enabled flows; `upsertOperation` writes both pointers unchecked) and raised it to Critical.
 
 #### Input contract: declared, not enforced
 
 **Severity:** Low — by design today, recorded so nobody assumes otherwise.
 
 An operation's `inputItems` contract (v1.35.0, extended in v1.36.0) drives the admin Test-run form, the prompt preview's placeholder input, and what the app is told to send. The run engine does **not** enforce it: a caller may send fewer, more, or differently-shaped segments and the run proceeds. Enforcement (refusing or naming a run whose segments do not match the contract) is a deliberate next step, not an oversight.
+
+#### Meta audit — minor findings (August 2026)
+
+The 45 minor findings from the [Meta Audit](#meta-audit--august-2026-four-dimensions). None has current user impact; each is real and evidenced. Grouped by where the fix lands. Items already tracked under [Performance — best-practice cleanups](#performance--best-practice-cleanups-august-2026-audit) are not repeated here.
+
+**Declared-vs-actual drift (cheap, do first)**
+
+- **`schema.modelNames` is missing `ai_input_type`.** The array lists 21 models; the schema template ships 22 — the v1.36 table was never added. Install and uninstall are unaffected because the scaffold unions the declared names with the ones it extracts from the template content (`init.ts` 188–192, 232), so the practical impact is the install summary printing 21 of 22 models and `findModuleSchema` matching on an incomplete list.
+- **`shadcnComponents` declares `skeleton`, which no template imports.** Fourteen distinct `@/components/ui/*` modules are imported; fifteen are declared. C27 is satisfied in the direction that matters (nothing imported is undeclared), but the extra entry installs a component the module never uses.
+- **The security manifest's header contradicts the schema.** It asserts the config tables "carry no owner columns", but `ai_prompt_segment`, `ai_approach`, `ai_discipline` and `ai_operation` each carry `userId`. Either the comment or the `ownedModels` list should change — the audit did not find a case where user-authored config rows are erased on account deletion.
+- **`auditEvents` declares 4 event names; the backend fires 14.** The manifest under-reports the module's own audit surface.
+- **`evalCaseUpdateSchema` is defined and exported but never referenced** — `PUT /admin/eval-cases/:id` validates with `evalCaseCreateSchema`, so an update must resend every field.
+- **Two file headers state the opposite of their code** — `services/ai-core.service.ts` on the axios baseURL, and a stale `display` block kind in the `ContextBlock` doc comment in `types/index.ts`.
+
+**Backend correctness and hygiene**
+
+- **The controller reimplements three ledger reads inline.** `listUsage`, `listReviewItems` and `updateReviewItem` run raw `prisma` calls in the route handler while the corresponding `ledgerService` methods — the correct implementations, with clamping — go uncalled. That is business logic in a route handler, and it leaves three service methods dead.
+- **`deleteOperation` does not clean up `ai_eval_case` rows** whose `operationId` points at the deleted operation.
+- **Check-then-write races on natural keys.** `createModel` reads `ai_model` by the `(providerId, modelId)` unique pair then creates; the unique constraint saves correctness but the error surfaces as a raw constraint violation rather than the intended message.
+- **`updateModel` accepts a `providerId` change** (`modelUpdateSchema` is `modelCreateSchema.partial()`), which can move a model to a provider whose terms it was never assessed against.
+- **A guardrail's admin-supplied `denominator.pattern` is compiled and run with the `g` flag over the whole concatenated context.** A catastrophically backtracking pattern is an admin-authored foot-gun on the run path.
+- **`runEval` loads every enabled golden case with no `take` cap** and runs the real pipeline over all of them — one provider call per case, plus one per model-scored guardrail.
+- **Breadth saturation is not named.** `runOneRetrieval` names an empty result and a clamped breadth, but a retrieval returning exactly `topK` hits — the signal that material was probably cut off — passes unremarked, which sits awkwardly beside the module's never-silent rule.
+- **`onPrepareDatabase` leaves its TRUNCATE script behind.** Every install and update writes `prisma/.ai-core-v2-prompt-model-prep.sql` into the host app and never removes it.
+
+**Performance (no current impact; worth doing as catalogues grow)**
+
+- **Six indexes are strict prefixes of another index on the same table** — `ai_usage_ledger` and `ai_flow_run` among them — so they cost writes on the tables that grow fastest and buy nothing.
+- **The same guardrail rows are fetched twice per language run** — `validateDisciplineSet` already loads them during resolution.
+- **The `ai_operation` row is read twice per run**, and again for every nested run (scorers, rerank, context builders).
+- **`assembleContext` runs its retrieval blocks and its per-embedding-model query vectors in sequential `for … await` loops** where the work is independent.
+- **`exportConfig` reads every prompt segment — including the `content @db.Text` column — plus both membership join tables twice**, when `listSegments` already returns what it needs.
+
+**Admin UI polish**
+
+- **Four hand-rolled primitive lookalikes**: a Badge-shaped `<span>` in the operations editor (with `Badge` imported in the same file), a card-shaped raw `<button>` in `ProviderCard`, hand-rolled empty states in `ContextTab` where `EmptyState` is available, and a raw unstyled native `<input type="file">` in `ConfigTab` amid otherwise-shadcn controls.
+- **Mutation errors are swallowed in two tabs** — `EvalsTab` renders only the client-side JSON parse error, and `UsageTab`'s Resolve/Dismiss buttons show nothing when the request fails.
+- **`markers` and `inputTypes` are excluded from the operations editor's loading and error gates**, so a failed request for either degrades the editor silently.
+- **The file-attach handlers register no `onerror` or `onabort` and perform no size or type check** before `readAsDataURL`.
+- **`ContextTab` can POST `modelId: ''`** when no enabled model exists, because `inertModelId` resolves to the empty string and `canSave` never checks it.
+- **`useRunOperation` does not invalidate `current-usage`**, though a run changes exactly the totals that query returns.
+- **Two surfaces exist only in the API.** The input-type catalogue has full CRUD, a service and hooks, but `useUpsertInputType` and `useDeleteInputType` have no consumer in any tab — so input types are read-only in practice. Flows have full admin CRUD endpoints and four unconsumed hooks but no tab, which is the concrete shape of the Flows gap noted under [Review-Queue UI Polish](#review-queue-ui-polish).
+
+**Tooling gap surfaced by this audit**
+
+- **`check-conformance.cjs` does not implement C8 or C9**, which is why the unscoped-`deleteMany` critical passed a green conformance run. It also does not cover C21–C24, which is why the config envelope's missing `moduleId` went unflagged. Both belong upstream in module-starter rather than in this module.
 
 ### Prompt Model Evolution — settled 24 July 2026
 
