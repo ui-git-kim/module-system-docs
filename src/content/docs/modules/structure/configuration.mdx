@@ -81,6 +81,8 @@ Node types have two flags that control ownership and visibility:
 
 Module-registered node types should still set `isSystem: true` and `userId: null` so they are marked system-owned and survive a replace-mode import. User-created types from the admin panel have `isSystem: false` and the creating user's ID.
 
+`userId: null` is also what makes a **shared type** possible. A type is read-shared across users only when its row is app-level *and* it sets `primaryScope.global: true`; the flag on a per-user row is inert. Turning the toggle on migrates the row to `userId: null` in the same write — see [Shared types](#shared-types-global-true).
+
 <Aside type="note">
 When a module registers a node type with `moduleId` set, the system tracks ownership. If the module is uninstalled, its node types can be cleaned up automatically.
 </Aside>
@@ -156,7 +158,7 @@ Configuration for each node type.
 | `builtInFieldConfig` | JSON | Merge templates / `editableBy` for built-in name, description, and slug fields |
 | `conditionalColor` | JSON | Colour rules based on a field value |
 | `permissions` | JSON | Node-level read / create / edit / archive / delete overrides — each `anyone` \| `admin` \| `system` |
-| `primaryScope` | JSON | Primary-node scope — `{ isPrimary?, scopedTypes?, isolation? }` for the header scope selector; `isolation: 'enforced'` turns it into a server-side, fail-closed space |
+| `primaryScope` | JSON | Scope — `{ isPrimary?, scopedTypes?, isolation?, global? }`. `isPrimary` adds the header scope selector and `isolation: 'enforced'` turns it into a server-side, fail-closed space; `global: true` makes the type **read-shared across all users** and space-exempt, and is honoured only on an app-level row (`userId` `null`) |
 | `governance` | JSON | Governance — `{ classification?: { levels?, default? } }` for data classification |
 | `fieldTemplateIds` | JSON | `string[]` — attached shared field-template ids (`structure_field_template`) |
 | `navigation` | JSON | Navigation config |
@@ -408,11 +410,17 @@ interface NodeTypeConfig {
     includeConnections?: boolean;
     includeChildCounts?: boolean;
   };
-  // Primary-node scope — see Primary scope below
+  // Scope — see Primary scope below
   primaryScope?: {
     isPrimary?: boolean;
     scopedTypes?: string[];
     isolation?: 'filter' | 'enforced';
+    // Read-shared type: every user reads the same entries and the type is
+    // exempt from enforced-space confinement. READS ONLY — writes are never
+    // widened, at any permission tier. Requires an app-level type row
+    // (structure_node_type.userId === null) and is mutually exclusive with
+    // isPrimary. See Shared types below.
+    global?: boolean;
   };
   // Data classification — see Governance below
   governance?: {
@@ -456,7 +464,9 @@ interface NodeTypeRules {
 
 ### Primary scope
 
-Mark a node type as the app's **primary scope** (e.g. Matter) so a header dropdown lets users pick the current instance and other types' lists filter to that instance's subtree. Configured on the admin **Hierarchy** tab. Added in v1.24.0.
+Mark a node type as the app's **primary scope** (e.g. Matter) so a header dropdown lets users pick the current instance and other types' lists filter to that instance's subtree. Added in v1.24.0.
+
+The toggles live in the node type's **Scope** section on the admin **Basic** tab — renamed from "Primary Scope" in v1.34.27, when the shared-type toggle joined it. The `scopedTypes` picker sits on the **Hierarchy** tab under **Spaces**, and appears only once the type is the primary scope.
 
 ```typescript
 // On NodeTypeConfig:
@@ -468,6 +478,8 @@ primaryScope?: {
                             // 'filter' (default) = client-side list scoping via
                             // pathPrefix; 'enforced' = server-side, fail-closed
                             // space confined by structure_node.rootNodeId
+  global?: boolean;         // Read-shared across all users, and space-exempt.
+                            // Mutually exclusive with isPrimary — see below
 };
 ```
 
@@ -485,6 +497,29 @@ Added in v1.34.0. With `isolation` left at its default `'filter'`, scoping is a 
 - Moving a node **out of** an enforced space is rejected unless its type opts in with `rules.allowCrossSpaceMove` (default off, and audited). That covers a move into a *different* space as well as a move to unscoped or scope-exempt territory — the old root is what the guard tests. Filing a node **in** from a non-enforced area is always allowed.
 
 The in-app API takes no scope query parameter — the active space is ambient. The [public REST API](/modules/structure/public-api/) has no session to read it from, so its list and get routes accept an explicit `?scopeRootId=` instead, which must name a node of an enforced primary type.
+
+#### Shared types (`global: true`)
+
+Added in v1.34.27. Setting `primaryScope.global: true` makes a node type **read-shared**: every user reads the same entries instead of each user having their own, and the type is **space-exempt** — its nodes stay visible inside any enforced space and are a valid connection target from any space. Use it for reference data the whole app draws on. The toggle is **Shared across all users**, in the same **Scope** section as the primary-scope toggle.
+
+Sharing is a **read** widening only:
+
+- **Writes are never widened.** A user can only ever modify entries they created — edit, archive, restore, delete, duplicate, favourite, move, add-child and every bulk operation — at **any** permission tier, with **no admin bypass**. The `permissions` tiers on a shared type only narrow who may create their own entries; they never widen who may change someone else's. A non-owner gets a read-only view: the detail header shows a lock and a **Read-only** marker, and every write control is hidden.
+- **A non-owner's row is sanitised** on every surface it can reach (detail, list, tree, search, children, descendants, connection endpoints, and semantic / lexical / hybrid results): `secret`-typed values are stripped (the keys are absent, not blanked), `embeddingText` is stripped, `settings` and `metadata` are blanked, and `isFavorite` is forced `false`. Favourites belong to the creator — the Favourites filter returns owned rows only, and a reader cannot favourite someone else's shared entry.
+- **Chunks and embeddings.** `embeddingText` is never returned to a non-owner. Chunks of a shared node have their `metadata` blanked, and are **omitted entirely when the source type declares any `secret` field**, because chunk prose can embed a secret. Resolution fails closed: a type or field-definition set that cannot be read yields no chunks.
+- **Edges are never shared.** Connections stay per-user rows — on a shared node you see only your own edges, and may create, promote, restore and delete your own. Deleting or restoring a shared node deliberately sweeps referencing edges **across owners**, so delete and restore stay symmetric.
+
+<Aside type="caution" title="Sharing requires an app-level type row">
+`global` is honoured only on a type row with `userId` `null`. Slugs are per user, so honouring the flag on a user-owned row would let one admin flag their own `tag` type and thereby admit *another user's* `tag` entries. Turning the toggle on migrates the row to app-level in the same write that stores the flag; a per-user row carrying `global` is inert.
+
+The migration is refused with a `400` while **another user already owns a live type with that slug**, since an app-level row shadows theirs on every read. Rename or remove the conflicting type first.
+</Aside>
+
+`global` and `isPrimary` are **mutually exclusive** — a type that *is* the space cannot also be the thing that sits outside every space. The admin form hides the shared toggle once the primary scope is on, and confirms before clearing a previously-set shared flag. A config that arrives with both set — JSON import writes `primaryScope` straight through — is resolved the same way server-side: **`isPrimary` wins and `global` is ignored**, and the form then shows the leftover flag as a clear-only control rather than a toggle that would look live but do nothing. The reserved `connection` slug can never be shared.
+
+The shared-slug list is read from the node-type table through a 15-second per-process cache, so turning sharing on can take a few seconds to be visible everywhere. Both directions are safe: newly sharing only adds rows, and un-sharing is refused outright while other users hold entries (see the node-type endpoints below). Note that `features.publicApi.enabled` plus `global` means **every user's entries of that type are reachable through one user's API key** — sanitised as above; see the [public REST API](/modules/structure/public-api/).
+
+For the day-to-day behaviour of a shared type — the read-only view, what a reader can and cannot do, and the residual caveats — see [Usage](/modules/structure/usage/).
 
 ### Governance (data classification)
 
@@ -825,7 +860,7 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 | GET | `/types/:slug` | Get type config |
 | POST | `/types` | Create type (admin only) |
 | PATCH | `/types/:slug` | Update type (admin only) |
-| DELETE | `/types/:slug` | Delete type (admin only, fails if nodes exist) |
+| DELETE | `/types/:slug` | Delete type (admin only, fails if nodes exist — counted **across owners** for a shared type) |
 | POST | `/types/reorder` | Batch `sortOrder` update — body `{ items: [{ slug, sortOrder }] }`, one transaction (admin only) |
 | GET | `/types/export` | Export **node types only** as JSON (admin only) |
 | POST | `/types/import` | Import types from JSON — `merge` or `replace` mode (admin only) |
@@ -835,6 +870,19 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 `/types/export` returns node types alone (`{ version, exportedAt, nodeTypes }`). For the whole configuration — node types, field templates, groups, connection types and formula functions — use `GET /config/export`, which is what the App Structure page's **Export** button calls. `POST /config/import` is **atomic**: any failure rolls the entire import back. It accepts `mode` (`merge`, the default, or `replace`) and `dryRun: true`, which computes the per-category diff inside a rolled-back transaction without writing or firing hooks. Either way it returns a per-category summary of created / updated / deleted / unchanged rows.
 
 Since v1.18.0, the list and get responses include two additive keys: `superClasses` (the raw parent slugs) and a read-only `resolved` block (`fields`, `features`, `ancestors`) with inheritance applied. See [Type Hierarchy](/modules/structure/type-hierarchy/).
+
+#### Shared-type failure conditions
+
+[Shared types](#shared-types-global-true) (`primaryScope.global`) add one new `400 Bad Request` condition and widen two existing ones. Each error names what has to be resolved — the slug, the entry count, or both (the share-on clash reports the slug; `DELETE /types/:slug` reports the count). All four exist for the same reason: a shared type's configuration is the single app-level row that **every** holder's entries are rendered and validated against, so a change that strands other users' entries is refused rather than half-applied.
+
+| Endpoint | Refused when | Fix |
+|----------|--------------|-----|
+| POST `/types`, PATCH `/types/:slug` | Turning sharing **on** while another user already owns a live type with that slug — the app-level row would shadow theirs on every read | Rename or remove the conflicting type first |
+| PATCH `/types/:slug`, POST `/types/import`, POST `/config/import` (any mode) | Turning sharing **off** while live (non-deleted) entries of the type belong to other users — including by *omitting* `primaryScope.global` from an imported config, since import writes whole-row semantics | Delete or migrate those entries first, or keep the flag set in the payload |
+| DELETE `/types/:slug` | Entries of the type exist — counted **across all owners** for a shared type, not just the caller's | Delete or migrate the entries first |
+| POST `/types/import`, POST `/config/import` (`replace` mode) | A shared type is absent from the payload and entries of it exist across the app — replace mode would otherwise sweep it away silently | Include the type in the import, or delete or migrate its entries first |
+
+The replace-mode guard runs through the same predicate as the delete it protects, so a shared type that is `isSystem: true` (or a pending proposal) is never swept and never blocks. `POST /config/import` is atomic — a refusal rolls the whole bundle back, and `dryRun: true` surfaces it without writing.
 
 ### Node Type Proposals
 
@@ -979,6 +1027,10 @@ type DataFilterOperator =
 ```
 
 Operators `is_empty` and `is_not_empty` do not require a `value`. The `between` operator expects `value` to be `[min, max]`. The `in` and `not_in` operators expect `value` to be an array. Set `valueType` whenever you compare a numeric or date custom field with `gt`/`gte`/`lt`/`lte`/`between` — without it the stored JSON value is cast as a number, so date fields compare lexicographically and sort wrongly.
+
+<Aside type="caution" title="Filters run before shared-node sanitisation">
+`dataFilters` are applied in SQL against the raw `data` column, which is **before** a non-owner's view of a [shared type](#shared-types-global-true) has its `secret` values stripped. An equality probe against a secret field therefore matches the shape of the stored **sealed envelope**, not plaintext — it cannot reveal a secret's value, but it is a distinguisher. The real residual is legacy plaintext written *before* a field was marked `secret`; those values seal on the next write of the node.
+</Aside>
 
 ---
 

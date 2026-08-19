@@ -166,6 +166,47 @@ Both options are accepted by `semanticSearchNodes`, `findSimilarNodes`, `semanti
 Omitting `excludeNodeTypes` is **not** a safe default — it means *no* exclusion. A retrieval arm that forgets it will surface read-restricted nodes to users who cannot open them.
 </Aside>
 
+### Shared node types in retrieval
+
+A node type whose config carries **`primaryScope.global: true`** is **read-shared**: every user reads the same rows for it, whoever created them. It is a deliberate widening of the ownership predicate that every retrieval method applies, so a consumer's recall changes the moment an admin flags a type. The toggle, its guards, and the write rules live on [Configuration](/modules/structure/configuration/) and [Usage](/modules/structure/usage/); what follows is only what a retrieval arm has to reason about.
+
+Exactly two filters relax:
+
+| Filter | Ordinary type | Shared type |
+|--------|---------------|-------------|
+| Ownership (`userId`) | The caller's rows only | Every user's rows of that type |
+| Enforced-space confinement (`scopeRootId`) | Rows outside the space are dropped | **Exempt** — a shared node belongs to every space |
+
+Nothing else moves. `excludeNodeTypes` still applies (a shared type named there is dropped like any other), `status` still applies, and the widening is keyed on the **node type**, never on the row — another user's rows of an ordinary type stay invisible, so a shared node is never a back door into a private one. With no type flagged shared, every predicate is byte-identical to the plain `userId` equality it replaced: no `OR` clause, no extra round trip, no behaviour change at all.
+
+**Where the space exemption lands.** `scopeRootId` compiles to `("rootNodeId" = $n OR "nodeType" IN (…shared…))` on `semanticSearchNodes`, `findSimilarNodes`, `hybridSearchNodes`, and on the joined source node of `semanticSearchChunks`, `lexicalSearchChunks` and `hybridSearchChunks`. The two methods that resolve the space themselves degrade rather than empty out: `structureService.searchNodes` returns **shared rows only** where it would previously have returned `[]` (no valid active space), and `expandGraph` never anchors on a shared seed — with *every* seed shared it falls back to the user's persisted active space, and to shared-only when there is no valid one.
+
+**The non-owner view.** A row the caller does not own is sanitised before it leaves the service, on every surface — node detail, list, tree, children, descendants, connection endpoints, and every semantic, lexical and hybrid result:
+
+| Field | What a non-owner gets |
+|-------|----------------------|
+| Secret-typed values in `data` | **Key absent.** Sealed envelopes and any value under a declared `secret` field id are removed, not blanked |
+| `embeddingText` | `null` |
+| `settings`, `metadata` | `{}` |
+| `isFavorite` | `false` |
+
+`embeddingText` is the one a retrieval consumer feels. It is the exact text that was embedded, built **from** the node's fields with secrets included and rendered nowhere, so it goes wholesale even though `data` is only filtered key by key. A consumer that re-embeds or runs staleness checks off `embeddingText` sees `null` on every node it does not own — only the creator's own ingest run can refresh it.
+
+**Chunks of a shared node.** Chunk readability follows the **source node's** type, so a chunk of a shared node is readable by every user. But a chunk's `content` is prose: it cannot be filtered key by key the way `data` can, and a secret's plaintext may sit inside it. The rule is therefore coarser than the node rule — for a non-owner's chunk:
+
+- **`metadata` is blanked** (`{}`), exactly as on a node row.
+- **The whole chunk is omitted** when the source node's type declares **any** secret field. Not redacted, not truncated — dropped from the result set.
+
+<Aside type="caution" title="Chunk omission fails closed">
+Both unknowns omit. A chunk whose **source type cannot be resolved** is dropped, and a shared type whose **field definitions will not resolve** is recorded as secret-bearing, so its chunks are dropped too. The rule only engages once some shared type declares a secret field — with none declared anywhere there is nothing to protect and chunks are served (with `metadata` still blanked). A retrieval arm should therefore expect **fewer chunk hits than node hits** for a shared, secret-bearing type, and must not read an empty chunk result as "this node has no spans".
+</Aside>
+
+**Write paths never widen.** `setNodeEmbedding`, `clearNodeEmbedding`, `replaceNodeChunks`, `setChunkEmbedding` and `deleteNodeChunks` keep their strict owner predicates, and so do the backfill queries — `listNodesNeedingEmbedding` and `listChunksNeedingEmbedding` return the caller's own rows only. An ingest job running as one user therefore never embeds or re-chunks another user's rows of a shared type: each shared node is embedded once, by its creator, and read by everyone. `nodeSimilarity` and `findSimilarNodes` accept a shared node as their source, so similarity still works across the boundary the write path does not cross.
+
+<Aside type="note" title="Telling an owned row from a shared one">
+`StructureNode.userId` is projected by every retrieval method, so a consumer distinguishes the two with `node.userId !== callerId` — no extra lookup. Newly sharing a type is additive and reaches other processes within a **15-second** per-process config cache window (un-sharing is refused outright while another user holds a live node of the type, so a reader is never stranded mid-window).
+</Aside>
+
 ### Opting in later
 
 An install that answered *No* can opt in afterwards. The cleanest path is **`npx structure reconfigure --set enableEmbeddings=true`** (or plain `npx structure reconfigure` for an interactive re-prompt): it re-renders the schema and the embeddings-gated files, re-runs the module migrations, and fires the **`onReconfigure`** heal — the same extension/index provisioning and P3009 recovery a fresh opt-in install runs, even though the module version hasn't changed. Manual alternatives still work: set `enableEmbeddings: true` in `.module-state.json` then run `npx structure update` (the runtime `ensureInfrastructure` pass creates the extension and index), or `npx structure init --force` for the full heal.
@@ -256,6 +297,7 @@ Method semantics:
 
 - **No database cascade.** `nodeId` is a plain FK. A node's `deleteNode` is a *soft* delete (`status: 'deleted'`), and chunk search filters the parent node's status — so a soft-deleted (or archived) node's chunks simply stop surfacing, and `restoreNode` brings them back. Re-chunking is `replaceNodeChunks` (delete + insert). Chunks are hard-removed only at **account erasure**, via the `structure.chunks` deletion handler (generated only on embeddings-enabled installs).
 - **Runtime self-heal.** `ensureInfrastructure()` also creates the chunk HNSW index, so the same lazy, idempotent repair covers chunk search.
+- **Shared source nodes.** Chunk readability follows the source node's type, so the chunks of a node whose type is shared are readable by every user — with the creator's `metadata` blanked, and the chunk omitted outright when that type declares any secret field. See [Shared node types in retrieval](#shared-node-types-in-retrieval).
 
 ## Lexical & hybrid search
 
@@ -386,6 +428,7 @@ Behaviour:
 - **Filters.** `origin` and `connectionTypes` choose which edges are walked; `status` picks which connection rows count (active only by default — pass `pending` to traverse unpromoted discovered edges).
 - **Scope-anchored.** When the account has enforced spaces configured, traversal is confined to the space the seeds sit in — the anchor is the first seed carrying a `rootNodeId`, and the confinement applies only when that root is an enforced one. There is no caller option; it is automatic.
 - **Read-gated on request.** `excludeNodeTypes` — resolved by the consumer via `structureService.getUnreadableTypes`, see [Read enforcement for retrieval consumers](#read-enforcement-for-retrieval-consumers) — filters the *reached* nodes only: traversal still passes *through* an excluded node, it just never surfaces.
+- **Shared types cross owners; edges never do.** A reached node of a shared type surfaces whoever created it, and is exempt from the space anchor above — but traversal always runs over the caller's **own** connections, so a shared node is reachable only through an edge the caller owns. A shared seed never anchors the traversal. See [Shared node types in retrieval](#shared-node-types-in-retrieval).
 - **Strictly a query primitive.** Orchestration, reranking, and budgets live upstream (cog-ingest / the engine). Graph distance is a **structural** relevance signal — never a temporal one.
 
 ## Bi-temporal (`observedAt`)

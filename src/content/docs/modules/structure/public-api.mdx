@@ -12,7 +12,7 @@ Structure ships an **internal** REST API (`/api/v1/structure/*`) that is authent
 The public API is **opt-in per node type** and **off by default** — a node type is only reachable once you enable its *Public REST API* toggle.
 
 <Aside type="note">
-The public API exposes node **instances** of a type (e.g. your clients, projects) — not the node-type configuration. It is a thin, authenticated layer over the same service that powers the in-app API, so the same field and constraint validation as the in-app write path applies, and all data stays scoped to the key owner's account.
+The public API exposes node **instances** of a type (e.g. your clients, projects) — not the node-type configuration. It is a thin, authenticated layer over the same service that powers the in-app API, so the same field and constraint validation as the in-app write path applies, and all data stays scoped to the key owner's account — unless the type is also marked *Shared across all users*, which deliberately widens reads across accounts (see [Shared types](#shared-types)).
 </Aside>
 
 ## Base URL
@@ -81,9 +81,30 @@ The `data` object holds the type's custom field values as key/value pairs. Field
 
 ### Scoped types
 
-If a node type is confined to an enforced [primary scope](/modules/structure/configuration/#primary-scope) (`primaryScope.isolation` set to `enforced` — the app's *spaces*), a public read of that type is confined to a single space. Name the space explicitly with `?scopeRootId=<root node id>`; if the parameter is absent, the read falls back to the key owner's **persisted active space** — the space they last selected in the app. With neither, it fails closed: an empty list from `GET /:type`, a **404** from `GET /:type/:id`. An explicitly supplied id that is not a valid enforced root returns **400** `Invalid scope for this request` (a stale persisted setting simply fails closed instead, with no 400). Instances of the enforced primary type *itself* are never confined — space roots stay listable so spaces remain switchable — so those reads ignore `scopeRootId` entirely, as do types the space does not confine.
+If a node type is confined to an enforced [primary scope](/modules/structure/configuration/#primary-scope) (`primaryScope.isolation` set to `enforced` — the app's *spaces*), a public read of that type is confined to a single space. Name the space explicitly with `?scopeRootId=<root node id>`; if the parameter is absent, the read falls back to the key owner's **persisted active space** — the space they last selected in the app. With neither, it fails closed: an empty list from `GET /:type`, a **404** from `GET /:type/:id`. An explicitly supplied id that is not a valid enforced root returns **400** `Invalid scope for this request` (a stale persisted setting simply fails closed instead, with no 400). Instances of the enforced primary type *itself* are never confined — space roots stay listable so spaces remain switchable — so those reads ignore `scopeRootId` entirely, as do types the space does not confine and types marked [shared](#shared-types).
 
 Because the fallback depends on in-app state that an integration cannot see, always pass `scopeRootId` explicitly from an external client.
+
+### Shared types
+
+A node type can be marked **Shared across all users** in the **Scope** section of its admin form (`primaryScope.global`). A shared type is **read-shared**: every user reads the same rows of it. See [Configuration](/modules/structure/configuration/) for the full behaviour.
+
+Combining that with **Public REST API** has a consequence an operator must weigh before turning both toggles on: **every user's instances of the type become reachable through any one user's API key**. Reads widen; writes never do.
+
+| Request | On a shared type |
+|---------|------------------|
+| `GET /:type` | Lists every user's active instances, not only the key owner's. Rows the key owner does not own come back sanitised. |
+| `GET /:type/:id` | Resolves another user's instance too, sanitised the same way. |
+| `POST /:type` | Unchanged — creates an instance owned by the key owner. |
+| `PATCH /:type/:id` | Only ever updates the key owner's own instances. Another user's row returns **404** `Node not found`, whatever the key's scopes or the type's permission tiers — there is no admin bypass. |
+
+A row the key owner does not own is **sanitised** before it is serialised: secret-typed values are removed from `data` (the keys are absent, not blanked), `embeddingText` is dropped, `settings` and `metadata` come back as `{}`, and `isFavorite` is forced `false`. The key owner's own rows are not touched by this shared-node sanitiser — the `GET /:type/:id` secret stripping described under [Security](#security) still applies to every row, the owner's included.
+
+Sharing is only honoured on an **app-level** type row (`structure_node_type.userId === null`); the flag on a per-user row is inert. That is what stops one account's configuration admitting another account's rows of a same-named type. Shared and *primary scope* are mutually exclusive — if a JSON config import sets both, `isPrimary` wins and the shared flag is ignored, so the type stays a space rather than becoming cross-account readable.
+
+<Aside type="caution">
+Enable **Public REST API** on a shared type only when cross-account read is exactly what you want. Prefer a read-only key, and remember that the per-type **permission tiers** only narrow who may create their own entries — they never widen who may change someone else's, and they do not narrow who may read a shared type through the public API.
+</Aside>
 
 ### Responses
 
@@ -103,7 +124,7 @@ Errors are always a flat `{ "error": "…" }` body:
 | `401` | `Missing API key`, `Invalid or expired API key` | No key sent, or the key is unknown, expired or revoked |
 | `403` | `API key missing required scope: write` | A `POST` or `PATCH` made with a read-only key |
 | `404` | `Not found` | Unknown type, non-exposed type, a type whose **Read** permission is *Admin*/*System*, or an id that is not of `:type` |
-| `404` | `Node not found` | Unknown id, or a node that sits outside the resolved [space](#scoped-types) |
+| `404` | `Node not found` | Unknown id, a node that sits outside the resolved [space](#scoped-types), or a `PATCH` aimed at another user's instance of a [shared type](#shared-types) |
 
 ### Examples
 
@@ -135,11 +156,12 @@ curl -X PATCH https://your-app.com/api/v1/public/structure/clients/NODE_ID \
 ## Security
 
 - **Keys are hashed.** Only a `hashSecret()` hash of each key is stored (via the [security feature](/module-starter/security/)) — never the plaintext. The raw key is returned once, at creation.
-- **Account-scoped.** Every request operates only on the key owner's data; create/update set the owner server-side and can never be overridden by the request body.
+- **Account-scoped.** Every request operates only on the key owner's data — the one deliberate exception being reads of a [shared type](#shared-types); create/update set the owner server-side and can never be overridden by the request body.
 - **Secrets never leave.** Secret-type field values are stripped from the `GET /:type/:id` response — they are decrypted only for in-app owners — and `/:type/schema` omits secret field descriptors entirely, so their existence and shape are never exposed. The list, `POST` and `PATCH` responses return the node's `data` as stored, so a secret field appears there as its encrypted envelope (`{ "__sealed": "…" }`), never as a readable value.
 - **Revoke any time.** Revoke a key from the **API Keys** tab; revoked (and expired) keys are rejected immediately. Keys are also erased when the owning account is deleted.
 - **Set an expiry at creation (v1.19.0).** The create dialog offers 30 / 90 / 365 days or *Never* (default **90 days**). Expiry was always enforced server-side; before v1.19.0 the admin UI could not set it, so every key issued in-app was perpetual. The plaintext key is also cleared from the client mutation cache when the dialog closes.
 - **Least privilege.** Issue read-only keys for read-only integrations, and expose only the node types an integration needs.
+- **Shared types widen reads across accounts.** Exposing a type that is also *Shared across all users* makes every account's instances of that type readable through any single key, sanitised as described under [Shared types](#shared-types). Writes stay owner-only at every permission tier. Do not combine the two toggles unless cross-account read is the intent.
 - **System/default types apply to everyone.** Enabling the toggle on a *system-default* node type (one shared across accounts, with no owner) exposes that type's endpoint for every account's keys — though each key still only ever sees its own instances. Prefer enabling it on the specific types you intend to publish.
 
 <Aside type="caution">

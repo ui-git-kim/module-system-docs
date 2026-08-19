@@ -935,6 +935,61 @@ Then pass that array as `excludeNodeTypes` on every retrieval call:
 `excludeNodeTypes` and `scopeRootId` both default to "no filtering". A consumer that forgets them will happily surface admin-only node types, and content from spaces the user isn't in, inside its own results. Structure cannot catch this for you.
 </Aside>
 
+### Shared Node Types: Read Across Owners, Write Owner-Only (v1.34.27+)
+
+An admin can flag a node type **Shared across all users** from the Scope section of its admin form — `primaryScope.global: true` on `NodeTypeConfig`. Any module that reads nodes, search results, or retrieval results has to account for this, even if your own module never sets the flag: on a shared type the rows Structure hands back are no longer guaranteed to be the caller's own. See [Configuration](/modules/structure/configuration/) for turning it on and [Usage](/modules/structure/usage/) for what an end user sees.
+
+The whole contract is one sentence: **a shared type is read-shared and never write-shared.**
+
+**Reads widen.** Every read path admits other users' rows of a shared type alongside the caller's own — `getNode`, `listNodes`, `getTree`, `getChildren`, `getDescendants`, the ancestor chain, `searchNodes`, every `structureEmbeddings` search and similarity method, `getNodeChunks`, `expandGraph`, and the hydrated `fromNode`/`toNode` on a connection. `excludeNodeTypes` still applies exactly as above — a shared type named there is dropped like any other. `scopeRootId` does **not** confine a shared type: it is exempt from enforced-space confinement, so it stays visible in every space and is a valid connection target from any space.
+
+**Writes do not.** `updateNode`, `deleteNode`, `archiveNode`, `restoreNode`, `moveNode`, `duplicateNode`, favourite toggles and every bulk method keep their plain `userId` ownership predicate and throw `NotFoundError` for a row the caller doesn't own — at **any** permission tier, with **no admin bypass**. The per-type `permissions` tiers only narrow who may create and edit their own entries; they never widen who may change someone else's.
+
+<Aside type="caution" title="Never assume you can write what you can read">
+This is the one mistake to avoid. If your module reads a node and then writes it back, compare `node.userId` with the acting user first — otherwise your UI renders an Edit button that 404s, and your backend logic silently fails on rows it was never allowed to touch.
+</Aside>
+
+```typescript
+const structureService = serviceRegistry.get('structure');
+
+// On a shared type this may be ANOTHER user's row
+const node = await structureService.getNode(nodeId, userId);
+const isOwner = node.userId === userId;
+
+if (!isOwner) {
+  // Read-only: structureService.updateNode(nodeId, userId, ...) throws NotFoundError
+}
+```
+
+`userId` is on the `StructureNode` wire type, so frontend registrations (tabs, actions, sidebar sections, card extensions) make the same comparison against the session user. Structure's own detail header and Settings tab do exactly that — every write control is hidden and a read-only marker takes its place for a non-owner.
+
+**A non-owner's row arrives sanitised.** Structure strips the creator's private material before the row leaves the service, on every surface — detail, list, tree, search, children, descendants, connection endpoints, and semantic/lexical/hybrid results:
+
+| Field | What a non-owner receives |
+|-------|---------------------------|
+| `data` | Secret-typed field values are **removed** — the keys are absent, not blanked. Probe with `'fieldId' in node.data`, never for `''` |
+| `embeddingText` | `null` |
+| `settings`, `metadata` | `{}` |
+| `isFavorite` | `false` — favourites are the creator's, and the Favourites filter returns owned rows only |
+
+Sanitisation happens inside the service, *before* the `structure.node.response` filter runs — so anything your filter hook adds back onto a node is **not** sanitised. Gate the enrichment on ownership if it carries per-user data.
+
+**Edges are never shared.** Sharing applies to nodes, not to connections: a connection row is itself a node of the reserved `connection` type, which can never be flagged shared. `getNodeConnections`, `listConnections` and `expandGraph`'s edge join all keep their plain `userId` predicate, so two users looking at the same shared node see different edge sets — each sees only their own, and may create, promote, restore and delete only their own. The one deliberate asymmetry: deleting or restoring a shared node sweeps the connections referencing it **across owners**, so a delete can't leave another user holding a live edge to a dead endpoint.
+
+**Chunks and embeddings are restricted.** This is what an ingest or RAG module most needs to know:
+
+| Method | Behaviour on a shared type |
+|--------|----------------------------|
+| `listNodesNeedingEmbedding` | Owner-scoped, never widened — a shared node is embedded once, on its owner's ingest pass, and a reader's pass never picks it up |
+| `setNodeEmbedding`, `clearNodeEmbedding`, `replaceNodeChunks`, `setChunkEmbedding`, `deleteNodeChunks` | Owner-scoped writes — they don't match a node the caller doesn't own |
+| `getNodeChunks`, `lexicalSearchChunks`, `semanticSearchChunks`, `hybridSearchChunks` | Widen on the **source node's** type. A non-owner's chunk has `metadata` blanked, and the chunk is **omitted entirely** when the source type declares any secret field — chunk `content` is prose, and a secret can sit inside it. Fails closed when the type or its field definitions can't be resolved |
+
+So a shared type that declares secret fields contributes node-level retrieval results but no chunk-level ones, and `embeddingText` is never available for another user's row. Build context bundles from what comes back, not from what you expect to come back.
+
+<Aside type="note" title="Guards and known limits">
+Structure **refuses** to un-share a type while any other user holds a live node of it (`BadRequestError` naming the slug and the count), counts a shared type's nodes across owners in `deleteNodeType`, and **fails** a replace-mode `importNodeTypes` rather than sweeping a shared type away under other users' rows. Surface those errors to the operator instead of retrying — each names what has to be migrated first. Two limits worth knowing: `dataFilters` run against the raw `data` column *before* sanitisation, so an equality probe on a secret field matches the sealed envelope's shape rather than plaintext (legacy values written before the field was marked secret are the real residual, until the next write seals them); and the shared-slug list is cached for 15s per process — bounded safe in both directions, because newly sharing is purely additive and un-sharing is refused while other users hold nodes.
+</Aside>
+
 ### Connection Lifecycle Methods (v1.16.0+)
 
 Connections carry provenance (`origin`) and lifecycle (`status`). Your module can create a connection as a `pending` proposal — it stays invisible to normal queries until it's promoted to active. All methods are available via `serviceRegistry.get('structure')`:
@@ -1058,6 +1113,10 @@ export async function initTasks(): Promise<void> {
 `createNodeType(userId, config)` writes the `userId` straight onto the row with **no** user-existence check — module schemas carry no foreign key to the user table, so nothing rejects a made-up actor string. Passing a module label creates a row owned by nobody and visible to nobody. It's the right call for user-initiated type creation — never for module seeding.
 </Aside>
 
+<Aside type="note" title="Two senses of shared">
+A `userId: null` type row is a shared **configuration** — every user sees the same type definition, but each still has their own private entries of it. That's different from the **Shared across all users** flag (`primaryScope.global`), which makes the *entries* readable across owners. Seeding with `importNodeTypes` gives you the app-level row that flag requires. A seed payload that leaves `primaryScope.global` unset never shares the entries, and it should stay that way — leave the flag to the admin. (A payload that *does* set it is a full sharing switch, guards and all.) See [Shared Node Types](#shared-node-types-read-across-owners-write-owner-only-v13427) above for what it changes for consumers.
+</Aside>
+
 <Aside type="note" title="Declare containment on the container type">
 Containment belongs on the *container* type's `rules.allowedChildren` — that's the admin UI's source of truth, and each type's parent list is derived from the other types' `allowedChildren`. `rules.allowedParents` is a legacy restriction: it's still enforced server-side, but the Hierarchy tab renders it read-only with only a **Clear** button. Seeding it makes your type's placement uneditable by admins, so leave it out and have the parent type list your slug instead.
 </Aside>
@@ -1089,6 +1148,8 @@ await structureService.updateNodeMetadata(
 ```
 
 The API endpoint is `PATCH /api/v1/structure/nodes/:id/metadata` with body `{ moduleId, data }`. Each module's writes are isolated — updating the `billing` namespace never touches the `tasks` namespace. Fires the `structure.node.metadataUpdated` action hook.
+
+On a [shared type](#shared-node-types-read-across-owners-write-owner-only-v13427), the metadata of another user's entry is blanked to `{}` on read and cannot be written, so namespace state you attach this way is always per-owner.
 
 <Aside type="tip" title="Metadata vs custom fields">
 Use **custom fields** (defined in node type config or via module field registration) for data that users see and edit. Use **metadata** for internal module state that drives logic but isn't directly user-facing — like sync status, cached counts, or external IDs.

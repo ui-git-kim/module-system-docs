@@ -24,7 +24,7 @@ The **Import Config** and **Export Config** buttons sit at the right of the admi
 - **Result summary:** after a successful import the dialog reports **created / updated / unchanged / deleted per category**. A row whose imported values match what is already stored counts as `unchanged`. The match is structural, not textual — key order does not matter and an omitted key compares equal to a stored `null` — and the row is still re-written either way, so the label is informational
 
 <Aside type="caution" title="Replace mode prunes stale rows in every present category">
-In **Replace** mode, for **each category present in the bundle**, existing rows not in the import are deleted — field templates, groups, node types, connection types, and functions. A category **absent** from the bundle is left completely untouched, so a partial bundle never wipes what it omits. System node types (`isSystem`) and pending proposals are never deleted, and connection types spare `isSystem` rows. Replace is useful for full config sync but destructive if a present category's array is incomplete. Use **Merge** mode for incremental updates.
+In **Replace** mode, for **each category present in the bundle**, existing rows not in the import are deleted — field templates, groups, node types, connection types, and functions. A category **absent** from the bundle is left completely untouched, so a partial bundle never wipes what it omits. System node types (`isSystem`) and pending proposals are never deleted, and connection types spare `isSystem` rows. A [shared node type](#primaryscope) that the bundle omits does not get pruned either — if entries of it exist the whole import is rejected instead. Replace is useful for full config sync but destructive if a present category's array is incomplete. Use **Merge** mode for incremental updates.
 </Aside>
 
 ---
@@ -211,7 +211,7 @@ Each node type property explained:
 | `color` | `string` | Hex colour (e.g., `#8b5cf6`). |
 | `sortOrder` | `number` | Display order in navigation and admin (default 50). |
 | `superClasses` | `string[]` | Parent type slugs for is-a inheritance (v1.18.0+, default `[]`). Fields and features are inherited from ancestors — see [Type Hierarchy](/modules/structure/type-hierarchy/). |
-| `primaryScope` | `object` | Marks this type as the primary scope and picks which node types the selected instance filters (`isPrimary`, `scopedTypes`; empty or `'*'` = every type). Set `isolation: 'enforced'` (v1.34.0+) to make each instance a server-side, fail-closed **space** — reads confine to the active instance and cannot leak across spaces (including AI context); default `'filter'` = client-side soft scoping. (v1.24.0+) |
+| `primaryScope` | `object` | Who this type's entries belong to. Marks the type as the primary scope and picks which node types the selected instance filters (`isPrimary`, `scopedTypes`; empty or `'*'` = every type), sets server-side space isolation (`isolation`), and flags the type as shared across all users (`global`, v1.34.27+). See the [primaryScope](#primaryscope) notes below. (v1.24.0+) |
 | `governance` | `object` | Data classification levels and the default level for this type (`classification.levels`, `classification.default`). (v1.25.0+) |
 | `aiFields` | `object` | AI Core prompt-assembly configuration — storage-only, consumed by ai-core's AI tab. (v1.30.0+) |
 | `fieldTemplateIds` | `string[]` | Attached shared field templates (reusable field sets). Reference by template **slug** or exported id — but only when the *same bundle* also carries that template in its `fieldTemplates` array, because the slug/id map is built solely from the templates being imported. Otherwise use the target app's template **id**. See [Field Template JSON](#field-template-json). (v1.29.0+; slug references v1.33.22+) |
@@ -298,6 +298,44 @@ Here `court-order` is-a `legal-document` and is-a `event`, inheriting the fields
 | `includeChildCounts` | `boolean` | `false` | Include counts of child nodes by type. |
 
 **groupSlug** — assigns this node type to a sidebar navigation group (must match a group's `slug`).
+
+### primaryScope
+
+Controls who this type's entries belong to. The whole object is optional; omit it for an ordinary per-user type.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `isPrimary` | `boolean` | `false` | Mark this type as the primary scope — picking an instance filters the app. (v1.24.0+) |
+| `scopedTypes` | `string[]` | `[]` | Which node types the selected instance filters. Empty or `["*"]` = every type. |
+| `isolation` | `'filter' \| 'enforced'` | `'filter'` | `'enforced'` (v1.34.0+) makes each instance a server-side, fail-closed **space** — reads confine to the active instance and cannot leak across spaces (including AI context). `'filter'` is client-side soft scoping. |
+| `global` | `boolean` | `false` | **Shared across all users** (v1.34.27+) — every user reads the same entries of this type, and the type is exempt from enforced-space confinement. Reads only; writes are never widened. |
+
+```json
+{
+  "slug": "tax-code",
+  "name": "Tax code",
+  "namePlural": "Tax codes",
+  "primaryScope": { "global": true }
+}
+```
+
+`global` is the JSON form of the admin form's **Scope › Shared across all users** toggle. It makes the type's entries *read*-shared: every user sees the same rows, and the type is a valid connection target from any space. It never widens writes — a user can only ever modify entries they own, at any permission tier and with no admin bypass, and a non-owner's copy of a row is sanitised (secret values, `embeddingText`, `settings`, `metadata` and `isFavorite` are stripped or blanked). `permissions` only narrows who may create their own entries. See [Usage](/modules/structure/usage/) for the full semantics.
+
+**Import behaviour for `global`:**
+
+- **`isPrimary` wins.** A config that sets both `isPrimary: true` and `global: true` is contradictory — a type that *is* the space cannot also sit outside every space. The server resolves it the same way the admin form does: the type is treated as the primary scope and `global` is ignored. The stored value is left as written, so the form then shows the shared row as a clear-only control rather than a live toggle.
+- **A shared type must live on an app-level row** (`structure_node_type.userId` is `null`). Importing a shared config over an existing **per-user** row promotes that row to app-level as part of the same write, so the flag actually takes effect instead of sitting inert. New rows are created app-level already. This ownership rule is what stops one admin's flag admitting another user's rows of the same slug.
+- **The reserved `connection` slug can never be shared** — connections are per-user edges.
+- **Turning sharing on is refused** when another user already owns a node type with that slug: a shared, app-level type would shadow theirs. The error names the slug; rename or remove the conflicting type first.
+- **Turning sharing off is refused** while any other user still holds a live (non-deleted) entry of that type — those entries would lose the configuration they are rendered and validated against. The error names the slug and the count. Note that import applies whole-row semantics: **omitting `primaryScope` (or omitting `global` within it) for a currently shared type is an un-share**, and hits this same guard.
+
+<Aside type="caution" title="global plus publicApi exposes every user's rows">
+A type that is both shared and has `features.publicApi.enabled` set means **every** user's entries of that type are reachable through any one user's API key (sanitised as described above). Only combine the two when that is what you intend — see the [public REST API](/modules/structure/public-api/).
+</Aside>
+
+<Aside type="note">
+Module-proposed node types (`POST /types/proposals`) cannot set `global` — it is stripped to `false` on the proposal, and approval copies the stored row rather than setting it. An admin write — the node-type form, `PATCH /types/:slug`, or a config import — is the only way the flag is ever set.
+</Aside>
 
 ---
 
@@ -590,6 +628,8 @@ A lone field object is treated as a one-element array. Once the fields are parse
 
 This is the safe default for incremental updates.
 
+Updates are whole-row: an omitted key is written as its empty value, not left at what is stored. That matters for [`primaryScope`](#primaryscope) — importing a config that omits `primaryScope.global` over a type that is currently shared is an **un-share**, and is refused while other users still hold live entries of that type. Conversely, importing a shared config over an existing **per-user** row promotes that row to app-level (`userId: null`) in the same write, so the flag takes effect rather than sitting inert.
+
 ### Replace Mode
 
 Replace mode applies to **every category present in the bundle** (since v1.33.34):
@@ -600,8 +640,10 @@ Replace mode applies to **every category present in the bundle** (since v1.33.34
 
 The delete is scoped per category: node types spare `isSystem` types and pending proposals; connection types spare `isSystem` rows; field templates, groups, and functions delete the importer's own stale rows. A category **absent** from the bundle is skipped entirely — its rows are never touched, so a partial bundle in Replace mode does not wipe what it omits.
 
+**Shared types are the one exception to the silent prune** (v1.34.27+). A [shared type](#primaryscope) (`primaryScope.global`) holds entries belonging to the whole app, so sweeping it away would strand every other user's rows. If the bundle omits a shared type that still has entries — counted **across all owners** — the import is **rejected** rather than applied, naming the slug and the entry count. Include the type in the bundle, or delete or migrate those entries first. A shared type that is `isSystem` or a pending proposal is not pruned anyway, so it never blocks.
+
 <Aside type="caution" title="Deleting node types that have data">
-Deleting a node type does not check for existing nodes — there is no foreign-key constraint linking a node to its type. A node type is removed silently, and any existing nodes keep an orphaned `nodeType` slug. Reassign or delete those nodes yourself if you do not want them orphaned.
+Apart from the shared-type guard above, deleting a node type does not check for existing nodes — there is no foreign-key constraint linking a node to its type. A node type is removed silently, and any existing nodes keep an orphaned `nodeType` slug. Reassign or delete those nodes yourself if you do not want them orphaned.
 </Aside>
 
 ### Dry Run (Preview)
@@ -628,7 +670,7 @@ Import processes categories in this order, all inside one transaction:
 
 ### Validation
 
-The import is **atomic**: the whole bundle is validated and applied in one transaction. Unknown fields are ignored, but a row that fails validation — a bad field-template / connection-type / function shape, a missing required key, a `superClass` cycle or orphan, or a reserved `origin` connection field — **rejects the entire import**. Nothing is written, and the dialog shows the reason. This replaces the old client-orchestrated flow that could half-apply an import and report "N items failed" without saying which. Node-type shape validation stays lenient (it only requires `slug`, `name`, `namePlural`).
+The import is **atomic**: the whole bundle is validated and applied in one transaction. Unknown fields are ignored, but a row that fails validation — a bad field-template / connection-type / function shape, a missing required key, a `superClass` cycle or orphan, or a reserved `origin` connection field — **rejects the entire import**. The three [shared-type](#primaryscope) guards reject the same way: a slug clash when a type becomes shared, an un-share that would strand another user's live entries, and (in Replace mode) a shared type the bundle omits while entries of it exist. Nothing is written, and the dialog shows the reason. This replaces the old client-orchestrated flow that could half-apply an import and report "N items failed" without saying which. Node-type shape validation stays lenient (it only requires `slug`, `name`, `namePlural`).
 
 ---
 
