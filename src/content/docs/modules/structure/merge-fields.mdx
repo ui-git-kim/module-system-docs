@@ -14,7 +14,7 @@ Structure supports two advanced field behaviours that work across all [field typ
 
 ## Merge Templates
 
-A merge template (the `computedTemplate` setting) auto-computes a field's value from other fields on the same node. When a field has a `computedTemplate`, it becomes **read-only** — the value is resolved automatically and synced back to the node's data.
+A merge template (the `computedTemplate` setting) auto-computes a field's value from other fields on the same node. When a field has a `computedTemplate`, it becomes **read-only** — the value is resolved automatically and, in a create/edit form, synced back to the node's data.
 
 ### Template Syntax
 
@@ -168,16 +168,26 @@ Index-based dereference also works:
 1. When the `NodeFieldRenderer` encounters a field with `computedTemplate`, it invokes `resolveTemplateAsync`
 2. The resolver parses all `{expression}` tokens and resolves them against the node's current data
 3. For `->` dereferences, the resolver fetches the referenced node via the API, caching results to avoid redundant requests
-4. The resolved value is set as the field's display value and automatically synced back to the node's data object
+4. The resolved value is set as the field's display value and, in a create/edit form, automatically synced back to the node's data object so it is captured on submit. In a read-only detail view the value is resolved and displayed but not written back (`NodeFieldRenderer`'s `autoPersistComputed` prop is `false` when not editing), so viewing a node never fires an update or an audit event
 5. The field renders as a read-only `<Input>` with a muted background
 
 <Aside type="tip">
-Merge templates resolve asynchronously because node-reference dereferences require API calls. The resolver uses a per-template cache, so within a single template, multiple tokens referencing the same node trigger only one fetch. The cache is not shared across templates — `NodeCard` resolves its title and body with separate caches, so a node referenced from two templates can be fetched twice.
+Merge templates resolve asynchronously because node-reference dereferences require API calls. The resolver keeps a per-template `Map`, so within a single template, multiple tokens referencing the same node trigger only one fetch. Those maps are not shared between templates — `NodeCard` resolves its title and body with separate maps — but the default fetcher routes every dereference through the shared React Query cache (`['structure', 'node', id]`, 30s `staleTime`), so a node referenced from two templates is still fetched only once, and the result is shared with `useNode`.
 </Aside>
 
-### Admin UI
+<Aside type="caution" title="Client-computes, server-accepts">
+Merge templates are resolved in the browser and the resolved value is submitted with the rest of the node. The API never recomputes a `computedTemplate`, and server-side field validation skips computed fields entirely — a direct API call can write any value into one. The form renders the field read-only, but that is a UI guard, not an enforcement boundary. Only `editableBy: 'admin' | 'system'` is enforced server-side, and it is enforced independently of the template.
+</Aside>
 
-In the admin panel's **Fields** tab, every field shows a **Merge Template** text input. Type the template expression directly, or use the **Insert field...** picker beside it to append `{field_id}` tokens for fields on the same node type.
+### The same tokens in a formula
+
+The [`formula` field type](/modules/structure/fields/#formula) reuses this exact token grammar. The difference is resolution: a merge template stringifies and concatenates each token (`resolveTemplateAsync`), while a formula binds each token to its raw, type-preserving value (`resolveTokenValue`), so `{price} * {qty}` multiplies two numbers instead of concatenating two strings.
+
+If a field carries both `computedTemplate` and `calcConfig`, the merge template wins outright — it owns both the render and the write-back, and the formula is ignored.
+
+### Admin UI — Merge Templates
+
+In the admin panel's **Fields** tab, every field except a `formula` field shows a **Merge Template** text input. Type the template expression directly, or use the **Insert field...** picker beside it to append `{field_id}` tokens for fields on the same node type. A `formula`-typed field shows a **Formula** input instead (with its own field-token and function pickers) — the two are mutually exclusive in the editor.
 
 When a field has a computed template, it appears as read-only with a muted background in the create/edit form. Users cannot modify the value manually.
 
@@ -262,6 +272,8 @@ In the admin panel, the **Built-in Fields** section provides a **Merge Template*
 
 <Aside type="note">
 Built-in field merge templates resolve at runtime (since v1.23.3). The create/edit form computes the **name**, **description**, and **slug** values from the node's data using the same `{expression}` syntax as custom fields and syncs each into its read-only input. The `editableBy` lock applies independently of the template.
+
+A built-in's template resolves against the node's **custom field data only** — it cannot reference another built-in. `{name}`, `{description}` and `{slug}` inside a built-in's template resolve to nothing (this prevents two mutually-referential built-ins, e.g. `name={slug}` and `slug={name}`, from oscillating forever). Custom fields have no such restriction: a custom field's `computedTemplate` can bind `{name}`, `{description}` and `{slug}`.
 </Aside>
 
 ---
@@ -287,13 +299,13 @@ interface MergeFieldToken {
 }
 ```
 
-The token set emits the resolver's **canonical, statically-enumerable token forms**: built-in `name` / `description` / `slug`; every top-level field; each `field-group` subfield as a first-item token (`{group.sub}`); and one-hop node-reference deref targets. For **every** `node-reference` field, the three built-in deref tokens `{ref->name}`, `{ref->description}`, and `{ref->slug}` are emitted unconditionally (independent of the reference's `allowedTypes`), plus one `{ref->field}` token per value field of each allowed referenced type. It includes own + inherited (Type Hierarchy) + module-registered fields. The resolver's parameterised forms — filtered lookups (`[sub=val]`), index access (`[0]`), and combined repeater + deref — are resolvable at runtime but are **not** surfaced as static tokens, since they depend on runtime data values. Pass `{ includeBuiltins: false }` to omit the built-ins (useful in the create/edit form, where `name` / `description` / `slug` are separate inputs, not entries in `node.data`).
+The token set emits the resolver's **canonical, statically-enumerable token forms**: built-in `name` / `description` / `slug`; every top-level field; each `field-group` subfield as a first-item token (`{group.sub}`); and one-hop node-reference deref targets. For **every** `node-reference` field, the three built-in deref tokens `{ref->name}`, `{ref->description}`, and `{ref->slug}` are emitted unconditionally (independent of the reference's `allowedTypes`), plus one `{ref->field}` token per value field of each allowed referenced type. It includes own + inherited (Type Hierarchy) + module-registered fields. The resolver's parameterised forms — filtered lookups (`[sub=val]`), index access (`[0]`), and combined repeater + deref — are resolvable at runtime but are **not** surfaced as static tokens, since they depend on runtime data values. Pass `{ includeBuiltins: false }` to omit the built-ins — used by the connection-type field editor, where a connection has no `name` / `description` / `slug`. The node create/edit form and the node detail view merge `name` / `description` / `slug` into the resolution bag before resolving, so a custom field's `computedTemplate` can bind `{name}`, `{description}` and `{slug}`; the node-type admin form therefore passes `includeBuiltins: true`.
 
 The pure core, `flattenMergeFields(fields, refFieldsBySlug, options)`, is exported too — call it directly when you already have field descriptors and a map of referenced-type fields (e.g. a payload from the schema endpoint below).
 
 ### The public schema endpoint
 
-For a consumer that runs outside the app, the [public REST API](/modules/structure/configuration/) gains a schema surface (API-key authed; the node type must have `features.publicApi.enabled`):
+For a consumer that runs outside the app, the [public REST API](/modules/structure/configuration/) gains a schema surface (API-key authed; the node type must have `features.publicApi.enabled` **and** a `permissions.read` tier below `admin` — a type whose read tier is `admin` or `system` returns 404):
 
 ```
 GET /api/v1/public/structure/:type/schema
@@ -309,7 +321,7 @@ It returns the flattener's **inputs** — not pre-baked tokens — so token gene
 }
 ```
 
-Run `flattenMergeFields(response.fields, response.referencedTypes)` on the payload to get the same `MergeFieldToken[]`. Secret fields (`type: 'secret'` or any field with a `secretConfig`) are dropped, and reference targets that are not themselves exposed are redacted — the endpoint never reveals a hidden type's existence or field shape.
+Run `flattenMergeFields(response.fields, response.referencedTypes)` on the payload to get the same `MergeFieldToken[]`. Secret fields (`type: 'secret'` or any field with a `secretConfig`) are dropped, and reference targets that are not themselves exposed are redacted — the endpoint never reveals a hidden type's existence or field shape. The read-tier test above is applied per referenced type as well, so a type whose read tier is `admin` or `system` is redacted from `nodeReferenceConfig.allowedTypes` and contributes no `->` deref tokens.
 
 ### Resolving a template without React — `resolveMergeFields`
 
@@ -322,7 +334,7 @@ import { resolveMergeFields } from '@/features/structure/utils/merge-fields';
 const title = await resolveMergeFields('{matter_number} — {assigned_client->name}', node);
 ```
 
-`resolveTemplateAsync(template, data, cache?, fetchNode?)` is the lower-level primitive. Its `fetchNode` is injectable — supply your own node fetcher for a non-app runtime; it defaults to `structureService.getNode`.
+`resolveTemplateAsync(template, data, cache?, fetchNode?)` is the lower-level primitive. Its `fetchNode` is injectable — supply your own node fetcher for a non-app runtime; it defaults to a query-cache-backed wrapper around `structureService.getNode` (keyed `['structure', 'node', id]` with a 30s `staleTime`, so repeated dereferences of the same node collapse into one request).
 
 ### Merge-field-driven cards
 
@@ -547,11 +559,11 @@ Here `closure_reason` is optional until `status` is set to "closed", at which po
 
 Key behaviours:
 
-- **Enforced on submit for both nodes and connections.** The same validator (`getMissingRequiredFields`) runs in the node create/edit form and the connection form.
+- **Enforced on submit in the UI for both nodes and connections.** The same validator (`getMissingRequiredFields`) runs in the node create/edit form and the connection form. This is a *client-side* guard: the server-side field validator enforces only the unconditional `required` flag, and skips any field that carries a `visibleWhen`, so a direct API write can still persist an empty conditionally-required field.
 - **ORs with the static `required` flag.** A field is mandatory when `required: true` (always) **or** when its `requiredWhen` condition currently holds — either one being satisfied makes the field required.
 - **A field hidden by `visibleWhen` is never required.** The validator skips invisible fields first, so a conditionally-hidden field can never trap the form in an unsubmittable state.
 
-### Admin UI
+### Admin UI — Conditions
 
 In the admin panel's **Fields** tab, each field has a **Visible When** editor. The editor provides:
 
@@ -559,7 +571,9 @@ In the admin panel's **Fields** tab, each field has a **Visible When** editor. T
 - An **operator** dropdown offering only four options: **Equals**, **Not equals**, **Is one of**, and **Has value**
 - A **value** input for the comparison value
 
-Multi-rule AND/OR conditions are not editable in the admin UI — they must be authored via JSON import/export (or the API). The remaining operators (`notIn`, `isEmpty`, `contains`, `greaterThan`, `lessThan`) are also only available through JSON or the API, even though the runtime evaluator honours them.
+Directly beneath it, each field also has a **Required When** editor with the same three controls and the same four operators (**Equals**, **Not equals**, **Is one of**, **Has value**), writing the `requiredWhen` setting described above.
+
+Multi-rule AND/OR conditions are not editable in the admin UI — they must be authored via JSON import/export (or the API). The remaining operators (`notIn`, `isEmpty`, `contains`, `greaterThan`, `lessThan`) are also only available through JSON or the API, even though the runtime evaluator honours them. This applies to both `visibleWhen` and `requiredWhen`.
 
 ### Real-World Example
 
@@ -698,5 +712,6 @@ This field only appears for children, and when visible, it auto-computes to some
 ## Next Steps
 
 - [Field Types Reference](/modules/structure/fields/) — All 22 built-in field types with configuration details
+- [The `formula` field type](/modules/structure/fields/#formula) — The same token grammar, evaluated as an expression over raw values
 - [Configuration](/modules/structure/configuration/) — Full node type config and API reference
 - [Integration](/modules/structure/integration/) — Registering custom field types from other modules

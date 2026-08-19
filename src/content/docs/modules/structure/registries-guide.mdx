@@ -68,8 +68,12 @@ import { nodeTypeRegistry } from '@/features/structure';
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `register(registration)` | `void` | Register a node type from code. The registration is remembered separately and survives every DB sync; a database row with the same slug wins |
+| `update(config)` | `void` | Replace one type's config and fire `onSync` |
+| `unregister(slug)` | `void` | Remove a type from the registry |
 | `getEnabledTypes()` | `NodeTypeConfig[]` | All enabled types, sorted by `sortOrder` |
 | `getConfig(slug)` | `NodeTypeConfig \| undefined` | Get the bare config for a single type |
+| `getEffectiveFields(slug)` | `NodeTypeField[]` | Own + type-hierarchy-inherited fields (`resolved.fields`, falling back to `fields`) |
 | `getAllTypes()` | `NodeTypeConfig[]` | All types (enabled and disabled), sorted by `sortOrder` |
 | `get(slug)` | `NodeTypeRegistration \| undefined` | Get the wrapper (config + optional component overrides) |
 | `getAll()` | `NodeTypeRegistration[]` | All registrations (wrappers) |
@@ -77,7 +81,7 @@ import { nodeTypeRegistry } from '@/features/structure';
 | `getSlugs()` | `string[]` | All registered slugs |
 | `has(slug)` | `boolean` | Check if a slug exists |
 | `isLoadedFromDb()` | `boolean` | Whether `syncFromDatabase` has completed |
-| `syncFromDatabase(types)` | `void` | Replace registry state with database records; fires `onSync` |
+| `syncFromDatabase(types)` | `void` | Re-apply the code registrations, then overlay the database records (DB wins per slug); fires `onSync`. Code-registered module types without a DB row survive the sync |
 | `onSync(callback)` | `() => void` | Subscribe to sync events — returns an unsubscribe function |
 | `getGroups()` | `NodeTypeGroup[]` | All node type groups |
 | `syncGroups(groups)` | `void` | Replace group data in the registry |
@@ -159,7 +163,13 @@ interface ConnectionTypeConfig {
   bidirectional?: boolean;     // default true
   maxConnections?: number;     // per node (null = unlimited)
   unique?: boolean;            // one connection per pair only
-  fields?: ConnectionTypeField[];
+  // Connections are nodes — the same rich field system as node types
+  fields?: NodeTypeField[];
+  fieldTemplateIds?: string[]; // attached shared field templates
+  // Server-computed own + attached-template fields (read-only, never persisted)
+  resolved?: { fields: NodeTypeField[] };
+  contextHints?: string;       // AI context — storage and exposure only
+  aiFields?: AiFieldsConfig;   // consumed by AI Core, not interpreted by Structure
   isSystem?: boolean;
   isEnabled?: boolean;
   sortOrder?: number;
@@ -180,6 +190,21 @@ These 8 registries are populated by module code at import time via side-effect i
 All content registrations share these properties: `id` (unique identifier), `moduleId` (your module's ID), `nodeTypes` (`'*'` for all types or `string[]` of slugs), and `order` (display position, default 50). Structure's built-in items span the full 0-100 scale — built-in tabs run from Overview (`0`) through Info (`10`), Children (`20`), Connections (`80`) to Settings (`100`), and built-in field types from `10` to `100` — so there is no single number that always sorts last. Choose an `order` relative to the built-in neighbours you care about, and remember that admin reordering can override any of these defaults.
 </Aside>
 
+**Reading a registry.** Each content registry ships a purpose-built reader. Prefer it over the registry's raw `getAll()`: the per-node-type readers apply `nodeTypes` targeting, `isVisible` filtering and the admin **Integrations** overrides that a raw list does not (enable/disable and order everywhere; a label or title override on tabs, actions, filters and sidebar sections; slot reassignment on card extensions — widgets take only enable/disable and order). `nodeFieldTypeRegistry` is the exception — its types are global, so its hook is a plain subscription.
+
+| Registry | Read it with | Signature |
+|----------|--------------|-----------|
+| `nodeTabRegistry` | `useNodeTabs` | `(node, nodeType) => NodeTabRegistration[]` — applies the type's `tabOrder`; `useBuiltInTabs` returns the same list unordered |
+| `nodeWidgetRegistry` | `useNodeWidgets` | `(location, node, nodeType) => NodeWidgetRegistration[]`; `useDashboardWidgets()` for the dashboard location |
+| `nodeCardExtensionRegistry` | `nodeCardExtensionRegistry.getExtensionsForNode` | `(node, position, nodeType) => NodeCardExtension[]` — no purpose-built hook; add `useNodeCardExtensionRegistry()` if you need to re-render when registrations change |
+| `nodeActionRegistry` | `useNodeActions` | `(location, node, nodeType) => NodeActionRegistration[]`; `useBulkActions(nodeType)` for the `bulk-action` location |
+| `nodeFieldTypeRegistry` | `useNodeFieldTypeRegistry` | `() => NodeFieldTypeRegistration[]` |
+| `nodeColumnRegistry` | `useNodeColumns` | `(nodeType) => NodeColumnRegistration[]` |
+| `nodeFilterRegistry` | `useNodeFilters` | `(nodeType) => { filters, filterValues, setFilter, clearFilters, applyClientFilters, serverQueryParams, hasActiveFilters }` |
+| `nodeSidebarSectionRegistry` | `useNodeSidebarSections` | `(node, nodeType) => NodeSidebarSectionRegistration[]` |
+
+The six purpose-built readers — `useNodeTabs`, `useNodeWidgets`, `useNodeActions`, `useNodeColumns`, `useNodeFilters` and `useNodeSidebarSections` — are exported from `@/features/structure`. The two registry-subscription hooks, `useNodeCardExtensionRegistry` and `useNodeFieldTypeRegistry`, are not on the barrel — import them from their registry module (`@/features/structure/config/extensions.registry`, `@/features/structure/config/field-types.registry`).
+
 ### 2. nodeTabRegistry
 
 Adds tabs to node detail pages. This is the most common integration — your module adds a tab that appears on specific (or all) node types.
@@ -196,7 +221,7 @@ nodeTabRegistry.register({
   order: 30,
   component: TasksTab,
   // Optional:
-  // getBadge: async (nodeId) => taskCountForNode(nodeId),
+  // getBadge: async (nodeId) => taskCountForNode(nodeId),   // declared, not yet rendered
   // isVisible: (node, nodeType) => nodeType.features?.tasks !== false,
 });
 ```
@@ -211,8 +236,8 @@ nodeTabRegistry.register({
 | `icon` | `string` | -- | Lucide icon name |
 | `nodeTypes` | `string[] \| '*'` | Yes | Which node types show this tab |
 | `order` | `number` | -- | Position in tab bar (default 50) |
-| `component` | `ComponentType<NodeTabProps>` | Yes | Receives `{ node, nodeType }` |
-| `getBadge` | `(nodeId: string) => Promise<string \| number \| null>` | -- | Async badge count/text |
+| `component` | `ComponentType<NodeTabProps>` | Yes | Receives `{ node, nodeType, isEditing? }` — `isEditing` reflects the detail header's edit toggle |
+| `getBadge` | `(nodeId: string) => Promise<string \| number \| null>` | -- | Async badge count/text. *Not yet consumed — declared on the type; Structure's tab bar does not render badges* |
 | `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
 
 **Admin control:** Admins can enable/disable, rename, and reorder tabs per node type on the Integrations tab.
@@ -252,7 +277,7 @@ nodeWidgetRegistry.register({
 | `component` | `ComponentType<NodeWidgetProps>` | Yes | Receives `{ node?, nodeType?, size }` |
 | `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
 
-**Admin control:** Admins can enable/disable and reorder widgets per node type on the Integrations tab. The Overview tab layout (single or two-column) is configured on the Templates tab.
+**Admin control:** Admins can enable/disable and reorder widgets per node type on the Integrations tab. The Overview tab layout (single or two-column) comes from the overview Component template assigned on the node type's **Pages** tab; the editor that authors those templates sits on the Components tab, which is currently compiled out, so as shipped an admin can only assign a template that already exists.
 
 ### 4. nodeCardExtensionRegistry
 
@@ -296,7 +321,11 @@ nodeCardExtensionRegistry.register({
 
 ### 5. nodeActionRegistry
 
-Adds action buttons to node detail headers, context menus, and bulk action bars.
+Declares action buttons for node detail headers, context menus, and bulk action bars.
+
+<Aside type="caution" title="Declared, not yet rendered by Structure">
+Nothing in Structure's generated UI renders these actions today. Registrations are collected, listed on the **Registries** admin tab, and admin-configurable on a node type's **Integrations** tab, and they are readable through `useNodeActions(location, node, nodeType)` and `useBulkActions(nodeType)` — but your module or the host app must render the buttons itself. `variant`, `bulkHandler`, `confirm` and `shortcut` are declared on the type and read by nothing.
+</Aside>
 
 ```typescript
 import { nodeActionRegistry } from '@/features/structure';
@@ -331,12 +360,12 @@ nodeActionRegistry.register({
 | `nodeTypes` | `string[] \| '*'` | Yes | Target node types |
 | `locations` | `NodeActionLocation[]` | Yes | `'detail-header'`, `'context-menu'`, `'bulk-action'` |
 | `order` | `number` | -- | Position in action list (default 50) |
-| `variant` | `'default' \| 'destructive' \| 'secondary'` | -- | Button style |
+| `variant` | `'default' \| 'destructive' \| 'secondary'` | -- | Button style. *Not yet consumed — declared on the type; nothing in Structure reads it* |
 | `handler` | `(node, nodeType) => Promise<void>` | Yes | Single-node action handler |
-| `bulkHandler` | `(nodes[], nodeType) => Promise<void>` | -- | Bulk action handler |
+| `bulkHandler` | `(nodes[], nodeType) => Promise<void>` | -- | Bulk action handler. *Not yet consumed — declared on the type; nothing in Structure reads it* |
 | `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
-| `confirm` | `{ title, description, confirmLabel?, variant? }` | -- | Confirmation dialog |
-| `shortcut` | `string` | -- | Keyboard shortcut (e.g., `'mod+shift+i'`) |
+| `confirm` | `{ title, description, confirmLabel?, variant? }` | -- | Confirmation dialog. *Not yet consumed — declared on the type; nothing in Structure reads it* |
+| `shortcut` | `string` | -- | Keyboard shortcut (e.g., `'mod+shift+i'`). *Not yet consumed — declared on the type; nothing in Structure reads it* |
 
 **Admin control:** Admins can enable/disable, override the label, and reorder actions per node type on the Integrations tab.
 
@@ -368,10 +397,11 @@ nodeFieldTypeRegistry.register({
   component: RichTextEditor,
   displayComponent: RichTextDisplay,
   // Optional:
+  // configSchema: [{ id: 'toolbar', type: 'select', label: 'Toolbar', ... }],
+  // Declared on the type but not yet consumed — do these in your component:
   // validate: (value, fieldConfig) => value ? null : 'Required',
   // transformBeforeSave: (value) => sanitiseHtml(value),
   // getDefaultValue: () => '',
-  // configSchema: [{ id: 'toolbar', type: 'select', label: 'Toolbar', ... }],
 });
 ```
 
@@ -382,16 +412,18 @@ nodeFieldTypeRegistry.register({
 | `id` | `string` | Yes | Field type identifier (e.g., `'rich-text'`) |
 | `moduleId` | `string` | Yes | Your module's ID |
 | `label` | `string` | Yes | Name shown in admin field picker |
-| `icon` | `string` | -- | Lucide icon for the picker |
-| `description` | `string` | -- | Help text in the selector |
+| `icon` | `string` | -- | Lucide icon for the picker. *Not yet consumed — declared on the type; nothing in Structure reads it* |
+| `description` | `string` | -- | Help text in the selector. *Not yet consumed — declared on the type; nothing in Structure reads it* |
 | `category` | `'text' \| 'media' \| 'reference' \| 'layout' \| 'custom'` | -- | Field categorisation |
 | `order` | `number` | -- | Position in field type picker (default 50) |
 | `component` | `ComponentType<FieldTypeRenderProps>` | Yes | Form field component for editing |
 | `displayComponent` | `ComponentType<FieldTypeDisplayProps>` | -- | Read-only display for cards/columns |
-| `validate` | `(value, fieldConfig) => string \| null` | -- | Custom validation |
-| `transformBeforeSave` | `(value) => unknown` | -- | Transform before saving |
-| `getDefaultValue` | `() => unknown` | -- | Default value factory |
+| `validate` | `(value, fieldConfig) => string \| null` | -- | Custom validation. *Not yet consumed — declared on the type; nothing in Structure reads it* |
+| `transformBeforeSave` | `(value) => unknown` | -- | Transform before saving. *Not yet consumed — declared on the type; nothing in Structure reads it* |
+| `getDefaultValue` | `() => unknown` | -- | Default value factory. *Not yet consumed — declared on the type; nothing in Structure reads it* |
 | `configSchema` | `NodeTypeField[]` | -- | Extra admin config fields |
+
+Today only `id`, `moduleId`, `label`, `category`, `order`, `component`, `displayComponent` and `configSchema` change what happens: the first five drive the admin field-type picker, the two components do the rendering, and `configSchema` renders the per-field options. Do your validation, defaulting and pre-save transformation **inside your own component**, not through the declared-but-unread callbacks.
 
 **Component props:**
 
@@ -414,7 +446,6 @@ nodeFieldTypeRegistry.register({
   category: 'media',
   component: MediaUploadField,      // your uploader
   displayComponent: MediaDisplay,   // thumbnail / filename / download link
-  getDefaultValue: () => null,
   configSchema: [
     { id: 'accept', type: 'text', label: 'Accepted MIME types', placeholder: 'image/*, application/pdf' },
     { id: 'maxSize', type: 'number', label: 'Max size (MB)' },
@@ -424,29 +455,6 @@ nodeFieldTypeRegistry.register({
 ```
 
 Your renderer reads its options from `field.config` (shaped by the `configSchema` above) and owns the stored value shape entirely.
-
-### formulaFunctionRegistry
-
-Registers **functions callable from the [`formula`](/modules/structure/fields/#formula) field type** — tier 1 of the formula function library (tier 2 is admin-defined named expressions). Structure seeds it with maths, text, logic and similarity functions; a module adds its own domain functions by importing the registry and calling `register()` (a side-effect import in the feature's `index.ts`).
-
-```typescript
-import { formulaFunctionRegistry } from '@/features/structure';
-
-// e.g. a colour module exposing perceptual colour distance to formulas
-formulaFunctionRegistry.register({
-  name: 'deltaEOK',
-  category: 'colour',
-  arity: 2,                        // number, or [min, max] (max Infinity = variadic)
-  description: 'Perceptual colour difference (OKLab ΔE)',
-  fn: (a, b) => deltaEOK(String(a), String(b)),   // may be sync or async
-});
-```
-
-Functions take already-evaluated argument values and return a `number | string | boolean | null | unknown[]` (or a `Promise` of one — an async function such as `semanticSimilarity` is awaited). A registered name shadows nothing and is called by name from a formula, e.g. `deltaEOK({colour_a}, {colour_b}) < 2`. Arguments are evaluated eagerly, so a function with side effects (network, cost) should be reached via the short-circuiting ternary rather than `if(...)`.
-
-<Aside type="caution">
-The function body is trusted code (unlike the admin-authored expression that calls it), so keep it pure and bounded — it runs on the client on every render of a node that uses the formula.
-</Aside>
 
 ### 7. nodeColumnRegistry
 
@@ -465,9 +473,6 @@ nodeColumnRegistry.register({
   alignment: 'center',
   sortable: true,
   render: (node) => <span>{node.metadata?.openTaskCount ?? 0}</span>,
-  // For expensive data, use prefetch:
-  // needsPrefetch: true,
-  // prefetch: async (nodeIds) => { await batchLoadTaskCounts(nodeIds); },
 });
 ```
 
@@ -487,16 +492,20 @@ nodeColumnRegistry.register({
 | `sortable` | `boolean` | -- | Enable sorting by this column |
 | `getSortValue` | `(node) => string \| number` | -- | Custom sort value extractor |
 | `isVisible` | `(nodeType) => boolean` | -- | Dynamic visibility |
-| `needsPrefetch` | `boolean` | -- | Whether data must be loaded before rendering |
-| `prefetch` | `(nodeIds: string[]) => Promise<void>` | -- | Batch data loader |
+| `needsPrefetch` | `boolean` | -- | Whether data must be loaded before rendering. *Not yet consumed — declared on the type; nothing in Structure reads it* |
+| `prefetch` | `(nodeIds: string[]) => Promise<void>` | -- | Batch data loader. *Not yet consumed — declared on the type; nothing in Structure reads it* |
 
-<Aside type="tip" title="Prefetch for performance">
-If your column displays data from your module's API (e.g., task count per node), use `needsPrefetch: true` and `prefetch` to batch-load data for all visible nodes in one request, rather than making per-row API calls.
+<Aside type="caution" title="Prefetch is declared, not yet invoked">
+The table view renders registered columns, but it never calls `prefetch` and never checks `needsPrefetch` — a column that waits for them renders empty on first paint and never fills in. To batch-load data for the visible page, have your module own the query (one TanStack Query keyed by node type/page) and have `render` read from that cache, falling back to a placeholder while it loads.
 </Aside>
 
 ### 8. nodeFilterRegistry
 
-Adds filter controls to list page filter bars. Supports client-side or server-side filtering.
+Declares filter controls for list page filter bars, in a client-side or server-side mode.
+
+<Aside type="caution" title="Declared, not yet rendered by Structure">
+List pages do not render module-registered filter components. Registrations are collected, listed on the **Registries** admin tab and admin-configurable on a node type's **Integrations** tab, and `useNodeFilters(nodeType)` returns them alongside `applyClientFilters(nodes)` and `serverQueryParams` — but nothing calls your `component`, `filterFn` or `toQueryParams` until your module or the host app renders the filter bar itself. Structure's own list filtering (type-aware field filters, search, status, saved presets) is a separate, built-in path.
+</Aside>
 
 ```typescript
 import { nodeFilterRegistry } from '@/features/structure';
@@ -537,7 +546,11 @@ nodeFilterRegistry.register({
 
 ### 9. nodeSidebarSectionRegistry
 
-Adds sections to the detail page sidebar (when using sidebar navigation style).
+Collects sections intended for a detail-page sidebar.
+
+<Aside type="caution" title="Declared, not yet rendered by Structure">
+The `sidebar` page-nav style renders a **vertical list of tabs**, not these sections — there is no other sidebar surface in the generated detail page. Registrations are collected, listed on the **Registries** admin tab, admin-configurable on a node type's **Integrations** tab, and returned by `useNodeSidebarSections(node, nodeType)`, but nothing in Structure renders them; `collapsible` and `defaultCollapsed` are read by nothing.
+</Aside>
 
 ```typescript
 import { nodeSidebarSectionRegistry } from '@/features/structure';
@@ -566,8 +579,8 @@ nodeSidebarSectionRegistry.register({
 | `nodeTypes` | `string[] \| '*'` | Yes | Target node types |
 | `order` | `number` | -- | Position in sidebar (default 50) |
 | `component` | `ComponentType<{ node, nodeType }>` | Yes | Section content component |
-| `collapsible` | `boolean` | -- | Whether section can collapse (default `true`) |
-| `defaultCollapsed` | `boolean` | -- | Start collapsed? (default `false`) |
+| `collapsible` | `boolean` | -- | Whether section can collapse (default `true`). *Not yet consumed — declared on the type; nothing in Structure reads it* |
+| `defaultCollapsed` | `boolean` | -- | Start collapsed? (default `false`). *Not yet consumed — declared on the type; nothing in Structure reads it* |
 | `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
 
 ---
@@ -625,8 +638,54 @@ structureRegistry.register({
 });
 ```
 
+**Methods:**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `register(registration)` | `void` | Register a module. Forwards `nodeTypes`, `tabs`, `widgets`, `cardExtensions`, `actions`, `fieldTypes`, `columns`, `filters` and `sidebarSections` to the individual registries, and stamps `moduleId` onto every entry in `fields` |
+| `unregister(moduleId)` | `void` | Unregister the module and everything it forwarded, including its fields |
+| `get(moduleId)` | `StructureModuleRegistration \| undefined` | One module's registration |
+| `getAll()` | `StructureModuleRegistration[]` | Every registration |
+| `getFieldsForNodeType(slug, adminFields?, fieldIntegrations?)` | `NodeTypeField[]` | The merge point: admin-defined fields first, then this type's module fields — with the admin **Integrations** overrides applied (disabled fields dropped, label overridden, sorted by the override order). Each module field carries `_moduleId` |
+| `getModuleFieldsForNodeType(slug)` | `(NodeFieldRegistration & { moduleDisplayName })[]` | Module fields only, with the owning module's display name — what the admin Integrations tab lists |
+| `validateDelete(node)` | `Promise<DeleteValidation>` | Runs every module's `onBeforeNodeDelete`; the first blocker wins, warnings and `itemsAffected` are merged |
+| `notifyNodeCreate(node)` | `Promise<void>` | Fans out to every `onNodeCreate` |
+| `notifyNodeDelete(nodeId, nodeType)` | `Promise<void>` | Fans out to every `onAfterNodeDelete` |
+| `notifyNodeMove(node, oldParentId, newParentId)` | `Promise<void>` | Fans out to every `onNodeMove` |
+
 <Aside type="note">
 You can register tabs, widgets, and other content items either through `structureRegistry.register()` (as arrays in the configuration object) or by calling the individual registries directly. Both approaches work — `structureRegistry` simply forwards to the individual registries. Use whichever style you prefer; direct calls are more explicit, while `structureRegistry` keeps everything in one place.
+</Aside>
+
+---
+
+## Function Registry
+
+### 11. formulaFunctionRegistry
+
+Registers **functions callable from the [`formula`](/modules/structure/fields/#formula) field type** — tier 1 of the formula function library (tier 2 is admin-defined named expressions). Structure seeds it with maths, text, logic and similarity functions; a module adds its own domain functions by importing the registry and calling `register()` (a side-effect import in the feature's `index.ts`).
+
+<Aside type="caution" title="Not on the feature barrel">
+Unlike the other ten registries, `formulaFunctionRegistry` is **not** re-exported from `@/features/structure`. It lives in `utils/formula.ts` — import it from `@/features/structure/utils/formula` (or `@/features/structure/utils`, which also re-exports the `FormulaFunction` type). Importing it from the barrel will not resolve.
+</Aside>
+
+```typescript
+import { formulaFunctionRegistry } from '@/features/structure/utils/formula';
+
+// e.g. a colour module exposing perceptual colour distance to formulas
+formulaFunctionRegistry.register({
+  name: 'deltaEOK',
+  category: 'colour',
+  arity: 2,                        // number, or [min, max] (max Infinity = variadic)
+  description: 'Perceptual colour difference (OKLab ΔE)',
+  fn: (a, b) => deltaEOK(String(a), String(b)),   // may be sync or async
+});
+```
+
+Functions take already-evaluated argument values and return a `number | string | boolean | null | unknown[]` (or a `Promise` of one — an async function such as `semanticSimilarity` is awaited). A function is called by name from a formula, e.g. `deltaEOK({colour_a}, {colour_b}) < 2`. Names resolve **tier 1 first**, so a registered function shadows an admin-defined named expression of the same name — and `register()` overwrites any existing entry, so reusing a built-in name (say `round`) replaces the built-in for every formula in the app. Namespace your names to avoid collisions. Arguments are evaluated eagerly, so a function with side effects (network, cost) should be reached via the short-circuiting ternary rather than `if(...)`.
+
+<Aside type="caution">
+The function body is trusted code (unlike the admin-authored expression that calls it), so keep it pure and bounded — it runs on the client on every render of a node that uses the formula.
 </Aside>
 
 ---
@@ -715,7 +774,7 @@ Admins see module-registered fields on the **Integrations tab** of each node typ
 
 ## Action Hooks
 
-Structure fires **49 action hooks** after every mutation. Other modules subscribe to these via the starter template's `actionRegistry` to react to node events — cleaning up data on delete, setting up defaults on create, syncing state on update.
+Structure fires **50 action hooks** after every mutation — 47 on every install, plus 3 more when opt-in embeddings are enabled. Other modules subscribe to these via the starter template's `actionRegistry` to react to node events — cleaning up data on delete, setting up defaults on create, syncing state on update.
 
 ### Registering a Hook
 
@@ -737,7 +796,7 @@ actionRegistry.addActionAsync(
 );
 ```
 
-### Node Hooks (17)
+### Node Hooks (20)
 
 | Hook | Context | Fires when |
 |------|---------|------------|
@@ -755,9 +814,12 @@ actionRegistry.addActionAsync(
 | `structure.node.duplicated` | `{ userId, sourceNodeId, newNode, includeChildren }` | A node is duplicated |
 | `structure.node.reordered` | `{ userId, parentId, nodeIds }` | Nodes are reordered within a parent |
 | `structure.node.metadataUpdated` | `{ userId, nodeId, moduleId }` | Namespaced metadata is written |
-| `structure.node.embeddingUpdated` | `{ userId, nodeId, embeddingModel }` | A node's embedding is stored or cleared (`embeddingModel` is `null` on clear) |
+| `structure.node.embeddingUpdated` | `{ userId, nodeId, embeddingModel }` | A node's embedding is stored or cleared — `embeddingModel` is `null` on clear (opt-in embeddings) |
 | `structure.node.chunksReplaced` | `{ userId, nodeId, count }` | A node's chunk set is replaced (opt-in embeddings) |
-| `structure.nodes.bulkCreated` | `{ userId, count, nodeTypes, nodeIds }` | Nodes are created via the bulk API (fires once for the batch; per-node `structure.node.created` hooks are skipped) |
+| `structure.nodes.bulkCreated` | `{ userId, count, nodeTypes, nodeIds }` | The bulk create API is called **with `skipHooks`** — one summary in place of the per-node hooks. Without `skipHooks` the bulk API fires `structure.node.created` per row and this hook does **not** fire, so subscribe to both if you must catch every create |
+| `structure.nodes.bulkArchived` | `{ userId, nodeIds }` | Nodes are bulk-archived from the list-page multi-select. Carries only the ids that succeeded, and fires *in addition* to each node's `structure.node.archived` |
+| `structure.nodes.bulkDeleted` | `{ userId, nodeIds }` | Nodes are bulk soft-deleted. Ids that succeeded; fires in addition to each node's `structure.node.deleted` |
+| `structure.nodes.bulkRestored` | `{ userId, nodeIds }` | Nodes are bulk-restored from archive. Ids that succeeded; fires in addition to each node's `structure.node.restored` |
 
 ### Chunk Hooks (1)
 
@@ -775,7 +837,7 @@ Opt-in embeddings only — fired by the `structureEmbeddings` service (see also 
 | `structure.connection.proposed` | `{ userId, connection }` | A connection is created with status `pending` (awaiting promotion) |
 | `structure.connection.promoted` | `{ userId, connection }` | A pending connection is promoted to active |
 | `structure.connection.deleted` | `{ userId, connectionId }` | A connection is deleted |
-| `structure.connections.bulkCreated` | `{ userId, count, connectionIds }` | Connections are created via the bulk API (fires once for the batch; per-connection `structure.connection.created` hooks are skipped) |
+| `structure.connections.bulkCreated` | `{ userId, count, connectionIds }` | The bulk create API is called **with `skipHooks`** — one summary in place of the per-connection hooks. Without `skipHooks` each row fires its own `structure.connection.created` / `.proposed` and this hook does **not** fire |
 
 ### Connection Type Hooks (3)
 
@@ -804,6 +866,12 @@ Opt-in embeddings only — fired by the `structureEmbeddings` service (see also 
 | `structure.nodeTypeGroup.created` | `{ userId, nodeTypeGroup }` | A node type group is created |
 | `structure.nodeTypeGroup.updated` | `{ userId, slug, changes }` | A node type group is updated |
 | `structure.nodeTypeGroup.deleted` | `{ userId, slug }` | A node type group is deleted |
+
+### Config Hooks (1)
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.config.imported` | `{ userId, result, mode }` | A full configuration bundle is imported (merge or replace) |
 
 ### Template Hooks (3)
 

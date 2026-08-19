@@ -75,10 +75,11 @@ Node types have two flags that control ownership and visibility:
 |------|-------|---------|
 | `userId` | `null` | System-level type — visible to all users |
 | `userId` | `string` | User-created type — visible to that user only |
-| `isSystem` | `true` | Protected type — only admins can edit, cannot be deleted by users |
-| `isSystem` | `false` | Regular type — users can edit and delete |
+| `isSystem` | `true` / `false` | Marks the type as module/system-owned |
 
-Module-registered node types should set `isSystem: true` and `userId: null` so they are protected system types. User-created types from the admin panel have `isSystem: false` and the creating user's ID.
+`isSystem` does **not** gate editing or deleting. Creating, updating and deleting node types is admin-only for *every* type (`requireAdmin` on `POST`/`PATCH`/`DELETE /types`), and `deleteNodeType` blocks only on existing nodes or on subtypes that inherit the slug — it never reads `isSystem`. Its one enforced effect is at import time: a `replace`-mode import (`POST /types/import`, `POST /config/import`) deletes the types not present in the payload but **spares `isSystem: true` rows**.
+
+Module-registered node types should still set `isSystem: true` and `userId: null` so they are marked system-owned and survive a replace-mode import. User-created types from the admin panel have `isSystem: false` and the creating user's ID.
 
 <Aside type="note">
 When a module registers a node type with `moduleId` set, the system tracks ownership. If the module is uninstalled, its node types can be cleaned up automatically.
@@ -107,6 +108,7 @@ The universal entity table — every node is stored here.
 | `color` | String? | Custom colour override |
 | `parentId` | String? | Parent node (self-referential) |
 | `path` | String? | Materialised path for tree queries |
+| `rootNodeId` | String? | Denormalised enforced-space root — the first path segment (itself for a root node), maintained on create and move. The column enforced scoping filters on; indexed as `@@index([userId, rootNodeId])` and `@@index([userId, rootNodeId, nodeType])`, and backfilled by the `1.34.0__root-node-id-backfill.sql` migration |
 | `depth` | Int | Tree depth (0 = root) |
 | `sortOrder` | Int | Position among siblings |
 | `fromNodeId` | String? | Source node for connections |
@@ -153,8 +155,8 @@ Configuration for each node type.
 | `fields` | JSON | Custom field definitions |
 | `builtInFieldConfig` | JSON | Merge templates / `editableBy` for built-in name, description, and slug fields |
 | `conditionalColor` | JSON | Colour rules based on a field value |
-| `permissions` | JSON | Node-level create / edit / archive / delete overrides |
-| `primaryScope` | JSON | Primary-node scope — `{ isPrimary?, scopedTypes? }` for the header scope selector |
+| `permissions` | JSON | Node-level read / create / edit / archive / delete overrides — each `anyone` \| `admin` \| `system` |
+| `primaryScope` | JSON | Primary-node scope — `{ isPrimary?, scopedTypes?, isolation? }` for the header scope selector; `isolation: 'enforced'` turns it into a server-side, fail-closed space |
 | `governance` | JSON | Governance — `{ classification?: { levels?, default? } }` for data classification |
 | `fieldTemplateIds` | JSON | `string[]` — attached shared field-template ids (`structure_field_template`) |
 | `navigation` | JSON | Navigation config |
@@ -162,7 +164,7 @@ Configuration for each node type.
 | `stageConfig` | JSON | StageConfig — stages, groups, transitions, defaultStage — column mapped to `workflowConfig` |
 | `contextHints` | String? | Free-text hints for AI context assembly, returned by `GET /nodes/:id/context` |
 | `contextConfig` | JSON | Context provider config — `includeAncestors`, `ancestorDepth`, `includeConnections`, `includeChildCounts` |
-| `aiFields` | JSON | AI Core prompt-assembly config — `{ promptSegments?, outputExamples? }` (storage-only; consumed by AI Core) |
+| `aiFields` | JSON | AI Core prompt-assembly config — `{ fields?, promptSegments?, outputExamples? }` (storage-only; consumed by AI Core) |
 | `groupSlug` | String? | References `structure_node_type_group.slug` for sidebar grouping |
 | `cardTemplateId` | String? | FK → structure_template for card view |
 | `listItemTemplateId` | String? | FK → structure_template for list view |
@@ -218,9 +220,20 @@ User-specific preferences and UI state.
 |--------|------|-------------|
 | `id` | String | CUID primary key |
 | `userId` | String | Unique owner reference (`@unique`) |
-| `settings` | JSON | Flexible settings object |
+| `settings` | JSON | Flexible settings object (see the keys below) |
 | `createdAt` | DateTime | Creation timestamp |
 | `updatedAt` | DateTime | Last update timestamp |
+
+The column is an open bag — other modules may add their own keys. The keys Structure itself writes are:
+
+| Key | Shape | Written by |
+|-----|-------|-----------|
+| `defaultView` | `'grid'` \| `'list'` \| `'table'` | The Structure settings page ("Default view") |
+| `treeExpanded` | `Record<nodeTypeSlug, string[]>` — expanded node ids per type | The tree list view, to persist expand state |
+| `filterPresets` | `Record<nodeTypeSlug, FilterPreset[]>` | Saved per-node-type list filter presets |
+| `currentScopeNodeId` | `string` — the selected primary-scope / enforced-space node id | The header scope selector; read server-side to resolve the active space |
+
+`PATCH /settings` **merges** into this object rather than replacing it, so writing one key leaves the others intact.
 
 ### structure_node_type_group
 
@@ -258,9 +271,13 @@ Configuration for typed connections between nodes. Controls which node types can
 | `isUnique` | Boolean | One connection per pair only (default false) |
 | `fields` | JSON | `NodeTypeField[]` — data fields on connections (same rich field system as node types) |
 | `fieldTemplateIds` | JSON | `string[]` — attached shared field-template ids (`structure_field_template`) |
-| `isSystem` | Boolean | Protected from user editing |
+| `contextHints` | String? | Free-text hints for AI context assembly — mirrors the node type column so a relationship can describe itself to AI too |
+| `aiFields` | JSON | AI Core prompt-assembly config — `{ fields?, promptSegments?, outputExamples? }` (storage-only; consumed by AI Core) |
+| `isSystem` | Boolean | Module/system-owned marker — spared by a `replace`-mode import |
 | `isEnabled` | Boolean | Whether the type is active |
 | `sortOrder` | Int | Display order (default 50) |
+| `createdAt` | DateTime | Creation timestamp |
+| `updatedAt` | DateTime | Last update timestamp |
 
 ### structure_api_key
 
@@ -301,13 +318,13 @@ A `@@unique([userId, name])` keeps function names unique per scope; `@@index([ca
 
 ### structure_chunk (opt-in)
 
-Created **only when embeddings are enabled** (added by the chunk-storage module migration, not the base schema). A dedicated pgvector table holding per-node text chunks and their embedding vectors for chunk-level semantic search. See [Cognitive Foundations](/modules/structure/cognitive/) for its columns and the chunk search service.
+Present **only when embeddings are enabled** — the model sits inside the `{{#if enableEmbeddings}}` block of the Prisma schema, so `prisma migrate` creates the table and its vector column like any other model. The `1.22.0__chunk-storage.sql` module migration adds only the HNSW index, which Prisma cannot express on an `Unsupported` column. A dedicated pgvector table holding per-node text chunks and their embedding vectors for chunk-level semantic search. See [Cognitive Foundations](/modules/structure/cognitive/) for its columns and the chunk search service.
 
 ### Raw SQL access notes
 
 If your code queries these tables directly (outside of Prisma), note two things:
 
-- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`, `structure_functions`). Use the plural names in raw SQL.
+- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`, `structure_functions`, `structure_chunks`). Use the plural names in raw SQL.
 - **`@map`-ed columns.** Two Prisma fields map to differently-named database columns (kept for historical reasons, no data move): `structure_node.stage` → column `workflowState`, and `structure_node_type.stageConfig` → column `workflowConfig`. Raw SQL must use the `workflowState` / `workflowConfig` column names.
 - **Unique constraints on `structure_node`.** Beyond the primary key, there are two compound uniques that the API surfaces as `400` errors:
   - `@@unique([userId, slug])` — a user can't have two nodes with the same slug
@@ -337,21 +354,37 @@ interface NodeTypeConfig {
   rules: NodeTypeRules;
   features: NodeTypeFeatures;
   fields?: NodeTypeField[];
-  // Merge templates / editableBy for built-in name, description, slug fields
-  builtInFieldConfig?: Record<string, unknown>;
+  // Merge templates / editableBy for the built-in name, description, slug fields
+  builtInFieldConfig?: {
+    name?: { computedTemplate?: string; editableBy?: 'anyone' | 'admin' | 'system' };
+    description?: { computedTemplate?: string; editableBy?: 'anyone' | 'admin' | 'system' };
+    slug?: { computedTemplate?: string; editableBy?: 'anyone' | 'admin' | 'system' };
+  };
   // Colour the node based on a field value
   conditionalColor?: {
     field: string;
     rules: Array<{ value: string; color: string }>;
     fallback?: string;
   };
-  // Node-level action overrides
+  // Node-level permission overrides. 'read' gates who can VIEW entries of this
+  // type (enforced server-side across reads, search and the public API); the
+  // others gate the write actions. 'system' = trusted in-process callers only
+  // (e.g. the cog-ingest engine) — no user or admin can perform it via UI or API.
   permissions?: {
-    create?: 'anyone' | 'admin';
-    edit?: 'anyone' | 'admin';
-    archive?: 'anyone' | 'admin';
-    delete?: 'anyone' | 'admin';
+    read?: 'anyone' | 'admin' | 'system';
+    create?: 'anyone' | 'admin' | 'system';
+    edit?: 'anyone' | 'admin' | 'system';
+    archive?: 'anyone' | 'admin' | 'system';
+    delete?: 'anyone' | 'admin' | 'system';
   };
+  // Type Hierarchy (is-a): parent type slugs — multiple inheritance, DAG-validated
+  superClasses?: string[];
+  // Server-computed inherited config, read-only — never sent back on save
+  resolved?: NodeTypeResolved;      // { fields, features, ancestors }
+  // Proposal state — null/absent = live type; 'pending' = awaiting admin approval
+  proposalStatus?: string | null;
+  // { proposedBy, reason?, sourceContext?, proposedAt } for proposed types
+  proposalMeta?: Record<string, unknown>;
   navigation: NodeTypeNavigation;
   // Template assignment — reference reusable templates per view
   cardTemplateId?: string | null;
@@ -375,6 +408,19 @@ interface NodeTypeConfig {
     includeConnections?: boolean;
     includeChildCounts?: boolean;
   };
+  // Primary-node scope — see Primary scope below
+  primaryScope?: {
+    isPrimary?: boolean;
+    scopedTypes?: string[];
+    isolation?: 'filter' | 'enforced';
+  };
+  // Data classification — see Governance below
+  governance?: {
+    classification?: {
+      levels?: Array<{ value: string; label: string; rank: number; color?: string }>;
+      default?: string;
+    };
+  };
 }
 ```
 
@@ -383,12 +429,18 @@ interface NodeTypeConfig {
 ```typescript
 interface NodeTypeRules {
   isRoot?: boolean;                 // Can exist at root level (no parent)
+  createFrom?: {                    // Where the "+ New" entry point appears.
+    sidebar?: boolean;              //   "New" sub-link under the sidebar nav row
+    headerToolbar?: boolean;        //   include in the header "+ New" dropdown (default on)
+  };                                // Only used when isRoot is true.
   allowedParents?: string[];        // Slugs of types this can nest inside
   allowedChildren?: string[];       // Slugs of types this can contain
   maxDepth?: number;                // Max nesting depth
   maxChildren?: number;             // Max number of direct children
   isHierarchical?: boolean;         // Can form hierarchies
   allowMultipleParents?: boolean;   // Tag-like behaviour
+  allowCrossSpaceMove?: boolean;    // Permit moving a node of this type between two
+                                    // enforced spaces (default off; audited)
   isConnection?: boolean;           // Is this a connection-type node?
   connectionConfig?: {
     fromTypes?: string[];
@@ -412,10 +464,27 @@ primaryScope?: {
   isPrimary?: boolean;      // This type is the primary scope; adds the header picker
   scopedTypes?: string[];   // Which type slugs the selection filters.
                             // empty or ['*'] = every type; a list = only those types
+  isolation?: 'filter' | 'enforced';
+                            // 'filter' (default) = client-side list scoping via
+                            // pathPrefix; 'enforced' = server-side, fail-closed
+                            // space confined by structure_node.rootNodeId
 };
 ```
 
 The selected instance's id is stored per user in `structure_settings` (`currentScopeNodeId`) via the `useCurrentScope()` store, and `NodeListPage` scopes matching lists by injecting `pathPrefix` (the selected node's materialised-path prefix). **`scopedTypes` is an admin choice:** leave it empty (or use `'*'`) to scope the whole app to the primary node, or list specific slugs to scope only those and leave global/reference types (e.g. legislation) unscoped. The primary type's own list is never filtered by its own selection. Built for one primary scope now, shaped so multiple/secondary scopes can be added later.
+
+#### Enforced spaces (`isolation: 'enforced'`)
+
+Added in v1.34.0. With `isolation` left at its default `'filter'`, scoping is a client-side convenience: the list page injects `pathPrefix` and nothing is enforced server-side. Setting `isolation: 'enforced'` promotes the primary type to a **space** and moves the confinement into the API:
+
+- The server resolves the caller's **active space** from `structure_settings.currentScopeNodeId` and confines reads to nodes whose `rootNodeId` matches it — lists, tree, keyword search, connections and the neighbourhood reads (children / descendants / path) all go through the same guard.
+- The **embeddings retrieval arm** (`semanticSearch*` / `lexicalSearch*` / `hybridSearch*` / `findSimilarNodes`) is *not* ambiently scoped. It lives in a separately generated service that cannot see the scope helpers, so it confines results only when the calling consumer passes `scopeRootId` explicitly — an opt-in contract for cog-ingest / AI Core, not a server-side guarantee. Making it ambient is a deferred, coordinated change.
+- It is **fail-closed**: an enforced type with no valid active space resolves to `deny` rather than falling back to unscoped results. A stale setting simply yields nothing; an explicitly supplied invalid scope is a `400`.
+- Instances of the enforced primary type itself are never confined, so the space list stays cross-space and users can still switch spaces.
+- Trusted in-process (system) callers bypass the guard; end-user calls never can.
+- Moving a node **out of** an enforced space is rejected unless its type opts in with `rules.allowCrossSpaceMove` (default off, and audited). That covers a move into a *different* space as well as a move to unscoped or scope-exempt territory — the old root is what the guard tests. Filing a node **in** from a non-enforced area is always allowed.
+
+The in-app API takes no scope query parameter — the active space is ambient. The [public REST API](/modules/structure/public-api/) has no session to read it from, so its list and get routes accept an explicit `?scopeRootId=` instead, which must name a node of an enforced primary type.
 
 ### Governance (data classification)
 
@@ -528,12 +597,17 @@ interface NodeTypeNavigation {
     defaultTab?: string;
   };
   listPage?: {
+    // The admin picker also writes 'tree' (the fourth list view) and the
+    // list page honours it — the union below still lags the UI
     defaultView?: 'grid' | 'list' | 'table';
     defaultSort?: string;
     showFilters?: boolean;
     showSearch?: boolean;
     groupBy?: string;
     card?: {
+      // Merge-field templates for the card's title and body — see Merge Fields
+      titleTemplate?: string;
+      bodyTemplate?: string;
       showDescription?: boolean;
       showIcon?: boolean;
       showColor?: boolean;
@@ -573,12 +647,13 @@ interface NodeTypeField {
 }
 ```
 
-**Built-in field types:** text, textarea, number, date, datetime, time, select, multiselect, chained-select, toggle, boolean, url, email, phone, address, name-field, secret, hidden, section-break, node-reference, field-group. See the [Field Types Reference](/modules/structure/fields/) for the full list with configuration and examples.
+**Built-in field types (22):** text, textarea, number, date, datetime, time, select, multiselect, chained-select, toggle, boolean, url, email, phone, address, name-field, secret, hidden, section-break, node-reference, field-group, formula. See the [Field Types Reference](/modules/structure/fields/) for the full list with configuration and examples.
 
 **New field types:**
 - `boolean` — renders as Yes/No radio buttons (not a toggle switch)
 - `field-group` — repeating field group (repeater). Contains sub-fields defined via the `fields` array (a `NodeTypeField[]` on the field-group field). Each entry adds a row with all sub-fields. Edited in admin via a dedicated sub-fields editor.
 - `node-reference` — supports `multiple: true` via its `nodeReferenceConfig` object (alongside `allowedTypes`), not in `options`, for multi-select node references
+- `formula` — admin-authored calculation field. `calcConfig: { formula, precision?, prefix?, suffix? }`; the expression is evaluated client-side over merge-field tokens against the `formulaFunctionRegistry` (dev-registered code functions) and the admin-defined `structure_function` named-expression library. Like `computedTemplate` the value is client-computed, read-only and server-accepted
 
 ### Labels
 
@@ -638,7 +713,7 @@ interface StageTransition {
 }
 ```
 
-When a node is created, the service auto-sets `stage` to `stageConfig.defaultStage`. Stage changes fire the `structure.node.stageChanged` action hook with `{ userId, node, oldStage, newStage }`. When `transitions` are defined, `updateNode` rejects a stage change the map does not permit — an unset from-stage (or an empty map) is unconstrained, so transition enforcement is fully opt-in.
+When a node is created, the service auto-sets `stage` to `stageConfig.defaultStage`. Stage changes fire the `structure.node.stageChanged` action hook with `{ userId, node, oldStage, newStage, oldGroup, newGroup }` — the group keys are the `StageGroup.slug` of the old and new stages (`undefined` when the stage has no group). When `transitions` are defined, `updateNode` rejects a stage change the map does not permit — an unset from-stage (or an empty map) is unconstrained, so transition enforcement is fully opt-in.
 
 ### ConnectionTypeConfig
 
@@ -660,6 +735,12 @@ interface ConnectionTypeConfig {
   unique?: boolean;            // one per pair only
   fields?: NodeTypeField[];    // same rich field system as node types
   fieldTemplateIds?: string[]; // attached shared field-template ids (structure_field_template)
+  // Server-computed own + attached-template fields (read-only; never persisted)
+  resolved?: { fields: NodeTypeField[] };
+  // AI context — storage + exposure only; AI Core consumes these. Mirrors the
+  // node type's pair so a relationship can describe itself to AI too.
+  contextHints?: string;
+  aiFields?: AiFieldsConfig;
   isSystem?: boolean;
   isEnabled?: boolean;
   sortOrder?: number;
@@ -687,6 +768,9 @@ All endpoints are prefixed with `/api/v1/structure`.
 | DELETE | `/nodes/:id` | Soft delete |
 | POST | `/nodes/:id/move` | Move to different parent |
 | POST | `/nodes/bulk` | Bulk create nodes (per-row atomic, partial success — see note below) |
+| POST | `/nodes/bulk-archive` | Bulk archive — body `{ ids: string[] }` (min 1, max 500); partial success |
+| POST | `/nodes/bulk-delete` | Bulk soft-delete — same body; partial success |
+| POST | `/nodes/bulk-restore` | Bulk restore from archive — same body; partial success |
 | POST | `/nodes/:id/duplicate` | Duplicate node (subtree copy) |
 | POST | `/nodes/:id/archive` | Archive |
 | POST | `/nodes/:id/restore` | Restore from archive |
@@ -696,6 +780,8 @@ All endpoints are prefixed with `/api/v1/structure`.
 | GET | `/nodes/:id/descendants` | Get all descendants |
 | GET | `/nodes/:id/context` | Get assembled node context (node, type, ancestors, breadcrumb, counts, connections) |
 | PATCH | `/nodes/:id/metadata` | Atomic namespaced metadata write |
+
+The three bulk status endpoints run each id through the single-node method (so cascades and per-node hooks are preserved), collect failures per id instead of aborting the batch, and return `{ succeeded: string[], errors: Array<{ id, error }> }`. When at least one id succeeds they fire one summary action hook — `structure.nodes.bulkArchived`, `structure.nodes.bulkDeleted` or `structure.nodes.bulkRestored` — carrying `{ userId, nodeIds }` for the ids that succeeded.
 
 <Aside type="note" title="Bulk create is partial-success, not all-or-nothing (v1.19.0)">
 `POST /nodes/bulk` creates each row atomically on its own and returns `{ created, errors }`, where
@@ -740,10 +826,13 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 | POST | `/types` | Create type (admin only) |
 | PATCH | `/types/:slug` | Update type (admin only) |
 | DELETE | `/types/:slug` | Delete type (admin only, fails if nodes exist) |
+| POST | `/types/reorder` | Batch `sortOrder` update — body `{ items: [{ slug, sortOrder }] }`, one transaction (admin only) |
 | GET | `/types/export` | Export **node types only** as JSON (admin only) |
 | POST | `/types/import` | Import types from JSON — `merge` or `replace` mode (admin only) |
+| GET | `/config/export` | Export the **full config bundle** as one JSON payload (admin only) |
+| POST | `/config/import` | Atomic full-bundle import — `mode` and `dryRun` (admin only) |
 
-The `/types/export` endpoint returns node types alone (`{ version, exportedAt, nodeTypes }`). The bundled configuration export — connection types, groups, and field templates alongside node types — is a **frontend admin-UI feature** (the App Structure page's **Export** button), assembled client-side, not this endpoint.
+`/types/export` returns node types alone (`{ version, exportedAt, nodeTypes }`). For the whole configuration — node types, field templates, groups, connection types and formula functions — use `GET /config/export`, which is what the App Structure page's **Export** button calls. `POST /config/import` is **atomic**: any failure rolls the entire import back. It accepts `mode` (`merge`, the default, or `replace`) and `dryRun: true`, which computes the per-category diff inside a rolled-back transaction without writing or firing hooks. Either way it returns a per-category summary of created / updated / deleted / unchanged rows.
 
 Since v1.18.0, the list and get responses include two additive keys: `superClasses` (the raw parent slugs) and a read-only `resolved` block (`fields`, `features`, `ancestors`) with inheritance applied. See [Type Hierarchy](/modules/structure/type-hierarchy/).
 
@@ -796,9 +885,9 @@ The public, API-key-authed data endpoints live under `/api/v1/public/structure/:
 |--------|------|-------------|
 | GET | `/templates` | List templates (optional `?type=` filter) |
 | GET | `/templates/:id` | Get single template |
-| POST | `/templates` | Create template |
-| PATCH | `/templates/:id` | Update template |
-| DELETE | `/templates/:id` | Delete template |
+| POST | `/templates` | Create template (admin only) |
+| PATCH | `/templates/:id` | Update template (admin only) |
+| DELETE | `/templates/:id` | Delete template (admin only) |
 
 ### Field Templates
 
@@ -811,6 +900,26 @@ Reusable shared field sets (`structure_field_template`) attached to node types v
 | POST | `/field-templates` | Create field template (admin only) |
 | PATCH | `/field-templates/:id` | Update field template (admin only) |
 | DELETE | `/field-templates/:id` | Delete field template (admin only) |
+
+### Functions
+
+The admin-defined named-expression library (`structure_function`) behind the `formula` field type — see [Field Types Reference](/modules/structure/fields/).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/functions` | List functions visible to the caller (own + system) |
+| GET | `/functions/:id` | Get a single function |
+| POST | `/functions` | Create a function (admin only, returns 201) |
+| PATCH | `/functions/:id` | Update a function (admin only) |
+| DELETE | `/functions/:id` | Delete a function (admin only, returns 204) |
+
+### Similarity
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/similarity` | Cosine similarity between two nodes' embeddings — body `{ nodeA, nodeB }` → `{ similarity: number \| null }`; `null` when embeddings are not enabled |
+
+This is the endpoint behind the formula library's `semanticSimilarity()` function.
 
 ### Settings
 
@@ -845,6 +954,8 @@ Reusable shared field sets (`structure_field_template`) attached to node types v
 | `stages` | Comma-separated list of stage slugs |
 | `stageGroup` | Filter by stage group slug |
 
+There is deliberately no scope parameter here: when a node type uses `primaryScope.isolation: 'enforced'`, confinement to the active space is **ambient** — resolved server-side from `structure_settings.currentScopeNodeId` on every read. Only the [public REST API](/modules/structure/public-api/), which has no session to read that from, accepts an explicit `?scopeRootId=`.
+
 ### Data Filters
 
 The `dataFilters` query parameter accepts an array of filter objects for advanced filtering on custom field values stored in the `data` JSON column:
@@ -854,6 +965,11 @@ interface DataFilter {
   fieldId: string;
   operator: DataFilterOperator;
   value?: unknown;
+  /** How gt/gte/lt/lte/between cast the stored JSON value so it orders
+   *  correctly: 'number' (the default) casts ::numeric, 'date' casts
+   *  ::timestamptz. Ignored by the equality / contains / membership
+   *  operators. Absent behaves as 'number' for backward compatibility. */
+  valueType?: 'text' | 'number' | 'date';
 }
 
 type DataFilterOperator =
@@ -862,7 +978,7 @@ type DataFilterOperator =
   | 'in' | 'not_in' | 'is_empty' | 'is_not_empty';
 ```
 
-Operators `is_empty` and `is_not_empty` do not require a `value`. The `between` operator expects `value` to be `[min, max]`. The `in` and `not_in` operators expect `value` to be an array.
+Operators `is_empty` and `is_not_empty` do not require a `value`. The `between` operator expects `value` to be `[min, max]`. The `in` and `not_in` operators expect `value` to be an array. Set `valueType` whenever you compare a numeric or date custom field with `gt`/`gte`/`lt`/`lte`/`between` — without it the stored JSON value is cast as a number, so date fields compare lexicographically and sort wrongly.
 
 ---
 
@@ -875,7 +991,7 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 | `createNodeSchema` | POST `/nodes` | `nodeType` and `name` required, max lengths |
 | `updateNodeSchema` | PATCH `/nodes/:id` | All fields optional, max lengths |
 | `moveNodeSchema` | POST `/nodes/:id/move` | `newParentId` required (nullable) |
-| `reorderNodesSchema` | POST `/reorder` | `nodeIds` array required (min 1) |
+| `reorderNodesSchema` | POST `/reorder` | `parentId` required (nullable), `nodeIds` array required (min 1, max 500) |
 | `createConnectionSchema` | POST `/connections` | `fromNodeId`, `toNodeId`, `connectionType` required; optional `origin` (lowercase-kebab) and `status` (`active` or `pending`) |
 | `createNodeTypeSchema` | POST `/types` | `slug` regex validated, `name`/`namePlural` required |
 | `updateNodeTypeSchema` | PATCH `/types/:slug` | All fields optional |
@@ -883,6 +999,10 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 | `approveNodeTypeProposalSchema` | POST `/types/proposals/:slug/approve` | Optional `scope` — `user` (default) or `system` |
 | `createTemplateSchema` | POST `/templates` | `name`, `type` required, `slug` regex validated |
 | `updateTemplateSchema` | PATCH `/templates/:id` | All fields optional |
+
+Request schemas type the `data` blob as an open bag, so there is a **second validation layer** underneath them. Every node create, update and bulk-create runs the submitted `data` against the node type's *resolved* field definitions — required presence, type, `validation.pattern`, `validation.min`/`max` and `select`/`multiselect` option membership — and throws a `400` on the first violation. This covers direct API, public API and module writes alike, not just the admin UI.
+
+Its scope is deliberately narrow: top-level fields only (`field-group` sub-fields are not walked); the `formula`, `section-break`, `hidden`, `field-group` and `secret` types are skipped; only *unconditional* `required` is enforced, so a field carrying `visibleWhen` is exempt; and data keys with no matching field definition are ignored. On update only the supplied keys are value-checked, though a required field cannot be cleared to empty.
 
 ---
 
@@ -896,14 +1016,28 @@ Complete list of subcommands exposed by `npx structure <command>`.
 | `update` | `--dry-run`, `--force`, `--skip-schema`, `--set <assignments...>` | Update templates and schema. `--dry-run` previews, `--force` proceeds through conflicts, `--skip-schema` updates templates only, `--set <assignments...>` also changes install-time answers (delegates to `reconfigure`) |
 | `reconfigure` | `--dry-run`, `--force`, `--set <assignments...>`, `--skip-schema` | Change install-time answers (toggle gated features) and re-sync files/schema, e.g. `--set enableEmbeddings=true` |
 | `migrate` | `--dry-run` | Add version headers to existing files (for installations that pre-date version tracking) |
-| `migrate-db` | `--dry-run` | Run the module's database migrations (SQL + TS backfills). `--dry-run` lists pending migrations without applying |
+| `migrate-db` | `--dry-run`, `--repair` | Run the module's database migrations (SQL + TS backfills). `--dry-run` lists pending migrations without applying; `--repair` reconciles schema drift instead — an additive-only heal (it never drops) of any module table, column or index the database is missing |
 | `uninstall` | `--force`, `--keep-data`, `--export <path>` | Remove the module. `--keep-data` preserves tables, `--export <path>` writes data to JSON before removal |
 | `disable` | `--force` | Temporarily disable without removing files |
 | `enable` | `--force` | Re-enable a disabled module |
 | `info` | — | Print module name, version, features, and available commands |
+| `update-schema` | `--force` | **Deprecated** — schema updates are part of `update`. Kept for backwards compatibility |
+
+### Module SQL migrations
+
+Structure ships six raw-SQL migrations, applied once per database (checksummed and append-only) by `init`, `update` and `migrate-db`. They run *after* `prisma migrate` and *before* the lifecycle hooks. Every one runs on every install — none is gated on an install answer — because each block self-guards on the table or column it touches and is exception-safe, so it can never fail an install.
+
+| Migration | What it provisions |
+|-----------|--------------------|
+| `1.16.0__cognitive-foundations.sql` | Two blocks: the pgvector extension (when the host advertises it) and the partial HNSW index on `structure_nodes.embedding`, which no-ops when that opt-in column is absent. There is deliberately **no** connection-origin index — the origin filters go through Prisma's JSON path filter, whose emitted expression an expression index would not match |
+| `1.22.0__chunk-storage.sql` | The HNSW index on `structure_chunks.embedding`, which Prisma cannot express on an `Unsupported` column. The table itself comes from the embeddings-gated schema block |
+| `1.32.0__lexical-search.sql` | The original functional GIN indexes for keyword and hybrid retrieval — superseded by the next migration, which drops them |
+| `1.33.0__search-vectors.sql` | Trigger-maintained `tsvector` columns for always-on keyword search, the GIN baseline, and feature-detected Lakebase `bm25`/`ann` indexes on embeddings installs |
+| `1.33.17__stage-rename.sql` | Rewrites the JSON keys the workflow → stage rename touched inside `structure_node_types` (`states` → `stages`, `defaultState` → `defaultStage`, `workflowStates` → `stages`). A no-op on fresh installs |
+| `1.34.0__root-node-id-backfill.sql` | Backfills `structure_nodes.rootNodeId` from the materialised path for enforced scoping. A no-op once every row is stamped |
 
 <Aside type="caution" title="Module migrations need a reachable database">
-Structure ships module SQL migrations (the first is `1.16.0__cognitive-foundations.sql`). Both `init` and `update` apply them, so they need a reachable database — set `DIRECT_DATABASE_URL` (or `DATABASE_URL`) in `backend/.env` before running either command.
+Both `init` and `update` apply these migrations, so they need a reachable database — set `DIRECT_DATABASE_URL` (or `DATABASE_URL`) in `backend/.env` before running either command. If a database has drifted (a table, column or index the module expects is missing), run `npx structure migrate-db --repair` for an additive-only heal rather than resetting.
 </Aside>
 
 ### Updating
@@ -936,6 +1070,6 @@ This removes generated files and the schema block. You will need to manually cle
 - [Field Types Reference](/modules/structure/fields/) — All 22 built-in field types with configuration and examples
 - [Merge Fields & Conditional Logic](/modules/structure/merge-fields/) — Auto-compute field values and control visibility
 - [Integration](/modules/structure/integration/) — How other modules extend Structure
-- [Registries Guide](/modules/structure/registries-guide/) — Comprehensive reference for all 10 registries, module fields, and hooks
+- [Registries Guide](/modules/structure/registries-guide/) — Comprehensive reference for all 11 registries, module fields, and hooks
 - [JSON Import & Export](/modules/structure/json-reference/) — Import and export Structure configurations
 - [Database docs](/starter-template/database/) — Starter template Prisma setup and migration commands
