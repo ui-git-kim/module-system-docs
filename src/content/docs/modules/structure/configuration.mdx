@@ -91,7 +91,7 @@ When a module registers a node type with `moduleId` set, the system tracks owner
 
 ## Database Schema
 
-Structure creates nine tables in your database, plus a tenth (`structure_chunk`) when embeddings are enabled.
+Structure creates ten tables in your database, plus an eleventh (`structure_chunk`) when embeddings are enabled.
 
 ### structure_node
 
@@ -104,6 +104,7 @@ The universal entity table — every node is stored here.
 | `nodeType` | String | References node type slug |
 | `name` | String | Display name |
 | `slug` | String? | URL-safe identifier |
+| `reference` | String? | Immutable, server-assigned reference number (e.g. `MAT-2026-0147`). `NULL` unless the node's type opts in via `referenceConfig` — see [Reference numbers](#reference-numbers). Issued from `structure_reference_counter` inside the same transaction as the create, and unique per user via `@@unique([userId, reference])`; no create, update, public-API, bulk or metadata path can change it afterwards |
 | `description` | String? | Rich text description |
 | `data` | JSON | Custom field values |
 | `icon` | String? | Custom icon override |
@@ -136,6 +137,26 @@ The universal entity table — every node is stored here.
 The schema uses multiple self-referential `@relation` directives to disambiguate `parentId`, `fromNodeId`, and `toNodeId` foreign keys. This is required by Prisma when a model references itself through multiple fields.
 </Aside>
 
+### structure_reference_counter
+
+The atomic sequence behind `structure_node.reference`. One row per (user, node type, period), created lazily the first time that key issues a number. Added in v1.35.0.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | String | CUID primary key |
+| `userId` | String | Owner |
+| `nodeType` | String | References node type slug |
+| `period` | String | `'YYYY'` for a type that resets yearly, `''` for every other (default `''`) — so a yearly reset starts a new row rather than destructively resetting one |
+| `lastValue` | Int | Highest number **issued** for this key (default 0) |
+| `createdAt` | DateTime | Creation timestamp |
+| `updatedAt` | DateTime | Last update timestamp |
+
+`@@unique([userId, nodeType, period])` is the arbiter for the atomic increment: assignment is a single `INSERT … ON CONFLICT … DO UPDATE … RETURNING "lastValue"`, run inside the same transaction as the node create, so two concurrent creates cannot receive the same number and a failed create burns none. There are no other indexes — `[userId]` and `[userId, nodeType]` are leftmost prefixes of that unique. The table is mapped to `structure_reference_counters` in the database.
+
+<Aside type="note" title="Why the counter is not a column on the node type">
+A counter is **runtime state**, not configuration. `structure_node_type.referenceConfig` rides node-type JSON export/import, so a high-water mark stored beside it would travel between environments and hand an imported config the source environment's issued numbers. Keeping the two apart lets the format move freely while the counter stays with the rows it numbered.
+</Aside>
+
 ### structure_node_type
 
 Configuration for each node type.
@@ -160,6 +181,7 @@ Configuration for each node type.
 | `permissions` | JSON | Node-level read / create / edit / archive / delete overrides — each `anyone` \| `admin` \| `system` |
 | `primaryScope` | JSON | Scope — `{ isPrimary?, scopedTypes?, isolation?, global? }`. `isPrimary` adds the header scope selector and `isolation: 'enforced'` turns it into a server-side, fail-closed space; `global: true` makes the type **read-shared across all users** and space-exempt, and is honoured only on an app-level row (`userId` `null`) |
 | `governance` | JSON | Governance — `{ classification?: { levels?, default? } }` for data classification |
+| `referenceConfig` | JSON | Reference-number format — `{ enabled?, prefix?, separator?, padding?, includeYear?, resetYearly? }`; `{}` (off) by default — see [Reference numbers](#reference-numbers) |
 | `fieldTemplateIds` | JSON | `string[]` — attached shared field-template ids (`structure_field_template`) |
 | `navigation` | JSON | Navigation config |
 | `labels` | JSON | Admin label overrides (the `getLabel` keys — see `NodeTypeLabels`) |
@@ -326,11 +348,12 @@ Present **only when embeddings are enabled** — the model sits inside the `{{#i
 
 If your code queries these tables directly (outside of Prisma), note two things:
 
-- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`, `structure_functions`, `structure_chunks`). Use the plural names in raw SQL.
+- **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`, `structure_functions`, `structure_reference_counters`, `structure_chunks`). Use the plural names in raw SQL.
 - **`@map`-ed columns.** Two Prisma fields map to differently-named database columns (kept for historical reasons, no data move): `structure_node.stage` → column `workflowState`, and `structure_node_type.stageConfig` → column `workflowConfig`. Raw SQL must use the `workflowState` / `workflowConfig` column names.
-- **Unique constraints on `structure_node`.** Beyond the primary key, there are two compound uniques that the API surfaces as `400` errors:
+- **Unique constraints on `structure_node`.** Beyond the primary key there are three compound uniques. The first two are client-supplied and the API surfaces them as `400` errors:
   - `@@unique([userId, slug])` — a user can't have two nodes with the same slug
   - `@@unique([userId, parentId, name])` — a user can't have two siblings with the same name under the same parent
+  - `@@unique([userId, reference])` — reference numbers are unique per user when present. Server-assigned rather than submitted, so it is not normally reachable from a request; Postgres allows any number of `NULL`s in a unique index, so types with references disabled are unaffected and the constraint is safe to add to a populated table
 
 ---
 
@@ -422,6 +445,8 @@ interface NodeTypeConfig {
     // isPrimary. See Shared types below.
     global?: boolean;
   };
+  // Reference numbers — see Reference numbers below
+  referenceConfig?: ReferenceConfig;
   // Data classification — see Governance below
   governance?: {
     classification?: {
@@ -545,6 +570,45 @@ governance?: {
 <Aside type="note">
 Classification levels are **per node type** and are **not** inherited through `superClasses` (own-config only, like the hierarchy rules). For an app-wide scheme, configure consistent levels across the types that need it. The per-node override is **API-only** for now (no UI picker yet), and export-pipeline enforcement is a consuming module's responsibility — structure only evaluates.
 </Aside>
+
+### Reference numbers
+
+Issue every entry of a node type an **immutable, server-assigned, human-readable reference** — `MAT-2026-0147` — that a person can quote in an email, a letter or an invoice. **Off by default, opt-in per type:** a type that leaves it off stores `NULL` and behaves exactly as it does today. Added in v1.35.0. The controls sit in the **Reference numbers** section of the admin **Basic** tab, next to **Scope**, because a reference is part of how an entry is *identified*.
+
+A derived name cannot carry identity. Two unrelated matters can both compute to "Schulz & Schulz", and adding a party silently changes a name something else already cited. `id` is a cuid — stable but opaque. `slug` is client-supplied, `@@unique([userId, slug])`, with no de-dup helper, so a computed slug collides. The reference is the citable handle: the server assigns it, nothing can change it, and the name is then free to be computed.
+
+```typescript
+// On NodeTypeConfig:
+referenceConfig?: ReferenceConfig;
+
+interface ReferenceConfig {
+  enabled?: boolean;      // Master switch. Anything other than true issues no references
+  prefix?: string;        // Leading segment, e.g. 'MAT' — omitted from the reference when empty
+  separator?: string;     // Segment separator (default '-'); an explicit '' joins segments directly
+  padding?: number;       // Zero-pad width (default 4, clamped 1–12; >2 digits ignored)
+  includeYear?: boolean;  // Four-digit year segment between the prefix and the sequence
+  resetYearly?: boolean;  // Restart the sequence at 1 each year — requires includeYear
+}
+```
+
+| Config | Renders |
+|--------|---------|
+| `{ enabled: true, prefix: 'MAT', separator: '-', padding: 4, includeYear: true, resetYearly: true }` | `MAT-2026-0147` |
+| `{ enabled: true, prefix: 'INC', padding: 4 }` | `INC-0031` |
+
+- **Padding only ever widens.** Once the counter outgrows the width the number simply keeps growing (`0999` → `1000` → `10000`). It is never truncated back to the width, because truncation collides. Every knob is parsed defensively and identically at runtime and in the `1.35.0__reference-numbers.sql` migration, so the two can never format the same number differently.
+- **`resetYearly` requires `includeYear`.** Restarting the sequence with no year segment in the reference would reissue numbers that collide with last year's, so the reset is ignored unless the year is present.
+- **Empty segments are omitted** — never a doubled separator. No prefix means no leading separator, and an explicit `separator: ''` joins the segments directly (`MAT20260147`).
+- **The year is the UTC year**, at runtime and in the migration alike, so a server in another time zone can never roll the period backwards and start reissuing numbers.
+- **Changing the format later never reissues.** Issued numbers are immutable, so editing the prefix, padding or separator only affects numbers handed out from then on.
+- **Give each enabled type a distinct format.** Uniqueness is per user across **all** types, not per type, so two enabled types configured with the same prefix, separator and padding compete for the same strings. Each has its own counter, so both will try to issue `MAT-0001` — the second one fails with *"Could not assign a unique reference number for node type … — check its reference format"* rather than silently issuing a duplicate.
+- **The format is own-config only.** Like the hierarchy rules and governance, `referenceConfig` is not inherited through `superClasses` — a subtype does not pick up its parent's format and must set its own.
+
+**Backfill on enable.** Flipping a type's `referenceConfig.enabled` from off to on — through `PATCH /types/:slug` or a config import — numbers that type's **existing** entries in `createdAt, id` order and seeds the counter above the highest value assigned, in the same transaction as the config write (so an import's dry-run abort rolls it back too). This is the primary backfill path: `referenceConfig` is a new column, so on an upgrading host nothing is enabled at the moment the v1.35.0 migration runs and its SQL backfill only covers types that were somehow already enabled. Only `reference IS NULL` rows are candidates, whatever their status, so enabling, disabling and re-enabling never renumbers an entry that already has one — a re-enable simply numbers whatever arrived while references were off, continuing above the stored counter.
+
+**Immutability.** No create, update, public-API, bulk or metadata path can set or change a reference. The sole exception is the import door, `POST /nodes/bulk` — see [Nodes](#nodes) under API Endpoints below.
+
+The number itself comes from [`structure_reference_counter`](#structure_reference_counter), keyed on (user, node type, period).
 
 ### AI Fields
 
@@ -802,7 +866,7 @@ All endpoints are prefixed with `/api/v1/structure`.
 | PATCH | `/nodes/:id` | Update node |
 | DELETE | `/nodes/:id` | Soft delete |
 | POST | `/nodes/:id/move` | Move to different parent |
-| POST | `/nodes/bulk` | Bulk create nodes (per-row atomic, partial success — see note below) |
+| POST | `/nodes/bulk` | Bulk create nodes — also the module's **import** door, so a row may carry an explicit `reference` (per-row atomic, partial success — see the notes below) |
 | POST | `/nodes/bulk-archive` | Bulk archive — body `{ ids: string[] }` (min 1, max 500); partial success |
 | POST | `/nodes/bulk-delete` | Bulk soft-delete — same body; partial success |
 | POST | `/nodes/bulk-restore` | Bulk restore from archive — same body; partial success |
@@ -831,6 +895,8 @@ fired for rows that were never persisted. Per-row atomicity is what the document
 per-node error collection actually requires. If you need all-or-nothing semantics, validate before
 calling, or delete the created ids on a non-empty `errors` array.
 </Aside>
+
+A node's [reference number](#reference-numbers) is server-assigned and immutable, so no request body may carry one: `createNodeSchema` strips the key on `POST /nodes`, and the [public REST API](/modules/structure/public-api/) validates with its own body schemas, which never carry it — so neither surface can set one. No update schema carries it either — `PATCH /nodes/:id`, `PATCH /nodes/:id/metadata` and the bulk status endpoints leave it untouched. The single exception is `POST /nodes/bulk`, the module's node-import door: each row may carry an optional `reference` (1–100 characters, `^[A-Za-z0-9][A-Za-z0-9._/-]*$`) so a migration keeps its existing numbers. It is accepted only from an **admin session or an in-process system caller**; any other caller is rejected, as is a row whose node type has references disabled — as a per-row entry in `errors`, since bulk create collects failures per row. An accepted value pushes that type's counter past itself, so a later assignment cannot reissue it.
 
 ### Connections
 
@@ -1042,6 +1108,7 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 |--------|---------|----------------|
 | `createNodeSchema` | POST `/nodes` | `nodeType` and `name` required, max lengths |
 | `updateNodeSchema` | PATCH `/nodes/:id` | All fields optional, max lengths |
+| `importNodeSchema` | POST `/nodes/bulk` (each row) | Everything in `createNodeSchema`, plus an optional `reference` — 1–100 chars, `^[A-Za-z0-9][A-Za-z0-9._/-]*$`; the service then accepts it only from an admin/system caller |
 | `moveNodeSchema` | POST `/nodes/:id/move` | `newParentId` required (nullable) |
 | `reorderNodesSchema` | POST `/reorder` | `parentId` required (nullable), `nodeIds` array required (min 1, max 500) |
 | `createConnectionSchema` | POST `/connections` | `fromNodeId`, `toNodeId`, `connectionType` required; optional `origin` (lowercase-kebab) and `status` (`active` or `pending`) |

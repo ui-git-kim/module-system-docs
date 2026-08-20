@@ -23,6 +23,73 @@ Check your installed version with `npx structure info`.
 
 ---
 
+## v1.35.0
+
+**Feature: reference numbers — a citable identity for an entry** *(generated-output, schema change)*
+
+An entry can now carry a server-assigned, human-readable reference — `MAT-2026-0147` — issued once and never changed afterwards. **Off by default**, switched on per node type under **Basic → Reference numbers**. A type that leaves it off stores `NULL` and behaves exactly as it did before.
+
+**Why a fourth identifier.** None of the three that already existed can be quoted. `name` is display text and is about to become formula-derived, so two unrelated matters both compute to "Schulz & Schulz", and adding a party silently rewrites a name something else already cited. `id` is a cuid — stable, but nobody reads one down a phone. `slug` is client-supplied and `@@unique([userId, slug])` with no de-dup helper, so a computed slug collides. The reference is the handle a human quotes; with it in place, the name is free to be computed.
+
+**The format**, stored as `structure_node_type.referenceConfig` (JSON, defaults `{}`):
+
+| key | default | effect |
+|---|---|---|
+| `enabled` | `false` | Master switch — anything other than `true` means the type issues none |
+| `prefix` | *(none)* | Leading segment, e.g. `MAT`. Omitted from the reference when empty |
+| `separator` | `-` | Joins the segments. An explicitly empty string is honoured (`MAT20260147`) |
+| `padding` | `4` | Zero-pad width, clamped 1–12. Only ever **widens**: `0999 → 1000 → 10000`, because lpad-truncating collides |
+| `includeYear` | `false` | Inserts the UTC year between the prefix and the number |
+| `resetYearly` | `false` | Restarts the count each year. Ignored without `includeYear` — resetting with no year segment reissues last year's numbers |
+
+`{ enabled: true, prefix: 'MAT', separator: '-', padding: 4, includeYear: true, resetYearly: true }` renders `MAT-2026-0147`; `{ enabled: true, prefix: 'INC', padding: 4 }` renders `INC-0031`. The form previews the current knobs live as you set them.
+
+**Where it shows.** As a monospace badge beside the entry name in the detail header — a button rather than plain text, because copying it is the whole point — and it is matched by list search, so a number pasted out of an email finds the record. It is deliberately **not** stripped for a non-owner on a shared node type: a reference carries no user content, and a read-only viewer is precisely who needs to cite one.
+
+**Storage.** `structure_node.reference` is `String?` with `@@unique([userId, reference])` — nullable so the column is additive on a populated table and so a disabled type stores nothing, and Postgres tolerates any number of NULLs in a unique index. The counter is its own model, `structure_reference_counter`, keyed `@@unique([userId, nodeType, period])`, where `lastValue` is the highest number **issued** and `period` is the four-digit year for a yearly-reset type and `''` otherwise. It is deliberately **not** a column on `structure_node_type`: a high-water mark is runtime state, and holding it in the type config would carry one environment's issued numbers into another through config export/import.
+
+**Assignment is a single statement** — `INSERT … ON CONFLICT … DO UPDATE … RETURNING` — run inside the same transaction as the node create. Two concurrent creates cannot receive the same number, and a failed create burns none. A duplicate that copies children takes one block allocation per node type rather than a round trip per row; a bulk import allocates per row inside that row's own transaction, so one failing row cannot abort the numbers already handed out.
+
+**Immutable once assigned**, and the schemas are what make it so:
+
+| path | reference |
+|---|---|
+| `POST /nodes`, public API create | Key stripped by the schema — never settable |
+| Every update, bulk status and metadata path | No update schema carries the key at all |
+| `POST /nodes/bulk` (the module's import door) | **Optional** `reference`, accepted only from an admin session or an in-process system caller |
+
+That one exception exists so a migration keeps its existing numbers. An imported value is validated (`^[A-Za-z0-9][A-Za-z0-9._/-]*$`, 100 characters) and pushes the type's counter past itself, so a later assignment cannot reissue it.
+
+**Existing entries are numbered on enable, not by the migration.** `referenceConfig` is a new column defaulting to `{}`, so at the moment the v1.35.0 SQL runs on an upgrading host nothing has references switched on and its backfill matches zero rows. The moment that actually matters is the config flip: `updateNodeType` — and a JSON config import, which is a first-class way to switch them on — numbers that type's existing entries in `createdAt, id` order and seeds the counter above the highest value assigned. It runs on the caller's own transaction, so it commits, or rolls back, with the write that enabled it (an import's dry-run abort included). Only `reference IS NULL` rows are candidates, so enable → disable → re-enable never renumbers an entry that already has one.
+
+<Aside type="caution" title="Schema change">
+One column on `structure_node`, one on `structure_node_type`, and the new `structure_reference_counters` table. `npx structure update` generates and applies the migration. The column is nullable and the config defaults to `{}`, so every existing entry and type is unaffected until an admin switches a type on.
+</Aside>
+
+<Aside type="note" title="The year is UTC, in both places">
+The runtime uses `getUTCFullYear()`, and the migration's `to_char("createdAt", 'YYYY')` is *already* the UTC year: `createdAt` is a `timestamp` **without** time zone written in UTC, and `to_char` over a plain timestamp performs no conversion. Adding `AT TIME ZONE 'UTC'` there would promote the value to `timestamptz` and make the year follow the session zone — that would be the bug rather than the fix. The two must agree, or an entry numbered by the backfill lands in a different period from the one it would have been given at create time.
+</Aside>
+
+**Also in this release: node revision history was built, then reverted before shipping.** A revisions model, a prior-state snapshot in `updateNode`, `getNodeRevisions` / `restoreNodeRevision`, routes, hooks and erasure were written in full on 2026-08-20 and then deliberately taken back out. Record versioning is likely field/type-based and belongs with document-management, which already owns file chain-of-custody and versioning; a second parallel history here would duplicate it, and the requirement is not yet understood well enough to build against (diffing a JSON `data` blob, restore versus view, per-field versus per-record). Nothing shipped, so there is nothing to migrate — it is recorded under [Parked](/modules/structure/roadmap/#parked--not-planned), and D8 is marked superseded on the [Decisions](/modules/structure/decisions/) page. The `auditEvents` contract half from v1.34.2 stays.
+
+See [Configuration](/modules/structure/configuration/) for the full `referenceConfig` reference.
+
+---
+
+## v1.34.28
+
+**Fix: hierarchy rules were not enforced on every node-creating path** *(generated-output)*
+
+`bulkCreateNodes` never called `enforceHierarchyRules`, so `POST /nodes/bulk` ignored `allowedChildren`, `allowedParents`, `maxChildren` and `maxDepth` entirely. It ran its own per-row permission check, parent-state resolution and field validation — which is why the gap was easy to miss — but nothing checked whether the row was allowed to sit where it was being put. The named consumer of that endpoint is a bulk writer (cog-ingest), which made it the most likely route for a node to land somewhere the type rules forbid. `duplicateNode` had the same hole on its re-parenting path.
+
+- **`bulkCreateNodes`** now enforces per row, inside the existing `try`, so a failing row becomes that row's entry in `errors` and the batch continues — the partial-success contract is unchanged. Per-type rules are memoised alongside the existing field-def and permission caches, so a 500-row batch pays one extra type read rather than 500. The `maxChildren` count stays per row by necessity: rows commit sequentially and each must see what the previous ones created.
+- **`duplicateNode`** enforces only when `targetParentId` is supplied. An in-place duplicate is deliberately left ungated — it copies a node beside itself, so `allowedParents`, `allowedChildren` and `maxDepth` are satisfied by construction, and enforcing the one rule it could breach (`maxChildren`) would start rejecting duplicates that succeed today. That call is recorded as an open question on the [Roadmap](/modules/structure/roadmap/#decisions-needed).
+- **`moveNode`'s `maxDepth` check** now measures the deepest descendant of the moved subtree rather than the moved node alone — but only for **deepening** moves. A sideways or shallower move cannot newly breach the limit, and measuring there would reject an already-deep subtree on the very operation that might be fixing it.
+
+Every other node-writing path was audited and left alone with reasons recorded: `restoreNode` and the bulk status methods change only `status`, `updateNode` cannot re-parent (its input carries no `parentId`), `importConfigBundle` writes type configuration and creates no nodes, and connections are edges governed by their own connection-type rules.
+
+---
+
 ## v1.34.27
 
 **Feature: shared node types, and the Scope section** *(generated-output)*
@@ -497,7 +564,7 @@ No schema or API change. A dependency-classification pass plus an independent `n
 
 Three loose ends from the generic-hardening plan, all additive.
 
-- **Audit-event contract (half of S1.6).** The security manifest now declares an `auditEvents` array covering all 50 domain events the module fires through `actionRegistry.doActionAll`: 47 always-on (node / connection / type / group / template / field-template / function / settings lifecycle), plus the three opt-in embeddings events, gated to embeddings installs. A consuming audit/activity module reads the formal list via `securityRegistry.getAuditEvents()` instead of hard-coding hook strings. The hook-doc table was corrected to match the real fire sites — it had drifted (missing bulk archive/delete/restore, field-template, function and config-import rows, and a stale `node.moved` payload that predated the S1.5 `rootNodeId` fields). *(The other half of S1.6 — a `structure_node_revision` table + restore — is still open.)*
+- **Audit-event contract (half of S1.6).** The security manifest now declares an `auditEvents` array covering all 50 domain events the module fires through `actionRegistry.doActionAll`: 47 always-on (node / connection / type / group / template / field-template / function / settings lifecycle), plus the three opt-in embeddings events, gated to embeddings installs. A consuming audit/activity module reads the formal list via `securityRegistry.getAuditEvents()` instead of hard-coding hook strings. The hook-doc table was corrected to match the real fire sites — it had drifted (missing bulk archive/delete/restore, field-template, function and config-import rows, and a stale `node.moved` payload that predated the S1.5 `rootNodeId` fields). *(The other half of S1.6 — a `structure_node_revision` table + restore — is still open.)* **— superseded 2026-08-20:** revisions were built in full and then reverted before shipping, on the view that record versioning is likely field/type-based and belongs with document-management. See the v1.35.0 entry, [D8](/modules/structure/decisions/) and [Parked](/modules/structure/roadmap/#parked--not-planned).
 - **Config-bundle dry-run / diff preview (S2.1).** `POST /config/import` accepts `dryRun: true`: it runs the real import transaction to compute an exact per-category diff, then rolls it back — nothing is written, no hook fires, and an invalid bundle still surfaces its rejection reason. Results now also carry a per-category **`unchanged`** count (rows that matched but were structurally identical). The admin import dialog gains a **Preview** button showing "N to create · N to update · N unchanged · N to delete" per category before you commit. *(Still open: per-definition config versioning.)*
 - **Retrieval space confinement — Structure-side half.** All six embeddings search methods (`semanticSearchNodes`, `findSimilarNodes`, `semanticSearchChunks`, `lexicalSearchChunks`, `hybridSearchNodes`, `hybridSearchChunks`) accept an opt-in `scopeRootId` that confines results to one enforced space via a self-contained `rootNodeId` SQL predicate — no cross-file helper, so it sidesteps the v1.34.1 revert. The consuming engine (cog-ingest / ai-core) still has to pass the active space; that coordination stays the open follow-up.
 

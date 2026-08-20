@@ -90,6 +90,15 @@ A node type object showing the commonly-used fields. Every field except `slug`, 
     "stages": true
   },
 
+  "referenceConfig": {
+    "enabled": true,
+    "prefix": "PRJ",
+    "separator": "-",
+    "padding": 4,
+    "includeYear": true,
+    "resetYearly": true
+  },
+
   "fields": [
     {
       "id": "budget",
@@ -213,6 +222,7 @@ Each node type property explained:
 | `superClasses` | `string[]` | Parent type slugs for is-a inheritance (v1.18.0+, default `[]`). Fields and features are inherited from ancestors — see [Type Hierarchy](/modules/structure/type-hierarchy/). |
 | `primaryScope` | `object` | Who this type's entries belong to. Marks the type as the primary scope and picks which node types the selected instance filters (`isPrimary`, `scopedTypes`; empty or `'*'` = every type), sets server-side space isolation (`isolation`), and flags the type as shared across all users (`global`, v1.34.27+). See the [primaryScope](#primaryscope) notes below. (v1.24.0+) |
 | `governance` | `object` | Data classification levels and the default level for this type (`classification.levels`, `classification.default`). (v1.25.0+) |
+| `referenceConfig` | `object` | Reference-number format for this type — an immutable, server-assigned handle like `MAT-2026-0147` on every entry. Off unless `enabled` is true; a type with it off stores no reference at all. See [referenceConfig](#referenceconfig) below. (v1.35.0+) |
 | `aiFields` | `object` | AI Core prompt-assembly configuration — storage-only, consumed by ai-core's AI tab. (v1.30.0+) |
 | `fieldTemplateIds` | `string[]` | Attached shared field templates (reusable field sets). Reference by template **slug** or exported id — but only when the *same bundle* also carries that template in its `fieldTemplates` array, because the slug/id map is built solely from the templates being imported. Otherwise use the target app's template **id**. See [Field Template JSON](#field-template-json). (v1.29.0+; slug references v1.33.22+) |
 | `builtInFieldConfig` | `object` | Computed templates and edit permissions for the built-in `name`, `description`, and `slug` fields (`computedTemplate`, `editableBy`). |
@@ -335,6 +345,43 @@ A type that is both shared and has `features.publicApi.enabled` set means **ever
 
 <Aside type="note">
 Module-proposed node types (`POST /types/proposals`) cannot set `global` — it is stripped to `false` on the proposal, and approval copies the stored row rather than setting it. An admin write — the node-type form, `PATCH /types/:slug`, or a config import — is the only way the flag is ever set.
+</Aside>
+
+### referenceConfig
+
+Gives every entry of this type an immutable, server-assigned reference number — `MAT-2026-0147`. The whole object is optional and references are **off by default**: omit the key, or leave `enabled` unset, and entries of the type store no reference at all. What this section covers is the *format*, which is the part that rides export and import; see [Configuration](/modules/structure/configuration/) for storage, assignment, and the immutability rules. (v1.35.0+)
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `enabled` | `boolean` | `false` | Issue references for this type. Every other key is ignored while this is off. |
+| `prefix` | `string` | `''` | Leading segment (e.g. `MAT`). An empty segment is dropped rather than leaving a doubled separator. |
+| `separator` | `string` | `'-'` | Joins the segments. An explicitly empty string is honoured (`MAT20260147`); only a missing or non-string value falls back to `-`. |
+| `padding` | `number` | `4` | Zero-pad width for the sequence, clamped to 1–12; a value of more than two digits is ignored and the default 4 applies. Padding only ever **widens**: once the counter outgrows it the number keeps growing (`0999` → `1000` → `10000`), because truncating would collide. |
+| `includeYear` | `boolean` | `false` | Insert the year of creation as a segment. The year is always the **UTC** year. |
+| `resetYearly` | `boolean` | `false` | Restart the sequence at 1 each year. Only meaningful alongside `includeYear` — without a year segment in the reference a reset would reissue numbers that collide, so it is ignored. |
+
+```json
+{ "enabled": true, "prefix": "MAT", "separator": "-", "padding": 4, "includeYear": true, "resetYearly": true }
+```
+
+issues `MAT-2026-0147`, while a flat per-type sequence:
+
+```json
+{ "enabled": true, "prefix": "INC", "padding": 4 }
+```
+
+issues `INC-0031`.
+
+**Import behaviour:**
+
+- **Turning it on backfills.** When an import flips `enabled` from off to on for a type, that type's existing entries are numbered in `createdAt, id` order and the counter is seeded above the highest value assigned. This is the primary way an existing dataset acquires numbers.
+- **Turning it off never renumbers.** Import is whole-row, so a bundle that **omits** `referenceConfig` writes `{}` and switches references off for that type. Entries already numbered keep their references — nothing can change an issued reference — the type simply stops issuing new ones. Re-enabling later numbers only the entries created in the gap.
+- **Editing the format does not reissue.** Changing `prefix`, `padding`, or the year keys on a type that already has references on affects new entries only.
+
+<Aside type="caution" title="The counter does not travel with the bundle">
+`referenceConfig` is configuration and round-trips on export and import like every other node-type key. The **counter** — the highest number issued so far — is runtime state in its own table (`structure_reference_counter`, keyed by user, node type, and period) and is deliberately kept out of the config bundle, so promoting a config never carries one environment's high-water mark into another.
+
+Promoting a config to another environment therefore carries the *format*, not the *position*: the target keeps its own numbering and continues from whatever it has already issued. Two environments importing the same bundle both mint `MAT-2026-…` numbers, and both start from their own next number — so a reference identifies an entry within one environment, not across them.
 </Aside>
 
 ---
@@ -628,7 +675,7 @@ A lone field object is treated as a one-element array. Once the fields are parse
 
 This is the safe default for incremental updates.
 
-Updates are whole-row: an omitted key is written as its empty value, not left at what is stored. That matters for [`primaryScope`](#primaryscope) — importing a config that omits `primaryScope.global` over a type that is currently shared is an **un-share**, and is refused while other users still hold live entries of that type. Conversely, importing a shared config over an existing **per-user** row promotes that row to app-level (`userId: null`) in the same write, so the flag takes effect rather than sitting inert.
+Updates are whole-row: an omitted key is written as its empty value, not left at what is stored. That matters for [`primaryScope`](#primaryscope) — importing a config that omits `primaryScope.global` over a type that is currently shared is an **un-share**, and is refused while other users still hold live entries of that type. Conversely, importing a shared config over an existing **per-user** row promotes that row to app-level (`userId: null`) in the same write, so the flag takes effect rather than sitting inert. It matters for [`referenceConfig`](#referenceconfig) too: a bundle that omits the key turns reference numbers off for that type (already-issued references are kept — they are immutable).
 
 ### Replace Mode
 
