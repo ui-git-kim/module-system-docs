@@ -1,13 +1,13 @@
 ---
 title: Design Decisions
-description: Standing design decisions for the Structure module — the generic-platform-hardening plan, the two new requirements (node input scope and enforced scoping) as decided and as shipped, and the settled parameters (D1–D11) behind them.
+description: Standing design decisions for the Structure module — the generic-platform-hardening plan, the requirements (node input scope, enforced scoping, merge/formula traversal) as decided and as shipped, and the settled parameters (D1–D13) behind them.
 sidebar:
   order: 14
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-This page records the **standing design decisions** behind the current generic-platform-hardening work, produced from the 2026-08-09 gap-analysis audit. It is the companion to the phase-by-phase [Build Plan](/modules/structure/build-plan/) (grounded insertion points) and the [Roadmap](/modules/structure/roadmap/) (sequencing).
+This page is the **decision record**: the standing design decisions behind the generic-platform-hardening work, seeded by the 2026-08-09 gap-analysis audit and extended as later calls are made (Decision C, merge/formula traversal, was settled 2026-08-20). Every status marker below was verified against `src/templates/**` at v1.34.28 (2026-08-20). Its companion is the [Roadmap](/modules/structure/roadmap/), which carries what is outstanding and in what order; the [Build Plan](/modules/structure/build-plan/) that this page was originally written against has since been archived and should not be worked from.
 
 ## Framing: Structure is a generic module
 
@@ -17,13 +17,15 @@ The plan sits inside a small module ecosystem, and the boundaries matter for wha
 
 | Module | Owns |
 |--------|------|
-| **Structure** | Hierarchy/organisation, the field/type system, **enforced scoping** (spaces), **input scope** (data provenance, *not built*), server-side write-path validation, **node-record** revisions (*not built*), the audit-event contract. |
+| **Structure** | Hierarchy/organisation, the field/type system, **enforced scoping** (spaces) and shared types, **provenance / who-may-create** (the `permissions.create` tier — the decided `inputScope` key was never built, D5), server-side write-path validation, **node-record** revisions (*scheduled, not built — D8*), the audit-event contract. |
 | **Document Management** | File upload/storage/dispatch; file chain-of-custody — read-only providers, SHA-256 `contentHash`, recent-access log, `resolveProvenance`, file versioning (V2). |
 | **cog-ingest** | Ingests data → runs the engine → **stores the output back into Structure** (via `serviceRegistry`, into `editableBy:'system'` fields). |
 
 <Aside type="caution" title="Do not duplicate document-management">
 Tamper-evident hashing and chain-of-custody for **files** already live in document-management. Structure provides generic **node-record** revisions + an audit-event contract; a consuming app composes chain-of-custody from both. Structure never hashes file bytes.
 </Aside>
+
+This table is the **canonical** statement of the module boundary, kept here with its reasoning. The [Roadmap](/modules/structure/roadmap/) header carries a short summary of it for readers who only open that page — edit this one first, then reconcile the summary.
 
 ## Audit summary (2026-08-09)
 
@@ -32,7 +34,7 @@ A nine-agent audit verified every gap-analysis item against `src/templates/**`. 
 - **Server-side field validation** — `data` is persisted as an open `z.record(z.string(), z.unknown())`, so a shared `validateNodeData` validator over the resolved `getFieldDefs` (required / type / pattern / min-max / enum) runs on **every** write path: create, update, bulk, the public API and `serviceRegistry`/cog-ingest callers alike. **✅ Shipped v1.33.31 (S1.1).**
 - **Computed-value trust** — `formula` / `computedTemplate` are client-computed and server-accepted (spoofable). *Confirmed gap — but deliberately **not** closed; see D11.*
 - **Node-type permissions** — enforced server-side inside the service methods (`assertNodePermission`), covering create / edit / archive / delete / move / duplicate / bulk-create, plus a `read` tier enforced across reads, search and the public API. **✅ Shipped v1.33.32; `read` tier v1.34.12.**
-- **Node revision history** — no revisions table anywhere; only soft-delete restore. *Confirmed gap.*
+- **Node revision history** — no revisions table anywhere; only soft-delete restore. *Confirmed gap, and now **scheduled work rather than an open question**: the contract half (the `auditEvents` declaration) shipped in v1.34.2, and the substantive half is ranked for build. See D8.*
 - **Config env-promotion** — atomic server-side full-bundle export/import (node types + field templates + groups + connection types + functions) applied inside a single transaction, with a dry-run/diff preview. **✅ Shipped v1.33.34–35; dry-run v1.34.2 (S2.1).**
 - **Node-instance import/export (CSV/JSON)** — absent.
 - **jsonb / path indexing** — `dataFilters` seq-scans (no GIN on `data`); path-prefix `LIKE` may not use the btree index on default-collation Postgres.
@@ -56,7 +58,7 @@ Node types need a clear provenance model: some are **system / shared-reference**
 </Aside>
 
 <Aside type="note" title="Tenancy">
-The product model is **solo (single-user-per-tenant)**: `tenantId === userId`. Shared (null-owner) nodes would therefore be app-wide. The design is built *tenantId-ready* — if multi-tenancy is ever added, `tenantId set + userId null` = tenant-wide and `both null` = platform-wide — but no `tenantId`/RLS is built now.
+The product model is **solo (single-user-per-tenant)**: `tenantId === userId`. A shared **type**'s rows are therefore readable app-wide — sharing is keyed on the node type, not on the null node owner this Aside originally assumed (D2/D7). The design is built *tenantId-ready* — if multi-tenancy is ever added, `tenantId set + userId null` = tenant-wide and `both null` = platform-wide — but no `tenantId`/RLS is built now.
 </Aside>
 
 ## Decision B — Enforced scoping (generic spaces)
@@ -72,10 +74,35 @@ Decision B is built: the denormalised `rootNodeId` column and its indexes, the `
 - Config gains **`primaryScope.isolation: 'filter' | 'enforced'`**. `'filter'` keeps today's soft behaviour; `'enforced'` makes the boundary mandatory, server-side, and **fail-closed** (absent/invalid scope denies rather than returning all roots). **✅ Shipped as `primaryScope.isolation`, with an admin toggle.**
 - Enforcement uses a denormalised **`rootNodeId` column** on `structure_node`, maintained wherever `path` is (create/move, cascaded to descendants), indexed `@@index([userId, rootNodeId])`. Equality predicates are index-friendly and reach surfaces path-prefix can't — connections (which have no path), the graph CTE, and raw-SQL search. **✅ Shipped**, with a backfill migration for existing rows.
 - The active scope is a **server-side persisted setting** (`structure_settings.currentScopeNodeId`, written by the `ScopeSelector`), re-validated on **every** request (row exists, is owned, and is an instance of an `enforced` primary type) and **fail-closed**; an explicit `?scopeRootId=` overrides it for the public API. Never a trusted client-store value. *(Decided as a per-request query param/header; the header transport was never built — the persisted setting replaced it.)*
-- **Every read surface** is scoped: `listNodes`, `getNode`, `searchNodes`, `getTree`, `getNodeConnections`, `listConnections`, `expandGraph`, `getNodeContext`, `dataFilters`/jsonb-search, merge-field deref, both public-API reads, and `moveNode`/`duplicateNode` targets. **✅ Shipped** — `listNodes`, `getNode`, `getTree`, `searchNodes`, `getNodeConnections`, `listConnections`, `expandGraph` and `getNodeContext` all resolve a scope before querying.
+- **Every read surface** is scoped: `listNodes`, `getNode`, `searchNodes`, `getTree`, `getNodeConnections`, `listConnections`, `expandGraph`, `getNodeContext`, `dataFilters`/jsonb-search, merge-field deref, both public-API reads, and `moveNode`/`duplicateNode` targets. **✅ Shipped** — `listNodes`, `getNode`, `getTree`, `searchNodes`, `getNodeConnections`, `listConnections`, `expandGraph` and `getNodeContext` all resolve a scope before querying. *Two residuals from the decided list, both still open at v1.34.27: `duplicateNode` re-runs the hierarchy rules and recomputes `rootNodeId` for the copy, but has **no** cross-space guard on `targetParentId` — nothing stops a duplicate landing in another enforced space the way `moveNode`'s `allowCrossSpaceMove` check does; and merge-field deref is confined only **transitively**, because it resolves each reference by fetching the node through `getNode` (which is scoped) rather than by a query of its own.*
 - **Connection joint rule (with Decision A):** a connection across two `enforced` spaces is rejected **unless** one endpoint is a scope-exempt reference node. Applied in `createConnection` — and therefore in `bulkCreateConnections`, which delegates to it. *As shipped, "scope-exempt" was at first purely structural (`enforcedRootIds`: either endpoint's root is not an enforced-space root); since v1.34.27 an endpoint whose type is `primaryScope.global` is exempt outright as well. The connection **row** is still owned by the caller — edges are never shared.*
 - **Cross-space move (D3):** off by default; a node type may opt in via an admin-set per-node-type flag (e.g. `rules.allowCrossSpaceMove`). When enabled, `moveNode` permits the move, recomputes `rootNodeId` across the whole subtree, and emits an audited `structure.node.moved` (carrying old/new `rootNodeId`). When disabled, cross-space moves are rejected. **✅ Shipped** as `rules.allowCrossSpaceMove`, with an admin toggle.
-- **Cross-module contract:** `rootNodeId` is added to node and connection **lifecycle-event payloads**, so **cog-ingest** (which stores output into Structure) and **document-management** (which subscribes to `structure.node.deleted/archived/moved`) inherit the scope without re-deriving it from `path`. *Partly shipped* — `structure.node.moved` carries the old/new `rootNodeId` and node-object payloads carry the row's `rootNodeId`, but `structure.node.deleted` still emits only `{ userId, nodeId, nodeType }`.
+- **Cross-module contract:** `rootNodeId` is added to node and connection **lifecycle-event payloads**, so **cog-ingest** (which stores output into Structure) and **document-management** (which subscribes to `structure.node.deleted/archived/moved`) inherit the scope without re-deriving it from `path`. *Partly shipped, still so at v1.34.27* — `structure.node.moved` carries the old/new `rootNodeId`, and `structure.node.archived` / `.restored` pass the whole node object (so the row's `rootNodeId` rides along). `structure.node.deleted` alone still emits only `{ userId, nodeId, nodeType }`, so document-management must re-derive scope on exactly the event where the row is about to vanish. The value is already on the loaded row, so closing it is a one-line change.
+
+## Decision C — Merge/formula traversal (2026-08-20)
+
+Merge templates and formula fields both need to reach **other nodes** — a parent, a set of children, the nodes a reference field points at — and then reduce what they find down to one string. Neither can today. The motivating case is a name that must disambiguate: a matter called "Schulz & Schulz & ICL" should read "Schulz B & Schulz J", which is a filter-map-join over a set of related nodes.
+
+**Decided — build both, formula first.** The formula language becomes the engine; merge-template token sugar follows later, once the engine has been used in anger.
+
+*Where it stands today (verified at v1.34.27):*
+
+- **One resolver already serves both.** A formula field's only door to node data is `EvalEnv.resolveToken`, wired to `resolveTokenValue` — the same token grammar merge templates use. Anything added to that resolver reaches both surfaces at once, which is what makes "formula first" cheap rather than duplicative.
+- The grammar dereferences **one hop along a reference field** — `{field->node_field}`, plus the repeater forms `{group[0].ref->field}` and `{group[subfield=value].target}`. It cannot walk the hierarchy at all, and it has no notion of a set.
+- A multi-value token is flattened with a **hardcoded** `val.join(', ')` — no separator, no filter, no ordering, no per-item template.
+- The library is **35 tier-1 functions** (math / text / logic / similarity) and **not one collection function** — though `FormulaValue` already admits `unknown[]`, so a list-returning call needs no change to the value type.
+- Built-in `name` / `description` / `slug` take a **`computedTemplate` only** (`builtInFieldConfig.{name,description,slug}: { computedTemplate?, editableBy? }`) — a substitution template, which can never express filter-map-join.
+
+*What is decided:*
+
+1. **Traversal, applied uniformly** — `children()`, `parents()`, `scope()` over the structural hierarchy, and traversal along reference fields, in the same call shape. Relationships here are modelled **both** ways and neither is being retired (D13), so traversal that understood only one of them would be half a feature.
+2. **List functions** — `pluck`, `join`, `filter`, `first`, `count`, and a per-item template function. Enough to turn a traversal result into a string deliberately, instead of inheriting the hardcoded `', '`.
+3. **Built-in fields accept a formula**, not just a `computedTemplate`. This is the load-bearing part: the Schulz case is unreachable from a substitution template no matter how the tokens are spelled.
+4. **Token sugar comes later** — `{parent->name}`, `{children[person][0]->surname}` and friends extend the existing `->` grammar to structural traversal. Worth doing, but only after the formula engine has proved the semantics in anger.
+
+<Aside type="caution" title="This work inherits D11">
+Formula values are **client-computed and server-accepted** (D11), and that property carries straight into everything above. Once built-in `name` can be formula-driven, a node's *name* becomes a client-derived value — the blast radius grows from one data field to the node's identity in lists, search results and merge output. That is **accepted**, not overlooked; D11 records why, and the trigger for revisiting it is a new untrusted write surface, which this work does not add.
+</Aside>
 
 ## Resolved follow-ups (2026-08-09)
 
@@ -97,16 +124,18 @@ D3, D4, and D7 were settled in a follow-up pass:
 
 | # | Decision | Choice |
 |---|----------|--------|
-| D1 | Global scope semantics | App-wide today (`tenantId === userId`); nullable-owner extends to tenant-wide later. |
+| D1 | Global scope semantics | App-wide today (`tenantId === userId`). The later extension to tenant-wide would be a `tenantId` column plus a scoping key on the **type** row — *not* the nullable node owner this row originally pointed at, which D2 abandoned. |
 | D2 | Shared-node storage | Decided as a **nullable (blank) owner** (driven by the `global` flag) — the cog-ingest house pattern. *Not built, and superseded by v1.34.27: `structure_node.userId` is still required. Sharing is keyed on the node **type** instead, so the read predicate admits a shared type's rows whatever their owner — no schema change. The null owner moved to the **type** row (`structure_node_type.userId`).* |
 | D3 | Cross-space move | **Admin-configurable per node type** (off by default; audited when on). Un-parked. ✅ Shipped v1.34.0 (`rules.allowCrossSpaceMove`). |
 | D4 | Admin data access | **No "see-all"** — `admin` configures the app, never reads users' data. Not a teams product. |
 | D5 | Input-scope shape | Decided as two axes (**`inputScope`** + **`global`**) plus an extended `permissions` tier. *As shipped: the extended **`permissions`** tier alone (v1.33.32) — `permissions.create` answers "who creates", so no `inputScope` key was ever added. `global` arrived later and separately as `primaryScope.global` (v1.34.27), governing **reads**, not creation.* |
 | D6 | Isolation config | **`primaryScope.isolation` enum** (`filter` or `enforced`), no new column. ✅ Shipped v1.34.0. |
 | D7 | Scope-exempt marker | Decided as an explicit top-level **`global`** flag over null-owner node rows. *As shipped, in two steps. v1.34.0: **structural** — the enforced primary type itself, or a type omitted from a space's non-empty `scopedTypes` list (an empty list confines everything) (`typeIsScoped`); or an endpoint whose root is not an enforced-space root (`enforcedRootIds`). v1.34.27 added the explicit marker as **`primaryScope.global`** (nested, and mutually exclusive with `isPrimary`), keyed on the node **type** and requiring an app-level **type** row (`structure_node_type.userId === null`); node rows keep their non-null `userId`. Both exemptions now coexist.* |
-| D8 | Node revisions | **Build in Stage 1** (generic history + restore; no tamper-evident hash chain). *Still unbuilt — there is no revisions table.* |
+| D8 | Node revisions | **Build in Stage 1** (generic history + restore; no tamper-evident hash chain). **Scheduled work, not an open question.** Still unbuilt at v1.34.27 — `grep -rni revision src/` returns zero hits and none of the ten schema models is a revisions table — which makes it the largest genuinely-open item in the doc set. The contract half shipped in v1.34.2 (the `auditEvents` declaration); the substantive half is a `structure_node_revision` model, a prior-state snapshot taken in `updateNode` before the in-place mutation, `getNodeRevisions` / `restoreNodeRevision` behind `assertNodePermission`, the `structure.node.revisionCreated` / `.reverted` hooks, and the erasure entry. Node-record only — no file bytes, no hash chain (that stays in document-management). Sequencing is on the [Roadmap](/modules/structure/roadmap/). |
 | D9 | Validation mechanism | **Application-layer** validator (over resolved `getFieldDefs`); DB CHECK/`pg_jsonschema` not adopted. ✅ Shipped v1.33.31 (`validateNodeData`). |
 | D10 | Tenancy | **userId-keyed** (solo product model); built tenantId-ready, tenantId not built. |
-| D11 | Computed-value server trust | **Not built — removed 2026-08-09.** The product is solo and its only external write surface is the user's own API-key public API, so there is no untrusted writer to spoof a `formula` / `computedTemplate` value; a server-side recompute would duplicate the evaluator and risk divergence. Revisit if a multi-user or unauthenticated write surface is ever added. |
+| D11 | Computed-value server trust | **Deliberately not built — settled 2026-08-09, re-confirmed 2026-08-20. Not open, do not re-litigate.** `formula` and `computedTemplate` values are computed on the **client** and accepted by the server as submitted: `validateNodeData` skips any def carrying a `computedTemplate` and skips the `formula` field type outright, and `updateNode` records in-code that a computed built-in is "deliberately NOT locked". The product is solo and its only external write surface is the user's own API-key public API, so there is no untrusted writer to spoof a value; a server-side recompute would duplicate the evaluator and risk divergence. **Consequence added 2026-08-20 (D12):** formula traversal inherits this property, and once built-in `name` is formula-driven a node's *name* becomes client-derived too — identity, not just a data field. Accepted knowingly. **Revisit trigger:** a multi-user or unauthenticated write surface. v1.34.27's shared types are *not* one — they widen reads only; writes stay owner-scoped. |
+| D12 | Merge/formula traversal | **Both — formula first.** Node traversal (`children()`, `parents()`, `scope()`, reference-field hops) and list functions (`pluck`, `join`, `filter`, `first`, `count`, a per-item template) land in the **formula engine**, and built-in `name`/`description`/`slug` gain a **formula** rather than only today's `computedTemplate`. Merge-token sugar (`{parent->name}`, `{children[person][0]->surname}`) follows **later**, once the engine has been used in anger. Settled 2026-08-20 — see Decision C; inherits D11. |
+| D13 | Relationship model | **Both structural and reference-field.** Hierarchy (`parentId` / `path`) and connections are structural; `node-reference` fields (`nodeReferenceConfig.allowedTypes`) carry relationships as data. Neither is being retired, so D12's traversal must treat them **uniformly** — one call shape over both, not a hierarchy-only feature. Settled 2026-08-20. |
 | — | Shared-type writes | **Owner-scoped, always.** A shared type is read-shared, never write-shared: at any `permissions` tier and with no admin bypass, a user may modify only entries they own, and connection edges stay per-user. Letting ordinary users co-edit one shared entry is a **future item**, deliberately out of v1.34.27. |
 | — | Blueprints / starter-packs | **Roadmap / future** (relevant if the module system is distributed). |
