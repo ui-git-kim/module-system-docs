@@ -1,7 +1,7 @@
 ---
 title: Providers & Adapters
 description: The owned provider interface, how the Vercel AI SDK is contained to one file, and adding a provider or model
-lastUpdated: 2026-08-09
+lastUpdated: 2026-08-19
 sidebar:
   order: 10
 ---
@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
 
 AI Core talks to model providers through an interface it owns, not through the Vercel AI SDK directly. The SDK is a transport detail, confined to a single file. Everything else in the feature — the resolver, the run engine, the ledger — types against AI Core's own `ProviderAdapter` contract and never learns what package moves the bytes. This page is the boundary: the owned interface, how the SDK is contained, the REST model-listing path that sits beside it, and how a new provider or model is added.
 
-<Aside type="note" title="Current as of v1.23.0">
-This page describes AI Core as implemented in module v1.23.0 (August 2026). The module installs into a real app, type-checks clean there, and the language, embedding, multimodal-embedding and rerank adapters have been exercised end-to-end against live providers. Still unbuilt (marked inline): the image/video adapters below (Black Forest Labs / Replicate) — see the [Roadmap](/modules/ai-core/roadmap/).
+<Aside type="note" title="Current as of v1.40.2">
+This page describes AI Core as implemented in module v1.40.2 (August 2026). The module installs into a real app, type-checks clean there, and the language, embedding, multimodal-embedding and rerank adapters — plus provider-native tools (web search and web fetch) — have been exercised end-to-end against live providers. Still unbuilt (marked inline): the image/video adapters below (Black Forest Labs / Replicate) — see the [Roadmap](/modules/ai-core/roadmap/).
 </Aside>
 
 ---
@@ -49,8 +49,8 @@ export interface ProviderAdapter {
 
 | Type | What it carries |
 |---|---|
-| `GenerateRequest` | `instructions`, `input`, `parameters: ResolvedParameters`, optional `schema` (structured output), optional `attachments: MediaAttachment[]`, optional `signal` |
-| `GenerateResult` | `text`, optional `structured`, `usage: NormalizedUsage`, `warnings: ProviderWarning[]`, `finishReason`, optional `rawFinishReason`, optional `reportedModelId`, optional `cacheApplied`, `latencyMs` |
+| `GenerateRequest` | `instructions`, `input`, `parameters: ResolvedParameters`, optional `schema` (structured output), optional `tools: ResolvedTool[]` (provider-native), optional `attachments: MediaAttachment[]`, optional `signal` |
+| `GenerateResult` | `text`, optional `structured`, optional `toolCalls` (name + count, by reference), optional `toolSources` (url + title), optional `stepCount`, `usage: NormalizedUsage`, `warnings: ProviderWarning[]`, `finishReason`, optional `rawFinishReason`, optional `reportedModelId`, optional `cacheApplied`, `latencyMs` |
 | `NormalizedUsage` | `inputTokens?`, `outputTokens?`, `totalTokens?`, `cacheReadTokens?`, `cacheWriteTokens?`, `reasoningTokens?`, and the provider-native `raw?` passed through for the ledger |
 | `GenerateRequest.cache?` | a resolved `CacheDirective` (`{ instructions?, inputBreak?, ttl }`) — owned offsets, not an SDK type; absent = no caching |
 | `ProviderWarning` | `kind` (`unsupported` · `compatibility` · `deprecated` · `other`) and a `detail` string |
@@ -59,13 +59,14 @@ export interface ProviderAdapter {
 | `RerankResult` | `ranking: RerankEntry[]` (each `{ originalIndex, score }`), optional `tokens`, `latencyMs` |
 | `MediaAttachment` | `mediaType`, `data` (base64 bytes or an http(s) URL the provider fetches), optional `name` |
 | `ResolvedParameters` | `maxOutputTokens?`, `temperature?`, `topP?`, `topK?`, `stopSequences?`, `seed?` — the values after explicit validation |
+| `ResolvedTool` | `id`, `name`, `kind` (`provider-native` · `function`), `providerToolId` (the provider tool key, e.g. `web_search`; `null` for a function tool), `config`, `egress` (`true` when using the tool sends content to a third party — the sensitivity gate covers it) |
 
 Two design commitments are baked into these shapes:
 
 - **An unknown count is reported as unknown, never invented as zero.** Every numeric field in `NormalizedUsage` is optional; an absent token count stays `undefined` rather than being filled with `0`. A fabricated zero would be a quiet lie about what ran.
 - **Attachments reach the provider and never the ledger.** `MediaAttachment` bytes ride to the adapter as file parts alongside the assembled input; they are never concatenated into the prompt text and never written to the usage ledger.
 
-`ListedModel` (`modelId`, optional `displayName`, optional `metadata`) and `MultimodalEmbedInput` (optional `text`, optional `media: MediaAttachment[]`) are the other exported shapes — `ListedModel` belongs to the REST model-listing path below, not to a live generation call, and `MultimodalEmbedInput` is the text-and-image input handed to `embedMultimodal`.
+`ListedModel` (`modelId`, optional `displayName`, optional `contextWindow`, optional `maxOutputTokens`, optional `metadata`) and `MultimodalEmbedInput` (optional `text`, optional `media: MediaAttachment[]`) are the other exported shapes — `ListedModel` belongs to the REST model-listing path below, not to a live generation call, and `MultimodalEmbedInput` is the text-and-image input handed to `embedMultimodal`.
 
 ---
 
@@ -75,8 +76,8 @@ Two design commitments are baked into these shapes:
 
 ```ts
 // backend/src/features/ai-core/providers/adapters.ts — the ONLY SDK import site
-import { APICallError, LoadAPIKeyError, Output, embedMany, generateText, rerank } from 'ai';
-import type { EmbeddingModel, LanguageModel, RerankingModel } from 'ai';
+import { APICallError, LoadAPIKeyError, Output, embedMany, generateText, rerank, stepCountIs } from 'ai';
+import type { EmbeddingModel, LanguageModel, RerankingModel, ToolSet } from 'ai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogle } from '@ai-sdk/google';
@@ -142,6 +143,7 @@ The structured value is validated upstream in the run engine, not trusted from t
 
 - **Usage** is mapped through `mapUsage` into `NormalizedUsage` (including `cacheReadTokens`, `cacheWriteTokens` and `reasoningTokens` where the provider reports them).
 - **Warnings are never swallowed.** `mapWarnings` turns each SDK warning into a `ProviderWarning`; an unlabelled one becomes `"unspecified provider warning"` rather than vanishing.
+- **Tool activity is captured by reference, never by content.** When the model used a provider-native tool, `toolCalls` records each tool's name and call count and `toolSources` the source URLs it was handed back (url and title only); `stepCount` records how many search-and-read rounds the run took. The search query sent and the page content returned never cross this boundary.
 
 ### Prompt caching (v1.9.0)
 
@@ -154,6 +156,22 @@ When an operation carries a `cache` policy, the run hands the adapter a resolved
 Embeddings go through `embedMany` and reranking through `rerank`, each wrapped the same way: timed, typed on failure, warnings surfaced. Embedding coverage is measured against a character budget derived from the resolved model's `maxInputTokens` (roughly four characters per token): an over-length input is reported as *partially* covered and the run surfaces `partial-embedding-coverage`, and full coverage is claimed only when the model declares no input ceiling. Where the SDK still exposes no signal — rerank token usage — AI Core reports the honest unknown (`undefined` tokens) rather than manufacturing a number.
 
 **Multimodal embedding (v1.11.0)** is the optional `embedMultimodal` method on the interface, implemented only by the Voyage adapter: it resolves the model through `multimodalEmbeddingModel` (`voyage-multimodal-3` / `-3.5`) and calls the same `embedMany`, passing text in `values` and images via `providerOptions.voyage.content` (an `image_url` for an http(s) URL, otherwise an `image_base64` data URI). It returns the identical `EmbedResult`, so the run pipeline and the vector store treat a multimodal vector exactly like a text one. Images reach the provider as content parts and never the ledger.
+
+### Provider-native tools — web search & web fetch
+
+An operation can opt into provider-native tools as `ResolvedTool` records (see [Configuration](/modules/ai-core/configuration/)). The adapter is the only layer that knows each provider's own tool shape: each factory's `buildTools` translates a resolved tool into the SDK's `ToolSet` for its provider, and nothing about that SDK tool shape leaks past `adapters.ts`. The providers host different tools, so the translation is asymmetric:
+
+| Provider | Web search | Web fetch |
+|---|---|---|
+| Anthropic | `web_search` → `webSearch_20250305` (passes `maxUses`, `allowedDomains`, `blockedDomains`) | `web_fetch` → `webFetch_20250910` (adds `maxContentTokens`) |
+| OpenAI | `web_search` → `webSearch` (provider defaults; config passthrough is a follow-up) | not hosted — skipped |
+| Google | `web_search` → `googleSearch` | `web_fetch` → `urlContext` |
+| Voyage | — (embeddings and reranking only) | — |
+
+Two rules keep the translation honest:
+
+- **A tool the provider cannot host is skipped, not faked.** OpenAI hosts no URL-fetch tool, so a `web_fetch` opt-in resolved onto an OpenAI model is dropped with a log line **and** a named `ProviderWarning` (`tool "…" is not hosted by provider …`) — an answer produced without a tool the operation was configured to use is a degraded answer, so the run names the shortfall rather than leaving it in a server log the caller never sees. Anthropic is the verified path.
+- **The search-and-read loop is bounded.** A tool run takes more than one step (the model searches, reads what comes back, then answers), so the SDK loop is allowed up to `TOOL_STEP_CAP` (5) steps via `stopWhen: stepCountIs(TOOL_STEP_CAP)`. This is a cost safety bound — each step is another model call — not an autonomous agent loop; the tool's own config (e.g. web search `maxUses`) is the finer, admin-set control.
 
 ---
 
@@ -195,6 +213,8 @@ The AI SDK exposes no model-listing surface, so the catalogue is fetched directl
 | Voyage | — | — | no listing endpoint |
 
 **Voyage publishes no catalogue endpoint** — its model ids are documented constants, so `listProviderModels('voyage')` returns an empty list, meaning *"nothing to refresh"* rather than *"no models exist."* The seeded records are the Voyage catalogue.
+
+Two things sit alongside the per-provider listings. **The models.dev open catalogue** — a single unauthenticated `GET https://models.dev/api.json` in `fetchModelsDevCatalogue` — overlays what the providers' own listings do not expose: context windows for OpenAI, knowledge cutoffs everywhere, output modalities and deprecation status. It is fetched once per refresh, and a failure degrades and is **named in the refresh result**, never silently absorbed. And **every catalogue call runs under a 20-second timeout** (`AbortSignal.timeout(REQUEST_TIMEOUT_MS)`): a provider that accepts the connection and then stalls is aborted and reported distinctly as a *timed out* (retryable) failure — not a refusal — rather than holding the admin's refresh request open indefinitely.
 
 Listing failures throw typed `ProviderCallError`s and are **not** caught in this file — the caller (the records service) treats a failed refresh as a logged fallback and marks the affected model records `capabilitiesStale`, so a refresh that did less than asked is always visible. A misbehaving endpoint that keeps promising more pages is capped and the cap-hit is logged.
 

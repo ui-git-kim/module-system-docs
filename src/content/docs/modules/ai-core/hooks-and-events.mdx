@@ -1,7 +1,7 @@
 ---
 title: Hooks & Events
 description: The action hooks AI Core fires, and how a consumer subscribes and registers flow handlers
-lastUpdated: 2026-08-09
+lastUpdated: 2026-08-19
 sidebar:
   order: 7
 ---
@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
 After it is installed, AI Core talks back to consumers two ways, and they are not the same mechanism. It **fires action hooks** on the starter's `actionRegistry` that a consumer can **subscribe** to — reacting after the fact. And it accepts **flow-step handlers** a consumer **registers** — code that runs *as a step inside a flow*. Both are code, wired at import time; neither is a database record. That places this whole page on the *register* side of the module's founding distinction — see [Registering & Seeding](/modules/ai-core/registering-and-seeding/) for the line between behaviour that runs and data that persists.
 
-<Aside type="note" title="Current as of v1.23.0">
-The hooks and the handler registry described here ship in module v1.23.0 (August 2026) and type-check clean in a real app; the module's consumer surface is now exercised end-to-end against live providers. Nothing on this page changed with that. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+<Aside type="note" title="Current as of v1.40.2">
+The hooks and the handler registry described here ship in the module and type-check clean in a real app; the module's consumer surface is now exercised end-to-end against live providers. Since v1.23.0 every payload gained a `userId` naming the acting user (or `null` outside a request), and five record-CRUD hooks were added for the newer config tables: `ai-core.policy.updated`, `ai-core.eval-case.updated`, `ai-core.input-type.updated`, `ai-core.marker.updated` and `ai-core.tool.updated`. See the [Roadmap](/modules/ai-core/roadmap/) for status.
 </Aside>
 
 ---
@@ -21,6 +21,8 @@ The hooks and the handler registry described here ship in module v1.23.0 (August
 Every hook fires **fire-and-forget, after the durable write it reports** — the ledger row for a run, the record row for an admin edit. AI Core dispatches with `void actionRegistry.doActionAll(...)` — the variant that fires **both** the synchronous and the asynchronous handler pools. The leading `void` keeps it fire-and-forget: the write path never awaits a subscriber, and no subscriber can affect it.
 
 The payloads carry **identifiers, versions, counts, actions and outcomes — never prompt or response content.** This is the ledger's no-content rule applied to the event stream: a run's segment text, a discipline's prose body, the values a model returned — none of it travels on a hook. A subscriber that needs numbers reads them back through the [Service API](/modules/ai-core/service-api/); a hook tells it *that* something happened and *which* record, not *what was said*.
+
+Every payload also carries a **`userId`** (`string | null`) naming the acting user behind the write. It is bound once per request by route middleware and read where the write happens, so it is present on every hook — the run-lifecycle hook and every record-CRUD hook alike. It is `null` when no request is in scope, such as a seed migration or a flow resumed by a background job — a truthful "no human caused this" rather than a guessed actor.
 
 > **The event says what changed and to which record — never what was in it.**
 
@@ -34,7 +36,7 @@ Two families: the **run lifecycle** hook, fired once per operation or embed call
 
 | Hook | Payload | Fired when |
 |---|---|---|
-| `ai-core.run.completed` | `{ ledgerId, operationId, tenantId, outcome }` | Immediately after the ledger row is written, on **every** terminal outcome of `run`, `embed` and each AI step of a flow. |
+| `ai-core.run.completed` | `{ userId, ledgerId, operationId, tenantId, outcome }` | Immediately after the ledger row is written, on **every** terminal outcome of `run`, `embed` and each AI step of a flow. |
 
 `outcome` is one of `'ok'`, `'error'`, `'refused'` or `'abstained'`. It fires on the success path, the abstention path *and* the shared failure/refusal path — a refused or errored run is an outcome, not a disappearance, so it still emits. Embeds emit `'ok'` on success. The payload does **not** carry token counts; read those from `getCurrentUsage` (worked example below).
 
@@ -44,15 +46,20 @@ Each fires fire-and-forget after the transaction commits. `action` names what ha
 
 | Hook | Payload | `action` values |
 |---|---|---|
-| `ai-core.provider.updated` | `{ id, action }` | `'updated'` |
-| `ai-core.model.updated` | `{ id, action }`, or the refresh variant `{ action: 'capabilities-refreshed', refreshed, stale }` (no `id`) | `'created'` · `'updated'` · `'deleted'` · `'capabilities-refreshed'` |
-| `ai-core.framework.updated` | `{ id, action }` | `'upserted'` · `'deleted'` |
-| `ai-core.segment.updated` | `{ key, version, action }` on write; `{ key, action }` on delete — keyed by `key`, not `id` | `'upserted'` · `'ensured'` · `'deleted'` |
-| `ai-core.approach.updated` | `{ key, version, action }` on write; `{ key, action }` on delete — keyed by `key`, not `id` | `'upserted'` · `'ensured'` · `'deleted'` |
-| `ai-core.operation.updated` | `{ id, action }` | `'upserted'` · `'deleted'` |
-| `ai-core.flow.updated` | `{ id, action }` | `'upserted'` · `'deleted'` |
-| `ai-core.discipline.updated` | `{ entity, action, id }`; guardrail upserts also carry `disciplineId` (deletes do not) | discipline: `'created'` · `'updated'` · `'deleted'` — guardrail: `'upserted'` · `'deleted'` |
-| `ai-core.review-item.updated` | `{ id, status, tenantId }` from the ledger; the admin-route variant carries only `{ id, status }` | the item's `status`, e.g. `'open'` |
+| `ai-core.provider.updated` | `{ userId, id, action }` | `'updated'` |
+| `ai-core.model.updated` | `{ userId, id, action }`, or the refresh variant `{ userId, action: 'capabilities-refreshed', refreshed, stale }` (no `id`) | `'created'` · `'updated'` · `'deleted'` · `'capabilities-refreshed'` |
+| `ai-core.framework.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.segment.updated` | `{ userId, key, version, action }` on write; `{ userId, key, action }` on delete — keyed by `key`, not `id` | `'upserted'` · `'ensured'` · `'deleted'` |
+| `ai-core.approach.updated` | `{ userId, key, version, action }` on write; `{ userId, key, action }` on delete — keyed by `key`, not `id` | `'upserted'` · `'ensured'` · `'deleted'` |
+| `ai-core.operation.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.flow.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.discipline.updated` | `{ userId, entity, action, id }`; guardrail upserts also carry `disciplineId` (deletes do not) | discipline: `'created'` · `'updated'` · `'deleted'` — guardrail: `'upserted'` · `'deleted'` |
+| `ai-core.review-item.updated` | `{ userId, id, status, tenantId, operationId }` from the ledger; the admin-route variant carries only `{ userId, id, status }` | the item's `status`, e.g. `'open'` |
+| `ai-core.policy.updated` | `{ userId, allowUnrecordedTerms, action }` — the zero-retention policy row (no `id`; it is the single `app` row) | `'updated'` |
+| `ai-core.eval-case.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.input-type.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
+| `ai-core.marker.updated` | `{ userId, id, action }` | `'upserted'` · `'ensured'` · `'deleted'` |
+| `ai-core.tool.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
 
 <Aside type="caution" title="There is no ai-core.guardrail.updated">
 Guardrail writes ride on **`ai-core.discipline.updated`** with `entity: 'guardrail'` (an upsert also carries a `disciplineId` naming the rule the guardrail enforces; a delete does not). Disciplines fire the same hook with `entity: 'discipline'`. One hook, discriminated by `entity` — subscribe to `ai-core.discipline.updated` and branch on the field if you only care about one.
@@ -99,7 +106,7 @@ import { serviceRegistry } from '@/config/service.registry';
 actionRegistry.addAction(
   'ai-core.run.completed',
   'my-feature-usage-meter',
-  (payload: { ledgerId: string; operationId: string; tenantId: string; outcome: string }) => {
+  (payload: { userId: string | null; ledgerId: string; operationId: string; tenantId: string; outcome: string }) => {
     // Non-blocking: mark the job's outcome now, refresh totals off-thread.
     void (async () => {
       await myFeature.markJobOutcome(payload.ledgerId, payload.operationId, payload.outcome);
