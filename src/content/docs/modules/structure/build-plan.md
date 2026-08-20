@@ -1,8 +1,8 @@
 ---
 title: Build Plan (historical)
-description: The retired veradai-driven and generic-hardening build plan, kept for provenance. Superseded by the Roadmap at v1.34.27.
+description: The retired veradai-driven and generic-hardening build plan, kept for provenance. Superseded by the Roadmap; hidden from the sidebar and reachable only by direct link.
 sidebar:
-  order: 99
+  hidden: true
 ---
 
 > **⚠️ HISTORICAL — do not work from this page.** This is the retired build plan (veradai-driven phases, then Generic Platform Hardening Stages 1–3). It was **superseded by the [Roadmap](/modules/structure/roadmap/) at v1.34.27**, which is the single live source for what is open and what is next. Nearly everything below has shipped, and the retained plan text describes designs that were later changed or abandoned — most notably S1.4's nullable-owner sharing model, which the code does **not** implement. The page is retained only for **provenance**: it records why each design was chosen and what was rejected. If you are picking up work, start at the Roadmap.
