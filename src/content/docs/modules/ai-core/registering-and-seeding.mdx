@@ -1,7 +1,7 @@
 ---
 title: Registering & Seeding
 description: How a consumer module plugs into AI Core — registering code that runs versus seeding records that persist
-lastUpdated: 2026-08-19
+lastUpdated: 2026-08-21
 sidebar:
   order: 5
 ---
@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
 A consumer module plugs into AI Core two ways, and they are not the same thing. One **registers** code that runs on every boot. The other **seeds** a record that persists in the database and can then be edited by an admin. This page is about that line — where it falls, why it falls where it does, and the exact calls on each side. For the contract you code against, see [Integration](/modules/ai-core/integration/); for the full method surface, see [Service API](/modules/ai-core/service-api/); for the events you can subscribe to, see [Hooks & Events](/modules/ai-core/hooks-and-events/).
 
-<Aside type="note" title="Current as of v1.40.2">
-This page describes AI Core as implemented in module v1.40.2 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers.
+<Aside type="note" title="Current as of v1.45.0">
+This page describes AI Core as implemented in module v1.45.0 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers.
 </Aside>
 
 ---
@@ -53,7 +53,7 @@ The consumer's side of the line follows the same logic. What a consumer contribu
 
 ## Seeding
 
-A consumer seeds its operations and prompt segments through the idempotent `ensure*` API. Both are **create-if-absent**: if the record already exists it is returned untouched, and an admin's later edits are never overwritten. The same surface also seeds content markers (`ensureMarker` — e.g. a chat consumer's `conversation-history` marker) and eval cases (`ensureEvalCase`), the two "how" record kinds — **approaches** (`ensureApproach`) and **disciplines with their guardrails** (`ensureDiscipline`, which creates the discipline and its brake(s) in one transaction; `ensureGuardrail` attaches a brake to an existing discipline) — all on the same create-if-absent terms. `ensureOperation` also carries the operation's declared **input contract** (`inputItems` — e.g. one instruction Message plus one marked, untrusted upload), its **tool opt-ins** (`toolIds`), and its own inline **`objective` / `approaches` / `disciplines`** (the per-operation slots the admin editor exposes) — so a consumer seeds a whole decomposed operation from code in one call rather than authoring shared segments and hand-composing them in the admin.
+A consumer seeds its operations and prompt segments through the idempotent `ensure*` API. Both are **create-if-absent**: if the record already exists it is returned untouched, and an admin's later edits are never overwritten. The same surface also seeds content markers (`ensureMarker` — e.g. a chat consumer's `conversation-history` marker), eval cases (`ensureEvalCase`), the two "how" record kinds — **approaches** (`ensureApproach`) and **disciplines with their guardrails** (`ensureDiscipline`, which creates the discipline and its brake(s) in one transaction; `ensureGuardrail` attaches a brake to an existing discipline) — and, when a consumer needs a role the built-ins don't cover, a novel **model purpose** (`ensurePurpose`) — all on the same create-if-absent terms. `ensureOperation` also carries the operation's declared **input contract** (`inputItems` — e.g. one instruction Message plus one marked, untrusted upload), its **tool opt-ins** (`toolIds`), and its own inline **`objective` / `approaches` / `disciplines`** (the per-operation slots the admin editor exposes) — so a consumer seeds a whole decomposed operation from code in one call rather than authoring shared segments and hand-composing them in the admin.
 
 > **An existing record is never touched — admin edits always win over consumer defaults.**
 
@@ -75,11 +75,11 @@ export async function seedAiCore(): Promise<void> {
     content: 'Quote the source span before recording any extracted value.',
   });
 
-  // Seed the operation — stating model REQUIREMENTS, never a model name
+  // Seed the operation — binding a model PURPOSE, never a model name
   await ai.ensureOperation({
     id: 'cog-ingest/extract-entities',
     description: 'Pull named entities out of ingested documents',
-    model: { kind: 'language', needsImageInput: false },
+    model: { purpose: 'analysis' },
     segmentKeys: ['cog-ingest/method-extraction'],
     schema: {
       type: 'object',
@@ -93,13 +93,15 @@ export async function seedAiCore(): Promise<void> {
 
 Both calls return `{ created, operation }` / `{ created, segment }` — `created` tells you whether this boot planted the row or found it already there. Most seed code ignores the return; it is there for callers that want to log first-run setup.
 
-### Consumers state requirements, never a model
+### Consumers bind a purpose, never a model
 
-`ensureOperation` takes a **model requirement**, not a model id. Selection prefers enabled models whose fetched capabilities are known to satisfy the requirement, excludes known-false, and never guesses beyond that — and the admin repoints the operation later at will.
+`ensureOperation` binds a **model purpose** — a semantic role like `'analysis'`, `'chat'` or `'summary'` — not a model id, and not a bundle of model requirements. The host admin owns the default model behind that name; the purpose resolves to a concrete model **at run time**, so an admin repointing which model does `'analysis'` re-points every operation on it at once, with nothing to reseed.
 
 > **Consumers name jobs, never models.**
 
-If no enabled model satisfies the requirement, `ensureOperation` throws an `IntegrityError` naming the requirement and telling the admin to enable a suitable model first — it never seeds an operation that cannot resolve.
+Because the built-in purposes exist on every install and the default is the admin's to wire, seeding is **host-agnostic**: `ensureOperation` does not need the purpose's default set at seed time, and it does not throw when the default is missing — the run refuses loudly (naming the unset default) until the admin wires it. What a consumer *does* need up front is the purpose itself: bind one of the built-ins, or introduce a **novel** purpose first with `ensurePurpose` (below).
+
+For an **embedding** operation, bind the `'embedding'` purpose and pass the vector **width** the store was built at — `{ purpose: 'embedding', dimensions: 1024 }` — so the run resolves the per-width embedding default (see `dimensions` below).
 
 ### `ensureOperation` — `EnsureOperationSpec`
 
@@ -107,7 +109,7 @@ If no enabled model satisfies the requirement, `ensureOperation` throws an `Inte
 |---|---|---|
 | `id` | `string` | The public job name. Namespace it with the consumer module id. |
 | `description` | `string` (optional) | Human-readable summary of the job. |
-| `model` | `EnsureModelRequirements` | What the job requires of a model — never a model name (below). |
+| `model` | `EnsureModelBinding` | The model binding — a **purpose** (the norm), plus the vector `dimensions` for an embedding purpose — never a model name (below). |
 | `dials` | `Dials` (optional) | Inline dial settings — see [Configuration](/modules/ai-core/configuration/). |
 | `segmentKeys` | `string[]` (optional) | Prompt segments to compose, in declared order. |
 | `systemWide` | `boolean` (optional) | When true, this operation's segments fold into every run's prompt. |
@@ -123,18 +125,28 @@ If no enabled model satisfies the requirement, `ensureOperation` throws an `Inte
 
 Note what is **not** here: `userModelChoice` and its allow-list are admin-only. A consumer cannot grant its own users a model picker — that is the app owner's decision, made in the admin.
 
-### `EnsureModelRequirements` — what a consumer may require
+### `EnsureModelBinding` — how a consumer binds a model
 
 | Field | Type | Notes |
 |---|---|---|
-| `kind` | `'language' \| 'embedding' \| 'rerank'` | The model class the job needs. |
-| `needsImageInput` | `boolean` (optional) | When true, models whose fetched capabilities deny image input are ineligible; known-true support is preferred over unknown. |
-| `dimensions` | `number` (optional) | Required embedding width. Selection considers only an embedding model whose `dimensions` match, so seeding **refuses early** if none is enabled rather than let a wrong-width vector reach the store — silent corruption of every later similarity search. Pass the width the vector column was built at (`structureService.getCognitiveCapabilities().embeddings.dimensions`). The embedding analogue of `needsImageInput`; ignored for non-embedding kinds. |
-| `multimodal` | `boolean` (optional) | Keeps only embedding models whose `multimodal` flag is set, for an operation embedded through `embedMultimodal`; ignored for non-embedding kinds. |
+| `purpose` | `string` | The **model purpose** to bind — a built-in role (`'analysis'`, `'chat'`, `'titles'`, `'summary'`, `'vision'`, `'embedding'`, `'rerank'`) or a novel one introduced first with `ensurePurpose`. Resolves to a concrete model at run time; the host admin owns the default behind the name. |
+| `dimensions` | `number` (optional) | **Embedding purpose only**: the exact vector width the operation needs. It rides with the binding and is matched against the purpose's per-width default — never inferred. Pass the width the store's vector column was built at (`structureService.getCognitiveCapabilities().embeddings.dimensions`). Ignored for non-embedding purposes. |
 
-<Aside type="tip" title="Require the embedding width, don't discover it at runtime">
-Without `dimensions`, an embed operation seeds against whatever embedding model the admin has enabled, and a width mismatch surfaces only at the run-time dimension gate on the first embed. Passing `dimensions` moves that check to **seed time**: `ensureOperation` picks a matching-width model or throws the `IntegrityError` immediately, naming the required width.
+<Aside type="tip" title="The type picks the role; the width keeps the gate">
+A wrong-width embedding vector silently corrupts every later similarity search, so the width is part of the binding, not a runtime discovery. Bind `{ purpose: 'embedding', dimensions: 1024 }` and the run resolves the embedding purpose's default *for that width* — refusing loudly if none is recorded — rather than embedding against whatever model happens to be enabled.
 </Aside>
+
+### `ensurePurpose` — introduce a novel purpose
+
+Most consumers just bind a built-in purpose — the seeded roles exist on every install, so nothing needs creating. When a consumer needs a role the built-ins don't cover, `ensurePurpose` creates it, create-if-absent like the rest of the surface. It **only defines the role**; the host admin still owns the default model behind it, so a purpose's default need not be set at seed time (the run refuses loudly, naming the unset default, until it is wired).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `string` | The purpose slug — the name operations bind. Namespace a consumer-specific one with the module id. |
+| `name` | `string` | Admin-facing display name. |
+| `description` | `string` (optional) | An admin note: what this purpose is for. |
+| `kind` | `'language' \| 'embedding' \| 'image' \| 'rerank'` | The model modality this purpose draws from. Immutable once the purpose exists. |
+| `defaultModelId` | `string \| null` (optional) | An optional starting default for a non-embedding purpose; usually left unset for the host admin to wire (embedding purposes carry per-width defaults instead, so leave this `null`). |
 
 ### `ensureSegment` — `EnsureSegmentSpec`
 
