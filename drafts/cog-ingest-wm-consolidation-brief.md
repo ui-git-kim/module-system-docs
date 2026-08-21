@@ -1,7 +1,11 @@
 # Design brief — wire working-memory consolidation (cog-ingest, C2)
 
-Status: DRAFT for Kim's approval. Nothing built yet. Prereqs shipped: `updateConnection`
-adapter + engine v1.12.2 vendored (v1.21.18).
+Status: **BUILT (v1.21.19)** — Kim approved all five decisions (retrieved-only). Two build-time
+refinements: (a) the trigger uses the engine's **user-wide `consolidate(userId)`**, NOT
+`consolidateSession` — `retrieve()` keys events independently of the working-memory session node,
+so a session-scoped call would match nothing; (b) event recording is **capped to the top matches**
+to bound write amplification and focus the co-activation signal. Prereqs shipped: `updateConnection`
+adapter + engine vendored (v1.21.18; re-vendored at v1.12.3 in v1.21.19).
 
 ## 1. The two gaps (recap)
 
@@ -43,8 +47,9 @@ Co-retrieval derivation (`getCoRetrievalPatterns` → `extractCoRetrievals`):
   node**, each carrying `usedWith` = the *other* nodes (A→[B,C], B→[A,C], C→[A,B]). The pair
   tally counts once per unordered pair (canonical lower-id ordering), so writing per-node is the
   contract — not one event for the whole set.
-- A pair must reach `frequency >= minFrequency` (default **2**) to create/strengthen an edge —
-  i.e. two nodes must co-occur across at least two retrievals before an edge forms.
+- A pair must reach `frequency >= threshold` to create/strengthen an edge. `getCoRetrievalPatterns`
+  defaults to 2, but `consolidate()` passes `ConsolidationOptions.threshold` (default **3**), which
+  wins — so via `consolidate()` the effective gate is **3** co-occurrences.
 
 Consolidation API (engine exports):
 - `consolidate(prisma, userId, options?)` — user-wide: reads all the user's co-retrieval events,
