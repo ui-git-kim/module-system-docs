@@ -41,7 +41,7 @@ npm link          # Makes the 'structure' command available globally
 The standard workflow when making changes:
 
 ```
-Edit templates → Build → Test in app → Version bump → Commit → Push
+Edit templates → Build → Test in app → Version bump → Rebuild → Commit → Push
 ```
 
 ### 1. Edit Templates
@@ -53,11 +53,11 @@ All your work happens in these locations:
 | `src/templates/frontend/` | Frontend component, hook, and service templates |
 | `src/templates/backend/` | Backend route, service, and registration templates |
 | `src/templates/schema.ts` | Prisma schema (database tables) |
-| `src/templates/migrations.ts` | Raw SQL migration templates (applied after `prisma migrate dev`) |
+| `src/templates/migrations.ts` | Raw SQL migrations, applied once per database after `prisma migrate dev`. **Append-only** — applied migrations are recorded with a checksum, so never edit an existing entry; add a new one. |
 | `src/module.ts` | Module configuration (routes, dependencies, features list) |
 
 <Aside type="caution">
-Never edit files in `src/scaffold/` or `src/cli.ts`. These are shared infrastructure — report bugs upstream to the module starter template.
+Never edit scaffold-owned infrastructure: `src/scaffold/`, `src/cli.ts`, `src/index.ts`, `scripts/`, `update-scaffold.*`, `VERSION`, `tsconfig.json`, `tsup.config.ts`, `.vscode/`. `scaffold:update` merges all of these from upstream, so local edits are lost — report bugs upstream to the module starter template instead.
 </Aside>
 
 ### 2. Build
@@ -79,7 +79,10 @@ npx structure init
 # Update existing installation (after template changes)
 npx structure update
 
-# Force overwrite all files
+# Preview what an update would change, without writing anything
+npx structure update --dry-run
+
+# Overwrite every conflicted file and remove orphans without prompting
 npx structure update --force
 
 # Start the app
@@ -87,11 +90,23 @@ npm run dev
 ```
 
 Verify that:
-- Frontend routes work (`/clients`, `/clients/:id`)
+- Frontend routes work — Structure registers `:nodeType` catch-alls, not fixed paths, and a fresh install has no node types. Create one under Admin > App Structure first (or import a config from `examples/`, e.g. `starter-minimal.json`, which defines the `space` type), then visit `/<slug>` and `/<slug>/<id>` — for example `/space` and `/space/<id>`
 - Backend API responds (`/api/v1/structure/nodes`)
 - Admin page loads at Admin > App Structure
 - Registrations are active (sidebar nav, header toolbar, admin page)
 - Action hooks fire on mutations (check structured logs)
+
+#### Type-check the generated code
+
+Templates are backtick strings, so `npm run type-check` only checks this repo — it cannot see the code the templates emit. Regenerate the generated files into a host app and type-check them there:
+
+```bash
+npm run build && node scripts/regen-host.cjs ../my-starter-app
+cd ../my-starter-app/frontend && npx tsc --noEmit -p tsconfig.json
+cd ../backend && npx tsc --noEmit -p tsconfig.json
+```
+
+`regen-host.cjs` applies the same placeholder substitution the installer does and writes the same `@generated-by` headers, so the host’s next `update` is not left prompting once per file.
 
 ### 4. Version Bump
 
@@ -103,7 +118,9 @@ npm run version:minor  # New feature (x.X.0)
 npm run version:major  # Breaking change (X.0.0)
 ```
 
-The `version:*` scripts bump the version and create a commit. For a tagged release, use the `release:*` variants instead — they perform the same bump and commit, but also create a matching git tag:
+The bump runs `scripts/check-conformance.cjs` first as a **soft gate**: if a Conformance Contract check regresses it prints the failures and prompts `Continue with the version bump anyway? [y/N]`, aborting if you decline. In CI, or with no TTY, it warns and proceeds. Run `npm run conformance:check` beforehand to see the detail.
+
+The `version:*` scripts rewrite `package.json` and `src/module.ts` and create a `chore(release): vX.Y.Z` commit. For a tagged release, use the `release:*` variants instead — they perform the same bump and commit, but also create a matching git tag:
 
 ```bash
 npm run release:patch  # Bump + commit + git tag (x.x.X)
@@ -111,7 +128,15 @@ npm run release:minor  # Bump + commit + git tag (x.X.0)
 npm run release:major  # Bump + commit + git tag (X.0.0)
 ```
 
-### 5. Commit and Push
+### 5. Rebuild
+
+```bash
+npm run build
+```
+
+The bump scripts do **not** rebuild. The version string is compiled into `dist/`, which is what a linked host app actually executes — skip this and `npx structure update` in the host still reports the previous version and writes stale `@generated-by` headers.
+
+### 6. Commit and Push
 
 ```bash
 git add src/templates/ src/module.ts
@@ -129,6 +154,7 @@ Templates use placeholder patterns that get replaced during installation:
 
 | Placeholder | Replaced With | Example |
 |-------------|--------------|---------|
+| `MY_FEATURE` | SCREAMING_SNAKE_CASE (substituted first) | `AI_CHAT` |
 | `My Feature` | Title Case (space-separated) | `Ai Chat` |
 | `my feature` | lowercase (space-separated) | `ai chat` |
 | `my-feature` | moduleId (kebab-case) | `ai-chat` |
@@ -143,6 +169,8 @@ Templates also support variable substitution from prompt answers:
 | `{{variableName}}` | Replace with prompt answer |
 | `{{variableName\|default}}` | Replace with prompt answer or default value |
 | `{{#if var}}...{{/if}}` | Conditional block |
+| `{{#if var}}...{{else}}...{{/if}}` | If/else block |
+| `{{#if var === 'value'}}` / `{{#if var !== 'value'}}` | Equality / inequality check (nesting supported) |
 
 ---
 
@@ -157,6 +185,8 @@ npm run scaffold:update   # Apply scaffold updates
 
 <Aside type="note">
 `scaffold:update` merges only infrastructure (`src/scaffold/`, `src/cli.ts`, `scripts/`, config) and never touches `src/templates/**` or `src/module.ts` — those are module-owned. Existing module-owned files are kept exactly as you have them, deleted ones are not re-introduced, and only genuinely-new template files are auto-added. Upstream edits to existing module-owned files are advisory — surfaced by `npm run scaffold:check` (`git diff HEAD..scaffold-upstream/main -- src/templates src/module.ts`) so you can hand-port them deliberately. Conflicts only arise in shared infrastructure files such as `package.json`.
+
+It also **restores** any scaffold-owned file that exists upstream but has gone missing from this module — git cannot re-add a file you deleted, it keeps the deletion on every future merge. `npm run scaffold:check` previews the missing set. If a removal was deliberate, record the exact path in a `.scaffoldignore` file in the module root, one per line (matched whole-line, so `#` comments are not supported).
 </Aside>
 
 ---
@@ -167,6 +197,13 @@ Structure defines lifecycle hooks in `module.ts` that run during installation an
 
 ```typescript
 lifecycle: {
+  // Runs in the CLI immediately BEFORE `prisma migrate dev` (scaffold >= 1.31.3),
+  // during both install and update. Declares the pgvector (+ Lakebase, when a
+  // pg_extension probe finds it installed) datasource extensions FIRST, so the
+  // migrate's shadow database includes them.
+  onPrepareDatabase: async (context) => {
+    await declareDatasourceExtensions(context.utils, context.moduleAnswers ?? {});
+  },
   onInstall: async (context) => {
     context.utils.log.success('Structure module installed successfully');
     context.utils.log.info('Configure node types via Admin > App Structure, or import a JSON config');
@@ -194,7 +231,7 @@ lifecycle: {
 },
 ```
 
-The `onInstall` hook fires after first installation. The `onUpdate` hook fires after updates and receives version transition information via `context.fromVersion`, `context.toVersion`, `context.versionChange`, and `context.changes`. Both `onInstall` and `onUpdate` call `healEmbeddingsSetup(...)` to ensure the pgvector infrastructure is in place when embeddings are enabled. The `onReconfigure` hook fires on a same-version answer change (e.g. `npx structure reconfigure --set enableEmbeddings=true`) — a case `onUpdate` never sees — and heals the pgvector infrastructure when embeddings are toggled on.
+The `onPrepareDatabase` hook fires in the CLI immediately before `prisma migrate dev` (scaffold 1.31.3 and later) on both install and update, so the migrate’s shadow database already includes the declared datasource extensions; the post-migrate embeddings heal repeats the same declaration idempotently as a fallback for older scaffolds. The `onInstall` hook fires after first installation. The `onUpdate` hook fires after updates and receives version transition information via `context.fromVersion`, `context.toVersion`, `context.versionChange`, and `context.changes`. Both `onInstall` and `onUpdate` call `healEmbeddingsSetup(...)` to ensure the pgvector infrastructure is in place when embeddings are enabled. The `onReconfigure` hook fires on a same-version answer change (e.g. `npx structure reconfigure --set enableEmbeddings=true`) — a case `onUpdate` never sees — and heals the pgvector infrastructure when embeddings are toggled on.
 
 ---
 
@@ -211,8 +248,11 @@ Files are in `docs/src/content/docs/modules/structure/`. Edit the `.mdx` files d
 Docs changes must be pushed separately since `docs/` is a git submodule:
 
 ```bash
-cd docs && git add . && git commit -m "Docs: description" && git push
-cd .. && git add docs && git commit -m "docs: update docs submodule"
+# docs/ is a SHARED repo across module repos — rebase before pushing
+cd docs && git add . && git commit -m "Docs: description" && git pull --rebase && git push
+
+# then push the submodule pointer in the module repo — do not skip this
+cd .. && git add docs && git commit -m "docs: update docs submodule" && git push
 ```
 
 ---
@@ -236,6 +276,9 @@ cd .. && git add docs && git commit -m "docs: update docs submodule"
 | `npm run release:major` | Breaking change bump + git tag |
 | `npm run scaffold:check` | Check for scaffold updates |
 | `npm run scaffold:update` | Apply scaffold updates |
+| `node scripts/regen-host.cjs <host-app>` | Regenerate the generated files into a host app so they can be type-checked |
+
+`scaffold:version:patch|minor|major` also exist. They bump the scaffold `VERSION` file (currently `1.31.15`), which is separate from the module version in `package.json` and `src/module.ts` — module developers should not run them, as `scaffold:update` carries the scaffold version forward.
 
 ---
 
@@ -249,8 +292,12 @@ Run through this before committing:
 - [ ] **Placeholders used** — Templates use `my-feature`, `MyFeature`, `myFeature` patterns
 - [ ] **Uses registries** — Generated code extends via registries, not core file edits
 - [ ] **Templates escaped** — `npm run check:templates` passes (catches an unescaped `${` interpolation inside a template string, which the build does not)
+- [ ] **Conformance passes** — `npm run conformance:check`
+- [ ] **Script parity** — `npm run parity:check` (only if you touched a paired `.ps1`/`.sh` script)
+- [ ] **Types check** — `npm run type-check`, plus `node scripts/regen-host.cjs <host-app>` and `tsc --noEmit` there if you changed generated code
 - [ ] **Build passes** — `npm run build` completes without errors
 - [ ] **Version bumped** — If templates changed, ran `npm run version:patch` (or minor/major)
+- [ ] **Rebuilt after the bump** — `npm run build` again, so `dist/` carries the new version
 - [ ] **Docs updated** — If behaviour changed, updated relevant `.mdx` files and pushed docs submodule
 
 ---
@@ -259,4 +306,4 @@ Run through this before committing:
 
 - [Configuration](/modules/structure/configuration/) — Database schema and API reference
 - [Integration](/modules/structure/integration/) — How other modules extend Structure
-- [Building Modules docs](https://saas.uniqueicon.com.au/module-starter/building-modules/) — Full guide to template development
+- [Building Modules](/module-starter/building-modules/) — Full guide to template development

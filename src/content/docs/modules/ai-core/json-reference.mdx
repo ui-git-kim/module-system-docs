@@ -1,14 +1,14 @@
 ---
 title: JSON Import & Export
-description: Set up an app's whole prompting from one model-agnostic JSON — import (merge/replace) and export markers, approaches, segments, presets, disciplines, guardrails, operations, flows and eval cases
+description: Set up an app's whole prompting from one model-agnostic JSON — import (merge/replace) and export markers, input types, tools, prompt frameworks, approaches, segments, disciplines, guardrails, operations, flows and eval cases
 sidebar:
   order: 6.5
-lastUpdated: 2026-08-08
+lastUpdated: 2026-08-19
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-AI Core's admin page supports full JSON import and export of an app's **prompting configuration** — markers, approaches, prompt segments, presets, disciplines and their guardrails, operations, flows and evaluation cases. Use it to back up your setup, migrate between environments, share a prompting design between apps, or seed a fresh install from one file.
+AI Core's admin page supports full JSON import and export of an app's **prompting configuration** — markers, input types, tools, prompt frameworks, approaches, prompt segments, disciplines and their guardrails, operations (composition, input contract, tool opt-ins, builder role and context blocks), flows and evaluation cases. Use it to back up your setup, migrate between environments, share a prompting design between apps, or seed a fresh install from one file.
 
 The config is deliberately **model-agnostic**. It never names a model. An operation carries the model *requirements* it needs (a language model, or an embedding model of a given width); the actual model is a database record the admin binds in the **Operations** tab. That keeps the file portable — the same config runs against whatever model palette a target install has enabled.
 
@@ -27,8 +27,22 @@ The **Export config** and **Import config** controls live in the admin page's **
 This is the **Prompt Model v2** config format (`"version": "2.0"`). The importer accepts **only** version `2.0`: a document with any other version — including a v1 export — is rejected loudly (a `config-version-unsupported` error), never silently mis-imported. There is **no v1 reader**. To move a v1 setup forward, upgrade the install (which resets the reshaped tables to the v2 built-ins — export first), then author or re-export the config in v2 shape.
 </Aside>
 
+<Aside type="danger" title="A foreign moduleId is refused before anything is written">
+Every export is stamped `"moduleId": "ai-core"`, and the importer refuses a document whose `moduleId` names another module — a `config-module-mismatch` error thrown **before a single row is touched**. This matters most in **Replace** mode: replace deletes the non-seeded records a document omits, so a config written for a different module could otherwise wipe records it knows nothing about. Version alone is not identity — any file claiming `"version": "2.0"` would otherwise be applied. An **absent** `moduleId` is tolerated (exports predating the stamp still import); only a present-and-mismatched one is fatal.
+</Aside>
+
 <Aside type="caution" title="Replace mode deletes omitted records">
-In **Replace** mode, any existing **non-seeded** record of an entity type present in the import that the import does **not** contain is deleted (its delete guards still apply — for example a guardrail whose deletion would leave a still-referenced discipline with no brake is a **named skip**, never force-deleted). **Seeded records are never deleted** — the shipped behavioural defaults, the scorer operations and the seeded markers are AI Core's equivalent of "system" records. An **absent** array (one you leave out of the file) triggers **no** deletion for that entity; an **empty** array (`[]`) means "there should be none — delete the rest". Use **Merge** for incremental updates.
+In **Replace** mode, any existing **non-seeded** record of an entity type present in the import that the import does **not** contain is deleted. **Seeded records are never deleted** — the shipped behavioural defaults, the scorer operations and the seeded markers, input types, tools and frameworks are AI Core's equivalent of "system" records. An **absent** array (one you leave out of the file) triggers **no** deletion for that entity; an **empty** array (`[]`) means "there should be none — delete the rest". Use **Merge** for incremental updates.
+
+Deletion reuses the same guards the admin CRUD uses, and a refusal is a **named skip** — never a force-delete, a silent drop or a hard abort:
+
+- a **marker** still referenced by a segment's `marker`, an operation's `contextMarker`, a declared input item or a context block — the skip names what still uses it (`still-referenced-by: operation "extract-entities" context block`);
+- an **input type** an operation still declares on its input contract;
+- a **tool** an enabled operation still opts into;
+- a **framework** a local model still points at — models are outside the config, so this is exactly where that is discovered;
+- a **guardrail** whose removal would leave a still-referenced discipline with no brake.
+
+The marker guard lives in the *import*, not in the service: deleting a marker from the admin refuses nothing, because an admin may retire one knowing full well what it frames. Omitting a marker from a Replace config is not that deliberate act — it would dangle every reference to it and the assembler would fall back to an unmarked frame without anyone being told.
 </Aside>
 
 <Aside type="note" title="Merge updates existing records">
@@ -44,11 +58,19 @@ When you click **Export config**, the downloaded JSON follows this shape:
 ```json
 {
   "version": "2.0",
+  "moduleId": "ai-core",
   "exportedAt": "2026-08-07T10:30:00.000Z",
+  "counts": {
+    "markers": 2, "inputTypes": 2, "tools": 2, "frameworks": 1,
+    "approaches": 3, "segments": 5, "disciplines": 4, "guardrails": 4,
+    "operations": 6, "flows": 0, "evalCases": 2
+  },
   "markers":     [ /* Marker objects */ ],
+  "inputTypes":  [ /* Input type objects */ ],
+  "tools":       [ /* Tool objects */ ],
+  "frameworks":  [ /* Framework objects */ ],
   "approaches":  [ /* Approach objects */ ],
   "segments":    [ /* Segment objects */ ],
-  "presets":     [ /* Preset objects */ ],
   "disciplines": [ /* Discipline objects */ ],
   "guardrails":  [ /* Guardrail objects */ ],
   "operations":  [ /* Operation objects */ ],
@@ -57,9 +79,23 @@ When you click **Export config**, the downloaded JSON follows this shape:
 }
 ```
 
-`version` is `"2.0"` for the current format and `exportedAt` is an ISO timestamp. Every entity array is optional on import — you can import a file with only `markers`, only `operations`, or any combination. Unknown fields are ignored, so an exported file re-imports cleanly.
+`version` is `"2.0"` for the current format, `moduleId` is `"ai-core"` — the module that wrote the file, checked on import so a document written for another module is refused before anything is written — and `exportedAt` is an ISO timestamp. `counts` is the per-entity row count the file claims to hold at export time, so a truncated or hand-edited document is visible before it is applied rather than after. The arrays are emitted in that order, which is also roughly the order they depend on each other. Every entity array is optional on import — you can import a file with only `markers`, only `operations`, or any combination. Unknown fields are ignored, so an exported file re-imports cleanly.
 
-What the export deliberately **omits**: surrogate database ids where a natural key exists (segments and approaches export by `key`, presets by `name`), the `createdAt`/`updatedAt`/`version` audit columns, an operation's bound model id, and anything that is runtime content rather than an authored config record. What it **includes**: each record's `seeded` flag, so provenance round-trips.
+What the export **includes** beyond the authored fields: each record's `seeded` flag, so provenance round-trips. What it leaves out is the subject of the next section.
+
+---
+
+## What the config does not carry
+
+The omissions are deliberate — they are what makes one file safe to move between installs.
+
+- **Models and providers.** Which models an install has enabled, under which provider accounts, is a local decision. An operation records what it *needs* of a model (`requirements`) rather than a model, and the import binds a local one.
+- **Provider terms options.** A recorded terms option is a **dated attestation about the reader's own account** — what that account's contract with a provider says, as at the day someone recorded it. Transplanting one would move a claim nobody on the receiving install ever made, so it never travels.
+- **An operation's `userModelAllowList`.** It holds local model record ids, which mean nothing anywhere else. The `userModelChoice` grant *does* round-trip (it is authored governance, not a model choice); set the allow-list itself in the **Operations** tab.
+- **Every runtime and data table** — runs, the usage ledger, eval results, the review queue. This is configuration, never history.
+- **Surrogate database ids where a natural key exists** — segments and approaches export by `key`, frameworks by `name` — and the `createdAt`/`updatedAt`/`version` audit columns.
+
+The same rule shapes one field *inside* the config: a retrieval block's embedding model is stored locally as a model record id, so it travels as a portable provider + model pair instead (see [Portability of a retrieval's embedding model](#portability-of-a-retrievals-embedding-model)).
 
 ---
 
@@ -73,14 +109,50 @@ What the export deliberately **omits**: surrogate database ids where a natural k
 
 Matched by `id`. `meaning` is the text stated to the model when this marker is in use; `renderingHint` is an optional tag-prefix hint the framework may honour. `injectionRisk` is **not** here — that is a per-segment, app-set flag (see [Segment](#segment) below), never a marker property.
 
+### Input type
+
+```json
+{ "id": "upload", "name": "File upload",
+  "description": "A file the caller attaches. It rides to the model as an attachment.",
+  "handling": "upload", "enabled": true, "seeded": true }
+```
+
+Matched by `id` — the kebab key an operation's [input contract](#operation) names. An **input type** is a *kind* of input an operation can declare: `text` ("Typed text") and `upload` ("File upload") are seeded, and an admin may add more — a voice note, a link.
+
+`name` and `description` are what the admin and the calling app read. `handling` is what the **transport** actually does with the content, and the engine understands two values only: `text` (content arrives as typed text) and `upload` (a file the caller attaches, riding as a media attachment on a marked context segment). An omitted `handling` imports as `text`, and at run time anything that is not exactly `upload` is read as `text` — so every admin-added type still resolves to one of the two things the engine can actually carry. The admin form offers only those two; a hand-written config is not re-checked against them, so keep to `text` or `upload`.
+
+### Tool
+
+```json
+{ "id": "web-search", "name": "Web search", "kind": "provider-native", "providerToolId": "web_search",
+  "config": {}, "egress": true, "enabled": true, "seeded": true }
+```
+
+Matched by `id` — the kebab key an operation's `toolIds` names. A **tool** is a provider-hosted capability an operation may opt into (`web-search` and `web-fetch` ship seeded).
+
+`kind` defaults to `provider-native`; `function` (an app-registered handler) is reserved and does not ship yet. `providerToolId` is the provider tool key the adapter maps to — `web_search`, `web_fetch` — so the record says **which capability to ask for**, never which model provides it; a provider with no equivalent skips the opt-in with an audit line rather than faking it. `config` holds options passed through to the provider tool. `egress` marks a tool that sends content to a third party: a **sensitive** operation refuses one, so the sensitivity gate covers tool traffic and not only model routing.
+
+### Prompt framework
+
+```json
+{ "name": "Anthropic XML",
+  "segmentOrder": ["voice", "approach", "discipline", "schema", "markers", "context", "date", "input"],
+  "wrapping": { "context": { "kind": "xml", "tag": "source" } },
+  "notes": null, "seeded": true }
+```
+
+Matched by **`name`**, not `id` — `ai_prompt_framework.id` is a local cuid that means nothing on another install, while the name is unique. A **framework** is the per-model prompt *shape*: `segmentOrder` is the ordered list of segment types, and `wrapping` states, per segment type, how it is wrapped — `{ "kind": "xml" | "markdown" | "plain", "tag"?: string }`.
+
+A framework only takes effect once a **model** points at it, and models never travel in the config — so an imported framework arrives **bound to nothing**, and the import says exactly that in a note rather than implying it changed how anything renders. Select it on a model in the **Models** tab.
+
 ### Approach
 
 ```json
 { "key": "expert-analyst", "name": "Expert analyst", "promptText": "Reason as a careful domain analyst...",
-  "contentSource": "static", "flavour": null, "userId": null, "seeded": false }
+  "description": null, "contentSource": "static", "flavour": null, "userId": null, "seeded": false }
 ```
 
-Matched by `key`. An **approach** is an *unmeasured* "how" — expertise, persona, reasoning style or tone — that a segment relates in via its `approaches` list. `promptText` is the text folded into the prompt; `contentSource` is `static` or `context`; `flavour` is an optional free-text tag. Approaches carry no `enabled` flag — membership in a segment's `approaches` list is the on/off switch.
+Matched by `key`. An **approach** is an *unmeasured* "how" — expertise, persona, reasoning style or tone — that a segment relates in via its `approaches` list. `promptText` is the text folded into the prompt; `contentSource` is `static` or `context`; `flavour` is an optional free-text tag. `description` is an optional admin note — what the approach is for; it never reaches the prompt, but it is authored content, so it round-trips through the config. Approaches carry no `enabled` flag — membership in a segment's `approaches` list is the on/off switch.
 
 ### Segment
 
@@ -104,22 +176,14 @@ The two "how" slots relate their members in as **objects**, stored on join rows 
 
 `important` lives on the **membership** (the join row), not on the approach or discipline record: a shared rule may be restated at the prompt tail (under the seeded `key-rules` marker, for recency) in one segment but not another. A segment carries no `enabled` flag — being listed in an operation's `segmentKeys` is the switch.
 
-### Preset
-
-```json
-{ "name": "balanced", "dials": { "effort": "medium", "outputRichness": "standard" }, "seeded": false }
-```
-
-Matched by `name`. `dials` is the dial bundle (see [Configuration](/modules/ai-core/configuration/)).
-
 ### Discipline
 
 ```json
 { "id": "my-app/cite-policy", "name": "Cite the clause", "promptText": "Quote the clause you rely on.",
-  "flavour": null, "userId": null, "seeded": false }
+  "description": null, "flavour": null, "userId": null, "seeded": false }
 ```
 
-Matched by `id` — a discipline **is** its key (there is no separate `key` column). A **discipline** is a *measured* "how": a rule that owns one or more [guardrails](#guardrail). The v2 record is slim — `id`, `name`, `promptText`, optional `flavour`, optional `userId`, `version`, `seeded`. The old tier/authority hierarchy is **gone**: there is no `tier`, no `authority`, no `appliesTo`, no `rationale`, no `checkId`. A discipline needs at least one guardrail to be a valid member of a `disciplines`-slot segment, but that invariant is enforced at write time and at resolution time (see the caution below), not during the disciplines pass — so disciplines import cleanly ahead of their guardrails. Disciplines carry no `enabled` flag — segment membership is the switch.
+Matched by `id` — a discipline **is** its key (there is no separate `key` column). A **discipline** is a *measured* "how": a rule that owns one or more [guardrails](#guardrail). The v2 record is slim — `id`, `name`, `promptText`, optional `description` (an admin note — what the rule is for; it never reaches the prompt, but it round-trips through the config), optional `flavour`, optional `userId`, `version`, `seeded`. The old tier/authority hierarchy is **gone**: there is no `tier`, no `authority`, no `appliesTo`, no `rationale`, no `checkId`. A discipline needs at least one guardrail to be a valid member of a `disciplines`-slot segment, but that invariant is enforced at write time and at resolution time (see the caution below), not during the disciplines pass — so disciplines import cleanly ahead of their guardrails. Disciplines carry no `enabled` flag — segment membership is the switch.
 
 ### Guardrail
 
@@ -141,9 +205,18 @@ Matched by `id`. A **guardrail** (the table was `ai_guardrail_check`, renamed to
   "id": "extract-entities",
   "description": "Pull named organisations from a document",
   "requirements": { "kind": "language" },
-  "presetName": "balanced",
   "segmentKeys": ["objective-extract", "format-entities"],
+  "inputItems": [
+    { "label": "What to look for", "kind": "text" },
+    { "label": "The contract", "kind": "upload", "marker": "document", "untrusted": true }
+  ],
+  "toolIds": ["web-search"],
   "systemWide": false,
+  "systemPromptOperationId": "house-frame",
+  "builderRole": null,
+  "contextOperationId": "extract-context",
+  "contextMarker": "source",
+  "contextBlocks": [],
   "userId": null,
   "schema": { "type": "object", "properties": { "entities": { "type": "array" } } },
   "dials": {},
@@ -156,9 +229,54 @@ Matched by `id`. A **guardrail** (the table was `ai_guardrail_check`, renamed to
 }
 ```
 
-Matched by `id` (the public job name). **`requirements` replaces a model** — `{ kind: "language" | "embedding" | "rerank", dimensions?, multimodal?, needsImageInput? }`. The preset is referenced by its portable `presetName`, not a database id.
+Matched by `id` (the public job name). **`requirements` replaces a model** — `{ kind: "language" | "embedding" | "rerank", dimensions?, multimodal?, needsImageInput? }`.
 
-Composition is **relational** in v2: `segmentKeys` is the ordered list of segment keys the operation composes (the operation no longer carries its own `disciplineIds` — disciplines live inside the segments it names). `systemWide` marks an operation whose segments fold into **every** run as a standing frame (skipped on an internal scorer run, so a scorer's prompt stays clean). `userModelChoice` is a governance flag that round-trips; the model allow-list holds local model ids and is not portable, so set it in the Operations tab.
+Composition is **relational** in v2: `segmentKeys` is the ordered list of segment keys the operation composes (the operation no longer carries its own `disciplineIds` — disciplines live inside the segments it names). `systemWide` marks an operation that **is** a system prompt — a named, reusable frame other operations select. `userModelChoice` is a governance flag that round-trips; the model allow-list holds local model ids and is not portable, so set it in the Operations tab.
+
+The rest of the authored surface travels too:
+
+- **`inputItems`** — the ordered **input contract**: what the caller supplies on each run. Each item is `{ label, kind, marker?, untrusted? }`, where `kind` is an [input type](#input-type) id. Upload handling always reaches the model as marked context; a text item that is marked or untrusted does too (framed, and fenced when untrusted), while the unmarked, trusted text item **is** the instruction the operation acts on. A `kind` naming no catalogue record falls back to the seeded reading (`upload` answers for itself, everything else is text) and the gap is named rather than the item dropped. `[]` means the default single message.
+- **`toolIds`** — the ordered [tool](#tool) opt-ins. The tools themselves travel in the `tools` array.
+- **`systemPromptOperationId`** — the system-prompt operation whose segments fold into this run; `null` = the default (the first-created enabled system-prompt operation). It names **another operation in this same array**. It is written `null` whenever the operation is itself `systemWide`.
+- **`builderRole`** — `null` for a normal operation, `"context"` for a **Context builder**. A builder is nothing without its blocks, so the role and the blocks travel together; exporting a builder as a plain operation would destroy it on re-import.
+- **`contextOperationId`** — normal operations only: the Context builder whose assembled context folds into this run; `null` = no context engine. Also names another operation in this array.
+- **`contextMarker`** — normal operations only: the **overall** marker framing the assembled context, and the fallback for any context block that names no marker of its own; `null` = the default `source`.
+- **`contextBlocks`** — Context builders only: the ordered blocks the builder composes (see the two sections below).
+
+#### Omitting a field: create versus update
+
+Whether an omitted field takes a default or is left alone depends on **whether the operation already exists**, not on which field it is. That distinction is what separates a safe partial import from a destructive one.
+
+**On create** — an operation the config introduces for the first time — every omitted field lands on the record's own default: `description`, `userId`, `schema`, `cache` and `evalConfig` to `null`; `segmentKeys` and `inputItems` to `[]`; `dials` to `{}`; `sensitivity` to `normal`; `systemWide`, `userModelChoice` to `false`; `enabled` to `true`; and the builder wiring and tool opt-ins (`toolIds`, `systemPromptOperationId`, `builderRole`, `contextOperationId`, `contextMarker`, `contextBlocks`) to no opt-ins, no builder role and no blocks. There is nothing to preserve, so a default is the only sensible reading.
+
+**On a merge update of an operation that already exists,** an omitted field is left **exactly as stored** — every field, without exception, both the fields above and the builder wiring. An absent key passes through as *undefined* and the write skips that column, so an omitted `segmentKeys` does **not** clear the composition, an omitted `inputItems` does **not** reset the input contract, and an omitted `contextOperationId` does **not** flatten a Context builder. Coercing an absent field to a default here would let a partial merge silently reset authored configuration it was never given — and it is the only reading under which a hand-written config that never mentions a Context builder cannot destroy one.
+
+To actually reset a field on an existing operation you must **state** it: `"segmentKeys": []` clears the composition, `"toolIds": []` drops every opt-in, `"contextOperationId": null` unbinds the builder, `"contextBlocks": []` empties it. The one exception to "empty means empty" is `"inputItems": []`, which restores the default single-message contract rather than an empty one.
+
+An export always states every field, so `export → import → export` is exact whichever path each operation takes.
+
+#### Portability of a retrieval's embedding model
+
+Inside `contextBlocks`, a `retrieval` block names the embedding model that turns the run's query into a vector. In the running system that is a **local `ai_model` record id**, which means nothing on another install, so the config carries a portable reference instead:
+
+```json
+{
+  "kind": "retrieval",
+  "method": "hybrid-chunk",
+  "marker": "source",
+  "topK": 8,
+  "nodeIds": ["clx8k2p9c0001..."],
+  "embeddingModel": { "providerId": "openai", "modelId": "text-embedding-3-large" }
+}
+```
+
+The **export** replaces the block's `modelId` with `embeddingModel: { providerId, modelId }` — the provider plus that provider's own pinned model string, which is the pair `ai_model` is unique on — read off the bound model row. No `modelId` is emitted. A binding pointing at a model row that no longer exists exports as **no binding at all**, rather than as a reference nothing could ever resolve.
+
+The **import** resolves that pair back to whatever local model matches. When nothing matches, the binding is **left off and named in the report**, never guessed: the run already names a retrieval with no embedding model as a gap, whereas a substituted model would silently embed the query into the wrong vector space. The note tells you which block and which provider/model pair, so you can bind an embedding model on that retrieval in the **Operations** tab. (If a block carries both an `embeddingModel` and a `modelId`, the portable reference wins and the stray local id is dropped.)
+
+Every other field of every block — `content`, `segmentKey`, `method`, `nodeTypes`, `topK`, `minScore`, `template`, `marker` and the rest — travels verbatim, and the operation write re-validates the block shape.
+
+One of those fields cannot be made portable: a retrieval's **`nodeIds`** name Structure nodes belonging to the install the config came from, and may match nothing on the target. They are carried as-is, and an import that meets them says so in a note rather than leaving you to discover a silently empty retrieval — check the scope on the target install.
 
 <Aside type="note" title="Operations bind a model on import">
 On **create**, an operation's `requirements` auto-select a local model (the same resolution `ensureOperation` uses); if no enabled model matches, the operation is **skipped and named** so you can enable or bind a model, then re-import. On **update**, the operation's existing model binding is **left untouched** — config never overwrites the model you chose in the Operations tab; only the prompt composition changes. Either way, set the exact model in the **Operations** tab.
@@ -178,7 +296,7 @@ Matched by `id`. Flows carry no `seeded` flag (AI Core ships none), so under **R
 
 ```json
 { "id": "my-app/extract-1", "operationId": "extract-entities", "label": "basic",
-  "input": { "segments": [ { "type": "task", "content": "..." } ] },
+  "input": { "segments": [ { "type": "input", "content": "..." } ] },
   "reference": { "answer": "..." }, "tags": [], "enabled": true, "seeded": false }
 ```
 
@@ -192,13 +310,17 @@ Matched by `id`. An eval case has no other natural key, so a **stable `id` is re
 
 1. **Merge (default, safe).** For every record in the config: create it if missing, update it if it exists (matched by the natural key above). Nothing is deleted. Every create and update is itemised in the report.
 
-2. **Replace.** The same upsert pass, then — for each entity type the config carries — delete the non-seeded records that the config omits. Seeded records are never deleted. Deletes reuse the same guards the admin CRUD uses; a refusal (for example a guardrail whose removal would leave a still-referenced discipline with no brake) is a **named skip**, not a silent drop.
+2. **Replace.** The same upsert pass, then — for each entity type the config carries — delete the non-seeded records that the config omits. Seeded records are never deleted. Deletes reuse the same guards the admin CRUD uses, plus the import's own marker guard; a refusal (a marker something still names, an input type an operation still declares, a tool an enabled operation still opts into, a framework a local model still points at, a guardrail whose removal would leave a still-referenced discipline with no brake) is a **named skip**, not a silent drop.
 
 </Steps>
 
 **Provenance and round-trips.** Each record's `seeded` flag is restored from the config on import, so `export → import → export` is stable (bar the `exportedAt` timestamp). A re-import of unchanged content does not churn versions or flip provenance.
 
-**Dependency order.** Records are imported roots-first — markers, approaches, disciplines, guardrails, then segments (which reference approaches and disciplines), presets, operations (which reference presets and segments), flows (which reference operations), then eval cases. Deletes under Replace run leaf-first, the reverse, so a referenced record is only removed after its referrers.
+**Dependency order.** Records are imported roots-first: markers, then the catalogues an operation draws on — input types, tools and prompt frameworks — then approaches, disciplines, guardrails, segments (which reference approaches and disciplines), operations (which reference segments, input types and tools), flows (which reference operations), then eval cases. Frameworks are a root in their own right: nothing else in the config references one, because a *model* does, and models stay local.
+
+**Operations are written in two passes.** Within the `operations` array, the operations that other operations point at — **Context builders** (`builderRole`) and **system-prompt operations** (`systemWide`) — are written first, then the rest. So `contextOperationId` and `systemPromptOperationId` resolve to a row that already exists no matter where their target sits in the document, and you can hand-write the file in whatever order reads best. Document order is preserved within each pass.
+
+Deletes under Replace run leaf-first, the reverse: eval cases, flows, operations, segments, guardrails, approaches, disciplines, then the root catalogues — frameworks, tools, input types and markers last, after every operation that could still name one. A referenced record is only ever removed after its referrers.
 
 ---
 
@@ -218,7 +340,15 @@ The import returns a per-entity report — the same detail the Config tab render
 }
 ```
 
-`skipped` names every record that did **not** apply and why; `notes` are advisories about records that did (an auto-bound model, a preset that could not be resolved). A partial import states exactly what did and did not apply — it is never presented as a clean pass.
+`skipped` names every record that did **not** apply and why; `notes` are advisories about records that **did** apply but could not carry everything across the install boundary:
+
+- an operation bound to a model auto-selected from its requirements;
+- a retrieval block whose portable `embeddingModel` matched no local model, imported with **no** embedding model rather than a substituted one;
+- an operation whose retrievals are scoped to Structure `nodeIds` from the source install;
+- a framework created but **bound to no model**, because models do not travel;
+- and, rarely, a record that was written but whose provenance flag or follow-up field could not be stamped — a committed row is always reported as applied, never as skipped.
+
+A partial import states exactly what did and did not apply — it is never presented as a clean pass. Import is per-item and commit-what-succeeds, not one big transaction: if a whole pass fails part-way, that pass is named in the report and everything already applied still stands.
 
 ---
 

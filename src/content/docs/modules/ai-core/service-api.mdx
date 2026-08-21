@@ -1,7 +1,7 @@
 ---
 title: Service API
 description: The full aiCoreService surface a consumer programs against, method by method
-lastUpdated: 2026-08-07
+lastUpdated: 2026-08-19
 sidebar:
   order: 6
 ---
@@ -12,8 +12,8 @@ This is the reference for `aiCoreService` — the single object AI Core register
 
 > **Consumers name jobs, never models.** No model id string appears anywhere in this surface.
 
-<Aside type="note" title="Current as of v1.18.0">
-This page describes AI Core as implemented in module v1.18.0 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and every method here — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and the `ensure*` seed helpers — has been exercised end-to-end against live providers. The semantic cache and a re-embedding migration remain planned; where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+<Aside type="note" title="Current as of v1.40.2">
+This page describes AI Core as implemented in module v1.40.2 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and every method here — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and the `ensure*` seed helpers — has been exercised end-to-end against live providers. Since v1.23.0 the surface has grown provider-native Tools (web search / fetch), the operation input contract and its `ai_input_type` catalogue, the Context builder, and the module-level zero-retention override (`ai_policy`). The semantic cache and a re-embedding migration remain planned; where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
 </Aside>
 
 ---
@@ -79,7 +79,7 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 
 **Returns** — a [`RunResult`](#runresult): `result` (`{ text, structured }`), `feedback` (the structured account of what the run could not do), and `audit` (audit-by-reference: the ledger id, the model actually used, parameters sent with any transforms, usage, warnings).
 
-**A shortfall is not an exception.** A schema-validation failure, an abstention below threshold, a truncated output, an unavailable markers preamble — these all **return** normally with the outcome named in `feedback.reason` (for example `schema-validation-failed`, `abstained-below-threshold`, `output-truncated-by-length-limit`). The structured output is preserved even on abstention. The system may do less than it was asked; the feedback says so on the same return.
+**A shortfall is not an exception.** A schema-validation failure, an abstention on weak support, a truncated output, an unavailable markers preamble — these all **return** normally with the outcome named in `feedback.reason` (for example `schema-validation-failed`, `abstained-below-groundedness`, `output-truncated-by-length-limit`). The structured output is preserved even on abstention. The system may do less than it was asked; the feedback says so on the same return.
 
 **Throws** — a genuine failure to run. Every throwing path still writes a ledger row before it rethrows: refusals and provider errors are outcomes, not disappearances.
 
@@ -95,11 +95,11 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 `RefusedError` carries a machine-readable `reason` and a `detail` object naming which constraint failed. Verified reasons `run` can raise, from resolution and from the run engine:
 
 - `operation-disabled` — the operation record is disabled.
-- `discipline-integrity-violation` — the resolved discipline set violates the authority hierarchy. Re-validated on **every** call, not only at write time.
+- `discipline-integrity-violation` — the resolved discipline set failed guardrail-integrity validation: a discipline with no live guardrail, or a model-scored guardrail whose scorer operation is missing. Re-validated on **every** call, not only at write time.
 - `model-choice-not-granted` / `model-not-in-allow-list` — a `userSelectedModelRecordId` was passed to an operation that does not grant user model choice, or the model is not in its allow-list.
 - `no-available-model` — the resolved model or its provider is missing, disabled, or has no key (`detail.failed` names which).
 - `no-model-under-acceptable-terms` — the sensitivity gate: the operation handles sensitive content but the model's provider is not under recorded zero-retention terms. Unrecorded terms are refused, not assumed compliant.
-- `preset-missing` / `invalid-operation-schema` — a dangling preset reference, or an operation schema that is not a supported object schema.
+- `invalid-operation-schema` — an operation schema that is not a supported object schema.
 - `prompt-segment-unavailable` — the operation references prompt segments that are missing or disabled (a silently dropped segment would change behaviour with no record).
 - `malformed-framework-record` — the resolved model's prompt framework record is malformed.
 - `model-lacks-image-input` — media was attached but the model's **fetched** capabilities say it does not accept image input. An unknown capability proceeds; only a known-false one refuses.
@@ -112,7 +112,7 @@ if (!aiCore) return;
 
 const { result, feedback, audit } = await aiCore.run(
   'extract-entities',
-  { segments: [{ type: 'task', content: sourceText, origin: 'user-supplied' }] },
+  { segments: [{ type: 'input', content: sourceText, origin: 'user-supplied' }] },
   { userId },
 );
 
@@ -244,10 +244,10 @@ retrieve(
 
 | Parameter | Type | Notes |
 |---|---|---|
-| `operationId` | `string` | Must resolve to a model of kind `embedding`. The operation carries the **grounding dials** (`retrievalBreadth`, `reranking`, `abstentionThreshold`) that configure retrieval — recorded on any operation, they only drive behaviour here. |
+| `operationId` | `string` | Must resolve to a model of kind `embedding`. The operation carries the **grounding dials** (`retrievalBreadth`, `reranking`, `retrievalAbstentionThreshold`) that configure retrieval — recorded on any operation, they only drive behaviour here. |
 | `input.query` | `string` | The natural-language query, embedded and matched against the chunk store. |
 | `input.nodeTypes` / `input.nodeIds` | `string[]` | Restrict the search to certain node types, or to chunks of specific nodes. |
-| `input.minScore` | `number` | A hard relevance floor Structure applies before results return — distinct from `abstentionThreshold`, which judges whether the *whole* retrieval is too weak. |
+| `input.minScore` | `number` | A hard relevance floor Structure applies before results return — distinct from `retrievalAbstentionThreshold`, which judges whether the *whole* retrieval is too weak. |
 | `input.expandGraph` | `boolean` | One-hop expansion over the top nodes' connections, when Structure exposes the primitive. |
 | `input.rerankOperationId` | `string` | The rerank operation used when the `reranking` dial is on. The dial on without one is a named gap, never a silent skip. |
 
@@ -257,7 +257,7 @@ retrieve(
 
 - **`retrievalBreadth`** caps how many chunks are fetched, clamped to a ceiling the store can honour; when the request exceeds it the clamp is named `retrieval-breadth-capped`, and a filled budget is named `retrieval-breadth-saturated` — a truncated result is never presented as the whole set.
 - **`reranking`** (with `input.rerankOperationId`) reorders the hits by a cross-encoder through a nested rerank operation with its own ledger row, inheriting this call's sensitivity.
-- **`abstentionThreshold`** compares the **measured** best similarity: a below-threshold retrieval is flagged `abstained-weak-retrieval` **and still returned** — the caller decides what weak context is worth; it is never silently treated as "no relevant context".
+- **`retrievalAbstentionThreshold`** compares the **measured** best similarity: a below-threshold retrieval is flagged `abstained-weak-retrieval` **and still returned** — the caller decides what weak context is worth; it is never silently treated as "no relevant context". (This is the *retrieval-strength* floor; whether an **answer** is well enough supported is the separate groundedness discipline.)
 
 **Degrade, don't fail** — an unreachable or unprovisioned store, a rerank outage, or a missing graph primitive becomes a named gap in `notFound` (`retrieval-store-unavailable`, `rerank-unavailable`, `graph-expansion-unavailable` / `-degraded`), never a thrown error. A genuine width **mismatch** (the model cannot produce the installed vector width) is still a hard `RefusedError` — a wrong-width query is broken, not weak.
 
@@ -377,7 +377,7 @@ ai?.registerFlowHandler('cog-ingest/dedupe', async (state, previous) => {
 ensureOperation(spec: EnsureOperationSpec): Promise<{ created: boolean; operation: ai_operation }>
 ```
 
-**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` requirements object (`kind`, optional `needsImageInput`, optional `dimensions` for a required embedding width), and the optional operation shape (`description`, `presetId`, `dials`, `disciplineIds`, `segmentKeys`, `schema`, `cache`, `sensitivity`). `cache` is a prompt-caching policy (`{ instructions?, context?, ttl? }`) — a create-time default the admin owns thereafter.
+**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` requirements object (`kind`, optional `needsImageInput`, optional `dimensions` for a required embedding width, optional `multimodal` for image-capable embedding), and the optional operation shape (`description`, `dials`, `segmentKeys`, `systemWide`, `schema`, `cache`, `evalConfig`, `sensitivity`, the declared input contract `inputItems`, and provider-hosted tool opt-ins `toolIds`). `systemWide` folds this operation's segments into every run's prompt. `cache` is a prompt-caching policy (`{ instructions?, context?, ttl? }`) — a create-time default the admin owns thereafter.
 
 **Returns** — `{ created, operation }`. `created` is `false` when the operation already existed (returned untouched) and `true` when it was seeded. The seeded row carries `seeded: true` so its provenance is visible in the admin.
 
@@ -410,7 +410,7 @@ await ai?.ensureOperation({
 ensureSegment(spec: EnsureSegmentSpec): Promise<{ created: boolean; segment: ai_prompt_segment }>
 ```
 
-**Parameters** — an [`EnsureSegmentSpec`](/modules/ai-core/registering-and-seeding/#ensuresegment--ensuresegmentspec): `key` (kebab-case, namespaced with the consumer module id), `type` (`voice` · `approach` · `discipline-text` · `schema-instruction` · `markers-preamble` · `injection-notice`), `name`, and `content`.
+**Parameters** — an [`EnsureSegmentSpec`](/modules/ai-core/registering-and-seeding/#ensuresegment--ensuresegmentspec): `key` (kebab-case, namespaced with the consumer module id), `slotType` (`approaches` · `disciplines` · `objective` · `context` · `examples` · `format` · `edge-cases`), `name`, optional `content` (the segment text; the `approaches` and `disciplines` slots carry their members instead of prose), `contentSource` (`static` · `context`), `injectionRisk`, `marker`, and — for the member slots — `approaches` (an array of `{ key, important? }`) or `disciplines` (an array of `{ id, important? }`).
 
 **Returns** — `{ created, segment }`, with the same `created` semantics as `ensureOperation`. Seeded segments carry `seeded: true`.
 
@@ -419,8 +419,8 @@ The full mechanics of both `ensure*` methods — idempotency, provenance, when t
 ```ts
 await ai?.ensureSegment({
   key: 'cog-ingest/method-extraction',
-  type: 'approach',
-  name: 'Extraction approach',
+  slotType: 'objective',
+  name: 'Extraction objective',
   content: 'Quote the source span before you record a value...',
 });
 ```
@@ -456,7 +456,7 @@ ensureMarker(spec: {
 }): Promise<{ created: boolean; marker: ai_marker }>
 ```
 
-The built-in markers (`source`, `example`, `conversation-history`) seed on install. Markers apply to context items only, never the task. Because a marker is semantic and carries no security meaning, the same `source` marker can wrap a low-risk stored record and a high-risk ingested document — the app flags each item's injection risk independently through `injectionRisk`. An unknown marker on an item degrades to a named gap (`marker-meaning-unavailable`) rather than silently vanishing.
+The built-in markers (`source`, `example`, `conversation-history`) seed on install. Markers apply to any supplied content item — input or context; a marked upload input renders as marked material. Because a marker is semantic and carries no security meaning, the same `source` marker can wrap a low-risk stored record and a high-risk ingested document — the app flags each item's injection risk independently through `injectionRisk`. An unknown marker on an item degrades to a named gap (`marker-meaning-unavailable`) rather than silently vanishing.
 
 ---
 
@@ -536,7 +536,7 @@ Every failure is loud, named and mapped. The base class carries an HTTP `status`
 | `BadRequestError` | 400 | `bad_request` | — | Invalid input — bad body, unknown ids, malformed schema, a rejected parameter. |
 | `NotFoundError` | 404 | `not_found` | — | A referenced record does not exist. |
 | `RefusedError` | 409 | `refused` | `reason: string`, `detail: Record<string, unknown>` | The operation exists but could not run under its declared constraints. Never falls back silently to a compliant-looking alternative. |
-| `IntegrityError` | 422 | `integrity_violation` | — | A write (or a seed) would leave the record graph lying — an authority-hierarchy breach, a hard discipline with no rationale or check, no model for a requirement. |
+| `IntegrityError` | 422 | `integrity_violation` | — | A write (or a seed) would leave the record graph inconsistent — a discipline with no live guardrail, or no enabled model satisfying an operation's requirements. |
 | `UnsupportedModelKindError` | 501 | `unsupported_model_kind` | — | The resolved model's kind has no adapter implementation in this version. |
 | `ProviderUnavailableError` | 503 | `provider_unavailable` | — | The provider has no API key configured or is disabled. |
 | `ProviderCallError` | 502 | `provider_call_failed` | `providerId`, `retryable`, `providerStatus?` | The upstream provider call failed; `retryable` says whether a retry is sensible. |
@@ -559,9 +559,10 @@ interface RunInput {
 }
 
 interface ConsumerSegment {
-  // "task" is the question/instruction; "context" is any supporting material
-  // to work with — material a model examines, never obeys.
-  type: 'task' | 'context';
+  // "input" is the caller's own message (the instruction); "context" is any
+  // supporting material to work with — material a model examines, never obeys.
+  // A document/file upload rides as context (marked, injection-defended).
+  type: 'input' | 'context';
   content: string;
   // SEMANTIC axis: the marker this context item is wrapped in — an admin-defined
   // label (a source, an example, prior conversation) whose meaning is stated
@@ -604,7 +605,10 @@ interface RunOptions {
   signal?: AbortSignal;
   userSelectedModelRecordId?: string;   // only honoured when the operation grants model choice
   maxOutputTokens?: number;             // tighten-only — see below
+  lastMessageAt?: Date;                 // contextual-time anchor: when the previous message was sent
   flowRunId?: string;
+  memory?: string[];                    // caller-supplied Memory context (untrusted; injection-fenced)
+  session?: string[];                   // caller-supplied Session context (untrusted; injection-fenced)
 }
 ```
 
@@ -633,14 +637,16 @@ interface Feedback {
   missing: string[];       // named gaps — what the operation could not do or find
   confidence: number | null;
   threshold: number | null;
+  groundedness: number | null;   // measured external-support score abstention compares against
   coverage: { unit: string; covered: number; total: number | null } | null;
   ref: string | null;      // ledger entry id — the audit reference for this exact call
 }
 ```
 
-- **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `abstained-below-threshold`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `markers-preamble-unavailable`, and so on.
+- **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `abstained-below-groundedness`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `markers-preamble-unavailable`, and so on.
 - **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line). It can also carry a gap that is not itself a `reason` — for example `prompt-cache-unsupported`, named when an operation configured to cache resolves to a provider that cannot honour it (the call runs uncached rather than pretending otherwise).
-- **`confidence` / `threshold`** — reported when known, even when the run passes. `confidence` is read from a top-level `confidence` field on structured output; abstention fires when it falls below `threshold` (the operation's `abstentionThreshold` dial).
+- **`confidence` / `threshold`** — reported when known, even when the run passes. `confidence` is read from a top-level `confidence` field on structured output and **reported for transparency only** — it is the weakest signal (the model grading its own work) and **never drives abstention**. `threshold` is the cutoff the measured groundedness score was compared against, or `null` when no grounding check ran.
+- **`groundedness`** — the **measured** external-support score (in `[0,1]`) from a grounding guardrail: how well the output is supported by its sources, computed outside the model's own say-so. This is the **sole** signal **answer abstention** acts on (reason `abstained-below-groundedness`); `confidence` is reported alongside but never moves the outcome. It is an input to feedback, never a certificate that the output is true. Opt an operation into it by adding the `ai-core/ground-claims` discipline in its Disciplines block.
 - **`coverage`** — `total: null` is itself a statement: no independent count of the whole exists, and inventing one is exactly what the module forbids.
 - **`ref`** — the ledger id for this call. The stored copy carries `ref: null` because the row is its own reference; the copy returned to you gets the id.
 

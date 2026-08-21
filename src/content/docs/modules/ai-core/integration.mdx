@@ -1,7 +1,7 @@
 ---
 title: Integration
 description: The consumer contract, content from outside, feedback, retrieval, and what AI Core does not own
-lastUpdated: 2026-08-07
+lastUpdated: 2026-08-19
 sidebar:
   order: 4
 ---
@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
 This page defines how other modules integrate with AI Core under the redesign: the contract every consumer codes against, how content that arrives from outside the app is handled, how operations report what they could not do, how retrieval grounds an operation, and — just as importantly — the boundary of what AI Core does not own.
 
-<Aside type="note" title="Current as of v1.18.0">
-This page describes AI Core as implemented in module v1.18.0 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers. Retrieval (v1.13.0), guardrail-check execution and groundedness scoring (v1.12.0), the evaluation harness (v1.14.0), markers (v1.15.0) and the taxonomy rework — semantic markers split from a per-item `injectionRisk` flag (v1.18.0) — are all **built**; the semantic cache and a re-embedding migration remain planned — see the [Roadmap](/modules/ai-core/roadmap/).
+<Aside type="note" title="Current as of v1.40.2">
+This page describes AI Core as implemented in module v1.40.2 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers. Retrieval (v1.13.0), guardrail execution and groundedness scoring (v1.12.0), the evaluation harness (v1.14.0), markers (v1.15.0) and the taxonomy rework — semantic markers split from a per-item `injectionRisk` flag (v1.18.0) — are all **built**; the semantic cache and a re-embedding migration remain planned — see the [Roadmap](/modules/ai-core/roadmap/). The prompt model v2 rework (v1.22.0) made approaches and disciplines their own records, and v1.23.0 removed presets entirely — an operation's dials now come straight from the operation. Since then the integration surface this page describes has grown: the operation input contract and its `ai_input_type` catalogue (v1.36.0), provider-hosted **Tools** — web search and fetch the model can call mid-run, opted in per operation — the **Context** builder that folds retrieval into an internally-assembled context slot (v1.29.0), and the module-level zero-retention override (`ai_policy`, v1.39.0–v1.40.0).
 </Aside>
 
 ---
@@ -37,10 +37,10 @@ This page describes AI Core as implemented in module v1.18.0 (August 2026). The 
 |---------------------|-----------|
 | Reach AI Core | `serviceRegistry.getOptional('ai-core')` |
 | Run a job | `aiCore.run(operationName, input, { userId })` — see [Usage](/modules/ai-core/usage/) |
-| Supply context | A context segment on the call, or per-operation retrieval via `aiCore.retrieve()` (v1.13.0) ([Service API](/modules/ai-core/service-api/#retrieve)) |
+| Supply context | A context segment on the call, per-operation retrieval via `aiCore.retrieve()` (v1.13.0), or a **Context builder** on the operation that AI Core assembles internally from text/retrieval/segment/memory/session blocks — the consumer supplies memory/session material via `RunOptions` ([Service API](/modules/ai-core/service-api/#retrieve)) |
 | Handle shortfalls | The structured `feedback` field on every return |
 | Declare content origin | Origin and verification state on every segment |
-| Extend the libraries | Consumers register their own operations, prompts, and disciplines |
+| Extend the libraries | Consumers seed their own operations, prompt segments, markers, and eval cases |
 
 ---
 
@@ -51,7 +51,7 @@ The whole public surface is one line:
 ```ts
 const { result, feedback, audit } = await aiCore.run(
   'extract-entities',
-  { segments: [{ type: 'task', content: '...' }] },
+  { segments: [{ type: 'input', content: '...' }] },
   { userId },
 );
 ```
@@ -85,7 +85,7 @@ Consumers see AI Core's surface and never `@anthropic-ai/sdk` — or any other p
 
 ### The context slot
 
-The context slot is the consumer's, unless retrieval fills it. A consumer that already knows exactly which content is relevant passes it as a context segment. A consumer that does not configures the operation to go and find it — see [Retrieval](#retrieval) below. Either way, the slot is filled deliberately, never both ways at once by accident.
+The context slot is the consumer's, unless retrieval or a Context builder fills it. A consumer that already knows exactly which content is relevant passes it as a context segment. A consumer that does not configures the operation to go and find it — see [Retrieval](#retrieval) below — or gives the operation a **Context builder**, which AI Core runs internally to assemble the slot from text, retrieval, segment, memory and session blocks; the consumer supplies the memory and session material via `RunOptions.memory` / `RunOptions.session`. Either way, the slot is filled deliberately, never both ways at once by accident.
 
 ### Consumers own their domain
 
@@ -170,6 +170,7 @@ Everything above lowers the odds. This part does not depend on the model coopera
 
 - **Every output is schema-validated.** Free-form output from an operation processing external content is a defect.
 - **Operations declare what they may reach.** An operation processing external content should not also hold the ability to change external state. Where both are needed, they are two operations with a human or a check between them.
+- **Egress tools are gated by sensitivity.** An operation can be opted into a provider-hosted tool — web search or fetch the model calls mid-run — but AI Core refuses an egress tool on a **sensitive** operation at resolution time, so external content is never paired with a channel that sends it back out.
 
 This is the separation principle in its purest form: **prose asks; code holds.**
 
@@ -181,7 +182,8 @@ This is the separation principle in its purest form: **prose asks; code holds.**
 | Marking and structural separation | AI Core |
 | Schema validation | AI Core |
 | Injection-detection hooks | AI Core |
-| Capability gating on tool use | The consuming pipeline |
+| Egress gate on tool use — refusing an egress tool (e.g. web search) on a sensitive operation | AI Core |
+| Opting an operation into a provider-hosted tool | The consumer / admin |
 | Splitting operations so external input and privileged action never share one call | The consuming pipeline |
 | Human verification of anything consequential | The consuming pipeline |
 
@@ -199,7 +201,7 @@ Instructions in the prompt telling the model to ignore injected instructions. De
 {
   result: { … },
   feedback: {
-    reason, missing, confidence, threshold, coverage, ref
+    reason, missing, confidence, threshold, groundedness, coverage, ref
   }
 }
 ```
@@ -233,7 +235,7 @@ AI Core never owns the data, the graph, or the columns; it reaches them through 
 
 ### Configured per operation, through the grounding dials
 
-An operation that needs context declares it. The grounding dials — retrieval breadth, reranking, abstention threshold — resolve how much is fetched, in what order, and what happens when nothing good comes back. Dials and presets are covered in [Configuration](/modules/ai-core/configuration/).
+An operation that needs context declares it. The grounding dials — retrieval breadth, reranking, retrieval abstention threshold — resolve how much is fetched, in what order, and what happens when nothing good comes back. (Whether an *answer* is well enough supported is a separate decision — the groundedness discipline, not a dial.) Dials are covered in [Configuration](/modules/ai-core/configuration/).
 
 ### Retrieval reports what it didn't find
 

@@ -35,7 +35,7 @@ When embeddings are enabled, the install adds:
 
 ### The `structureEmbeddings` service
 
-The service is generated only on embeddings-enabled installs and registered in the `serviceRegistry` as **`structureEmbeddings`**. It is an **in-process API only — there are no HTTP routes** for embeddings or search. This is deliberate: frontends have no embedder, so every caller must supply vectors (the engine embeds text, Structure stores and searches).
+The service is generated only on embeddings-enabled installs and registered in the `serviceRegistry` as **`structureEmbeddings`**. It is an **in-process API** — the write path and the search methods have **no HTTP routes**. This is deliberate: frontends have no embedder, so every caller must supply vectors (the engine embeds text, Structure stores and searches). The one exception is **`POST /api/v1/structure/similarity`** (session-authed, body `{ nodeA, nodeB }` → `{ similarity: number | null }`), a thin `structureService.semanticSimilarity` wrapper over `nodeSimilarity` that powers the formula field's `semanticSimilarity(a, b)` and returns `null` on installs without embeddings.
 
 ```typescript
 interface StructureEmbeddingsService {
@@ -86,10 +86,13 @@ interface StructureEmbeddingsService {
 }
 
 interface SemanticSearchOptions {
-  topK?: number;        // default 20, max 200
-  minScore?: number;    // default 0.5; score = 1 - cosine distance
-  nodeTypes?: string[]; // filter by node type slugs
-  status?: string[];    // default ['active']
+  topK?: number;               // default 20, max 200
+  minScore?: number;           // default 0.5; score = 1 - cosine distance
+  nodeTypes?: string[];        // filter by node type slugs
+  status?: string[];           // default ['active']
+  // Consumer contract — see "Read enforcement for retrieval consumers" below
+  scopeRootId?: string;        // confine to the space with this rootNodeId (rows with a null rootNodeId are excluded)
+  excludeNodeTypes?: string[]; // node types the end user may not read — the caller supplies them
 }
 
 interface FindSimilarOptions extends SemanticSearchOptions {
@@ -107,9 +110,9 @@ Method semantics:
 
 - **`setNodeEmbedding`** validates the vector dimension and that every value is finite, and rejects a blank `embeddingText` or an `embeddingModel` that is missing or longer than 100 characters (both `BadRequestError`). It writes via a parameterised raw `UPDATE`, throws `NotFoundError` when the node doesn't exist, and fires `structure.node.embeddingUpdated`.
 - **`clearNodeEmbedding`** nulls all three columns and fires the same hook with `embeddingModel: null`.
-- **`listNodesNeedingEmbedding`** returns active nodes with `embeddingModel IS NULL`, oldest first (`limit` defaults to 100, max 500). When `nodeTypes` is omitted, it resolves the node types whose `features.cognitiveIngest.enabled` is `true` — see [features.cognitiveIngest](#featurescognitiveingest).
+- **`listNodesNeedingEmbedding`** returns active nodes with `embeddingModel IS NULL`, oldest first (`limit` defaults to 100, max 500). When `nodeTypes` is omitted, it resolves the **enabled** node types whose *effective* `features.cognitiveIngest.enabled` is `true` — the flag is resolved through the type hierarchy, so a subtype of a cognitive-enabled type is included without restating it (a disabled ancestor still contributes inherited config, but is never itself a candidate) — see [features.cognitiveIngest](#featurescognitiveingest).
 - **`semanticSearchNodes`** requires `userId` scoping, uses the cosine operator (`<=>`), over-fetches 2× `topK` and tunes `hnsw.ef_search` per query (shared-table recall), then converts distance to score and applies `minScore`.
-- **`findSimilarNodes`** joins target against source inside the database, so the stored vector is never round-tripped. Throws `NotFoundError` if the node doesn't exist; returns `[]` if it has no embedding yet.
+- **`findSimilarNodes`** joins target against source inside the database, so the stored vector is never round-tripped. Throws `NotFoundError` if the node doesn't exist; returns `[]` if it has no embedding yet, and `[]` outright when the **source** node's own type is listed in `excludeNodeTypes` — a read-restricted node never leaks its existence through its neighbourhood.
 - **`nodeSimilarity`** returns the cosine similarity in `[0,1]` between two owned nodes' embeddings, computed in-DB like `findSimilarNodes` (the vectors never leave the database). Returns `null` when either node is missing, not owned by `userId`, or has no embedding yet, and `1` when both ids are the same. It powers the formula field's `semanticSimilarity(a, b)` function — see [Formula fields](/modules/structure/fields/).
 
 ### Discovery
@@ -138,6 +141,71 @@ if (embeddings) {
   const results = await embeddings.semanticSearchNodes(userId, queryVector, { topK: 10 });
 }
 ```
+
+### Read enforcement for retrieval consumers
+
+The retrieval methods on `structureEmbeddings` — and `structureService.expandGraph` — are **`serviceRegistry`-only (system-tier)**: they trust their caller and deliberately do *not* resolve the end user's permissions themselves. A consumer that serves results to a person (cog-ingest, ai-core, any RAG arm) must therefore pass two things on **every** retrieval call:
+
+- **`excludeNodeTypes`** — the node types the end user may not read. Resolve them with `structureService.getUnreadableTypes(userId, { isAdmin, isSystem })`, which returns the slugs whose per-type `read` permission is `admin` or `system` (and `[]` for an admin or system caller). Listed types are dropped from results with a SQL `"nodeType" NOT IN (…)`.
+- **`scopeRootId`** — the root node id of the active enforced space, when the account has enforced spaces configured. The consumer resolves and validates the space; Structure only applies the filter. Rows with a `null` `rootNodeId` are excluded whenever it is set.
+
+```typescript
+// Serving retrieval results to an end user? Resolve their read-restricted types first.
+const unreadable = await structureService.getUnreadableTypes(endUserId, { isAdmin, isSystem });
+
+const hits = await embeddings.semanticSearchNodes(endUserId, queryVector, {
+  topK: 10,
+  excludeNodeTypes: unreadable, // omit or [] for no exclusion
+  scopeRootId,                  // omit for no space confinement
+});
+```
+
+Both options are accepted by `semanticSearchNodes`, `findSimilarNodes`, `semanticSearchChunks`, `lexicalSearchChunks`, `hybridSearchNodes` and `hybridSearchChunks`; `expandGraph` takes `excludeNodeTypes` (its space anchoring is automatic — see [Graph expansion](#graph-expansion)). `structureService.searchNodes` is the exception: it is a user-facing method, so it resolves the read gate itself and takes `isAdmin` / `isSystem` instead.
+
+<Aside type="caution">
+Omitting `excludeNodeTypes` is **not** a safe default — it means *no* exclusion. A retrieval arm that forgets it will surface read-restricted nodes to users who cannot open them.
+</Aside>
+
+### Shared node types in retrieval
+
+A node type whose config carries **`primaryScope.global: true`** is **read-shared**: every user reads the same rows for it, whoever created them. It is a deliberate widening of the ownership predicate that every retrieval method applies, so a consumer's recall changes the moment an admin flags a type. The toggle, its guards, and the write rules live on [Configuration](/modules/structure/configuration/) and [Usage](/modules/structure/usage/); what follows is only what a retrieval arm has to reason about.
+
+Exactly two filters relax:
+
+| Filter | Ordinary type | Shared type |
+|--------|---------------|-------------|
+| Ownership (`userId`) | The caller's rows only | Every user's rows of that type |
+| Enforced-space confinement (`scopeRootId`) | Rows outside the space are dropped | **Exempt** — a shared node belongs to every space |
+
+Nothing else moves. `excludeNodeTypes` still applies (a shared type named there is dropped like any other), `status` still applies, and the widening is keyed on the **node type**, never on the row — another user's rows of an ordinary type stay invisible, so a shared node is never a back door into a private one. With no type flagged shared, every predicate is byte-identical to the plain `userId` equality it replaced: no `OR` clause, no extra round trip, no behaviour change at all.
+
+**Where the space exemption lands.** `scopeRootId` compiles to `("rootNodeId" = $n OR "nodeType" IN (…shared…))` on `semanticSearchNodes`, `findSimilarNodes`, `hybridSearchNodes`, and on the joined source node of `semanticSearchChunks`, `lexicalSearchChunks` and `hybridSearchChunks`. The two methods that resolve the space themselves degrade rather than empty out: `structureService.searchNodes` returns **shared rows only** where it would previously have returned `[]` (no valid active space), and `expandGraph` never anchors on a shared seed — with *every* seed shared it falls back to the user's persisted active space, and to shared-only when there is no valid one.
+
+**The non-owner view.** A row the caller does not own is sanitised before it leaves the service, on every surface — node detail, list, tree, children, descendants, connection endpoints, and every semantic, lexical and hybrid result:
+
+| Field | What a non-owner gets |
+|-------|----------------------|
+| Secret-typed values in `data` | **Key absent.** Sealed envelopes and any value under a declared `secret` field id are removed, not blanked |
+| `embeddingText` | `null` |
+| `settings`, `metadata` | `{}` |
+| `isFavorite` | `false` |
+
+`embeddingText` is the one a retrieval consumer feels. It is the exact text that was embedded, built **from** the node's fields with secrets included and rendered nowhere, so it goes wholesale even though `data` is only filtered key by key. A consumer that re-embeds or runs staleness checks off `embeddingText` sees `null` on every node it does not own — only the creator's own ingest run can refresh it.
+
+**Chunks of a shared node.** Chunk readability follows the **source node's** type, so a chunk of a shared node is readable by every user. But a chunk's `content` is prose: it cannot be filtered key by key the way `data` can, and a secret's plaintext may sit inside it. The rule is therefore coarser than the node rule — for a non-owner's chunk:
+
+- **`metadata` is blanked** (`{}`), exactly as on a node row.
+- **The whole chunk is omitted** when the source node's type declares **any** secret field. Not redacted, not truncated — dropped from the result set.
+
+<Aside type="caution" title="Chunk omission fails closed">
+Both unknowns omit. A chunk whose **source type cannot be resolved** is dropped, and a shared type whose **field definitions will not resolve** is recorded as secret-bearing, so its chunks are dropped too. The rule only engages once some shared type declares a secret field — with none declared anywhere there is nothing to protect and chunks are served (with `metadata` still blanked). A retrieval arm should therefore expect **fewer chunk hits than node hits** for a shared, secret-bearing type, and must not read an empty chunk result as "this node has no spans".
+</Aside>
+
+**Write paths never widen.** `setNodeEmbedding`, `clearNodeEmbedding`, `replaceNodeChunks`, `setChunkEmbedding` and `deleteNodeChunks` keep their strict owner predicates, and so do the backfill queries — `listNodesNeedingEmbedding` and `listChunksNeedingEmbedding` return the caller's own rows only. An ingest job running as one user therefore never embeds or re-chunks another user's rows of a shared type: each shared node is embedded once, by its creator, and read by everyone. `nodeSimilarity` and `findSimilarNodes` accept a shared node as their source, so similarity still works across the boundary the write path does not cross.
+
+<Aside type="note" title="Telling an owned row from a shared one">
+`StructureNode.userId` is projected by every retrieval method, so a consumer distinguishes the two with `node.userId !== callerId` — no extra lookup. Newly sharing a type is additive and reaches other processes within a **15-second** per-process config cache window (un-sharing is refused outright while another user holds a live node of the type, so a reader is never stranded mid-window).
+</Aside>
 
 ### Opting in later
 
@@ -201,11 +269,13 @@ interface StructureEmbeddingsService {
 }
 
 interface ChunkSearchOptions {
-  topK?: number;        // default 20, max 200
-  minScore?: number;    // default 0.5; score = 1 - cosine distance
-  nodeIds?: string[];   // restrict to chunks of these source nodes
-  nodeTypes?: string[]; // restrict to chunks whose source node is one of these types
-  status?: string[];    // source-node status filter (default ['active'])
+  topK?: number;               // default 20, max 200
+  minScore?: number;           // default 0.5; score = 1 - cosine distance
+  nodeIds?: string[];          // restrict to chunks of these source nodes
+  nodeTypes?: string[];        // restrict to chunks whose source node is one of these types
+  status?: string[];           // source-node status filter (default ['active'])
+  scopeRootId?: string;        // confine to the space with this rootNodeId (matched on the source node)
+  excludeNodeTypes?: string[]; // source-node types the end user may not read
 }
 
 interface ChunkSearchResult {
@@ -227,6 +297,7 @@ Method semantics:
 
 - **No database cascade.** `nodeId` is a plain FK. A node's `deleteNode` is a *soft* delete (`status: 'deleted'`), and chunk search filters the parent node's status — so a soft-deleted (or archived) node's chunks simply stop surfacing, and `restoreNode` brings them back. Re-chunking is `replaceNodeChunks` (delete + insert). Chunks are hard-removed only at **account erasure**, via the `structure.chunks` deletion handler (generated only on embeddings-enabled installs).
 - **Runtime self-heal.** `ensureInfrastructure()` also creates the chunk HNSW index, so the same lazy, idempotent repair covers chunk search.
+- **Shared source nodes.** Chunk readability follows the source node's type, so the chunks of a node whose type is shared are readable by every user — with the creator's `metadata` blanked, and the chunk omitted outright when that type declares any secret field. See [Shared node types in retrieval](#shared-node-types-in-retrieval).
 
 ## Lexical & hybrid search
 
@@ -244,11 +315,16 @@ structureService.searchNodes(
     topK?: number;        // default 20, max 200
     nodeTypes?: string[]; // filter by node type slugs
     status?: string[];    // default ['active']
+    scopeRootId?: string; // confine to one enforced space (its root node id)
+    isAdmin?: boolean;    // admin caller — read-restricted types are not filtered out
+    isSystem?: boolean;   // trusted system caller — bypasses the read gate and space resolution
   }
 ): Promise<{ node: StructureNode; score: number }[]>;
 ```
 
-It **auto-indexes** `name` + `description` + **every string value in the node `data` JSON** (via `jsonb_to_tsvector`) into a **trigger-maintained `structure_node.searchVector` tsvector column**, served by a **GIN** index. Queries run `websearch_to_tsquery` and rank by **`ts_rank_cd`** — `score` is the raw `ts_rank_cd` (higher is better, unbounded — **not** a 0..1 similarity like the cosine `score`). A blank query returns `[]`. There is no per-type configuration knob: a database trigger maintains the column on every insert/update, so keyword search works out of the box across name, description, and custom-field content.
+It **auto-indexes** `name` + `description` + **every string value in the node `data` JSON** (via `jsonb_to_tsvector`) into a **trigger-maintained `structure_node.searchVector` tsvector column**, served by a **GIN** index. Queries run `websearch_to_tsquery` and rank by **Lakebase BM25** (`<@>` / `to_bm25query`) when the `lakebase_bm25` index is available, otherwise **`ts_rank_cd`** — either way `score` is higher-is-better and unbounded (**not** a 0..1 similarity like the cosine `score`). A blank query returns `[]`. There is no per-type configuration knob: a database trigger maintains the column on every insert/update, so keyword search works out of the box across name, description, and custom-field content.
+
+**Server-side gates.** When the account has enforced spaces configured, `searchNodes` confines results to the active space and returns `[]` when no space can be resolved (fail-closed); pass `scopeRootId` to name the space explicitly, or `isSystem` for a trusted caller that should bypass it. For callers that are neither admin nor system it also excludes node types the user may not read — unlike the `structureEmbeddings` methods, `searchNodes` resolves that gate itself, so a caller never passes `excludeNodeTypes` here.
 
 This is the **ranked upgrade** of the `listNodes` `search` substring filter, and it is what `getCognitiveCapabilities().lexical.enabled` (now always `true`) reports.
 
@@ -283,19 +359,23 @@ interface StructureEmbeddingsService {
 }
 
 interface ChunkLexicalOptions {
-  topK?: number;        // default 20, max 200
-  nodeIds?: string[];   // restrict to spans of these source nodes
-  nodeTypes?: string[]; // restrict to chunks whose source node is one of these types
-  status?: string[];    // source-node status filter (default ['active'])
+  topK?: number;               // default 20, max 200
+  nodeIds?: string[];          // restrict to spans of these source nodes
+  nodeTypes?: string[];        // restrict to chunks whose source node is one of these types
+  status?: string[];           // source-node status filter (default ['active'])
+  scopeRootId?: string;        // confine to the space with this rootNodeId (matched on the source node)
+  excludeNodeTypes?: string[]; // source-node types the end user may not read
 }
 
 interface HybridSearchOptions {
-  topK?: number;           // default 20, max 200
-  rrfK?: number;           // RRF constant k (default 60); larger flattens each rank's contribution
-  lexicalWeight?: number;  // weight on the lexical arm (default 1)
-  semanticWeight?: number; // weight on the semantic arm (default 1)
+  topK?: number;               // default 20, max 200
+  rrfK?: number;               // RRF constant k (default 60, clamped 1..1000); larger flattens each rank's contribution
+  lexicalWeight?: number;      // weight on the lexical arm (default 1)
+  semanticWeight?: number;     // weight on the semantic arm (default 1)
   nodeTypes?: string[];
-  status?: string[];       // default ['active']
+  status?: string[];           // default ['active']
+  scopeRootId?: string;        // confine to the space with this rootNodeId
+  excludeNodeTypes?: string[]; // node types the end user may not read
 }
 
 interface ChunkLexicalResult { chunk: StructureChunk; nodeId: string; score: number; } // score = BM25 or ts_rank_cd (higher is better; not 0..1)
@@ -312,7 +392,7 @@ interface HybridSearchResult  { node: StructureNode; score: number; }           
 score = Σ_arm  weight_arm / (rrfK + rank_arm)
 ```
 
-Each arm over-fetches 3× `topK`; a node that surfaces in only one arm contributes `0` from the other. `lexicalWeight` / `semanticWeight` bias the mix (both default `1`), and `rrfK` (default `60`) flattens how much each rank position contributes. A blank query drops the lexical arm and the result is the pure semantic ranking.
+Each arm over-fetches 3× `topK`; a node that surfaces in only one arm contributes `0` from the other. `lexicalWeight` / `semanticWeight` bias the mix (both default `1`), and `rrfK` (default `60`, clamped to `1..1000`) flattens how much each rank position contributes. A blank query drops the lexical arm and the result is the pure semantic ranking.
 
 **Filtered-search hygiene (v1.33.6).** Every arm is always `userId`-scoped (plus optional status/type filters), so filtered queries get the treatment they need. On the **semantic arm**, when pgvector ≥ 0.8 the vector queries set `hnsw.iterative_scan = strict_order` — the HNSW scan keeps going until the filtered `LIMIT` is filled instead of post-filtering a fixed candidate set — while keeping the 3× over-fetch; `lakebase_ann` has no iterative-scan equivalent and relies on the over-fetch + `ef_search` tuning. On the **keyword arm**, BM25 queries set `lakebase_bm25.prefilter = on` so the strict `WHERE` filters run inside the bm25 scan rather than after top-K. Both are `SET LOCAL` (transaction-scoped), feature-detected, and no-ops off Lakebase / pre-0.8 pgvector.
 
@@ -335,6 +415,7 @@ const reached = await structureService.expandGraph(userId, seedIds, {
   origin: 'discovered',             // only traverse edges with this data.origin
   connectionTypes: ['relates-to'],  // only traverse these connection type slugs
   limit: 500,                       // cap on returned neighbours (default 500, max 5000)
+  excludeNodeTypes: unreadable,     // reached nodes of these types are dropped
 });
 // → [{ nodeId: string, hopDistance: number }, …]  (ordered by hopDistance; seeds excluded)
 ```
@@ -345,6 +426,9 @@ Behaviour:
 - **`userId`-scoped, one recursive CTE.** The whole neighbourhood is a single parameterised recursive query; every caller value is bound.
 - **Minimum hop distance.** A node reachable by several paths reports its shortest. Seeds are excluded from the results, and only **active, owned** nodes come back.
 - **Filters.** `origin` and `connectionTypes` choose which edges are walked; `status` picks which connection rows count (active only by default — pass `pending` to traverse unpromoted discovered edges).
+- **Scope-anchored.** When the account has enforced spaces configured, traversal is confined to the space the seeds sit in — the anchor is the first seed carrying a `rootNodeId`, and the confinement applies only when that root is an enforced one. There is no caller option; it is automatic.
+- **Read-gated on request.** `excludeNodeTypes` — resolved by the consumer via `structureService.getUnreadableTypes`, see [Read enforcement for retrieval consumers](#read-enforcement-for-retrieval-consumers) — filters the *reached* nodes only: traversal still passes *through* an excluded node, it just never surfaces.
+- **Shared types cross owners; edges never do.** A reached node of a shared type surfaces whoever created it, and is exempt from the space anchor above — but traversal always runs over the caller's **own** connections, so a shared node is reachable only through an edge the caller owns. A shared seed never anchors the traversal. See [Shared node types in retrieval](#shared-node-types-in-retrieval).
 - **Strictly a query primitive.** Orchestration, reranking, and budgets live upstream (cog-ingest / the engine). Graph distance is a **structural** relevance signal — never a temporal one.
 
 ## Bi-temporal (`observedAt`)
@@ -471,16 +555,20 @@ The v1.32.0 `cognitiveIngest.textTemplate` option (and the `searchText` column b
 
 ## New action hooks
 
-Six hooks join the [Structure action hooks](/modules/structure/integration/#reacting-to-structure-events-action-hooks):
+Eight hooks join the [Structure action hooks](/modules/structure/integration/#reacting-to-structure-events-action-hooks):
 
 | Hook | Context | Fires when |
 |------|---------|------------|
 | `structure.connection.proposed` | `{ userId, connection }` | A connection is created with status `pending` |
 | `structure.connection.promoted` | `{ userId, connection }` | A pending connection is promoted to active |
 | `structure.node.embeddingUpdated` | `{ userId, nodeId, embeddingModel }` | An embedding is set — or cleared (`embeddingModel: null`) |
+| `structure.node.chunksReplaced` | `{ userId, nodeId, count }` | A node's chunk set is replaced by `replaceNodeChunks` |
+| `structure.chunk.embeddingUpdated` | `{ userId, chunkId, embeddingModel }` | A chunk embedding is stored by `setChunkEmbedding` |
 | `structure.nodeType.proposed` | `{ userId, proposal }` | A node type is proposed |
 | `structure.nodeType.proposalApproved` | `{ userId, nodeType, scope }` | A proposal is approved (the type is live) |
 | `structure.nodeType.proposalRejected` | `{ userId, slug, config, meta }` | A proposal is rejected — carries the full proposed config |
+
+The three embeddings hooks — `structure.node.embeddingUpdated`, `structure.node.chunksReplaced` and `structure.chunk.embeddingUpdated` — are declared only on embeddings-enabled installs; the other five are always registered.
 
 <Aside type="note" title="Amended semantics: created means went live">
 `structure.connection.created` and `structure.nodeType.created` now mean **"went live"** — they fire when something is created directly as active, *or* at promotion/approval. Listeners never hear `created` for a pending row, so existing listeners keep working unchanged.

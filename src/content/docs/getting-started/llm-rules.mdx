@@ -1,15 +1,15 @@
 ---
 title: LLM Rules
 description: Authoritative rules for AI assistants working with the Module System
-lastUpdated: 2026-07-19
+lastUpdated: 2026-08-19
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 These rules apply across the **entire Module System**: starter template, module starter, and individual modules. All `CLAUDE.md` files should reference this document.
 
 <Aside type="note" title="Product & isolation model">
-The system builds **single-tenant** SaaS apps — one owner per app (an individual or a solo/small business), with **no team/organisation features and no per-seat billing** (permanently out of scope). Each owner's isolated area is their **space**, created automatically 1:1 with the user — never call it a "workspace", and never surface "tenant" (the internal isolation-key name) to users. Isolation is delegated to Neon and keyed on a per-owner column — declared as `tenantId` in module security manifests — and each user maps 1:1 to their own space. **Read the [Product model](/getting-started/product-model/) before building any account/tenant feature.** See also [Security Feature](/starter-template/security-feature/).
+The system builds **single-tenant** SaaS apps — one owner per app (an individual or a solo/small business), with **no team/organisation features and no per-seat billing** (permanently out of scope). Each owner's isolated area is their **space**, created automatically 1:1 with the user — never call it a "workspace", and never surface "tenant" (the internal isolation-key name) to users. Isolation is delegated to Neon and keyed on a per-owner column, and each user maps 1:1 to their own space. **Both module shapes are legitimate:** a module whose tables are all `userId`-keyed registers `ownedModels: []` in its security manifest and needs no isolation column — that is the default. Adopting Neon RLS is an explicit opt-in: add `tenantId String` (+ `@@index([tenantId])`) to the model and list it in `ownedModels`. Note that `tenantId` is *also* the key-derivation context argument to `encryptField`/`decryptField`, where a userId-keyed module passes its `userId` — that use is unrelated to RLS. **Read the [Product model](/getting-started/product-model/) before building any account/tenant feature.** See also [Security Feature](/starter-template/security-feature/).
 </Aside>
 
 ---
@@ -82,12 +82,34 @@ navigationRegistry.registerMain({
 | `styleRegistry` | Runtime CSS + shadcn components.json contributions | Frontend |
 | `filterRegistry` | Data transformation hooks | Both |
 | `actionRegistry` | Side effect hooks | Both |
+| `moduleRegistry` | Runtime module manifest (id, name, version, depends) | Backend |
 
 → See [Registry Reference](/starter-template/registries/) for complete API documentation.
 
 → See [Base Registry](/starter-template/base-registry/) for creating custom registries.
 
 → See [Filter & Action Hooks](/starter-template/hooks/) for the hook system.
+
+`moduleRegistry` is available from starter v1.48.0. Register with it through a guarded dynamic `import('../modules/index.js')` inside a `try`/`catch`, so the module degrades to a silent no-op on an older host instead of crashing boot.
+
+### Modules May Define Their Own Registries
+
+A module that offers extension points to *other* modules defines them exactly the way the starter does:
+
+```typescript
+import { BaseRegistry, createRegistryHook } from '@/config/base.registry';
+
+class NodeTabRegistry extends BaseRegistry<NodeTabRegistration> {}
+export const nodeTabRegistry = new NodeTabRegistry();
+export const useNodeTabRegistry = createRegistryHook(nodeTabRegistry);
+```
+
+Rules:
+
+- **Extend `BaseRegistry<T>`** — never hand-roll a bare `Map`. You lose ordering, duplicate-id detection, and the subscription that drives re-render.
+- **Every registration carries `moduleId` and an `order`** on the unified 0-100 scale.
+- **Expose a `useXRegistry` hook** via `createRegistryHook` so React consumers re-render when a module registers late.
+- **Registries live in `config/*.registry.ts`**; re-export the registry itself (not the hook alone) from the feature barrel.
 
 ### Self-Registration Pattern
 
@@ -182,12 +204,18 @@ src/module.ts                # Module definition
 Any file affecting generated output
 ```
 
-Commands:
+Commands — a cloned module ships **two** bump scripts. Both rewrite the version in `package.json` **and** `src/module.ts`; the only difference is that `release:*` also creates a git tag:
 ```bash
-npm run release:patch   # The default — almost everything
-npm run release:minor   # Rare — a new subsystem / registry (or headline release)
-npm run release:major   # A deliberate epoch / post-launch breaking migration
+# Routine template work — bump + commit, no tag
+npm run version:patch|minor|major
+
+# A published release — bump + commit + git tag
+npm run release:patch|minor|major
 ```
+
+<Aside type="caution">
+  Neither script rebuilds `dist/`. The module's `bin` and any `npm link`ed host run the **built** output, so always run `npm run build` **after** the bump, before testing or publishing.
+</Aside>
   </TabItem>
 </Tabs>
 
@@ -219,7 +247,9 @@ import { prisma } from '../../lib/prisma';
 
 ### 5. File Headers
 
-Every new file needs a three-field header:
+Every new file needs a header. There are **two lanes**.
+
+**Core / starter-template files** use the three-field header:
 
 ```typescript
 // ========================================================================
@@ -229,7 +259,16 @@ Every new file needs a three-field header:
 // ========================================================================
 ```
 
-`PURPOSE` is a short one-liner; `DESCRIPTION` is the fuller explanation (often spanning several wrapped comment lines, aligned under the first word).
+**Module template files** use the two-field header — `DESCRIPTION` is optional, reserved for the handful of templates whose behaviour needs a paragraph of context:
+
+```typescript
+// ========================================================================
+// FILE: backend/src/features/my-feature/index.ts
+// PURPOSE: Public exports and registry integrations for MyFeature module
+// ========================================================================
+```
+
+`PURPOSE` is a short one-liner; `DESCRIPTION` is the fuller explanation (often spanning several wrapped comment lines, aligned under the first word). During install/update the scaffold prepends its own `// @generated-by: <id> v<version> | hash: <hash>` line above this block — don't write that line by hand.
 
 ### 6. Deprecate Before Removing Public Exports
 
@@ -308,11 +347,12 @@ If you can't shim (e.g. the old API returns `Promise<T>`, the new one is sync), 
 A starter template has one audience: every downstream app, each with its own brand, palette, typography scale, and density preferences. If the template bakes in design decisions — "headings are 1.25rem, badges are green-600, cards get shadow-md" — every downstream app has to fight those decisions or accept a template that doesn't match their design system. That's the opposite of the template's value proposition.
 
 <Aside type="note" title="This rule binds modules too">
-**Module code is in scope**, for the same reason: a module ships to many apps, so a hardcoded `text-2xl font-bold` fights every design system it lands in. Module UI lands under `frontend/src/features/<module>/` — inside the boundary below. The three typography lanes for module (and template) code:
+**Module code is in scope**, for the same reason: a module ships to many apps, so a hardcoded `text-2xl font-bold` fights every design system it lands in. Module UI lands under `frontend/src/features/<module>/` — inside the boundary below. The typography lanes for module (and template) code:
 
-1. **Prose** — markdown, streamed/ingested content, chat → `typeset` + a preset on the container; values live in the app-owned `typeset.css`.
-2. **Component-level emphasis** — a stat value, a wordmark → `data-slot` + a Style Registry entry. [Typeset is explicitly **not** for component styling](https://ui.shadcn.com/docs/typeset); the starter's `foundation.slots` already styles `widget-stat-value` and `plan-name`, deriving scale from the typeset contract.
-3. **Everything else** — delete the class. `text-sm text-muted-foreground` → `text-muted-foreground`: keep the semantic colour, drop the scale.
+1. **Inside a shadcn primitive** — a `CardTitle`, `DialogTitle`, `Label`, `Badge`, `TableHead` → use the primitive; it already carries the theme's type voice. Never restyle its text.
+2. **Standalone headings / labels / captions** (no shadcn primitive) — page titles, section headings, eyebrows → the `<Heading>` / `<Text>` primitives from `@/components/typography` (v2.6.0). Values live in the foundation typography roles, scaled to the app's shadcn tokens. Never a bare `<h1>` (Preflight resets it to body type) or `text-2xl font-semibold`.
+3. **Prose** — markdown, streamed/ingested content, chat → `typeset` + a preset on the container; values live in the app-owned `typeset.css`.
+4. **Component-level emphasis on a bespoke element** — a stat value, a wordmark → `data-slot` + a Style Registry entry. [Typeset is explicitly **not** for component styling](https://ui.shadcn.com/docs/typeset); the starter's `foundation.slots` already styles `widget-stat-value` and `plan-name`.
 </Aside>
 
 The rule:
@@ -328,7 +368,7 @@ The rule:
 
 **Template code must NOT use:**
 
-- **Typography scale** — `text-xs`, `text-sm`, `text-base`, `text-lg`, `text-xl`, `text-2xl+`. Typography sizing is a design decision; the user's `globals.css`, shadcn's base `body` rules, and (since v1.60.0) the app-owned **`typeset.css`** handle scale globally. Template/module markup may add the semantic **shadcn Typeset** classes — `typeset`, presets like `typeset-docs`, and `not-typeset` — on prose/markdown/streamed-content containers; the values always live in `typeset.css` (regenerate via https://ui.shadcn.com/typeset).
+- **Typography scale** — `text-xs`, `text-sm`, `text-base`, `text-lg`, `text-xl`, `text-2xl+`. Typography sizing is a design decision; the user's `globals.css`, shadcn's base `body` rules, and (since v1.60.0) the app-owned **`typeset.css`** handle scale globally. Template/module markup may add the semantic **shadcn Typeset** classes — `typeset`, presets like `typeset-docs`, and `not-typeset` — on prose/markdown/streamed-content containers; the values always live in `typeset.css` (regenerate via https://ui.shadcn.com/typeset). For **standalone headings / labels / captions**, use the `<Heading>` / `<Text>` primitives (v2.6.0); the `.ui-*` role values live in the foundation typography roles, scaled to the app's shadcn tokens. See [UI Typography](/starter-template/typography/).
 - **Font weight utilities** — `font-light`, `font-medium`, `font-semibold`, `font-bold`, `font-extrabold`. Same reasoning.
 - **Colour literals** — `bg-red-500`, `text-blue-600`, `border-green-400`, arbitrary `bg-[#hex]`. Use semantic tokens or delegate to Style Registry entries.
 - **Decorative shadows** — `shadow-sm`, `shadow-md`, `shadow-lg`. The shadow scale is part of the design system.
@@ -343,6 +383,7 @@ The rule:
 |-------|------|
 | Your generated `globals.css` | Colour palette, radius scale, shadow scale, font family, base `body` rules |
 | Your `typeset.css` (v1.60.0) | Prose typography: the shadcn Typeset variables (`--typeset-size/leading/flow`, `--typeset-font-*`) + presets. App-owned — the template ships a starter, the builder at ui.shadcn.com/typeset generates your real one |
+| Foundation typography roles (v2.6.0) | The discrete UI type scale (`.ui-*`) for standalone headings/labels/captions — `config/foundation-style.registration.ts`, scaled to your shadcn tokens (`--font-heading`, `--text-*`, …); consumed by the `<Heading>` / `<Text>` primitives. See [Typography](/starter-template/typography/) |
 | Your `components/ui/*.tsx` | Per-primitive styling (button variants, tab variants, card treatment) |
 | **Style Registry entries** (module-contributed) | Overrides that cut across multiple primitives or add new design variants. See [`/starter-template/style-system/`](/starter-template/style-system/). |
 | Template code | **None of the above**. Layout + semantic tokens only. |
@@ -444,7 +485,10 @@ You're building a **feature that plugs into the starter template**.
 
 **Rules:**
 - Use registries to extend the app (never modify core files)
-- Follow the exact feature structure from starter template
+- **Only `src/templates/**` and `src/module.ts` are module-owned** — `scaffold:update` never overwrites them
+- **Never edit scaffold-owned files** — `src/scaffold/**`, `src/cli.ts` and `scripts/**` are synced down from the Module Starter by `npm run scaffold:update`, so local edits are overwritten on the next merge. Fix the bug **upstream** in the Module Starter and pull it down
+- **Don't delete scaffold files either** — `scaffold:update` backfills any scaffold-owned file that has gone missing (git cannot re-add a file the downstream deleted). Record a deliberate removal as an exact path, one per line, in a `.scaffoldignore` file at the module root
+- Follow the module feature structure — see [File Reference](/module-starter/file-reference/). Modules group registries under `config/` and registration side-effect files under `registrations/`; a small app feature may keep them flat at the feature root
 - Bump version when templates change
 - Backend services must use `createModuleLogger()` for structured logging
 - Backend services must fire `actionRegistry.doActionAll()` (or `doActionParallel`) after CRUD operations — plain `doAction()` fires the sync pool only, skips `addActionAsync` consumers, and fails conformance check **C18**
@@ -511,16 +555,19 @@ navigationRegistry.registerMain({
 
 ```
 frontend/src/features/[feature]/
-├── index.ts                    # Exports + registration imports
-├── routes.config.tsx           # Route definitions
-├── navigation.registration.ts  # Nav registry
-├── settings.registration.ts    # Settings registry (if needed)
+├── index.ts                    # Exports + registration imports (side effects first)
+├── routes.config.tsx           # Route definitions (stays at the feature root)
+├── config/                     # Registry definitions (*.registry.ts)
+├── registrations/              # *.registration.ts side-effect files
 ├── components/                 # UI components
 ├── pages/                      # Page components
 ├── services/                   # API service layer
 ├── hooks/                      # Custom hooks
+├── utils/                      # Feature-local helpers
 └── types/                      # TypeScript types
 ```
+
+A small app feature may keep its one or two `*.registration.ts` files flat at the feature root instead of in `registrations/`. The same applies to a **module**: a module that generates a single `navigation.registration.ts` may leave it flat, while one with a set of them — as this module does — groups them under `registrations/`. See [File Reference](/module-starter/file-reference/) for the generated-output tree.
 
 ### Backend Structure
 
@@ -573,11 +620,30 @@ NEON_AUTH_URL=https://xxx.neonauth.region.aws.neon.tech/neondb/auth
 
 ### Migrations
 
-Always use `migrate dev`, never `db push`:
+On a **clean app with no modules installed**, always use `migrate dev`, never `db push`:
 
 ```bash
 cd backend && npx prisma migrate dev --name describe_change
 ```
+
+<Aside type="danger" title="Never run migrate dev on a module-bearing app">
+`prisma migrate dev` drift-checks the **whole** database and **RESETS** it when it meets objects Prisma's migration history doesn't know about — a vector module's runtime-created `CREATE EXTENSION vector` and HNSW indexes (whose shape depends on the app's configured vector width, so they can't be static migration files), plus non-Prisma tables such as `_module_migrations` and `AuditLog`.
+
+Module schema changes go through the scaffold's **drift-immune** path instead: `prisma migrate diff` **offline** (datamodel → datamodel, so it never connects to the DB and runtime objects are invisible) → write a real migration file → `prisma migrate deploy`, which never drift-checks and never resets. Run it via the module CLI — `npx <module> init` / `npx <module> update`. Apply anything by hand with `npx prisma migrate deploy`, not `migrate dev`.
+
+Also declare every runtime-created non-Prisma table in the host's `prisma.config.ts` `tables.external`.
+</Aside>
+
+### Module Schemas
+
+A module's Prisma models are merged into an **arbitrary host's** `schema.prisma`, so they must be **self-contained**:
+
+- **No `@relation` to a model the module does not own.** Reference core entities (the user, for example) with a plain scalar FK plus `@@index([userId, …])`. Self-referential relations *within* the module's own tables are fine — Prisma requires them for parent/child links.
+- **Never add fields to `User`** or any other core model. Create a `<module>_settings` table instead.
+- **Prefix every table with the module id** (`structure_node`, `structure_settings`) so two modules can never collide in the shared schema.
+- Runtime-created non-Prisma tables must be declared in the host's `prisma.config.ts` `tables.external`.
+
+→ See [Module Database](/module-starter/database/) for the full guide.
 
 ### Structured Logging
 
@@ -594,6 +660,23 @@ console.log('Subscription created');
 ```
 
 → See [Structured Logging](/starter-template/logging/) for full details.
+
+### Secrets & Encryption
+
+Never hand-roll crypto in a feature or module. The security feature supplies the primitives from the same import barrel the logger comes from:
+
+```typescript
+import { hashSecret, verifySecret, encryptField, decryptField } from '../security/index.js';
+
+const keyHash = hashSecret(apiKey);                              // store the hash, never the token
+const ok      = verifySecret(presented, keyHash);                // constant-time compare
+const sealed  = await encryptField(value, { tenantId: userId }); // at-rest field encryption
+const plain   = await decryptField(sealed, { tenantId: userId });
+```
+
+Declare every encrypted or hashed field in the module's `securityRegistry` manifest so deletion and export handling stay correct.
+
+→ See [Security Feature](/starter-template/security-feature/) for full details.
 
 ### Theme Utilities
 
@@ -692,7 +775,8 @@ See `frontend/src/features/admin/context/AppSettingsContext.tsx` in the starter 
 | Missing `.js` in backend imports | Always: `import { x } from './file.js'` |
 | Using `NavItem` instead of `NavigationItem` | Use exact type names from registry |
 | Editing `components/ui/` | Never edit shadcn - regenerate instead |
-| Using `db push` | Use `prisma migrate dev` |
+| Using `db push` | Use `prisma migrate dev` — but only on a clean app with no modules installed (see the next row) |
+| Running `prisma migrate dev` on an app with modules installed | Use the module CLI (`npx <module> init` / `npx <module> update`), which diffs offline and applies with `migrate deploy`. `migrate dev` drift-checks the whole DB and **resets** it when it meets runtime-created objects (pgvector extensions, HNSW indexes, `_module_migrations`, `AuditLog`). See [Migrations](#migrations). |
 | Forgetting version bump | Bump after any infrastructure change |
 | Forgetting to push docs | Always push docs submodule |
 | Deleting a public export outright | Ship a deprecation shim + warning + docs entry. See [Versioning & Deprecation](/starter-template/versioning/). Rule 6 covered this in detail. |
@@ -715,6 +799,11 @@ See `frontend/src/features/admin/context/AppSettingsContext.tsx` in the starter 
 | Unnamespaced query keys (e.g. `['subscription']` inside the billing module) | Prefix every module query key with the module ID: `['billing', 'subscription']`. |
 | Constructing a second `QueryClient` in a feature or module | There is exactly one `QueryClient`, mounted at the app root in `main.tsx`. Import `useQuery`/`useQueryClient` — never `new QueryClient()`. |
 | Storing server data in Zustand / a custom store | Server state belongs in TanStack Query. Use Zustand only for client-only UI state. |
+| Editing or deleting a file under `src/scaffold/`, `src/cli.ts`, or `scripts/` in a cloned module | Those are scaffold-owned and resynced by `scaffold:update`. Fix the bug upstream in the Module Starter; record a deliberate deletion in `.scaffoldignore`. |
+| Bumping a module's version without rebuilding | `version:*` / `release:*` rewrite `package.json` + `src/module.ts` only — they do **not** rebuild `dist/`, which is what the module's `bin` and any `npm link`ed host run. Always `npm run build` **after** the bump. |
+| Hand-rolling hashing or encryption in a module | Use `hashSecret` / `verifySecret` / `encryptField` / `decryptField` from the security feature, and declare the fields in the security manifest. |
+| A module registry hand-rolled on a bare `Map` | Extend `BaseRegistry<T>` and expose a `useXRegistry` hook via `createRegistryHook`, so ordering, duplicate-id detection, and late-registration re-render all work. |
+| A module model with `@relation` to a core entity, or a new field on `User` | Module schemas are self-contained: plain scalar FK + `@@index`, and a `<module>_settings` table instead of touching `User`. |
 
 ---
 
@@ -798,7 +887,7 @@ Downstream repos pull changes via `scaffold:update` or `template:update`, which 
 - ❌ Modify core files for features
 - ❌ Edit `components/ui/` (shadcn)
 - ❌ Put business logic in route handlers
-- ❌ Use `db push` instead of `migrate dev`
+- ❌ Use `db push` instead of `migrate dev` — and never run `migrate dev` on an app with modules installed (see [Migrations](#migrations))
 - ❌ Skip version bumping
 - ❌ Leave docs changes unpushed
 - ❌ Ship deprecation shims pre-launch (no launched consumer needs them — update the repos together)
@@ -808,11 +897,22 @@ Downstream repos pull changes via `scaffold:update` or `template:update`, which 
 
 ## Testing Checklist
 
+**Apps / starter template**
+
 - [ ] TypeScript compiles: `npm run type-check` (or `npm run build`)
 - [ ] Frontend runs: `npm run dev:frontend`
 - [ ] Backend runs: `npm run dev:backend`
 - [ ] Registrations appear correctly
 - [ ] **Version bumped** (if infrastructure changed)
+- [ ] **Docs pushed** (if documentation changed)
+
+**Modules** — a module repo has no `dev:frontend`, `dev:backend`, or `test` script:
+
+- [ ] `npm run check:templates` passes (no unescaped `${`)
+- [ ] `npm run conformance:check` and `npm run parity:check` pass
+- [ ] `npm run build` succeeds
+- [ ] Generated code type-checks **in a real host app** — `npm run build && node scripts/regen-host.cjs <path-to-host-app>`, then `tsc --noEmit -p tsconfig.json` in that host. A module's own `type-check` / `build` compiles the template *files*, not the generated code inside the backtick strings, so it cannot catch an error in what the module emits.
+- [ ] **Version bumped**, then **rebuilt** (`npm run build` after the bump)
 - [ ] **Docs pushed** (if documentation changed)
 
 ---
@@ -827,10 +927,18 @@ npm run template:version:patch
 npm run template:version:minor
 npm run template:version:major
 
-# Modules
+# Modules — bump + commit, no tag (routine template work)
+npm run version:patch
+npm run version:minor
+npm run version:major
+
+# Modules — bump + commit + git tag (a published release)
 npm run release:patch
 npm run release:minor
 npm run release:major
+
+# Always rebuild after a module bump — the bump does not touch dist/
+npm run build
 ```
 
 ### Common Commands
@@ -839,7 +947,8 @@ npm run release:major
 npm run dev                    # Run frontend + backend
 npm run build                  # Type-check (tsc) + build both projects
 cd backend && npx prisma studio        # Database GUI
-cd backend && npx prisma migrate dev   # Migrations
+cd backend && npx prisma migrate dev    # Migrations - clean app only, never with modules installed
+cd backend && npx prisma migrate deploy # Apply a migration by hand on a module-bearing app
 cd frontend && npx shadcn@latest add [component]
 ```
 

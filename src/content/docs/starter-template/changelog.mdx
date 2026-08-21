@@ -17,6 +17,71 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v2.6.4
+
+**Security tier prompt + auto-provisioned field-encryption key (no more manual `.env`)**
+
+The default tier is `hardened`, which turns field encryption on — but `create-app` wrote no key, so a fresh app failed closed on the key provider at boot (`SECURITY_KEY_PROVIDER=kms` resolves from the hardened default, with no KMS configured) until you hand-edited `.env`. The tooling now provisions a working local key so any tier boots clean, with KMS an explicit upgrade.
+
+- **`create-app` prompts for the security tier** (standard / hardened / strict, default hardened) and writes `SECURITY_PROFILE`, then generates a `SECURITY_ENCRYPTION_KEY` (base64, 32 bytes) and sets `SECURITY_KEY_PROVIDER=env`. Hardened/strict boot with field encryption working via a local key — no KMS, no fail-closed. The "Set up AWS KMS now?" prompt still flips custody to KMS.
+- **`sync-env` backfills existing apps** on `template:update`: when the tier needs a key (hardened/strict) but none is configured, it generates one and appends it active with `SECURITY_KEY_PROVIDER=env`. It never touches an app that already has a key or a KMS intent — a broken KMS app must fix KMS, not silently switch key roots. Idempotent.
+- Net: apps boot clean out of the box **and** after updates without hand-editing `.env`; move custody to AWS KMS anytime with `npm run security:setup-kms`.
+
+---
+
+## v2.6.3
+
+**Fix: `EmailConfig` model missing after `template:update` (email boot error)**
+
+Apps that ran `template:update` across the email-feature boundary (v2.5.5+) got the email code that queries `prisma.emailConfig` but **not** the `EmailConfig` model — the update script's schema auto-add list covered AppSettings / Space / Notification / InstalledModule but was never extended for `EmailConfig`. Result: `TypeError: Cannot read properties of undefined (reading 'findUnique')` in the boot log (caught and non-fatal — email fell back to the console default, but noisy).
+
+- **`update-template` (`.ps1` + `.sh`) now auto-adds the `EmailConfig` model** to a downstream schema when missing, exactly like the other foundation models, and flags a migration. New apps were unaffected (`create-app` already ships it).
+- **`wireEmailFromDatabase` is hardened:** when the model isn't in the Prisma client (app not migrated yet) it logs one clean, actionable `warn` and keeps the console default, instead of a `TypeError`; a missing table is likewise a `warn`, not an `error`.
+- **To resolve on an already-updated app:** run `template:update` again (it adds the model) → `npx prisma migrate dev` + `npx prisma generate`. Until then the boot is clean and email uses the console default.
+
+---
+
+## v2.6.2
+
+**Runtime module discovery — `GET /api/v1/modules/status` + `useModuleInstalled()`**
+
+One module can now ask, at runtime, whether **another** module is installed — so it can gate its UI on a companion's presence (e.g. the structure module hides tabs when `ai-core` isn't installed). Previously the runtime knew this only via the **admin-only, heavyweight** `/api/v1/admin/modules/overview`; there was no general, non-admin way for a module's own UI to check.
+
+- **Backend:** a new lightweight, **authenticated-but-not-admin** endpoint `GET /api/v1/modules/status` returns `{ installed: string[], enabled: string[] }` — the registered module ids and the subset effectively enabled by this boot's gate. It's a pure in-process `moduleRegistry` read (`getModuleStatus()` / `modulesService.getStatus()`), no DB, never throws. `installed` is presence (`registered = installed ≠ enabled`); `enabled` subtracts this boot's withheld ids (`getLastBootDisabledIds()`), **not** the mirror `InstalledModule.enabled` column. The admin overview endpoint is unchanged.
+- **Frontend:** a new `features/modules/` slice with a root-of-the-authenticated-shell **`ModuleStatusProvider`** (mounted in `DashboardPage`, beside `AppSettingsProvider`) wrapping one cached query, plus synchronous, forgiving hooks: **`useModuleInstalled(id)`**, `useModuleEnabled(id)`, `useInstalledModules()`, `useModuleStatus()`. A component reads presence with no fetch of its own and no loading flicker — `const showAiTabs = useModuleInstalled('ai-core')`. Outside the provider (or on error) they fail **closed** (return `false` / empty), so a dependent UI hides until presence is positively confirmed.
+- **Semantics + limits:** presence reflects **backend registration**, so a *frontend-only* dependency (no backend `module.registration.ts`) won't appear — the same excusal the boot dependency-check already makes. Install/enable/disable is **restart-to-apply**, so the status is effectively static per session. Any authenticated user can read the id lists (low-sensitivity; not exposed publicly like branding).
+- **Additive**: new files + one route registration + one provider mount; no contract change, no new dependency, no `create-app` wiring. Propagates via `template:update`. See [Modules Feature → Runtime module status](/starter-template/modules-feature/#runtime-module-status-non-admin).
+
+---
+
+## v2.6.1
+
+**Typography — relative heading scale (anchor × multiplier)**
+
+The v2.6.0 `.ui-*` heading roles pinned each step to a fixed `--text-*` token, so a different shadcn config (different card-title size) broke the page > section > card hierarchy. Heading sizes are now **relative**: an anchor (`--ui-scale-base`, defaulting to the CardTitle tier `--text-lg`) × a per-role multiplier (`--ui-<role>-scale`).
+
+- **Defaults:** `display 2 / title 1.65 / heading 1.35 / subheading 1.15` × the CardTitle tier — a page title is ~1.65× the card titles, a section ~1.35×, and the whole ladder scales together with whatever shadcn config is active.
+- **Retune with one token:** `--ui-scale-base` moves the entire ladder (repoint it if your card title sits on another step); `--ui-<role>-scale` resizes one step (`--ui-heading-scale: 1.5` = section headings at 1.5× the card); `--ui-<role>-size` still pins an absolute size as an escape hatch.
+- Body/label/caption/overline stay on the shadcn body scale (`--text-sm` / `--text-xs`) — only the four heading roles are relative.
+- No markup changes — the `<Heading>` / `<Text>` API is unchanged; additive, and any existing `--ui-*-size` override still wins. Docs: [Typography](/starter-template/typography/).
+
+---
+
+## v2.6.0
+
+**Structured typography — the `<Heading>` / `<Text>` primitives + `.ui-*` roles**
+
+A firm, consistent type system for discrete UI text (page titles, section headings, standalone labels/captions) — the gap shadcn leaves open, filled in a way that **tracks whatever preset the app was initialised with**. shadcn's theming ships font *faces* and colours but no size scale, and Tailwind's Preflight resets bare headings to body type — so template headings like `PageHeader`'s `<h1>` rendered flat. This closes that without hard-coding any size in markup.
+
+- **New primitives: `<Heading>` / `<Text>`** (`@/components/typography`, deps: `cn` only). `<Heading level={1..4} variant?>` and `<Text variant="body|label|caption|overline">` render a semantic element and apply one `.ui-*` role class — the sanctioned vehicle so template/module code never hand-rolls `text-2xl font-semibold`. `level` (the tag) decouples from `variant` (the size) for correct heading outlines.
+- **Eight foundation typography roles** (`.ui-display`, `.ui-title`, `.ui-heading`, `.ui-subheading`, `.ui-body`, `.ui-label`, `.ui-caption`, `.ui-overline`) in `config/foundation-style.registration.ts`. **Scaled to your shadcn tokens** — each defaults to `var(--ui-<role>-size, var(--text-*, <fallback>))` on `--font-heading` at `--font-weight-*` — so a themed `--text-2xl` or `--font-heading` flows straight through. Retune a role app-wide via its `--ui-*` token; the paused style module will own deep theming.
+- **Cascade fix.** The foundation entry (and `admin.stat-value`) now ship inside `@layer components`, so the rules beat Preflight yet **lose to a Tailwind utility** on the element — a real escape hatch, no `!important`. `:where()` keeps specificity at zero. The four legacy slots (`widget-stat-value`, `plan-name`, `auth-wordmark`) are re-pointed onto the shared `--text-*` grid (lossless at default token values), so slots and roles read as one system.
+- **Retrofit.** The two shared blocks (`PageHeader`, `SectionHeader`) plus ~8 standalone headings across dashboard/admin/user/notifications/support now use the primitives. Every shadcn primitive's own text (`CardTitle`, `Label`, `Badge`, …) is left untouched.
+- **Rules.** The [structure-only policy](/getting-started/llm-rules/#7-template-components-use-structure--semantic-tokens-only) `Allowed` list adds the primitives/`.ui-*` roles; new **[Typography](/starter-template/typography/)** page documents the decision tree and the retune surface.
+- **No new package, env var, database change, or `create-app` wiring** — the foundation entry and primitives propagate via the ordinary `template:update` git merge. Existing apps get it (and should adopt `<Heading>`/`<Text>` in new code) on their next update.
+
+---
+
 ## v2.5.13
 
 **Sidebar sections can carry an accent colour**

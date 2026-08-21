@@ -103,11 +103,65 @@ All hooks receive a context object with utilities:
     prompt: (question: string, defaultValue?: string) => Promise<string>,
     confirmPrompt: (question: string, defaultValue?: boolean) => Promise<boolean>,
   },
+  installedModules: {             // The modules set up in this app (see below)
+    all: readonly InstalledModuleInfo[],       // every module, self included
+    others: readonly InstalledModuleInfo[],    // self excluded — the common "siblings" case
+    get(id: string): InstalledModuleInfo | undefined,
+    has(id: string, range?: string): boolean,       // installed (+ optional semver range)
+    isEnabled(id: string, range?: string): boolean, // installed AND enabled
+  },
 }
 ```
 
 <Aside type="note">
 Path-taking utils (`fileExists` / `readFile` / `writeFile` / `ensureDir`) resolve **relative** paths against `context.cwd`. `runCommand` **never throws** — on a non-zero exit it resolves with the captured `stderr` (or the error message), so check `stderr` rather than wrapping the call in try/catch. In CI/non-interactive runs, `prompt`/`confirmPrompt` return their default without blocking.
+</Aside>
+
+### Discovering other installed modules
+
+Every hook's context carries **`installedModules`** — a read-only view of the modules set up in the **same app** — so a module can coordinate with its siblings at install/update time. Use it to seed a cross-link only when a companion module is present, warn when an optional integration target is missing, or branch on a sibling's version. It reads the scaffold's install records (`.module-manifests.json` + `.module-state.json`) for you, so you never parse those internal files by hand.
+
+```typescript
+onInstall: async ({ installedModules, utils }) => {
+  // Every OTHER module in this app (self excluded).
+  for (const m of installedModules.others) {
+    utils.log.info(`sibling: ${m.id}@${m.version ?? '?'} (${m.enabled ? 'enabled' : 'disabled'})`);
+  }
+
+  // Presence, optionally within a semver range (the contract's range semantics).
+  if (installedModules.has('billing', '^2.0.0')) {
+    // seed a cross-link into billing
+  }
+
+  // Installed AND enabled — the right check before wiring into a sibling.
+  if (installedModules.isEnabled('audit')) {
+    // subscribe to the audit module's events
+  }
+
+  // Full record (or undefined if not installed).
+  const aiCore = installedModules.get('ai-core');
+  if (aiCore?.backendPath) {
+    // aiCore.backendPath, aiCore.version, aiCore.name, …
+  }
+},
+```
+
+| Member | Returns | Notes |
+|--------|---------|-------|
+| `all` | `readonly InstalledModuleInfo[]` | Every installed module, **self included**, sorted by id |
+| `others` | `readonly InstalledModuleInfo[]` | Every module **except** the current one — the usual "siblings" case |
+| `get(id)` | `InstalledModuleInfo \| undefined` | One module by id, or `undefined` when not installed |
+| `has(id, range?)` | `boolean` | Installed? With `range`, also requires the recorded version to satisfy it (an unknown version fails a ranged check) |
+| `isEnabled(id, range?)` | `boolean` | Installed **and** enabled (optionally within a range) |
+
+Each `InstalledModuleInfo` is `{ id, name, version, enabled, installedAt, frontendPath?, backendPath?, isSelf }`. `version` is `string \| null` (null when neither the state nor manifest recorded one). `enabled` follows the scaffold's "active?" convention — only an explicit `enabled: false` in `.module-state.json` counts as disabled; a module with no state row reads as enabled. Reads are **lazy + memoised**: the files are parsed the first time a hook queries `installedModules` and cached for the life of the context.
+
+<Aside type="caution" title="Self is absent from onPrepareDatabase during a fresh install">
+Every hook sees the current module ("self") in `installedModules` **except `onPrepareDatabase` during a fresh `init`** — that hook runs *before* the scaffold writes the module's own manifest/state rows (it precedes the very migrate that installs the module), so on a first install `all` / `get(selfId)` / `isSelf` don't include self there. `others` (the siblings) is unaffected — which is all pre-migrate DB prep needs. Self **is** present for `onPrepareDatabase` on `update`, and for every other hook. Use `context.phase` (`'install' | 'update'`) if a `onPrepareDatabase` hook needs to distinguish the two.
+</Aside>
+
+<Aside type="note" title="This is install-time discovery — not the runtime registry">
+`installedModules` is **scaffold-owned** and lives in `src/scaffold/types.ts` (`InstalledModuleInfo` / `InstalledModulesAccess`), the same place as `onReconfigure` / `onPrepareDatabase`. It is built by the **module CLI** and reflects what is set up **on disk** — it is not the app's runtime registry. For a module's **runtime** code to react to another module (at app boot / request time), use the sanctioned runtime seams instead: for **frontend UI gating** ("is another module installed?"), the starter's `useModuleInstalled(id)` / `useModuleEnabled(id)` hooks from `@/features/modules` (backed by `GET /api/v1/modules/status`, **starter v2.6.2+**) — see [Modules Feature → Runtime module status](/starter-template/modules-feature/#runtime-module-status-non-admin); and for backend cross-module wiring, the [cross-module event bus](#cross-module-events-a-reusable-pattern), `serviceRegistry.get(OTHER_MODULE_SERVICE_KEY)`, and the host's `moduleRegistry`. Declaring a hard `depends` (with a semver range) is still the right tool when your module cannot function without another — the CLI enforces it at install and the host at boot.
 </Aside>
 
 **Install-specific context:**

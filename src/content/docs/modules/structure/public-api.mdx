@@ -12,7 +12,7 @@ Structure ships an **internal** REST API (`/api/v1/structure/*`) that is authent
 The public API is **opt-in per node type** and **off by default** — a node type is only reachable once you enable its *Public REST API* toggle.
 
 <Aside type="note">
-The public API exposes node **instances** of a type (e.g. your clients, projects) — not the node-type configuration. It is a thin, authenticated layer over the same service that powers the in-app API, so all field and constraint validation still applies, and all data stays scoped to the key owner's account.
+The public API exposes node **instances** of a type (e.g. your clients, projects) — not the node-type configuration. It is a thin, authenticated layer over the same service that powers the in-app API, so the same field and constraint validation as the in-app write path applies, and all data stays scoped to the key owner's account — unless the type is also marked *Shared across all users*, which deliberately widens reads across accounts (see [Shared types](#shared-types)).
 </Aside>
 
 ## Base URL
@@ -27,9 +27,9 @@ The public API exposes node **instances** of a type (e.g. your clients, projects
 
 <Steps>
 
-1. **Expose a node type.** In **Admin → Structure Types**, edit a type and turn on **Public REST API** (under Features). Its instances become reachable at `/api/v1/public/structure/<slug>`.
+1. **Expose a node type.** In **Admin → App Structure → Structure Types**, edit a type, open its **Properties** tab and turn on **Public REST API** (in the *Entry Lifecycle* section). Its instances become reachable at `/api/v1/public/structure/<slug>`.
 
-2. **Create an API key.** Go to the **API Keys** tab, click **New Key**, give it a name, and choose **Read only** or **Read & write**. The full key is shown **once** — copy it immediately; it is stored only as a hash and cannot be retrieved again.
+2. **Create an API key.** Go to the **API Keys** tab on the same **App Structure** page, click **New Key**, give it a name, and choose **Read only** or **Read & write**. The full key is shown **once** — copy it immediately; it is stored only as a hash and cannot be retrieved again.
 
 3. **Call the API.** Send the key on every request (see [Authentication](#authentication)).
 
@@ -48,7 +48,7 @@ curl https://your-app.com/api/v1/public/structure/clients \
   -H "X-API-Key: sk_xxxxxxxxxxxxxxxx"
 ```
 
-A missing, invalid, expired, or revoked key returns **401**. A request for a node type that does not exist or is not exposed returns **404** (the API does not reveal which types exist).
+A missing, invalid, expired, or revoked key returns **401**. A request for a node type that does not exist, is not exposed, or whose per-type **Read** permission is set to *Admin* or *System* returns **404** — the three cases are deliberately indistinguishable, so the API never reveals which types exist. The `/schema` response likewise omits referenced types that are not themselves publicly readable, and filters them out of each field's `allowedTypes`.
 
 ## Scopes
 
@@ -61,21 +61,86 @@ Each key carries a scope:
 
 A write request made with a read-only key returns **403**.
 
+Key scope is not the only gate. A node type's own **permission tiers** apply as well, and an API-key caller is never treated as an admin or as a system caller: if the type's *Create* permission is *Admin* or *System* a `POST` is rejected, and if its *Edit* permission is *Admin* or *System* a `PATCH` is rejected — with a **400** `Not permitted to create|edit nodes of type "…"`, whatever the key's scopes. Per-field `editableBy` restrictions apply the same way: a `PATCH` that carries a custom field marked *system* (or *admin* only) returns **400** `Field "…" is not editable`.
+
 ## Endpoints
 
 All endpoints are relative to `/api/v1/public/structure`.
 
 | Method | Path | Scope | Description |
 |--------|------|-------|-------------|
-| `GET` | `/:type` | read | List instances of the type. Query params: `page`, `limit` (max 100), `search`, `sortBy`, `sortOrder`. Returns active nodes. |
+| `GET` | `/:type` | read | List instances of the type. Returns active nodes. Query params: `page` (≥&nbsp;1), `limit` (1–100), `search` (≤&nbsp;200 characters), `sortBy` (`name` \| `createdAt` \| `updatedAt` \| `sortOrder`), `sortOrder` (`asc` \| `desc`), and `scopeRootId` (see [Scoped types](#scoped-types)). An out-of-range or unrecognised value returns **400**. |
 | `GET` | `/:type/schema` | read | Bindable merge-field descriptors for the type (own + inherited fields, secrets omitted), plus a map of one-hop referenced types that are themselves exposed. Registered before `/:type/:id`, so `schema` is not captured as an `:id`. |
-| `GET` | `/:type/:id` | read | Fetch one instance (404 if it isn't of `:type`). |
+| `GET` | `/:type/:id` | read | Fetch one instance (404 if it isn't of `:type`). Accepts `scopeRootId` (see [Scoped types](#scoped-types)). Child nodes are never included — a child may be of a non-exposed type — and secret field values are stripped from `data`. |
 | `POST` | `/:type` | write | Create an instance. Body: `name` (required), `slug`, `description`, `data`, `parentId`, `stage`, `classification`. |
-| `PATCH` | `/:type/:id` | write | Update an instance. Body: any of `name`, `slug`, `description`, `data`, `stage`, `classification` (nullable on `PATCH`). |
+| `PATCH` | `/:type/:id` | write | Update an instance. Body: any of `name`, `slug`, `description`, `data`, `stage`, `classification` — `stage` and `classification` may be sent as `null` to clear them. `parentId` is accepted only on `POST`, so the public API cannot re-parent a node. |
 
 There is intentionally **no `DELETE`** — deletion is only available through the in-app interface.
 
-The `data` object holds the type's custom field values as key/value pairs. As in the app, field-level validation (required fields, types, enums, lengths) is applied in the UI rather than enforced server-side — send values that match the type's field definitions. The `data` object is size-bounded (100&nbsp;KB); the other fields have their own length limits (`name` and `slug` up to 255 characters, `description` up to 5000).
+The `data` object holds the type's custom field values as key/value pairs. Field values **are** enforced server-side (since v1.33.31) against the type's resolved field definitions — its own fields, the fields of any attached field templates, and inherited fields — covering unconditional `required`, value type, `min`/`max`, enum membership for `select` and `multiselect`, and string length and `pattern`. A violation returns **400** naming the field, e.g. `Field "industry" is required`. Not yet covered: field-group sub-fields, `requiredWhen`, and fields carrying a `visibleWhen` (skipped for the required check only). Structural and derived field types are skipped outright — `section-break`, `hidden`, `field-group`, `formula`, `secret`, and any field with a `computedTemplate`. The `data` object is size-bounded (100&nbsp;KB); the other fields have their own length limits (`name` and `slug` up to 255 characters, `description` up to 5000).
+
+### Reference numbers
+
+A node type can be configured to issue an immutable, server-assigned **reference** for every entry it holds — `MAT-2026-0147`. It is **off by default** and opt-in per type; see [Configuration](/modules/structure/configuration/) for the format options and how to turn it on.
+
+On this API a reference is strictly **read-only**:
+
+| Aspect | On the public API |
+|--------|-------------------|
+| Reads | `reference` is a top-level field on the node object in every response body — `GET /:type`, `GET /:type/:id`, `POST` and `PATCH` alike. A type that issues no references returns `"reference": null`. |
+| Writes | Neither the `POST` nor the `PATCH` body schema carries the key, so a `reference` sent in the body is **silently dropped** before the request reaches the service: the write succeeds and the stored value is whatever the server assigned (or stays `null`). No public route can set or change one. |
+| Search | `?search=` matches `reference` as well as `name`, `description` and custom field values, so pasting a whole reference into `search` finds that one entry. |
+| Sorting | `sortBy` does not accept `reference` — the enum is unchanged. |
+| `/:type/schema` | Describes the type's **custom** fields only, so `reference` — a built-in column, like `name` — never appears there. |
+
+The one door that accepts an explicit `reference` is the module's node **import** path, `POST /api/v1/structure/nodes/bulk`, so a migration can keep the numbers a record already had. That endpoint is on the **internal**, session-authed API and only honours an explicit value for an admin or in-process system caller — it is **not** reachable with an API key. The public surface is mounted separately at `/api/v1/public/structure` and exposes only the five endpoints above.
+
+### Scoped types
+
+If a node type is confined to an enforced [primary scope](/modules/structure/configuration/#primary-scope) (`primaryScope.isolation` set to `enforced` — the app's *spaces*), a public read of that type is confined to a single space. Name the space explicitly with `?scopeRootId=<root node id>`; if the parameter is absent, the read falls back to the key owner's **persisted active space** — the space they last selected in the app. With neither, it fails closed: an empty list from `GET /:type`, a **404** from `GET /:type/:id`. An explicitly supplied id that is not a valid enforced root returns **400** `Invalid scope for this request` (a stale persisted setting simply fails closed instead, with no 400). Instances of the enforced primary type *itself* are never confined — space roots stay listable so spaces remain switchable — so those reads ignore `scopeRootId` entirely, as do types the space does not confine and types marked [shared](#shared-types).
+
+Because the fallback depends on in-app state that an integration cannot see, always pass `scopeRootId` explicitly from an external client.
+
+### Shared types
+
+A node type can be marked **Shared across all users** in the **Scope** section of its admin form (`primaryScope.global`). A shared type is **read-shared**: every user reads the same rows of it. See [Configuration](/modules/structure/configuration/) for the full behaviour.
+
+Combining that with **Public REST API** has a consequence an operator must weigh before turning both toggles on: **every user's instances of the type become reachable through any one user's API key**. Reads widen; writes never do.
+
+| Request | On a shared type |
+|---------|------------------|
+| `GET /:type` | Lists every user's active instances, not only the key owner's. Rows the key owner does not own come back sanitised. |
+| `GET /:type/:id` | Resolves another user's instance too, sanitised the same way. |
+| `POST /:type` | Unchanged — creates an instance owned by the key owner. |
+| `PATCH /:type/:id` | Only ever updates the key owner's own instances. Another user's row returns **404** `Node not found`, whatever the key's scopes or the type's permission tiers — there is no admin bypass. |
+
+A row the key owner does not own is **sanitised** before it is serialised: secret-typed values are removed from `data` (the keys are absent, not blanked), `embeddingText` is dropped, `settings` and `metadata` come back as `{}`, and `isFavorite` is forced `false`. A [reference number](#reference-numbers) is deliberately left intact — it carries no user content and is the citable handle for the record, so hiding it would obscure the identifier while still returning the thing it identifies. The key owner's own rows are not touched by this shared-node sanitiser — the `GET /:type/:id` secret stripping described under [Security](#security) still applies to every row, the owner's included.
+
+Sharing is only honoured on an **app-level** type row (`structure_node_type.userId === null`); the flag on a per-user row is inert. That is what stops one account's configuration admitting another account's rows of a same-named type. Shared and *primary scope* are mutually exclusive — if a JSON config import sets both, `isPrimary` wins and the shared flag is ignored, so the type stays a space rather than becoming cross-account readable.
+
+<Aside type="caution">
+Enable **Public REST API** on a shared type only when cross-account read is exactly what you want. Prefer a read-only key, and remember that the per-type **permission tiers** only narrow who may create their own entries — they never widen who may change someone else's, and they do not narrow who may read a shared type through the public API.
+</Aside>
+
+### Responses
+
+| Endpoint | Success body |
+|----------|--------------|
+| `GET /:type` | **200** `{ nodes, total, page, limit, totalPages }` |
+| `GET /:type/schema` | **200** `{ type, fields, referencedTypes }` |
+| `GET /:type/:id` | **200** the node object (no `children`, secrets stripped) |
+| `POST /:type` | **201** the created node |
+| `PATCH /:type/:id` | **200** the updated node |
+
+Errors are always a flat `{ "error": "…" }` body:
+
+| Status | Message | When |
+|--------|---------|------|
+| `400` | The failing check, e.g. `Field "industry" is required` | Query or body schema failure, field validation, scope or per-type permission rejection |
+| `401` | `Missing API key`, `Invalid or expired API key` | No key sent, or the key is unknown, expired or revoked |
+| `403` | `API key missing required scope: write` | A `POST` or `PATCH` made with a read-only key |
+| `404` | `Not found` | Unknown type, non-exposed type, a type whose **Read** permission is *Admin*/*System*, or an id that is not of `:type` |
+| `404` | `Node not found` | Unknown id, a node that sits outside the resolved [space](#scoped-types), or a `PATCH` aimed at another user's instance of a [shared type](#shared-types) |
 
 ### Examples
 
@@ -107,10 +172,13 @@ curl -X PATCH https://your-app.com/api/v1/public/structure/clients/NODE_ID \
 ## Security
 
 - **Keys are hashed.** Only a `hashSecret()` hash of each key is stored (via the [security feature](/module-starter/security/)) — never the plaintext. The raw key is returned once, at creation.
-- **Account-scoped.** Every request operates only on the key owner's data; create/update set the owner server-side and can never be overridden by the request body.
+- **Account-scoped.** Every request operates only on the key owner's data — the one deliberate exception being reads of a [shared type](#shared-types); create/update set the owner server-side and can never be overridden by the request body.
+- **Secrets never leave.** Secret-type field values are stripped from the `GET /:type/:id` response — they are decrypted only for in-app owners — and `/:type/schema` omits secret field descriptors entirely, so their existence and shape are never exposed. The list, `POST` and `PATCH` responses return the node's `data` as stored, so a secret field appears there as its encrypted envelope (`{ "__sealed": "…" }`), never as a readable value.
+- **References are server-assigned.** Where a type issues [reference numbers](#reference-numbers), the value is allocated by the server inside the create transaction and is immutable from then on. No public endpoint accepts it on the way in, and no update path anywhere writes the column.
 - **Revoke any time.** Revoke a key from the **API Keys** tab; revoked (and expired) keys are rejected immediately. Keys are also erased when the owning account is deleted.
 - **Set an expiry at creation (v1.19.0).** The create dialog offers 30 / 90 / 365 days or *Never* (default **90 days**). Expiry was always enforced server-side; before v1.19.0 the admin UI could not set it, so every key issued in-app was perpetual. The plaintext key is also cleared from the client mutation cache when the dialog closes.
 - **Least privilege.** Issue read-only keys for read-only integrations, and expose only the node types an integration needs.
+- **Shared types widen reads across accounts.** Exposing a type that is also *Shared across all users* makes every account's instances of that type readable through any single key, sanitised as described under [Shared types](#shared-types). Writes stay owner-only at every permission tier. Do not combine the two toggles unless cross-account read is the intent.
 - **System/default types apply to everyone.** Enabling the toggle on a *system-default* node type (one shared across accounts, with no owner) exposes that type's endpoint for every account's keys — though each key still only ever sees its own instances. Prefer enabling it on the specific types you intend to publish.
 
 <Aside type="caution">

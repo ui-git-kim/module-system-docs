@@ -1,17 +1,17 @@
 ---
 title: Prompt Assembly
 description: How segments and per-model frameworks compose a prompt — the slot sort, the system-wide fold, restated key rules, the date anchor, marked content, the injection-risk notice, and one-content-N-models
-lastUpdated: 2026-08-08
+lastUpdated: 2026-08-19
 sidebar:
   order: 8
 ---
 
 import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
-A prompt in AI Core is never hand-wired. **Everything in a prompt is a segment.** An operation composes an ordered set of segments; each segment declares only *what kind* of slot it is (its `slotType`); a per-model **framework** says where each slot type goes and in what syntax; and the **assembler** matches, renders and joins them into the text a model receives. This page is a deep dive on that mechanism — the slot sort at its centre, the system-wide fold that folds an app's standing prompt into every run, the two "how" slots that pull `approach` and `discipline` records, the restated key rules at the tail, the wrapping styles, the two axes that describe a content item (its semantic marker and its per-item injection-risk flag), the marked spans, the computed date anchor, and the single override that can replace it all.
+A prompt in AI Core is never hand-wired. **Everything in a prompt is a segment.** An operation composes an ordered set of segments; each segment declares only *what kind* of slot it is (its `slotType`); a per-model **framework** says where each slot type goes and in what syntax; and the **assembler** matches, renders and joins them into the text a model receives. This page is a deep dive on that mechanism — the slot sort at its centre, the system-wide fold that folds an operation's selected (or default) system prompt into each run, the two "how" slots that pull `approach` and `discipline` records, the restated key rules at the tail, the wrapping styles, the two axes that describe a content item (its semantic marker and its per-item injection-risk flag), the marked spans, the computed date anchor, and the single override that can replace it all.
 
-<Aside type="note" title="Current as of v1.22.0 (Prompt Model v2)">
-This page describes AI Core as implemented in module v1.22.0 (August 2026, hardened through v1.22.2). The **Prompt Model v2** rework reshaped composition: everything in a prompt is now a `ai_prompt_segment`; an operation composes ordered segments through `ai_operation_segment`; the two "how" slots relate to `ai_approach` (unmeasured) and `ai_discipline` (measured) records; a `systemWide` operation's segments fold into every run; and members flagged `important` are restated at the tail under a seeded `key-rules` slot. Retrieval (v1.13.0), guardrail execution and groundedness scoring (v1.12.0), the evaluation harness (v1.14.0), markers (v1.15.0) and marker hardening (v1.18.0–v1.19.0) all carried forward; the semantic cache and a re-embedding migration remain planned — see the [Roadmap](/modules/ai-core/roadmap/).
+<Aside type="note" title="Current as of v1.40.2 (Prompt Model v2)">
+This page describes AI Core as implemented in module v1.40.2 (August 2026). The **Prompt Model v2** rework reshaped composition: everything in a prompt is now a `ai_prompt_segment`; an operation composes ordered segments through `ai_operation_segment`; the two "how" slots relate to `ai_approach` (unmeasured) and `ai_discipline` (measured) records; a `systemWide` operation is a named, reusable system prompt that other operations select; and members flagged `important` are restated at the tail under a seeded `key-rules` slot. Retrieval (v1.13.0), guardrail execution and groundedness scoring (v1.12.0), the evaluation harness (v1.14.0), markers (v1.15.0) and marker hardening (v1.18.0–v1.19.0) all carried forward. Landing since v1.23.0 and touching this page: the runtime slot rename `task`→`input` (v1.27.0), provider-native tools for web search and fetch, the operation input contract with its `ai_input_type` catalogue, the Context builder, a fourth seeded framework (`openai-markdown-xml`, v1.36.0), and the module-level zero-retention override (`ai_policy`, v1.40.0). The semantic cache and a re-embedding migration remain planned — see the [Roadmap](/modules/ai-core/roadmap/).
 </Aside>
 
 <Aside type="tip" title="Where this is heading">
@@ -37,11 +37,13 @@ The slot types divide by what they carry:
 
 - **"What" slots** — `objective`, `examples`, `format`, `edge-cases`. Authored, versioned, admin-editable segment records; the text lives in the segment's `content` field.
 - **"How" slots** — `approaches` and `disciplines`. These segments carry no content of their own; they relate (through the `ai_segment_approach` / `ai_segment_discipline` join tables) to `approach` records (an **unmeasured** how — expertise, persona, reasoning, tone) and `discipline` records (a **measured** how — a rule that owns one-or-more guardrails). The prose that renders is the record's, in join-row order.
-- **Consumer content** — the runtime `context` and `task` a consumer passes to `aiCore.run`, each optionally carrying a marker, an injection-risk flag, a timestamp and media. No author, no version.
+- **Consumer content** — the runtime `context` and `input` a consumer passes to `aiCore.run`, each optionally carrying a marker, an injection-risk flag, a timestamp and media. No author, no version.
 
 Two more slots render mechanically, positioned by the framework but sourced from data rather than an authored segment: the system-side **`markers`** slot (each in-use marker's meaning, introduced by the `markers-preamble` `approach` record and — when any content item is flagged an injection risk — closed by the `injection-notice` `approach` record), and the **`key-rules`** slot (the `important`-flagged members restated at the tail). The `date` segment is computed the same way.
 
 A segment declares its slot type and nothing about where it lands, **because position depends on which model is about to receive it** — and only the framework knows that. Segments, frameworks, approaches and disciplines are all database records; how they are managed lives on [Configuration](/modules/ai-core/configuration/).
+
+**Since v1.23.0**, an operation can carry its **own** `approaches` and `disciplines` slots directly. These are stored as private per-operation segments under a reserved dotted key (`op.<id>.approaches` / `op.<id>.disciplines`) using the existing join tables — no schema addition — and the resolver and assembler treat them as ordinary `approaches`/`disciplines` segments. The assembly mechanism described here is unchanged.
 
 <Aside type="note" title="There is no `role` field">
 A segment never declares whether it belongs to the system or the user side. That split is **derived** at assembly — from the slot type (some slot types are instructions-side, the rest input-side) and from the system-wide fold below. Nothing stores it, so nothing can drift out of sync with the slot order.
@@ -54,7 +56,7 @@ A segment never declares whether it belongs to the system or the user side. That
 The prompt has two sides, and each slot type belongs to exactly one of them:
 
 - **Instructions (system) side** — `approaches`, `disciplines`, `objective`, `examples`, `format`, `edge-cases`, `markers`, `key-rules`.
-- **Input (user) side** — `context`, `date`, `task`.
+- **Input (user) side** — `context`, `date`, `input`.
 
 Assembly walks the framework's declared order, keeps the slot types belonging to the side it is building, renders each type's content, applies that type's wrapping, and joins the blocks with blank lines. It is pure: the same inputs always yield the same prompt.
 
@@ -64,7 +66,7 @@ A framework need not mention every slot type. Any type absent from its declared 
 
 ```
 approaches → disciplines → objective → examples → format → edge-cases
-  → markers → key-rules → context → date → task
+  → markers → key-rules → context → date → input
 ```
 
 Note the boundary: `key-rules` is the last instructions-side type and `context` the first input-side type, so the restated rules and the marker meanings that introduce the material sit immediately ahead of the content they govern — automatically, on every call, because the order is structural rather than remembered. A framework that says nothing about a slot still gets that slot's content, just in the default position; a framework that names a slot this version does not produce renders it as nothing, rather than failing the call.
@@ -77,7 +79,7 @@ The **key-rules** slot is the tail-recency counterweight. `important` is a per-m
 
 ### The system-wide fold
 
-An operation's composed segments are not the whole story. Before assembly, the resolver **unions the operation's own segments with the segments of every operation flagged `systemWide`** — the "system prompt is an operation" — folding an app's standing prompt into every run and deduplicating so a segment shared between the two appears once. The one exception: on an **internal/nested run** (a model-scored guardrail calling its scorer operation), the system-wide fold is **skipped**, so a scorer's prompt is exactly its own segments and the app's standing instructions never bias the score it produces.
+An operation's composed segments are not the whole story. Before assembly, the resolver **folds in the segments of the operation's selected system-prompt operation** — the one it names in `systemPromptOperationId`, or the default (the first-created enabled `systemWide` operation) when it names none — deduplicating so a segment shared between the two appears once. A `systemWide` operation is itself a named, reusable system prompt that *other* operations select ("the system prompt is an operation"); it folds none of its own, and adding a second one changes nothing until an operation selects it. The one exception: on an **internal/nested run** (a model-scored guardrail calling its scorer operation), the fold is **skipped**, so a scorer's prompt is exactly its own segments and the app's standing instructions never bias the score it produces.
 
 ---
 
@@ -91,13 +93,14 @@ Wrapping is the framework's second job. The same segment content is packaged in 
 
 A missing framework, or a slot the framework does not give wrapping for, renders `plain`.
 
-Three frameworks ship seeded, and the point of having three is worth stating plainly: **they declare the same slot order; only the wrapping differs per family.**
+Four frameworks ship seeded. Three of them — `anthropic-xml`, `generic-markdown` and `plain` — **declare the same slot order; only the wrapping differs per family.** The fourth, `openai-markdown-xml`, follows OpenAI's documented shape and moves **Examples** to after the other instruction slots (`objective → format → edge-cases → examples`), so the seeded frameworks do not all share one order.
 
 | Seeded framework | Wrapping | For |
 |---|---|---|
-| `anthropic-xml` | XML tags (`approaches`, `rules`, `objective`, `examples`, `output_format`, `edge_cases`, `markers`, `key_rules`, `context`, `current_date`; `task` plain) | Claude model families |
+| `anthropic-xml` | XML tags (`approaches`, `rules`, `objective`, `examples`, `output_format`, `edge_cases`, `markers`, `key_rules`, `documents`, `current_date`; `input` plain) | Claude model families |
 | `generic-markdown` | Markdown headings | Families without a documented tag preference |
 | `plain` | None | Models that respond poorly to structural markup |
+| `openai-markdown-xml` | Markdown headings for the instruction slots, an XML `<documents>` wrapper for context (and Examples ordered after edge-cases) | GPT model families |
 
 Under `anthropic-xml`, the instructions side of an approaches-plus-discipline-plus-markers operation — here carrying one `source`-marked context item the app flagged as an injection risk — renders like this:
 
@@ -124,7 +127,7 @@ The identical segments under `generic-markdown` become `## Approaches`, `## Rule
 
 ## Markers frame content automatically
 
-Two independent axes describe a content item. **What it is** is the *semantic* axis — the **marker** (`ai_marker`): an admin-managed record with a `meaning`, stating that a span is a source, an example, prior conversation. **Whether a model might wrongly obey instructions hidden in it** is the *security* axis — the per-item **`injectionRisk`** flag on the consumer segment, set by the app from the item's provenance, never by the end user. The same `source` marker can wrap a low-risk stored record and a high-risk ingested document; the marker says what the content is, the flag says how hard to defend against it. A marker carries no injection-risk meaning of its own, and both axes apply to context items only — a marker or a flag on the task is ignored, because the task *is* the instruction.
+Two independent axes describe a content item. **What it is** is the *semantic* axis — the **marker** (`ai_marker`): an admin-managed record with a `meaning`, stating that a span is a source, an example, prior conversation. **Whether a model might wrongly obey instructions hidden in it** is the *security* axis — the per-item **`injectionRisk`** flag on the consumer segment, set by the app from the item's provenance, never by the end user. The same `source` marker can wrap a low-risk stored record and a high-risk ingested document; the marker says what the content is, the flag says how hard to defend against it. A marker carries no injection-risk meaning of its own, and both axes apply to any supplied content item — **input or context**: a marked, injection-risky upload sent as input is sanitised and nonce-fenced exactly like a context item. The operation's *instruction* comes from its authored slots (approaches, disciplines, objective), not from an input segment, so only the user's plain (unmarked) message is left alone. An operation's declared input contract fills a marker and the injection-risk flag onto the caller's input by position, so a declared-untrusted upload is fenced on every path (including HTTP and the admin Test-run).
 
 The canonical order places the generated `markers` slot near the end of the instructions side — after it only the restated `key-rules` — and `context` as the **first** input-side type, so the statement of what a marker means sits just ahead of the marked content, on every call, because the order is structural rather than remembered.
 
@@ -170,15 +173,15 @@ Markers, not mere delimiters. Wrapping content in a single pair of delimiters is
 The `date` segment is computed, never authored and never persisted. It is rebuilt on every call from the call's own moment and the resolved model's knowledge cutoff:
 
 ```
-Today's date is 2026-07-24. Your training data has a cutoff of 2025-01-01;
+Today's date is 2026-07-24 (UTC). Your training data has a cutoff of 2025-01-01;
 treat knowledge after it as absent, not false.
 ```
 
-A null knowledge cutoff renders as `unknown`. This is an epistemic feature, not a formatting nicety: the model is told today's date and the edge of its own knowledge in one line.
+A null knowledge cutoff renders as `unknown`. This is an epistemic feature, not a formatting nicety: the model is told today's date and the edge of its own knowledge in one line. The date is the **UTC** calendar day — `isoDate` is `toISOString()` — and the anchor names UTC explicitly, so `Today's date is …` stays true for a deployment east or west of UTC rather than reading a day off for part of every day.
 
 **It must never survive into stored history.** A conversation carried forward across weeks that keeps its old date segments accumulates contradictory anchors — twenty statements of what "today" is, all but one stale. Recomputing every call and persisting none is the rule: one anchor, always current, no survivors.
 
-The same anchor drives relative time. Where a `context` or `task` segment carries a timestamp, the assembler renders it against the call's own moment — `dated: about three weeks before now`, `dated: earlier today` — at day, week, month or year granularity. Content dated *after* the anchor renders as `after now` rather than being hidden: a future-dated document is a fact worth stating. AI Core is the only party that knows when the call is happening, which is exactly what makes this its job rather than the consumer's.
+The same anchor drives relative time. Where a `context` or `input` segment carries a timestamp, the assembler renders it against the call's own moment — `dated: about three weeks before now`, `dated: earlier today` — at day, week, month or year granularity. Content dated *after* the anchor renders as `after now` rather than being hidden: a future-dated document is a fact worth stating. AI Core is the only party that knows when the call is happening, which is exactly what makes this its job rather than the consumer's.
 
 ---
 
