@@ -41,6 +41,10 @@ export default defineConfig({
               slug: "getting-started/documentation",
             },
             {
+              label: "Session Practices",
+              slug: "getting-started/session-practices",
+            },
+            {
               label: "Neon Database Setup",
               slug: "getting-started/neon-setup",
             },
@@ -366,6 +370,7 @@ export default defineConfig({
                 { label: "Developer Workflow", slug: "colour-palette/developer-workflow" },
                 { label: "Changelog", slug: "colour-palette/changelog" },
                 { label: "Roadmap", slug: "colour-palette/roadmap" },
+                { label: "Archive Audit", slug: "colour-palette/archive-audit" },
               ],
             },
             {
