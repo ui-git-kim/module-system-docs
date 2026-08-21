@@ -20,23 +20,16 @@ This roadmap reflects current plans and may change based on feedback and require
 
 Issues discovered but not yet fixed.
 
-### Large Documents Are Silently Truncated at 8,000 Characters
+### Large Documents Silently Truncated at 8,000 Characters — ✅ Resolved (engine v1.11.1)
 
-**Severity:** High
-**Where:** vendored engine — `cognitive-db/src/core/embedding.service.ts` (`generateEmbeddingText`, `DEFAULT_MAX_TEXT_LENGTH`)
+**Where:** vendored engine — `cognitive-db/src/core/embedding.service.ts` (`generateEmbeddingText`)
 
-A document of any length is **stored** in full but **embedded over only its first 8,000 characters** (≈2,000 tokens). `generateEmbeddingText` uses a content node's `summary` when one exists and otherwise calls `truncateText(rawContent, 8000)`; the ingest flow never sets a summary on the content node, so in practice every content node is embedded from its opening ~8,000 characters. Nothing errors and nothing is logged — the remainder is simply absent from the vector.
+Originally, a document of any length was stored in full but **embedded over only its first ~8,000 characters** — `generateEmbeddingText` called `truncateText(rawContent, 8000)` when no summary was set, and the ingest flow never set one, so the remainder was silently absent from the node vector (a 60-page affidavit was retrievable on its first few pages only — the failure that most reliably produces fabricated answers).
 
-Consequences:
+**Resolved in cognitive-db v1.11.1** (confirmed by the 2026-08-20 engine sweep). `generateEmbeddingText` now uses a fit-first `pickEmbeddingText` — the full raw text when it is ≤ 8,000 characters, else the node's LLM summary, else truncated raw only as a last resort — and both ingest paths guarantee an LLM summary before embedding (`perceptionService.ensureContentSummary` + the perceive step on the v1 path; step 3b on the Structure path). Long content is never silently embedded from truncated raw text.
 
-- A 60-page affidavit is retrievable on its first two or three pages only. A query about anything later either misses or returns a plausible-but-wrong neighbour — the retrieval failure that most reliably produces fabricated answers.
-- The truncation happens **inside the engine, before the provider is called**, so the embedding model's own input window (Voyage 3.5 is 32K tokens) is never reached and raising it changes nothing.
-- `embeddingDimensions` is unrelated — it sets vector *width*, not how much text can be embedded.
-
-**Workaround:** None that preserves recall. Splitting a long document into separate ingests before submission is the only way to get more than the opening pages into vectors today. Fixed by *Chunking for Large Documents* below.
-
-<Aside type="tip" title="Update (2026-08-01): module-side chunking shipped in v1.15.0">
-cog-ingest now splits documents and writes **per-chunk vectors** to Structure's chunk store, embedded through AI Core — so retrieval no longer depends on this coarse node vector (see *Chunking for Large Documents* below and the [v1.15.0 changelog](/modules/cog-ingest/changelog/)). What remains is **engine-side**: this node-level vector is still generated from the first 8,000 characters via `generateEmbeddingText`. Making it summary-based (or retiring it in favour of chunk vectors) is a separate engine session. The two live in parallel today — chunk vectors carry retrieval; the node vector still truncates.
+<Aside type="note">
+Residual, by design (not a bug): a long document's **node-level** vector is a ~500-token *summary* vector, so engine node-level retrieval alone is coarse for long documents. Full-fidelity retrieval relies on cog-ingest's **per-chunk vectors** in Structure's chunk store (shipped v1.15.0) — the correct, intended division. Retiring the node vector entirely is a Phase-5 clean-up, not a bug.
 </Aside>
 
 ### Embedding Seams Are Dormant, and One Is Misleading
@@ -46,7 +39,7 @@ cog-ingest now splits documents and writes **per-chunk vectors** to Structure's 
 
 Several embedding seams exist but are not connected, and one will actively mislead whoever wires chunking:
 
-- **`needsChunking()` is dead code carrying the wrong unit.** The engine exports `needsChunking(text, maxTokens = 8000)` and re-exports it from the package root, but nothing calls it and there is no splitter for it to gate. Its threshold is 8,000 **tokens**, whereas the truncation that actually fires is 8,000 **characters** — roughly a four-fold difference. Sizing chunks from this helper would be wrong.
+- **`needsChunking()` — ✅ removed (engine v1.11.1).** The engine previously exported a `needsChunking(text, maxTokens = 8000)` helper that nothing called and whose unit (tokens) mismatched the truncation that actually fired (characters). It is gone in v1.11.1 — a NOTE in `embedding.provider.ts` now states chunking is cog-ingest's job, which the module's splitter (v1.15.0) owns.
 - **Structure's embedding write path has no caller.** `structureEmbeddings.setNodeEmbedding` is registered and documented as "the engine write path", but nothing in cog-ingest or Structure calls it. Embeddings today are written by the vendored engine into `cog_nodes`, never `structure_node`.
 - **A host may have no embedding column at all.** The Structure embedding column is opt-in at install, so an app that did not opt in has no `structure_node.embedding` and Structure-side semantic search cannot run there regardless of what the engine stores.
 
@@ -118,6 +111,10 @@ The AI Core prompt model was redesigned (authored **slots**; `input` / `context`
 - Reshape `cognitive-db/docs/ai-core-operations.json` from `approaches` / `disciplines` **string arrays** into AI Core **records** (composed by reference) plus an explicit **input contract** per op (which item is the injection-fenced upload, which is reference `context`).
 - Make the manifest a real **engine package export** (not a `docs/*.json`) so the vendored tarball ships it and it cannot drift from the shipped engine.
 - cog-ingest reads the export and seeds each engine op through the same `seedLanguageOperation` path at boot. Then reconsider the engine adapter's per-call `task` — its standing instruction should live in the op's objective rather than ride as a runtime `input` segment.
+
+<Aside type="tip" title="cog-ingest half shipped (v1.21.14)">
+The consumer side of A2 landed: **`seedEngineOperations()`** loads a `cognitive-db/operations` package export and seeds each engine language op via `seedLanguageOperation` (boot + lazy self-heal on the first engine `runLanguage`), and **`ensureEmbedOperations` now also seeds `cognitive-db/embed-*`** so the engine's embed calls resolve. Degrade-safe — a **no-op until the engine ships the export**. What remains is entirely **engine-side**: reshape the manifest into the record shape (approaches keyed + deduped; disciplines expressed as approaches since the injected facade has no `ensureDiscipline`; per-op input contract; markers) and ship it as a real package export (today `package.json` `files: ["dist","prisma"]` excludes `docs/`, so the manifest isn't even in the tarball, and it's drifted 1.7.0 vs 1.11.1). The expected export shape is documented inline in `ai.ts` as the contract. See the engine worklist.
+</Aside>
 
 **Next — Structure v1.35 integration (the module owes Structure two things):**
 
