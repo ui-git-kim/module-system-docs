@@ -1,7 +1,7 @@
 ---
 title: Disciplines & Guardrails
 description: Rules as records, the guardrails that measure them, and the one gate enforced at write time and again on every call
-lastUpdated: 2026-08-19
+lastUpdated: 2026-08-23
 sidebar:
   order: 9
 ---
@@ -14,8 +14,8 @@ The rule is a database record. Its guardrail is a database record too — but th
 
 > **Prose asks; code holds.**
 
-<Aside type="note" title="Current as of v1.40.2">
-The discipline and guardrail machinery described here is the **Prompt Model v2** shape (v1.22.0, August 2026): the CRUD service, the write-time integrity rules, the resolution-time re-validation, the two deterministic built-ins (`coverage-reported`, `feedback-present`), the deterministic `source-verification` built-in and the model-scored **groundedness** guardrail all ship and have been exercised end-to-end against live providers. There is no `tier`, no `authority` hierarchy, and no `enabled` flag on these records any more — v2 removed all three. A few `config-io` **replace-mode** edge cases remain on the [Roadmap](/modules/ai-core/roadmap/); the resolver still refuses at run time in every one of them.
+<Aside type="note" title="Current as of v1.48.0">
+The discipline and guardrail machinery described here is the **Prompt Model v2** shape (v1.22.0, August 2026): the CRUD service, the write-time integrity rules, the resolution-time re-validation, the deterministic built-ins (`coverage-reported`, `feedback-present`, `source-verification`, and — new in **v1.48.0** — the admin-authored `assertion-rules`) and the model-scored **groundedness** guardrail all ship and have been exercised end-to-end against live providers. Since **v1.48.0 a guardrail is standalone and reusable**: it attaches to one or more disciplines through `ai_discipline_guardrail` rather than naming a single one (the old `ai_guardrail.disciplineId` is nullable and deprecated). There is no `tier`, no `authority` hierarchy, and no `enabled` flag on these records — v2 removed all three. A few `config-io` **replace-mode** edge cases remain on the [Roadmap](/modules/ai-core/roadmap/); the resolver still refuses at run time in every one of them.
 </Aside>
 
 ---
@@ -31,14 +31,14 @@ Neither is the brake alone:
     An authored record. Says how the operation must proceed, and — where it prohibits something — what to do instead. A prohibition with no named alternative gets taken anyway under pressure.
   </Card>
   <Card title="Guardrail — the verification" icon="approve-check">
-    A separate record that names the discipline it measures and points at an implementation: deterministic code, or a model-scored scorer operation. Without at least one, the rule is merely written down — an approach, not a discipline.
+    A separate, **reusable** record that points at an implementation — deterministic code, or a model-scored scorer operation — and is **attached** to the disciplines it measures (one guardrail can measure several). Without at least one attached, a discipline is merely written down — an approach, not a discipline.
   </Card>
 </CardGrid>
 
 Every serious system in the field keeps the authored rule and its enforcement in different places and binds them loosely, and nobody has closed that seam. AI Core does not close it either — it **manages** the gap and refuses the two states that would let it rot:
 
-- **Orphaned guardrail** — a guardrail naming a discipline that does not exist. Refused at write time (`upsertGuardrail` — "an orphaned guardrail measures nothing").
-- **Unguarded discipline** — a discipline with no guardrail. The "merely asked for" rule. `validateDisciplineSet` reports `discipline-without-guardrail`, so it can never resolve into a run.
+- **Attachment to a missing record** — attaching a guardrail to a discipline (or a discipline to a guardrail) that does not exist. Refused at write time (`attachGuardrail`). A guardrail itself is reusable and may sit unattached — it simply measures nothing until it is attached.
+- **Unguarded discipline** — a discipline with no attached guardrail. The "merely asked for" rule. `validateDisciplineSet` reports `discipline-without-guardrail`, so it can never resolve into a run.
 
 The two are enforced by the same gate that guards everything else on this page, described below.
 
@@ -86,17 +86,19 @@ The v1 behavioural rules — `no-sycophancy`, `refusal-boundary`, `ask-dont-gues
 
 ## Guardrails are their own records
 
-A guardrail is a separate record — the table `ai_guardrail` (renamed from the v1 `ai_guardrail_check`). It names the discipline `id` it measures, declares a `kind`, and carries a `config`:
+A guardrail is a separate, **reusable** record — the table `ai_guardrail` (renamed from the v1 `ai_guardrail_check`). Since **v1.48.0** it stands on its own: it declares a `kind` and a `config`, and is **attached** to the disciplines it measures through `ai_discipline_guardrail` (many-to-many) rather than naming one:
 
 | Field | Purpose |
 |---|---|
-| `id` | Kebab-case guardrail id. |
-| `disciplineId` | The discipline this guardrail measures — the join key of the brake. A guardrail naming a discipline that does not exist is refused at write time. |
+| `id` | Kebab-case guardrail id (optionally namespaced `owner/name`). |
+| `disciplineId` | **Deprecated (v1.48.0), nullable.** Attachments moved to `ai_discipline_guardrail`; kept only for the pre-join seeds and the data migration, never read for resolution. |
 | `kind` | `deterministic` (runs in code) · `model-scored` (calls a scorer operation). |
-| `config` | Implementation config. The run engine dispatches on `config.builtin` for **both** kinds. For a deterministic built-in, `{ builtin: '...' }` names the runtime function; for a model-scored one, `{ builtin: 'groundedness', scorerOperation: '...', threshold, onFail }` — a model-scored config without a `builtin` (only `groundedness` is implemented) is reported as `guardrail-check-unimplemented`, never run silently. |
+| `config` | Implementation config. The run engine dispatches on `config.builtin` for **both** kinds. For a deterministic built-in, `{ builtin: '...' }` names the runtime function (e.g. `assertion-rules` carries a `rules` array); for a model-scored one, `{ builtin: 'groundedness', scorerOperation: '...', threshold, onFail }` — a model-scored config without a `builtin` (only `groundedness` is implemented) is reported as `guardrail-check-unimplemented`, never run silently. |
 | `promptText` | Optional: what the model is told will be checked, rendered alongside the discipline. |
-| `version` | Bumps when the guardrail's own substance (target discipline, kind, config or rubric prompt) moves. |
+| `version` | Bumps when the guardrail's own substance (kind, config or rubric prompt) moves. |
 | `seeded` | `true` for built-ins. |
+
+Attachments live in **`ai_discipline_guardrail`** (`disciplineId`, `guardrailId`, `position`). Deleting a discipline removes its attachments (the reusable guardrails survive); deleting a guardrail detaches it everywhere first; the resolver runs the **deduped** set an operation's disciplines attach.
 
 Rules and guardrails **version independently** — that is exactly why the guardrail is a separate record, not an embedded body. A guardrail's `version` bumps when its own substance moves; the discipline's `version` bumps on its own edits. The ledger records both, so a run is explicable against the precise rule *and* the precise guardrail that were in force.
 
@@ -114,6 +116,22 @@ Rules and guardrails **version independently** — that is exactly why the guard
 </CardGrid>
 
 A third deterministic built-in, `source-verification`, is opt-in for extraction operations: it verifies each returned item against the source (config carries `itemsPath` and `matchMode`) and reports coverage — where the source has no independent count, completeness is reported as *unverified* rather than assumed. Backs `ai-core/verify-extraction-against-source`.
+
+#### `assertion-rules` — a check you configure (v1.48.0)
+
+The other deterministic built-ins each do one fixed thing. `assertion-rules` is the general one: its *test* is authored in the admin, so a deterministic guardrail is no longer limited to "every returned item appears in the source". Its config carries a `rules` array; each rule holds over the whole structured output, or — with `forEach` — over **each item** of a list path, optionally gated by a `when` clause (an *if X then Y*). A rule requires **all** (`allOf`) or **any** (`anyOf`) of its clauses to hold, where a clause is a `field` plus a `condition`:
+
+```json
+{
+  "builtin": "assertion-rules",
+  "rules": [
+    { "forEach": "records", "clause": { "field": "standing", "condition": "one-of", "value": ["told", "held", "before-court"] } },
+    { "forEach": "actions", "when": { "field": "type", "condition": "one-of", "value": ["send", "file", "delete"] }, "clause": { "field": "confirmation", "condition": "exists" } }
+  ]
+}
+```
+
+Conditions: `exists` · `absent` · `non-empty` · `empty` · `equals` · `not-equals` · `one-of` · `matches` / `not-matches` (a regular expression) · `gte` · `lte` · `between` · `length-between` · `unique` · `is-type` · `appears-in-source` (the value appears in the run's supplied material — no model call, the same haystack `source-verification` uses). Every failing rule names itself in feedback (`assertion-failed:<label>`); an empty, null or otherwise misconfigured rule is named too (`assertion-rule-misconfigured:<label>`), never a silent pass. It runs in code, with no model call. This expresses the common shape of most deterministic checks: *each item carries a tag from an allowed set*, *this field must be present*, *if it's an outward action, a confirmation must be present*.
 
 ### The model-scored guardrail
 
@@ -150,11 +168,11 @@ This is the load-bearing part. There is exactly **one** function that decides wh
 
 The gate fires when a **disciplines segment's membership changes** (`records.upsertSegment`, on the disciplines slot). Adding a discipline to a segment is what turns it on, so that is the moment to check the resulting set holds. Since v1.23.0 an operation can also carry its **own** disciplines slot — a private per-operation segment — and the same gate fires from `records.upsertOperation` when that slot changes: same function, same refusal. The related CRUD refusals guard the surrounding records:
 
-- **A guardrail must name an existing discipline.** `upsertGuardrail` refuses an orphaned guardrail — one whose `disciplineId` resolves to nothing — because it measures nothing.
-- **A referenced discipline cannot be deleted.** `deleteDiscipline` is refused while any segment still carries it via `ai_segment_discipline`, naming every referring segment and the enabled operations that compose them — deleting underneath a live composition would silently narrow those operations. Once unreferenced, its guardrails cascade-delete with the row.
-- **Removing the last guardrail is allowed but loud.** `deleteGuardrail` is never refused, but if it strips a discipline's *last* guardrail it logs an audited warning: that discipline now has no brake and will fail `validateDisciplineSet` until it gains another.
+- **A guardrail is standalone; attaching requires both ends to exist.** `upsertGuardrail` creates a reusable guardrail that names no discipline; `attachGuardrail` refuses a discipline or a guardrail that does not exist. A discipline needs at least one *attached* guardrail to resolve.
+- **A referenced discipline cannot be deleted.** `deleteDiscipline` is refused while any segment still carries it via `ai_segment_discipline`, naming every referring segment and the enabled operations that compose them — deleting underneath a live composition would silently narrow those operations. Once unreferenced, its guardrail **attachments** are removed (the reusable guardrails themselves survive).
+- **Removing the last guardrail is allowed but loud.** `detachGuardrail` (and deleting a guardrail) is never refused, but if it strips a discipline's *last* guardrail it logs an audited warning: that discipline now has no brake and will fail `validateDisciplineSet` until it gains another.
 
-Authoring a new discipline and its guardrail is therefore a short, ordered sequence — the guardrail write requires the discipline to already exist:
+Authoring a new discipline and its guardrail is therefore a short, ordered sequence — attaching requires the discipline to already exist:
 
 <Steps>
 
@@ -171,14 +189,17 @@ Authoring a new discipline and its guardrail is therefore a short, ordered seque
    });
    ```
 
-2. **Attach a guardrail.** It must name the discipline above, so the discipline has to exist first. Without at least one guardrail the record is an approach, not a discipline.
+2. **Create a guardrail (reusable) and attach it.** A guardrail is standalone — it names no discipline — and is attached to one or more disciplines. Attaching requires the discipline to exist first. Without at least one attached, the record is an approach, not a discipline.
 
    ```ts
    await disciplinesService.upsertGuardrail({
      id: 'guardrail-cite-policy-clause',
-     disciplineId: 'my-app/cite-policy-clause',
      kind: 'deterministic',
      config: { builtin: 'source-verification', itemsPath: 'clauses', matchMode: 'normalized' },
+   });
+   await disciplinesService.attachGuardrail({
+     disciplineId: 'my-app/cite-policy-clause',
+     guardrailId: 'guardrail-cite-policy-clause',
    });
    ```
 
@@ -196,7 +217,7 @@ Because both moments call one function, a raced admin write cannot cause a silen
 
 ## The seam is managed, not closed
 
-Nobody closes the seam between the authored rule and its enforcement, so AI Core does not claim to prevent every gap — it makes each one loud at the moment it would matter. The strong cases *are* refused: an unguarded discipline can never resolve into a run (`discipline-without-guardrail`), an orphaned guardrail is refused at write, a referenced discipline cannot be deleted, and a model-scored guardrail whose scorer is gone refuses rather than passing silently. The one deliberately-permitted gap — deleting a discipline's last guardrail — is allowed but logged loudly, and caught at the next resolution.
+Nobody closes the seam between the authored rule and its enforcement, so AI Core does not claim to prevent every gap — it makes each one loud at the moment it would matter. The strong cases *are* refused: an unguarded discipline can never resolve into a run (`discipline-without-guardrail`), attaching a guardrail to a missing discipline is refused at write, a referenced discipline cannot be deleted, and a model-scored guardrail whose scorer is gone refuses rather than passing silently. The one deliberately-permitted gap — detaching (or deleting) a discipline's last guardrail — is allowed but logged loudly, and caught at the next resolution.
 
 A few `config-io` **replace-mode** edge cases remain — a scorer operation or an eval case orphaned by a self-inconsistent hand-authored replace, and create-path provenance under a transient database failure. They are narrow, low-severity, and the resolver still refuses at run time in every one; they are tracked on the [Roadmap](/modules/ai-core/roadmap/).
 
