@@ -9,7 +9,7 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 The icon picker is a shared component library at `@/components/icon-picker` that all modules must use when they need icon selection. It provides headless primitives for full control and composed components for common use cases.
 
 <Aside type="note">
-The headless primitives (`useIconPicker`, `IconPickerGrid`, `IconRenderer`) depend only on React and `lucide-react`. The composed components (`IconPicker`, `IconPickerDialog`) additionally require shadcn `Button`, `Input`, and `Dialog`.
+The headless primitives (`useIconPicker`, `IconPickerGrid`, `IconRenderer`) depend only on React and `lucide-react`. The composed components (`IconPicker`, `IconPickerDialog`) additionally require shadcn `Button`, `Command`, and `Dialog`.
 </Aside>
 
 ---
@@ -86,9 +86,15 @@ const {
   category,      // Active category filter (null = all)
   setCategory,   // Set category filter
   categories,    // All available categories (readonly array)
-  icons,         // Filtered IconData[] based on search + category
+  icons,         // Filtered IconData[] — capped at 300 (see below)
+  totalCount,    // Total icons matching search + category, before the cap
+  isCapped,      // true when the match count exceeds the cap
 } = useIconPicker();
 ```
+
+<Aside type="note" title="`icons` is capped at 300">
+To keep the DOM from mounting the full ~1600-icon set at once, `icons` is truncated to at most 300 entries (`MAX_VISIBLE_ICONS`) — this applies to the unfiltered browse view and to any broad search or category that still matches hundreds. `totalCount` reports the full match count and `isCapped` is `true` whenever the list was truncated, so you can render a "Showing X of Y" hint that prompts the user to refine their search to reach the rest.
+</Aside>
 
 Each `IconData` in the `icons` array contains:
 
@@ -202,21 +208,23 @@ const [icon, setIcon] = useState<string | null>(null);
 
 `useIconPicker` loads the **entire** Lucide icon set and merges the `lucide-tags.json` search metadata, then memoises search and category filtering. Enumerating every icon is the whole point of a *browse-everything* picker — but it also means the picker **cannot be tree-shaken**: it deliberately pulls in all of Lucide.
 
-<Aside type="caution" title="Reach the picker only through a dynamic import">
-Because it enumerates the full icon set, the picker must live in its **own lazy chunk**. Never import `IconPicker` or `IconPickerDialog` eagerly into a route or a shared bundle — every icon would ship in that bundle. Lucide's own docs warn that importing the whole `icons` object "is not recommended when you are using a bundler since your application build size will grow substantially." Load the picker on demand, so its code (and all of Lucide) is fetched only when a user actually opens it:
+<Aside type="caution" title="Reach the browse UI only through a dynamic import">
+Because it enumerates the full icon set, the browse UI must live in its **own lazy chunk**. Never import `IconPicker` — or use `useIconPicker` / `IconPickerGrid` directly — eagerly into a route or a shared bundle, since every icon would ship in that bundle. Lucide's own docs warn that importing the whole `icons` object "is not recommended when you are using a bundler since your application build size will grow substantially." Load these on demand, so their code (and all of Lucide) is fetched only when a user actually opens the picker.
+
+`IconPickerDialog` is the exception: it already lazy-loads `IconPicker` (and therefore the full Lucide barrel) internally when the dialog first opens, and its trigger resolves the current icon per-icon via `IconRenderer`. So `IconPickerDialog` is safe to import eagerly — as the Quick Start above does — and needs no wrapping `lazy()`. When you build your own trigger from the raw hook or grid, do the lazy-loading yourself:
 
 ```tsx
 import { lazy, Suspense, useState } from 'react';
 
-const IconPickerDialog = lazy(() =>
-  import('@/components/icon-picker').then((m) => ({ default: m.IconPickerDialog })),
+const IconPicker = lazy(() =>
+  import('@/components/icon-picker').then((m) => ({ default: m.IconPicker })),
 );
 
 function IconField() {
   const [icon, setIcon] = useState<string | null>(null);
   return (
     <Suspense fallback={null}>
-      <IconPickerDialog value={icon} onChange={setIcon} allowNone />
+      <IconPicker onChange={setIcon} allowNone />
     </Suspense>
   );
 }
@@ -227,7 +235,7 @@ function IconField() {
 
 ## Categories
 
-The `CATEGORIES` constant is a readonly array of all 41 Lucide icon categories. `CATEGORY_LABELS` maps each category to a human-friendly label.
+The `CATEGORIES` constant is a readonly array of all 43 Lucide icon categories. `CATEGORY_LABELS` maps each category to a human-friendly label.
 
 ```tsx
 import { CATEGORIES, CATEGORY_LABELS } from '@/components/icon-picker';
@@ -271,8 +279,8 @@ import { DynamicIcon } from 'lucide-react/dynamic';
 Mind the naming difference: this picker stores **PascalCase** names (`"AlertCircle"`), while `DynamicIcon` expects **kebab-case** (`"alert-circle"`) — so they are not drop-in interchangeable. Convert the name, or keep using a bundle-safe `IconRenderer` / a small curated `{ AlertCircle, … }` map when the set of possible icons is fixed.
 </Aside>
 
-<Aside type="note" title="Verify the renderer's internals against the code">
-The export name (`IconRenderer`) and its `{ icon, fallback, strokeWidth }` contract are confirmed on this page, but **whether `IconRenderer` resolves names without importing the full barrel could not be verified from the docs repo**. Check the component source (`frontend/src/components/icon-picker/IconRenderer.tsx`): if it code-splits (via `lucide-react/dynamic` or a lazy lookup) it is safe to use anywhere; if it imports the full `icons` object, treat it as picker-chunk-only and use `DynamicIcon` / a curated map in hot render paths.
+<Aside type="note" title="IconRenderer is bundle-safe anywhere">
+`IconRenderer` resolves a saved name via [`DynamicIcon`](https://lucide.dev/guide/packages/lucide-react#dynamic-imports) from `lucide-react/dynamic` (`frontend/src/components/icon-picker/IconRenderer.tsx`), so it code-splits one icon per chunk and **never** imports the full Lucide barrel. It is safe to use in any hot, eagerly-loaded path — nav, dashboard, admin JSON config — including alongside `IconPickerDialog`'s trigger. It converts the stored PascalCase name to kebab-case at the boundary, so the stored-name contract is unchanged.
 </Aside>
 
 ---
@@ -292,7 +300,8 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 
 function CustomIconPicker({ onSelect }: { onSelect: (icon: string | null) => void }) {
-  const { search, setSearch, category, setCategory, categories, icons } = useIconPicker();
+  const { search, setSearch, category, setCategory, categories, icons, totalCount, isCapped } =
+    useIconPicker();
 
   return (
     <div>
@@ -344,6 +353,13 @@ function CustomIconPicker({ onSelect }: { onSelect: (icon: string | null) => voi
           </p>
         )}
       />
+
+      {/* Cap hint — prompt a refine when matches were truncated */}
+      {isCapped && (
+        <p className="py-2 text-center text-muted-foreground">
+          Showing {icons.length} of {totalCount} icons — refine your search to see more.
+        </p>
+      )}
     </div>
   );
 }
