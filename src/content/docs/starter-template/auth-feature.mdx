@@ -172,15 +172,24 @@ The `AuthProtectedRoute` component:
 
 ```tsx
 // frontend/src/features/auth/components/AuthProtectedRoute.tsx
+import { Navigate, useLocation } from 'react-router';
+import { Spinner } from '@/components/ui/spinner';
+
 export function AuthProtectedRoute({ children }: { children: React.ReactNode }) {
   const { data, isPending } = useSession();
+  const location = useLocation();
 
   if (isPending) {
-    return <div className="flex min-h-screen items-center justify-center">Loading...</div>;
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <Spinner className="size-8 text-muted-foreground" />
+      </div>
+    );
   }
 
+  // Remember where the user was headed so sign-in can return them there.
   if (!data?.user) {
-    return <Navigate to="/auth/sign-in" replace />;
+    return <Navigate to="/auth/sign-in" replace state={{ from: location }} />;
   }
 
   return <>{children}</>;
@@ -329,7 +338,7 @@ The `requireAuth` middleware verifies JWT tokens using JWKS (JSON Web Key Set) f
 
 ```typescript
 // backend/src/middleware/auth.middleware.ts
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyOptions } from 'jose';
 import { env } from '../config/env.js';
 
 // JWKS client — automatically caches and refreshes public keys
@@ -338,6 +347,13 @@ const baseUrl = env.NEON_AUTH_URL.endsWith('/')
   : env.NEON_AUTH_URL;
 const jwksUrl = new URL(`${baseUrl}/.well-known/jwks.json`);
 const JWKS = createRemoteJWKSet(jwksUrl);
+
+// Optional issuer/audience checks — jose validates `iss`/`aud` ONLY when these
+// options are supplied. Both are unset by default, so existing deployments are
+// unaffected (the signature is always bound to this instance's JWKS).
+const jwtVerifyOptions: JWTVerifyOptions = {};
+if (env.NEON_AUTH_ISSUER) jwtVerifyOptions.issuer = env.NEON_AUTH_ISSUER;
+if (env.NEON_AUTH_AUDIENCE) jwtVerifyOptions.audience = env.NEON_AUTH_AUDIENCE;
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   try {
@@ -349,12 +365,15 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     }
 
     const token = authHeader.slice(7);
-    const { payload } = await jwtVerify(token, JWKS);
+    const { payload } = await jwtVerify(token, JWKS, jwtVerifyOptions);
 
-    // Attach user data to the request object
+    // Attach user data to the request object. tenantId is the isolation key
+    // for data scoping (RLS + owned()); in solo apps it equals the user id.
+    const userId = payload.sub as string;
     req.user = {
-      id: payload.sub as string,     // 'sub' claim = user ID
-      email: payload.email as string, // 'email' claim = user email
+      id: userId,                      // 'sub' claim = user ID
+      email: payload.email as string,  // 'email' claim = user email
+      tenantId: userId,                // solo default: tenant === user
     };
 
     next();
@@ -1166,14 +1185,18 @@ A module that wants a different look can register CSS through the `styleRegistry
 
 ## Sign Out
 
+Use `signOutAndClear()` — it calls `authClient.signOut()`, then clears the TanStack Query cache in a `finally`. That frees the previous account's cached profile (including a base64 avatar), notifications, and settings immediately, and closes a same-tab privacy gap where the old data would otherwise linger (until `gcTime`) and be briefly readable after a user switch. The starter wires it into `NavUser` and the `DataPrivacyPage`. Callers own any navigation afterwards.
+
 ```tsx
-import { authClient } from '@/features/auth';
+import { signOutAndClear } from '@/features/auth';
 
 async function handleSignOut() {
-  await authClient.signOut();
+  await signOutAndClear();       // signOut() + queryClient.clear()
   window.location.href = '/auth/sign-in';
 }
 ```
+
+`authClient.signOut()` remains the underlying primitive — reach for it directly only if you deliberately want to end the session **without** dropping the cache.
 
 ---
 
@@ -1189,6 +1212,14 @@ VITE_NEON_AUTH_URL=https://your-project.neonauth.region.aws.neon.tech/neondb/aut
 
 ```env
 NEON_AUTH_URL=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
+
+# Optional JWT claim hardening — both OFF unless set. When set, requireAuth
+# rejects tokens whose `iss` / `aud` claim doesn't match (RFC 8725 §3.8).
+# Defence-in-depth against audience confusion when one Neon Auth instance
+# issues tokens for multiple relying parties; the signature is always bound
+# to this instance's JWKS regardless.
+# NEON_AUTH_ISSUER=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
+# NEON_AUTH_AUDIENCE=your-app-audience
 ```
 
 <Aside type="caution">
@@ -1310,6 +1341,7 @@ Neon Auth is still marked **beta** on Neon's side. Watch the changelog on [https
 |------|-----|
 | Make authenticated API calls from frontend | Use `api` from `@/lib/api` — tokens are injected automatically |
 | Get current user in a React component | `const { data } = useSession()` then `data?.user` |
+| Sign the user out | `signOutAndClear()` from `@/features/auth` — ends the session and clears the query cache |
 | Get user ID in backend route handler | `req.user!.id` (after `requireAuth`) |
 | Get user email in backend route handler | `req.user!.email` (after `requireAuth`) |
 | Register authenticated backend routes | `routeRegistry.register({ ..., requiresAuth: true })` |
