@@ -17,6 +17,94 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v2.7.1
+
+**Nav registry `icon` accepts any SVG-rendering component — unblocks barrel-free module icons**
+
+The navigation registry typed `icon` strictly as `LucideIcon`, so a module could satisfy it only with a directly-imported Lucide component. A module that renders **config-driven** icons — a node type's stored Lucide *name*, chosen in the admin UI — therefore reached for lucide's full `icons` map (~1600 components) to turn a name into a component, landing the whole barrel in the app's first-paint bundle. That undid, inside the module's chunk, the very win the template's own `IconRenderer` got in v2.6.7.
+
+- **New exported `NavIcon` type** (`@/config`): `LucideIcon | ComponentType<SVGProps<SVGSVGElement>>`. `NavigationItem.icon` (and the admin nav-management sortable-item consumer) now accept it. Rendering is unchanged — both forms render as `<item.icon />`.
+- This lets a module resolve a stored icon **name** through the DynamicIcon-based `IconRenderer` (`@/components/icon-picker`) — one lazy chunk per icon actually used — instead of importing the whole barrel. The Structure module does exactly this in its matching release (sidebar / group-section icons).
+- Additive and backwards-compatible: every existing `icon: SomeLucideIcon` still type-checks (`LucideIcon` is a member of the union). **Patch.**
+
+**Propagation:** frontend-only (`frontend/src`); no schema, migration, or env change — apps get it on `template:update`. Validated by a real-app `tsc` (veradai): zero errors across the whole frontend, every nav render site and the admin sortable-list consumer included. A module that resolves config-driven nav icons needs this starter version (≥ v2.7.1) to type-check.
+
+---
+
+## v2.7.0
+
+**New: shell-init registry — modules can run post-auth initialisation in the app shell**
+
+A new `shellInitRegistry` (frontend) lets a module mount a component **once inside the authenticated shell**, after login — for priming navigation or caches from server data, or opening a subscription, **without an import-time side effect that races authentication**.
+
+- **The failure it fixes:** a module that primes its sidebar by fetching at *import* time fires before the auth token lands, fails, and never retries — so its nav appears only after the user visits one of its pages. It registers a null-rendering init component instead; `DashboardPage` (behind the auth guard) mounts it post-login via a new `ShellInit`, so the work runs reliably and re-runs on a fresh login.
+- `shellInitRegistry.register({ id, component, order? })` + `useShellInitRegistry()`, exported from `@/config`. See [Registries → Shell Init Registry](/starter-template/registries/#shell-init-registry).
+- **Minor** (new registry). Additive and inert until a module registers.
+
+**Propagation:** frontend-only; apps get it on `template:update`. Modules adopt it with a `shell-init.registration.ts` (e.g. the Structure module registers its `StructureInit` so the sidebar primes on load, not on first visit).
+
+---
+
+## v2.6.8
+
+**Fix: `IconRenderer` type error from v2.6.7 (DynamicIcon `name`)**
+
+v2.6.7's `IconRenderer` failed `type-check` in a real app. Two problems: `name={name as keyof typeof dynamicIconImports}` widened to `string` at the call site (the import map is `Record<string, …>` there), and — decisively — the `{...props}` spread came *after* the explicit `name`, so SVGProps' optional `name?: string` clobbered the required `IconName`-typed prop with `string`. Surfaced by veradai's `tsc` (the template can't type-check itself).
+
+- Cast to lucide's exported `IconName` type, and set `name` **last** so it wins over the `{...props}` spread.
+- No behaviour change; the v2.6.7 memory win (per-icon dynamic loading, no full barrel) stands.
+
+**Propagation:** frontend-only. **Apps that took v2.6.7 should take v2.6.8 before building** — v2.6.7's `IconRenderer` breaks `type-check`/build.
+
+---
+
+## v2.6.7
+
+**Frontend memory reductions — on-demand icons, lazy settings pages, split notifications route**
+
+A verified frontend memory investigation (leaks: none; caching: well-tuned; admin + charts: already lazy) found two real levers for what an app loads up-front and holds in the JS heap. Fixed:
+
+- **Icon rendering no longer pulls the full lucide barrel.** `IconRenderer` resolved saved icons by indexing lucide's entire `icons` map (~1600 components) — a dynamic index no bundler can tree-shake, so any app that renders DB-configured icons (sidebar, nav, cards) shipped the whole set in its main bundle. It now resolves each icon on demand via `lucide-react/dynamic` (`DynamicIcon`), converting the stored PascalCase name to kebab at the boundary (stored-name contract unchanged; unknown names still fall back gracefully). Closes the [2026-08-19 upstream issue](/starter-template/upstream-issues/).
+- **The icon browser loads only when opened.** `IconPickerDialog` now `React.lazy`-loads `IconPicker`, so the full icon map + the 232 KB tags JSON download only on first open, not with whatever bundle imports the picker trigger. The grid also caps at 300 for *any* view (broad searches included), not just the default browse.
+- **Settings pages load on demand.** All six settings screens (incl. the ~1,200-line Security page) were statically registered and shipped in the first-paint bundle even though only one renders at a time. They're now `React.lazy` (mirroring the admin pages), rendered inside a `<Suspense>` in `DynamicSettingsPage` — moving ~2,700 lines of settings UI (and an eagerly-reachable date library) out of the initial load.
+- **Notifications route is lazy** (mirrors the support route) — the non-landing `/notifications` page no longer sits in the first-paint bundle.
+
+**Not changed:** the Login page was left eager (it's the logged-out landing screen; lazy-splitting it trades a fetch on the login path for a marginal saving). No leaks were found; the query cache and admin/charts splitting were already optimal.
+
+**Propagation:** frontend-only (`frontend/src`); no schema, migration, or env change — apps get it on `template:update`. The template's own nav uses direct component refs, so the icon win lands in apps that render saved (picker-chosen) icons. Modules carry their own icon/bundle surfaces — a separate per-module pass.
+
+---
+
+## v2.6.6
+
+**Dependency-audit follow-up — allowlist the Prisma-pulled `deepmerge-ts` chain**
+
+A proper `npm audit` (it runs off the lockfile — the v2.6.5 audit pass had wrongly skipped it, assuming it needed `node_modules`) surfaced high advisories beyond that report. Dispositioned:
+
+- **`deepmerge-ts` (GHSA-ggr8-5vv4-36mx, stack exhaustion)** is pulled in transitively by **Prisma 7** (surfacing on `deepmerge-ts` plus its carriers `@prisma/config` / `prisma`). The only `npm audit fix` **downgrades Prisma to 6.x** (breaking), so it's now allowlisted — `deepmerge-ts` precisely by GHSA, the GHSA-less carriers by package name (tagged `known:pkg`, so they stay visible) — until Prisma bumps `deepmerge-ts` to ≥ 8. Re-review on the next Prisma release.
+- **`nanoid` (GHSA-2v37-7h3g-55p8)** is **not** allowlisted — it has a safe, non-breaking `npm audit fix`. Apply it in a cloned app (`package-lock.json` is app-owned; run `npm audit fix` + test) rather than accepting it. The gate keeps surfacing it as NEW until then.
+- **`better-auth`** (critical, Neon managed chain) remains allowlisted — the standing "stay managed + monitor" decision.
+- The audit-gate's blanket-suppression re-review note now names both upstream chains (Neon / Prisma).
+
+**Propagation:** `.audit-allowlist.json` + `scripts/audit-gate.mjs` reach apps via `template:update` (CI config only — no runtime code, no schema, no env key).
+
+---
+
+## v2.6.5
+
+**Cleanup & security audit remediation — durable GDPR audit trail, dedupe, audit-gate hardening**
+
+A read-only cleanup & security audit (6 dimensions, each adversarially verified) came back **0 critical / 1 moderate / 3 minor** — backend authorization (no IDOR), backend input/error handling, and frontend security were all clean. This release remediates the code findings.
+
+- **Data/Compliance (Moderate):** the two most sensitive GDPR actions — **account deletion** (`user.deleted`) and **personal-data export** — never reached the durable/compliance audit sink; both were only ephemeral pino logs, so in compliance `auditMode` (immutable, hash-chained, GDPR Art. 30) an erasure or export left **no permanent record**. `user.deleted` is now wired into `ACTIVITY_HOOKS`, and `exportUserData` emits a new `user.dataExported` hook (added to the hooks catalog + the user security manifest's `auditEvents`). Payloads are still redaction-summarised, so no large/sensitive blobs are stored.
+- **Cleanup (Minor):** `SecurityAdminPage` imported a byte-identical local `cap()` helper — it now uses the canonical `cap()` exported from the admin `system-blocks`.
+- **Pipeline (Minor):** `scripts/audit-gate.mjs` now **prefers specific advisory-id (GHSA) allowlisting over blanket package-name suppression**, tags blanket matches as `known:pkg` (so a *new* advisory in an already-listed package stays visible for review rather than silently hidden), and records `GHSA-g38m-r43w-p2q7` explicitly. The deliberate blanket suppression of the unfixable Neon/better-auth chain is unchanged.
+- **Known / unchanged:** CI remains **parked** (`workflow_dispatch` only) pending the GitHub-side secrets — the pipeline definition is sound; restore the `push`/`pull_request` triggers when Actions is configured.
+
+**Propagation:** apps pull v2.6.5 via `template:update`; the backend change touches `backend/src` only (no schema/model change, **no migration**, no new env key). The new `user.dataExported` hook is additive.
+
+---
+
 ## v2.6.4
 
 **Security tier prompt + auto-provisioned field-encryption key (no more manual `.env`)**
