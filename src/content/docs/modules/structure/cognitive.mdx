@@ -511,6 +511,55 @@ New and extended endpoints (internal API, session-authed, relative to `/api/v1/s
 | `PATCH` | `/connections/:id` | Replace a connection's `data` and/or `metadata` (userId-scoped; 404s a foreign id) |
 | `GET` | `/nodes/:id/connections?status=&origin=` | Node connections; `status` comma-separated, default `active` |
 
+## Deduplicating and re-organising nodes
+
+cognitive-db's ingest pipeline discovers the same real-world entity more than once and, over time, condenses the graph. Three service methods cover that — two of which already existed:
+
+- **`archiveNode(id, userId, options?)`** — soft-hide a node (`status: 'archived'`). Already shipped; serviceRegistry-callable.
+- **`moveNode(id, userId, newParentId, sortOrder?, options?)`** — re-parent a node and its subtree, enforcing the type's hierarchy rules and the enforced-space boundary. Already shipped; serviceRegistry-callable.
+- **`mergeNode(fromId, intoId, userId, options?)`** — fold a duplicate node into a canonical one. Added in v1.36.13.
+
+So the "archive / merge / re-parent" capability the engine needs is: `archiveNode` (archive), `moveNode` (re-parent), and `mergeNode` (merge). Only merge was new.
+
+### `mergeNode`
+
+```typescript
+await structureService.mergeNode(duplicateId, canonicalId, userId, {
+  reparentChildren: true,   // default — move the duplicate's children under the canonical
+  mergeData: true,          // default — backfill the canonical's EMPTY data fields from the duplicate
+  retire: 'archive',        // default — 'archive' | 'delete' the duplicate
+});
+```
+
+In a single transaction, `mergeNode`:
+
+1. **Re-points every connection** touching the duplicate onto the canonical. An edge that would become a self-loop (it ran between the two merged nodes) is dropped; an edge that would duplicate one the canonical already has is collapsed. Bidirectional connection types are compared as unordered pairs.
+2. **Re-parents the duplicate's direct children** under the canonical (subtree paths cascade). A child whose name collides with an existing child of the canonical is suffixed (`… (merged)`), never dropped — the `(userId, parentId, name)` unique constraint can never abort the merge.
+3. **Backfills the canonical's empty `data` fields** from the duplicate — a populated canonical field always wins, and secret values are re-sealed on write (legacy plaintext is never relocated in the clear).
+4. **Retires the duplicate** — archived by default, or soft-deleted with `retire: 'delete'`, which also cascades the duplicate's remaining subtree and sweeps every edge touching it or a descendant (mirroring `deleteNode`).
+
+Preconditions (each throws `BadRequestError` / `NotFoundError`): both nodes exist and are owned by `userId`, are the **same node type**, are **not** a shared/global type, sit in the **same space**, neither is an **ancestor/descendant** of the other, and neither is soft-deleted. `mergeNode` fires `structure.node.merged` (`{ userId, fromId, intoId, node, reparentedChildren, repointedConnections, droppedConnections }`) and returns the canonical node.
+
+<Aside type="note">
+`mergeNode` is a serviceRegistry-only service primitive — no HTTP route, no built-in UI. Hierarchy rules (`maxChildren` / `maxDepth`) are deliberately **not** re-checked on the re-parented children: a merge combines two same-type nodes whose children were already valid, and enforcing `maxChildren` here would reject merges a plain move never would.
+</Aside>
+
+### Exact-name lookup (dedup)
+
+The exact-name dedup stage needs to find an existing node by name, confined to a scope. `listNodes` supports this directly:
+
+- **`name`** — exact-equality filter on the node name. Combined with `parentId` it is served by the `(userId, parentId, name)` index.
+- **`nameInsensitive: true`** — case-insensitive match (`"Acme"` matches `"acme"`). LIKE metacharacters in the value are escaped, so a name such as `node_1` matches literally rather than as a wildcard. Pair it with a `parentId` / `pathPrefix` scope (the insensitive form is unindexed).
+- **`options.scopeRootId`** — for a trusted (`isSystem`) caller, confines the list to one enforced space, matching the retrieval arm. `parentId` and `pathPrefix` confine unconditionally for any caller.
+
+```typescript
+const existing = await structureService.listNodes(
+  userId,
+  { type: 'company', name: 'Acme Corp', nameInsensitive: true, parentId },
+  { isSystem: true, scopeRootId },
+);
+```
+
 ## Node-type proposals
 
 A cognitive module that keeps meeting an entity with no matching node type can **propose** one instead of creating it. Proposing is deliberately **non-admin** (it's the low-privilege path); reviewing is admin-only.
