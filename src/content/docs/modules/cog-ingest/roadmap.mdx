@@ -139,6 +139,36 @@ The engine reached **v1.12.10** (re-vendored in **v1.21.24**). The bump is addit
 - **Connection-type seeding — ✅ shipped (v1.21.27).** cog-ingest seeds the eight connection types the engine emits (`related_to` / `co-activated` / `qualifies` / `may_answer` / `answers` / `followed_by` / `analogous_to` / `proxy_for`) from the engine's `COGNITIVE_DB_CONNECTION_TYPES` export (cognitive-db v1.12.11), each with its `relationClass` backbone. Per-user (Structure's `createConnectionType` pins `userId`), idempotent, degrade-safe, seeded on first ingest. Structure's `createConnection` already accepts unregistered types, so this is ontology hygiene (named/typed edges) rather than a correctness fix — but it anchors the growing vocabulary to the fixed relation-class backbone.
 - **Parked (do not wire):** `archiveNode` / `moveNode` / `mergeNode` — these are the archive / merge / re-parent levers of the [parked data-minimisation work](#data-minimisation-storage-lifecycle--parked-reassess-via-a-design-process). Leaving them unwired is degrade-safe and consistent with that decision.
 
+### Content-driven splitting (auto-detect → split → evidence graph)
+
+The big feature this section tracks: hand cog-ingest **anything** — a chat PDF export, a screenshot, an email, a pile of notes — and it works out for itself (1) that the content is a *composite* of many units, (2) how to break it up, (3) which units form a *conversation*, and (4) how to file it. Driven by the **content's shape, not per-source configuration** — the system must *know without being told* that something needs splitting. It generalises across apps (legal-evidence and the personal "brain assistant" share one mechanism).
+
+<Aside type="tip" title="Shipped (v1.21.33): shape detection — the foundation">
+The first layer is built and validated: `detectContentShape` (`my-feature.detection.ts`) classifies content as `email-thread` / `chat-log` / `chat-screenshot` / `structured-document` / `notes-list` / `document` from cheap deterministic signals, and returns `{ shape, needsSplit, splitter, confidence, needsTriage }`. It runs on every ingest as an **observe-and-record** stage (records the verdict on the content metadata + logs it; takes no splitting action yet), so the signals can be tuned on real ingests before the fan-out is wired. A weak/ambiguous top score sets `needsTriage` — the seam for the AI triage op below. See the [changelog](/modules/cog-ingest/changelog/).
+</Aside>
+
+**The layers:**
+
+1. **Shape detection — ✅ shipped (observe-only, v1.21.33).** Deterministic signals decide the clear cases; `needsTriage` flags the rest.
+2. **AI triage (planned).** For low-confidence blobs, a cheap AI op — *"is this one thing or many, and where are the boundaries?"* — segments arbitrary content. This is *parsing*, not analysis. It's the general fallback that makes the mechanism work for freeform notes.
+3. **Splitters, pluggable by shape (planned).** Each emits `Unit[] = { text, sender/role, timestamp?, medium, order, replyTo? }`:
+   - `email-thread` — RFC822 `Message-ID` / `In-Reply-To` / `References` + quoted-reply boundaries. **Deterministic — email threading is free from headers**, no AI needed.
+   - `chat-export-text` — the positional parser (PDF exports; see the message-ingest plan).
+   - `chat-screenshot` — a **vision op** that reads a screenshot into structured messages. Generalises across apps (iMessage / WhatsApp / Discord / Messenger / RCS) because the model reads the layout — bubble side, sender labels, timestamps — rather than a hardcoded per-app parser.
+   - `structured-sections` — heading/rule splitter (the court-rules case).
+   - `notes-list` — bullet / dated-entry / heading heuristics + AI segment.
+   This finally *executes* the `preprocessing` / `PreprocessedItem[]` fan-out that exists in the schema but has never run — with the auto-detect layer on top so it fires without per-source config.
+4. **Conversation finder (planned).** *Not just time gaps* — a post-ingest AI pass over the Message nodes that clusters by participant + topic coherence + reply links + time, **across sources and mediums** (so a text thread and an email thread about the same subject join up), and creates `Conversation` nodes + `followed_by` / `part_of` edges.
+5. **Evidence hierarchy + provenance (planned).** `Structure.createNode` accepts `parentId`, so:
+   - `Source Document` (the raw artifact — PDF / `.eml` / screenshot; holds the original file reference + content hash + ingest job — *this is what the lawyer is handed*) → `Evidence` → `Conversation` → `Message`, each a real node type.
+   - **Every derived node carries an `extracted_from` edge back to its Source Document** (+ char offset / bbox) — chain-of-custody, so any message is one click from verification against the raw original.
+   - Messages also carry `from` / `to` edges to `Person` nodes.
+   - The brain-assistant maps the same shape onto `Source → Segment → Item`.
+
+**AI-operations model (cross-cutting).** The AI ops these layers need — triage, screenshot-reader, conversation-finder, field-extraction — live in **AI Core** (app-agnostic, injection-fenced), and each declares **admin-settable variables** that customise it per app / per source (participants, medium, the target node-type's fields, jurisdiction, tone). Same base operation, different admin variables → one AI Core serves both the legal-evidence app and the brain-assistant. It is the runtime extension of the `{{variable}}` substitution the module already uses at generation time.
+
+**Build order (chosen):** shape detection first (done) → AI triage → the two deterministic splitters (email-thread + chat-export-text) → the vision screenshot reader → the conversation finder → the evidence hierarchy + provenance edges.
+
 ### Urgent — Chunking for Large Documents
 
 <Aside type="caution" title="Next up — everything else in this section waits behind it">
