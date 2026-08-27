@@ -57,14 +57,14 @@ The stages, in order. **Two "detect" steps sit on either side of extraction** �
 |---|-------|--------------|-----------|-------------------|
 | 1 | **Acquire → parse** | Decide *how* to get the text out (a scan needs OCR, a screenshot needs vision, a JavaScript page needs rendering, a digital PDF just needs its text) and produce **one clean, layout-faithful version** — reading order, tables, headings, sections all preserved. | Deterministic | **Docling** (on the VM) is the parser; images/scans go through its OCR. |
 | 2 | **Check the parse** | Grade how well the parse went, *before* spending any AI. Garbage in is caught here. | Deterministic grade first, AI check only if borderline | Docling's own confidence report (poor→excellent, per region + overall) is the gate; the **parse-QA** op (via AI Core) is the second, semantic tier. |
-| 3 | **Detect shape** ✅ | On the *clean text*: is this one item or a composite (a chat, an email thread, a rules document)? Which splitter? Form-agnostic — the same document classifies identically from a PDF, a URL, a screenshot, or a paste. | Deterministic classifier first | cog-ingest's shape detection. |
+| 3 | **Detect shape** ✅ | On the *clean text*: is this one item or a composite (a chat, an email thread, a rules document)? Which splitter? Form-agnostic — the same document classifies identically from a PDF, a URL, a screenshot, or a paste. | Deterministic first; **AI triage** if unclear | cog-ingest's shape detection (a weak score sets `needsTriage`). |
 | 4 | **Retrieve / match / connect** | *Before any AI:* do we already have this, or something like it? Resolve the content — and the people/entities in it — to **existing** nodes, and connect to them. | Exact-hash dedup first, then semantic match | The graph lives in **Structure**; uncertain matches go to the inbox (see below). |
 | 5 | **Split → typed nodes** ✅ | Break a composite into its units: a **container** node plus **one child node per unit**, each the type the shape implies, each with a provenance edge back. | Deterministic producers | cog-ingest's producer framework + split fan-out. |
 | 6 | **Organise** | AI reads the split units and *structures* them — grouping, ordering, shaping the raw pieces into the form the fields expect. Organising the data is often *how* the fields get their values, so it runs hand-in-hand with populate. | AI | AI Core. |
 | 7 | **Populate fields** | Fill each node's fields. The source config says, *per field*, deterministic (straight from the text) or AI. | Mixed, per field | Field **definitions** live in Structure; cog-ingest owns the *filling*. AI fields route through **AI Core**. |
 | 8 | **Find + connect other node types** | Go looking for *different* node types inside the content (for evidence: "behaviours") and connect them to the units. Several passes, one per type you seek. Each is AI *and* a retrieve — a match may already exist. | AI + retrieve | The cognitive-db **engine** (perceive → extract → discover, per node) + retrieve-to-connect. |
 | 9 | **Check the fields** | A second pass over the *filled values* (not the parse): are the AI-filled fields faithful, grounded in the source text? | AI judge, on AI fields only | **AI Core** — a semantic review op; low scores go to the inbox. |
-| 10 | **Link / provenance** | Attach every node, field and edge back to its exact origin — which document, page/section, snippet. | Deterministic | cog-ingest writes the provenance edges. |
+| 10 | **Link / provenance** | Attach every node, field and edge back to its exact origin (which document, page/section, snippet), and lay the **`followed_by`** sequence edges between consecutive units in a thread so message order survives. | Deterministic | cog-ingest writes the provenance + sequence edges. |
 
 <Aside type="tip" title="The multi-pass, in plain terms">
 Stage 1 pulls the clean text out. Stage 2 checks the pull was good enough to build on. Stages 4–8 organise it — matching against what's already there, splitting into typed pieces, structuring and filling the details, and finding the *other* things hiding in it. Stage 9 checks the *details* the way stage 2 checked the *text*. Every check is cheapest-first and only escalates to a model — or to a human — when something looks uncertain.
@@ -108,6 +108,16 @@ Source Document   ← the raw artifact (the PDF / .eml / screenshot) + its hash 
 ```
 
 Every derived node carries an **`extracted_from`** edge back to its Source Document (plus a character-offset / bounding-box), so any message is one click from verification against the raw original — chain of custody. The **brain-assistant** app maps the identical shape onto `Source → Segment → Item`. The *types* are Structure config; the *shape* is the same.
+
+## AI triage — the general-purpose splitter
+
+The deterministic producers handle the shapes we *recognise* — a chat, an email thread, a rules document. But a lot of what gets thrown at the system is **ambiguous or freeform**: a mixed document, a pile of unstructured notes, something in a format no producer knows. A deterministic splitter has nothing to grip there.
+
+<Aside type="caution" title="This is what makes 'anything in' actually true">
+**AI triage is the fallback splitter**, and it's a bigger deal than an "extra pass" — it's what lets the system take *anything*, not just the neat cases. When detection's confidence is low (the shipped detector already flags this as `needsTriage`), an AI op reads the content and answers the split question the deterministic path can't: **"is this one thing or many, and where are the boundaries?"** It segments arbitrary content into units so the rest of the pipeline — organise, populate, connect, link — treats them like any other unit.
+</Aside>
+
+So triage isn't niche: it's the general-purpose segmenter sitting *behind* the deterministic producers. Deterministic-first (a producer handles a clear shape cheaply), **AI triage where the shape is unclear** — the same "deterministic first, AI only where it must" rule, applied to splitting itself. It's also the natural home for the harder judgement calls: a document that's really *several* documents bundled together, or notes that are secretly a to-do list plus a journal entry.
 
 ## Retrieve = match = connect
 
@@ -225,7 +235,9 @@ Submitting opens a **pipeline-progress screen** that narrates each step (acquire
 
 5. **The visual Producers editor** (a node-flow over the stages) + the shared 3-tab ingest component (Text / URL / Upload) + a pipeline-progress screen.
 
-6. **The extra passes** — AI triage for ambiguous blobs, the vision screenshot reader, the semantic conversation-finder, and per-source "find other node types" passes (e.g. behaviours).
+6. **AI triage — the general-purpose splitter.** Segment ambiguous / freeform content the deterministic producers can't ("one thing or many, and where are the boundaries?"). This is what generalises the pipeline beyond the neat cases, so it's a first-class capability, not an afterthought.
+
+7. **The remaining passes** — the vision screenshot reader, the semantic **cross-medium** conversation-finder (join a text thread and an email thread on the same subject into one conversation), and per-source "find other node types" passes (e.g. behaviours).
 
 </Steps>
 
