@@ -19,8 +19,8 @@ The system must **know without being told** that something needs splitting. You 
 The pipeline is built to be **app-neutral on purpose**. The same mechanism serves a **legal-evidence app** (where the hierarchy is `Source Document → Evidence → Conversation → Message`) *and* a personal **"brain assistant"** for emails and random notes (where the identical shape maps onto `Source → Segment → Item`). This is *why* so many decisions went generic — the node types, the field definitions, and the wording of every review question are configuration, so nothing in the pipeline itself is welded to legal documents.
 </Aside>
 
-<Aside type="tip" title="The one rule">
-**Deterministic first, AI only where it must.** Anything that can be filled straight from the text — an identifier, a citation, a date, a sender — is filled deterministically. AI is spent only on judgement (a summary, a classification, resolving "is this the same person?"), and only where a source asks for it. This keeps cost and error down, and keeps the data clean — and the graph and retrieval are only ever as good as what goes in.
+<Aside type="tip" title="The one rule — deterministic first, then AI to enrich and verify">
+**Fill everything you can straight from the text first** — it's cheaper and exact. But AI is **not only a fallback** for what the deterministic pass can't reach: it also **enriches, cleans, double-checks and confirms** the data, so what lands in the database is both *rich* and *correct*. This matters most for long documents — an affidavit turned into searchable text + vectors — where you want to trust the searchable copy and never have to reopen the original. Deterministic for the facts plainly on the page; AI to interpret, to check the extraction, and to fill the judgement. The graph and retrieval are only ever as good as what goes in.
 </Aside>
 
 This page is the master reference. The [changelog](/modules/cog-ingest/changelog/) records what has shipped; the [roadmap](/modules/cog-ingest/roadmap/) tracks what is next.
@@ -31,17 +31,17 @@ The system is configured at three levels — two are top-level (module config, b
 
 <CardGrid>
   <Card title="Engine configuration" icon="setting">
-    **Top-level · exists.** The cognitive-db engine settings — perception, discovery, features. Unchanged.
+    **Top-level.** The cognitive-db engine settings — perception, discovery, features.
   </Card>
   <Card title="Producers" icon="puzzle">
-    **Top-level · new · the node types + the pipeline shape.** Reusable stages that emit typed nodes and carry the *standard shape* of the thing they make. Eventually a visual node-flow editor over the pipeline stages.
+    **Top-level · the building blocks.** The reusable pipeline stages that emit typed nodes and carry the *standard shape* of the thing they make (a Message's fields, an Email's fields). Think of them as the palette the flow is built from.
   </Card>
   <Card title="Sources" icon="document">
-    **Per content-kind · the context.** A named preset (Court Documents, Text Messages, Evidence) supplying the container node type, acquisition settings, which producers apply, the field-population profile, and the per-source AI variables.
+    **Per content-kind · the context, and the flow.** A named preset (Court Documents, Text Messages, Evidence) that supplies the container node type, acquisition settings, the field-population profile, and the per-source AI variables — *and* wires the producer blocks into a pipeline for that content-kind.
   </Card>
 </CardGrid>
 
-**Producers make the node types (the *shape*); sources supply the fields, context and variables (the *context*); detection routes content to the right producer.** A plain single-type source (split off) is the degenerate, backward-compatible case.
+**Producers are the reusable blocks (the *shape*); a source supplies the context + variables and assembles the blocks into a flow (the *context*); detection routes content to the right source.** The **visual node-flow editor lives mainly at the source level** — you drag producer/stage blocks into the flow for that content-kind — though the producer blocks themselves can also be edited where they're defined.
 
 ## The pipeline
 
@@ -51,23 +51,28 @@ The pipeline is not one linear pass — it is a **configurable graph of stages**
 Several stages are *composable and repeatable*: a source can add a "find behaviours" pass, another can add a "find deadlines" pass, and a hard document can run "extract → check → organise" more than once. That is only possible if the pipeline is a graph you assemble, not a fixed line. Getting the executor + graph working is the foundation everything else hangs off.
 </Aside>
 
-The stages, in order. **Two "detect" steps sit on either side of extraction** — one to extract *well*, one to split *well* — and **two quality checks** — one on the parse, one on the filled fields.
+The stages, in order. Deterministic work comes first and gives the AI its context; AI then **organises, enriches and verifies**. Two **detect** steps sit either side of extraction (extract well, then split well), two **quality checks** (the parse, then the filled fields), and two points where **a human steps in** — to confirm matches, and to answer the AI's questions.
 
-| # | Stage | What it does | Det. or AI | Who does the work |
-|---|-------|--------------|-----------|-------------------|
-| 1 | **Acquire → parse** | Decide *how* to get the text out (a scan needs OCR, a screenshot needs vision, a JavaScript page needs rendering, a digital PDF just needs its text) and produce **one clean, layout-faithful version** — reading order, tables, headings, sections all preserved. | Deterministic | **Docling** (on the VM) is the parser; images/scans go through its OCR. |
-| 2 | **Check the parse** | Grade how well the parse went, *before* spending any AI. Garbage in is caught here. | Deterministic grade first, AI check only if borderline | Docling's own confidence report (poor→excellent, per region + overall) is the gate; the **parse-QA** op (via AI Core) is the second, semantic tier. |
-| 3 | **Detect shape** ✅ | On the *clean text*: is this one item or a composite (a chat, an email thread, a rules document)? Which splitter? Form-agnostic — the same document classifies identically from a PDF, a URL, a screenshot, or a paste. | Deterministic first; **AI triage** if unclear | cog-ingest's shape detection (a weak score sets `needsTriage`). |
-| 4 | **Retrieve / match / connect** | *Before any AI:* do we already have this, or something like it? Resolve the content — and the people/entities in it — to **existing** nodes, and connect to them. | Exact-hash dedup first, then semantic match | The graph lives in **Structure**; uncertain matches go to the inbox (see below). |
-| 5 | **Split → typed nodes** ✅ | Break a composite into its units: a **container** node plus **one child node per unit**, each the type the shape implies, each with a provenance edge back. | Deterministic producers | cog-ingest's producer framework + split fan-out. |
-| 6 | **Organise** | AI reads the split units and *structures* them — grouping, ordering, shaping the raw pieces into the form the fields expect. Organising the data is often *how* the fields get their values, so it runs hand-in-hand with populate. | AI | AI Core. |
-| 7 | **Populate fields** | Fill each node's fields. The source config says, *per field*, deterministic (straight from the text) or AI. | Mixed, per field | Field **definitions** live in Structure; cog-ingest owns the *filling*. AI fields route through **AI Core**. |
-| 8 | **Find + connect other node types** | Go looking for *different* node types inside the content (for evidence: "behaviours") and connect them to the units. Several passes, one per type you seek. Each is AI *and* a retrieve — a match may already exist. | AI + retrieve | The cognitive-db **engine** (perceive → extract → discover, per node) + retrieve-to-connect. |
-| 9 | **Check the fields** | A second pass over the *filled values* (not the parse): are the AI-filled fields faithful, grounded in the source text? | AI judge, on AI fields only | **AI Core** — a semantic review op; low scores go to the inbox. |
-| 10 | **Link / provenance** | Attach every node, field and edge back to its exact origin (which document, page/section, snippet), and lay the **`followed_by`** sequence edges between consecutive units in a thread so message order survives. | Deterministic | cog-ingest writes the provenance + sequence edges. |
+| # | Stage | What it does | How | Who |
+|---|-------|--------------|-----|-----|
+| 1 | **Acquire → parse** | Decide *how* to get the text out (scan → OCR, screenshot → vision, JavaScript page → render, digital PDF → its text) and produce **one clean, layout-faithful version** — reading order, tables, headings preserved. | Deterministic | **Docling** on the VM |
+| 2 | **Check the parse** | Grade the parse *before* spending any AI. Garbage in is caught here. | Det. grade → AI if borderline | Docling confidence report + the parse-QA op |
+| 3 | **Detect shape** ✅ | On the *clean text*: one item or a composite? which splitter? Form-agnostic. | Det. → AI triage if unclear | cog-ingest detection (`needsTriage`) |
+| 4 | **Retrieve / match / connect** | *Before AI:* do we already have this, or something like it? Resolve the content + its people/entities to **existing** nodes and connect to them. | Hash dedup → semantic match | Structure graph + the engine |
+| 5 | **Confirm** *(human)* | You confirm the matches — *"yes, that's the same person / rule / matter — connect it"*, or *"no, it's new"*. | **You** | Suggestions inbox |
+| 6 | **Split → typed nodes** ✅ | Break a composite into units: a **container** + **one child per unit**. A new child **type is created here** if the ontology doesn't have it yet (declared → auto → propose). | Deterministic producers | producer framework + split |
+| 7 | **Populate — deterministic** | Fill every field that's plainly on the page (numbers, dates, citations, senders). Doing this *first* also gives the AI its context for the next stage. | Deterministic | cog-ingest |
+| 8 | **Organise** | AI structures the data — grouping, ordering, shaping the pieces into the form the fields expect, using the deterministic fields as context. | AI | AI Core |
+| 9 | **Analyse + enrich** | AI fills the judgement fields (summary, applies-to, deadlines) *and* enriches, cleans and confirms the rest — so the stored copy is rich and correct, not just raw text. | AI | AI Core (field descriptions are the prompt) |
+| 10 | **Clarify** *(human)* | The AI can hand **questions back to you** — "I need X to fill this" — to get more information or resolve an ambiguity before finalising. | **You** | Suggestions inbox |
+| 11 | **Check the fields** | A second pass over the *filled values*: faithful? grounded in the source text? | AI judge, on AI fields | AI Core |
+| 12 | **Chunk + embed** | Split long content into chunks, give each a short **summary/context**, and store the vectors — so an affidavit is searchable *without* reopening the original. | Deterministic + AI (per-chunk summary) | Structure chunk store + AI Core |
+| 13 | **Cog-db engine** | On ingestion, the engine perceives each node and **extracts entities / concepts / discovers connections** across the wider graph. | AI (the engine) | cognitive-db |
+| 14 | **Find + connect other types** | Targeted passes for *specific* node types the source cares about (evidence → "behaviours"), matched to existing and connected. One per type. | AI + retrieve | engine + retrieve-to-connect |
+| 15 | **Link / provenance** | Every node, field and edge back to its exact origin, plus the **`followed_by`** sequence edges so message order survives. | Deterministic | cog-ingest |
 
 <Aside type="tip" title="The multi-pass, in plain terms">
-Stage 1 pulls the clean text out. Stage 2 checks the pull was good enough to build on. Stages 4–8 organise it — matching against what's already there, splitting into typed pieces, structuring and filling the details, and finding the *other* things hiding in it. Stage 9 checks the *details* the way stage 2 checked the *text*. Every check is cheapest-first and only escalates to a model — or to a human — when something looks uncertain.
+Pull the clean text out (1), check it's good enough to build on (2). Match it against what's already there and let you confirm (4–5). Split into typed pieces (6). Fill what's plainly there deterministically — which gives the AI its footing — then let AI organise, fill and enrich the rest, pausing to ask you anything it needs (7–10). Check the filled values the way we checked the text (11). Make it searchable (12), let the engine find the entities and connections (13–14), and tie everything back to its source (15). Every check is cheapest-first and only escalates — to a model, or to you — when something's uncertain.
 </Aside>
 
 ## Producers — the standard shapes
@@ -117,13 +122,13 @@ The deterministic producers handle the shapes we *recognise* — a chat, an emai
 **AI triage is the fallback splitter**, and it's a bigger deal than an "extra pass" — it's what lets the system take *anything*, not just the neat cases. When detection's confidence is low (the shipped detector already flags this as `needsTriage`), an AI op reads the content and answers the split question the deterministic path can't: **"is this one thing or many, and where are the boundaries?"** It segments arbitrary content into units so the rest of the pipeline — organise, populate, connect, link — treats them like any other unit.
 </Aside>
 
-So triage isn't niche: it's the general-purpose segmenter sitting *behind* the deterministic producers. Deterministic-first (a producer handles a clear shape cheaply), **AI triage where the shape is unclear** — the same "deterministic first, AI only where it must" rule, applied to splitting itself. It's also the natural home for the harder judgement calls: a document that's really *several* documents bundled together, or notes that are secretly a to-do list plus a journal entry.
+So triage isn't niche: it's the general-purpose segmenter sitting *behind* the deterministic producers. Deterministic-first (a producer handles a clear shape cheaply), **AI triage where the shape is unclear** — the same deterministic-first rule, applied to splitting itself. It's also the natural home for the harder judgement calls: a document that's really *several* documents bundled together, or notes that are secretly a to-do list plus a journal entry.
 
 ## Retrieve = match = connect
 
 The `retrieve` stage is not just "skip duplicates". When it resolves an incoming thing to something you already have, it **connects to it in the same move** — that is the engine's *retrieve-to-connect*. So a large share of your connections are made **here, at match time, before** the AI goes looking for brand-new ones.
 
-- A message sender "Tim" is matched to your existing Person "Tim Collier", and the message's `from` edge lands on that real Person.
+- A message sender "John" is matched to your existing Person "John Citizen", and the message's `from` edge lands on that real Person.
 - A Discord display-name / handle resolves to the same canonical Person.
 - A re-uploaded rules document is recognised as a new edition of one you already have.
 
@@ -173,7 +178,12 @@ Every stage that can be uncertain emits a **review item** into the Suggestions i
 The *mechanism* is generic; the *words* are per-app configuration. A legal app renders it "Is this the same **Person** already in the matter?"; a design app renders the identical question "Is this an **iteration of** that 2-year-old design?". Same three-way resolution, same evidence panel, same queue — only the strings differ.
 </Aside>
 
-**Confidence gates (nothing is auto-destroyed):**
+**Two of these points are explicit stops in the flow, not just background gates:**
+
+- **Confirm the matches** *(after retrieve)* — when the pipeline resolves something to an existing node, you get the match question above and confirm the connection before it's committed: *"yes, that's the same — connect it"*, or *"no, it's new"*.
+- **Answer the AI's questions** *(during analyse)* — filling fields isn't one-way. When the AI needs more to do it well — a missing detail, an ambiguity only you can settle — it hands a **question back to you** rather than guessing. You answer; it continues.
+
+Everything else rides the same mechanism as a **background gate**:
 
 - **High → straight through**, no human (clean parse, exact non-duplicate, a deterministic field, an AI field the judge scored well).
 - **Medium → review queue** (a borderline parse grade, a semantic near-duplicate, a middling AI field, a proposed new type on a "review" source).
@@ -203,7 +213,7 @@ It has **three input modes** — the user provides, detection classifies (no mor
   </Card>
 </CardGrid>
 
-**RSS is not an input mode** — it's a source *polling* setting, so it lives in the source config, not this component.
+**RSS is an input mode too — but admin-only for now**, so it's configured on the *source* (as a polling setting) rather than offered in this user-facing component.
 
 Submitting opens a **pipeline-progress screen** that narrates each step (acquire → check → detect → split → populate → link) as it happens, with a verbose **testing mode** that shows the detection detail and *what each producer emitted*. Detection is shown **in the user's ingest view**, not just to admins — so anyone can see what the system made of their content while it's being tuned.
 
