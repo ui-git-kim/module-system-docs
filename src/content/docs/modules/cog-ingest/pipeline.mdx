@@ -1,0 +1,179 @@
+---
+title: Ingestion Pipeline
+description: The master architecture for content-driven ingestion — anything in, graph out. The config layers, the pipeline stages, producers, retrieve/match/connect, and the quality + human-in-the-loop model.
+lastUpdated: 2026-08-28
+sidebar:
+  order: 1
+  label: "Pipeline & Architecture"
+---
+
+import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+**Anything in, graph out.** Hand cog-ingest anything — a chat export, a screenshot, an email, a legislation URL, a pile of notes — and it works out the pieces itself and files them as a graph: typed nodes, populated fields, discovered connections, each traceable back to the raw original. Driven by the **content's shape, not per-source configuration**. One mechanism serves both a legal-evidence app and a personal "brain assistant".
+
+<Aside type="tip" title="The one rule">
+**Deterministic first, AI only where it must.** Anything that can be filled straight from the text — an identifier, a citation, a date, a sender — is filled deterministically. AI is spent only on judgement (a summary, a classification, resolving "is this the same person?"), and only where a source asks for it. This keeps cost and error down, and keeps the data clean — and the graph and retrieval are only ever as good as what goes in.
+</Aside>
+
+This page is the master reference. The [changelog](/modules/cog-ingest/changelog/) records what has shipped; the [roadmap](/modules/cog-ingest/roadmap/) tracks what is next.
+
+## The three config layers
+
+The system is configured at three levels — two are top-level (module config, beside the engine settings), one is per content-kind.
+
+<CardGrid>
+  <Card title="Engine configuration" icon="setting">
+    **Top-level · exists.** The cognitive-db engine settings — perception, discovery, features. Unchanged.
+  </Card>
+  <Card title="Producers" icon="puzzle">
+    **Top-level · new · the node types + the pipeline shape.** Reusable stages that emit typed nodes and carry the *standard shape* of the thing they make. Eventually a visual node-flow editor over the pipeline stages.
+  </Card>
+  <Card title="Sources" icon="document">
+    **Per content-kind · the context.** A named preset (Court Documents, Text Messages, Evidence) supplying the container node type, acquisition settings, which producers apply, the field-population profile, and the per-source AI variables.
+  </Card>
+</CardGrid>
+
+**Producers make the node types (the *shape*); sources supply the fields, context and variables (the *context*); detection routes content to the right producer.** A plain single-type source (split off) is the degenerate, backward-compatible case.
+
+## The pipeline
+
+The pipeline is not one linear pass — it is a **configurable graph of stages** (a DAG), run by a small stage executor. Each stage reads and adds to one shared working context; a stage can gate the flow. The visual **Producers** editor is a picture of this graph, and the executor runs it — so the picture isn't just a diagram, it executes.
+
+<Aside type="note" title="Why the graph matters">
+Several stages are *composable and repeatable*: a source can add a "find behaviours" pass, another can add a "find deadlines" pass, and a hard document can run "extract → check → organise" more than once. That is only possible if the pipeline is a graph you assemble, not a fixed line. Getting the executor + graph working is the foundation everything else hangs off.
+</Aside>
+
+The stages, in order. **Two "detect" steps sit on either side of extraction** — one to extract *well*, one to split *well* — and **two quality checks** — one on the parse, one on the filled fields.
+
+| # | Stage | What it does | Det. or AI | Who does the work |
+|---|-------|--------------|-----------|-------------------|
+| 1 | **Acquire → parse** | Decide *how* to get the text out (a scan needs OCR, a screenshot needs vision, a JavaScript page needs rendering, a digital PDF just needs its text) and produce **one clean, layout-faithful version** — reading order, tables, headings, sections all preserved. | Deterministic | **Docling** (on the VM) is the parser; images/scans go through its OCR. |
+| 2 | **Check the parse** | Grade how well the parse went, *before* spending any AI. Garbage in is caught here. | Deterministic grade first, AI check only if borderline | Docling's own confidence report (poor→excellent, per region + overall) is the gate; the **parse-QA** op (via AI Core) is the second, semantic tier. |
+| 3 | **Detect shape** ✅ | On the *clean text*: is this one item or a composite (a chat, an email thread, a rules document)? Which splitter? Form-agnostic — the same document classifies identically from a PDF, a URL, a screenshot, or a paste. | Deterministic classifier first | cog-ingest's shape detection. |
+| 4 | **Retrieve / match / connect** | *Before any AI:* do we already have this, or something like it? Resolve the content — and the people/entities in it — to **existing** nodes, and connect to them. | Exact-hash dedup first, then semantic match | The graph lives in **Structure**; uncertain matches go to the inbox (see below). |
+| 5 | **Split → typed nodes** ✅ | Break a composite into its units: a **container** node plus **one child node per unit**, each the type the shape implies, each with a provenance edge back. | Deterministic producers | cog-ingest's producer framework + split fan-out. |
+| 6 | **Populate fields** | Fill each node's fields. The source config says, *per field*, deterministic (straight from the text) or AI. | Mixed, per field | Field **definitions** live in Structure; cog-ingest owns the *filling*. AI fields route through **AI Core**. |
+| 7 | **Find + connect other node types** | Go looking for *different* node types inside the content (for evidence: "behaviours") and connect them to the units. Several passes, one per type you seek. Each is AI *and* a retrieve — a match may already exist. | AI + retrieve | The cognitive-db **engine** (perceive → extract → discover, per node) + retrieve-to-connect. |
+| 8 | **Check the fields** | A second pass over the *filled values* (not the parse): are the AI-filled fields faithful, grounded in the source text? | AI judge, on AI fields only | **AI Core** — a semantic review op; low scores go to the inbox. |
+| 9 | **Link / provenance** | Attach every node, field and edge back to its exact origin — which document, page/section, snippet. | Deterministic | cog-ingest writes the provenance edges. |
+
+<Aside type="tip" title="The multi-pass, in plain terms">
+Stage 1 pulls the clean text out. Stage 2 checks the pull was good enough to build on. Stages 4–7 organise it — matching against what's already there, splitting into typed pieces, filling the details, and finding the *other* things hiding in it. Stage 8 checks the *details* the way stage 2 checked the *text*. Every check is cheapest-first and only escalates to a model — or to a human — when something looks uncertain.
+</Aside>
+
+## Producers — the standard shapes
+
+A producer is more than a splitter: it carries the **standard shape** of the thing it makes — the node type *and* its known generic fields.
+
+- `split-structured` → **Section** (number, title).
+- `split-chat` → **Message** (sender, timestamp, direction, text).
+- `split-email` → **Email** (from, to, subject, date).
+- `split-screenshot` (vision) → reads bubbles / sender / time across chat apps.
+
+So "we know a text message has these fields" lives in the producer. Everything *else* a child carries, it **inherits from the container's type** through Structure's hierarchy — a Message is a sub-type of Evidence and carries Evidence's fields too. You tune Evidence's fields once as the shared base.
+
+### Container + child types
+
+<Steps>
+
+1. **The source defines the container type** (e.g. Evidence). **One container node per ingest** — it holds the raw content + provenance. *This is what you hand the lawyer.*
+
+2. **Split creates one child node per unit under the container** (`parentId`), each with an `extracted_from` edge back to the raw.
+
+3. **A new child *type* is created only when split produces a unit whose type your ontology doesn't have yet.** Resolution order: **declared** (in the source's split config) → **auto-create** the type → **propose** it into the review queue → **fall back** to the container's type. Never silently dropped.
+
+4. **Children inherit the container's fields**, plus their own generic ones.
+
+</Steps>
+
+## Retrieve = match = connect
+
+The `retrieve` stage is not just "skip duplicates". When it resolves an incoming thing to something you already have, it **connects to it in the same move** — that is the engine's *retrieve-to-connect*. So a large share of your connections are made **here, at match time, before** the AI goes looking for brand-new ones.
+
+- A message sender "Tim" is matched to your existing Person "Tim Collier", and the message's `from` edge lands on that real Person.
+- A Discord display-name / handle resolves to the same canonical Person.
+- A re-uploaded rules document is recognised as a new edition of one you already have.
+
+**Entity and person matching is the engine's job, not the splitter's.** The split stage only records the raw `from`/`to` **handles** as the message's own fields; resolving those to a canonical Person happens at `retrieve` (+ the engine + the review inbox). Doing it in the splitter would create duplicate people and pollute your single source of truth.
+
+## Two levels of output
+
+The crux of the field model: a node's fields come from two places, and **cog-ingest never defines them — Structure does** — it only decides *how each gets populated*.
+
+| Level | What it is | Filled by |
+|-------|-----------|-----------|
+| **Producer output** | The child node type + its own generic fields; everything else inherited from the container type | created at split |
+| **Source output** | The population profile + the per-source AI fields (`context` / `insights`) over the container's types | deterministic + AI |
+
+**The division:** Structure owns the field & connection *definitions* (including a shared "AI fields" template you attach to every type). cog-ingest reads them and owns the *population* — which field gets its value, and how. No duplication.
+
+<Aside type="tip" title="The field description is the prompt">
+When a field is AI-filled, its plain-language **description in Structure is the instruction the AI fills against** — the same description a person reads. New field sets stay pure configuration; adding a field never means writing code. (`context` and `insights` are deliberately **per-source**, because "insight" has to be precisely scoped in a legal app.)
+</Aside>
+
+## Quality — the parse and the fields
+
+Clean input is the whole game. Two distinct quality passes, each cheapest-first:
+
+- **Parse quality (stage 2):** Docling grades the extraction per region and overall (it scores the *worst* patches, so a mostly-good document with a few bad spots still gets flagged). A clean digital PDF flows straight through; a poor scan is held for review before a single AI token is spent.
+- **Field quality (stage 8):** a second model judges the AI-filled values — faithful? grounded in the source? A model's own confidence number measures "does this look familiar", not "is this correct", so we gate on a *semantic* second pass and on **grounded evidence** (every filled field keeps its source snippet), not a self-reported score.
+
+**Critical fields are weighted harder** — "90% accurate is useless if the missing 10% is the critical field."
+
+## Human-in-the-loop
+
+<Aside type="note" title="One generic mechanism, skinned per app">
+Every stage that can be uncertain emits a **review item** into the Suggestions inbox with a fixed, app-neutral shape: **what** was uncertain, **the evidence** (the exact snippet + where it would land), a **confidence band**, and a small set of generic choices. The most common choice is the **match question**:
+
+> *"We found something similar already in your system — is this a **match**, an **iteration-of** the existing one, or **new**?"*
+
+The *mechanism* is generic; the *words* are per-app configuration. A legal app renders it "Is this the same **Person** already in the matter?"; a design app renders the identical question "Is this an **iteration of** that 2-year-old design?". Same three-way resolution, same evidence panel, same queue — only the strings differ.
+</Aside>
+
+**Confidence gates (nothing is auto-destroyed):**
+
+- **High → straight through**, no human (clean parse, exact non-duplicate, a deterministic field, an AI field the judge scored well).
+- **Medium → review queue** (a borderline parse grade, a semantic near-duplicate, a middling AI field, a proposed new type on a "review" source).
+- **Low → held** until resolved (a poor parse, a critical field the judge flagged, a conflicting duplicate).
+
+A dedup match is **detected automatically, resolved manually** — merge / keep existing / keep incoming / keep both, always previewable, with a conflict/additive diff. And every human resolution is stored so the same source does better next time.
+
+## AI ops with variables
+
+Every AI op the pipeline uses — parse-QA, field-analysis, the field-quality judge, connection discovery, the conversation-finder — lives in **AI Core** (app-agnostic, injection-fenced), and each declares **admin-settable variables** a source fills in (participants, medium, the target type's fields, jurisdiction, tone). Same base op, different variables → one AI Core serves every app.
+
+## Who owns what
+
+| Module | Owns |
+|--------|------|
+| **Structure** | Node-type & connection-type *definitions*, fields, field templates, hierarchy (`parentId`), the graph itself. |
+| **Document Management** | File upload & storage; emits the upload event (powers the Upload input). |
+| **Docling** (sidecar) | The parse: PDF / Office / OCR / tables, plus the first parse-quality grade. |
+| **AI Core** | The AI operations + their variable contracts; model routing; injection fencing. |
+| **cog-ingest** | Orchestrates the pipeline; owns detection, producers, the population profiles, provenance, and the review-item feed. |
+
+## Shipped &amp; build order
+
+**Done:** shape detection (v1.21.33), surfaced on the job (v1.21.34), the stage executor (v1.21.35), the **producer framework + split fan-out** (v1.21.36 — the parsers + container/child fan-out with `extracted_from` / `followed_by` provenance).
+
+**Next, in order:**
+
+<Steps>
+
+1. **Run the whole current pipeline through the graph.** Move the steps that still run inline (acquire, the engine pass, chunk/embed) into stages, so the fixed pipeline runs as the DAG — no behaviour change. This is the foundation for the visual editor and every new stage.
+
+2. **Realign the split.** Stop creating/linking Person in the splitter (record `from`/`to` handles as fields only) — matching belongs to `retrieve` + the engine + the inbox.
+
+3. **Build `retrieve` / match / connect** — dedup + resolve-to-existing + connect, with the inbox surfacing uncertain matches.
+
+4. **Build `populate`** — deterministic fields, then AI fields driven by each Structure field's description, then the field-quality check. *(This is what makes each court rule understood, not just stored.)*
+
+5. **The visual Producers editor** (a node-flow over the stages) + the shared 3-tab ingest component (Text / URL / Upload) + a pipeline-progress screen.
+
+6. **The extra passes** — AI triage for ambiguous blobs, the vision screenshot reader, the semantic conversation-finder, and per-source "find other node types" passes (e.g. behaviours).
+
+</Steps>
+
+<Aside type="caution" title="The worked example, kept generic">
+A court-rules document is just *one shape the generic pipeline recognises*. Docling parses the full-text PDF → the parse is graded → it is detected as a composite → each rule becomes its own node → deterministic fields fill straight from the text and AI fields (plain-language summary, who it applies to, deadlines) fill against their Structure descriptions → the field-quality pass checks them → the engine discovers cross-references between rules → provenance ties each rule back to its section. Swap the PDF for a chat export or a folder of emails and the *same stages* run — only the per-source config and wording change. Nothing in the pipeline is welded to legal documents.
+</Aside>
