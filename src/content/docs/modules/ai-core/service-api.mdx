@@ -1,7 +1,7 @@
 ---
 title: Service API
 description: The full aiCoreService surface a consumer programs against, method by method
-lastUpdated: 2026-08-22
+lastUpdated: 2026-09-01
 sidebar:
   order: 6
 ---
@@ -12,8 +12,8 @@ This is the reference for `aiCoreService` — the single object AI Core register
 
 > **Consumers name jobs, never models.** No model id string appears anywhere in this surface.
 
-<Aside type="note" title="Current as of v1.50.6">
-This page describes AI Core as implemented in module v1.47.0 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and every method here — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and the `ensure*` seed helpers — has been exercised end-to-end against live providers. Since v1.23.0 the surface has grown provider-native Tools (web search / fetch), the operation input contract and its `ai_input_type` catalogue, first-class Contexts (the `ai_context` table, in `foundation` and `background` kinds — a context is its own record binding no model, not an operation), and the module-level zero-retention override (`ai_policy`). The semantic cache and a re-embedding migration remain planned; where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+<Aside type="note" title="Current as of v1.52.0">
+This page describes AI Core as implemented in module v1.52.0 (September 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and every method here — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and the `ensure*` seed helpers — has been exercised end-to-end against live providers. Since v1.23.0 the surface has grown provider-native Tools (web search / fetch), the operation input contract and its `ai_input_type` catalogue, first-class Contexts (the `ai_context` table, in `foundation` and `background` kinds — a context is its own record binding no model, not an operation), and the module-level zero-retention override (`ai_policy`). The semantic cache and a re-embedding migration remain planned; where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
 </Aside>
 
 ---
@@ -290,7 +290,7 @@ runFlow(
 |---|---|---|
 | `flowId` | `string` | Must exist and be enabled. |
 | `input` | [`RunInput`](#runinput--consumersegment) | Base segments passed to every operation step. |
-| `opts.initialState` | `Record<string, unknown>` | Seeds the flow's working memory. It travels the same path as all state — persisted on the run row, surfaced to operation steps as a **visible** context segment, handed to handler steps as their input. Never a hidden side channel. |
+| `opts.initialState` | `Record<string, unknown>` | Seeds the flow's working memory. It travels the same path as all state — persisted on the run row **while the run is live** (a completed/failed row stores `{}` as of v1.52.0; only a suspended run keeps state, for resume), surfaced to operation steps as a **visible** context segment, handed to handler steps as their input. Never a hidden side channel. Size-capped when serialised (1M chars) — at the wire, and again whenever a handler grows it. |
 
 **Returns** — a [`FlowRunResult`](#flows): `runId`, `status` (`running` · `suspended` · `completed` · `failed`), `stepResults` in order, and `suspendedFeedback` (present only when suspended: the feedback that paused the flow, tagged with `stepIndex` and `operationId`). **Feedback attaches to the operation that raised it, never to the flow** — the flow collects; it does not own.
 
@@ -301,7 +301,7 @@ An operation step declared with `waitOnFeedback` suspends the flow when its feed
 | Error | When |
 |---|---|
 | `NotFoundError` | The flow id does not exist. |
-| `RefusedError` | `flow-disabled`; `flow-steps-invalid` (no runnable, or a malformed, step); `flow-handler-not-registered` (a handler step names a handler nobody registered — refused loudly, never silently skipped); plus any `RefusedError` bubbling out of an operation step. |
+| `RefusedError` | `flow-disabled`; `flow-steps-invalid` (no runnable, or a malformed, step); `flow-handler-not-registered` (a handler step names a handler nobody registered — refused loudly, never silently skipped); `flow-state-too-large` (v1.52.0 — the working state exceeds 1M chars serialised, checked where it grew: at the step folding it into a prompt, or right after the handler step that inflated it); plus any `RefusedError` bubbling out of an operation step. |
 
 Any error inside the step loop marks the run row `failed` and rethrows — a failed flow is a loud outcome, never a quietly abandoned row.
 
@@ -332,7 +332,7 @@ resumeFlow(
 | Error | When |
 |---|---|
 | `NotFoundError` | No **suspended** run with that id exists **for the caller's tenant**. Tenant isolation: a cross-tenant or non-suspended id is reported as not found — no acknowledgement it exists elsewhere. |
-| `RefusedError` | The same step-loop refusals as `runFlow`. |
+| `RefusedError` | The same step-loop refusals as `runFlow` — plus `flow-state-too-large` can fire **before** the step loop here (v1.52.0): the stored state merged with `resolution` can exceed what either could alone, and an over-budget merge is refused before anything persists, leaving the run suspended and resumable. |
 
 <Aside type="caution" title="Resumed steps see only working memory">
 The original input segments are not persisted (the run row and the ledger hold references and working memory, never request content). A resumed operation step therefore sees only the flow's `state`, and the first resumed step starts with a `null` previous result. A flow that needs input material after a suspension must carry the parts that matter in `state` via a handler step.
@@ -491,7 +491,7 @@ The billing callback. **AI Core counts; billing asks.** AI Core owns its usage c
 getCurrentUsage(args: { tenantId: string; since?: Date }): Promise<CurrentUsage>
 ```
 
-**Parameters** — `tenantId` (required) and an optional `since` cut-off. Omitting `since` counts the tenant's whole ledger history.
+**Parameters** — `tenantId` (required) and an optional `since` cut-off. Omitting `since` counts everything the ledger **holds** — the tenant's whole history only while no `ledgerKeepDays` retention window is set (the default). Once an admin opts into ledger retention (v1.52.0, [Configuration → Data retention](/modules/ai-core/configuration/#data-retention-v1520)), the no-`since` form reports the retained window; a billing consumer must keep `ledgerKeepDays` at least as long as its longest billing window.
 
 **Returns** — a [`CurrentUsage`](#currentusage): totals (`operations`, `inputTokens`, `outputTokens`) plus a per-operation breakdown in `byOperation`. Unknown token counts contribute zero to the sums but are never invented.
 
@@ -591,7 +591,12 @@ Media for vision-capable models, attached to a segment. It never enters the asse
 ```ts
 interface MediaAttachment {
   mediaType: string;   // IANA media type, e.g. "image/png"
-  data: string;        // base64 bytes, or an https URL to a public host (plain http and private/internal/link-local addresses are refused)
+  data: string;        // base64 bytes, or an https URL to a public host (plain http and
+                       // private/internal/link-local addresses are refused). Since v1.52.0
+                       // the MODULE downloads a URL itself and hands the provider bytes:
+                       // 25MB per attachment, 50MB total per run, a 20s transfer timeout,
+                       // and any redirect refused — an oversized, slow or redirecting URL
+                       // now refuses the run instead of riding through.
   name?: string;
 }
 ```
