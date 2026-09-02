@@ -19,7 +19,7 @@ The core principle constrains the roadmap. The database stores references, metad
 
 ## Known Issues
 
-V1 has shipped at release version `1.6.0`. The items below were surfaced while designing the upload → ingest pipeline (see **Next up**); they are gating prerequisites for that work rather than field-reported defects.
+V1 has shipped at release version `1.7.0`. The items below were surfaced while designing the upload → ingest pipeline (see **Next up**); they are gating prerequisites for that work rather than field-reported defects.
 
 - **The upload hook is synchronous, so async subscribers are silently skipped — resolved (v1.2.3 + v1.4.0).** `documentManagementService.upload()` originally fired `documents.document.uploaded` via `actionRegistry.doAction` (sync), which never reached `addActionAsync` consumers, and the payload carried only `{ userId, providerId, remotePath, fileName }`. **v1.2.3** made it an awaited async fan-out (`doActionParallel`) with an enriched payload; **v1.4.0** then added a real `contentHash` for **streamed** uploads (the stream is teed through a SHA-256 passthrough) plus a `documentId` field, so the event now carries `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }`. Severity: Medium.
 - **No default-provider fallback for a brand-new user — resolved in v1.2.4 (when configured).** `uploadToDefault` now throws *"No default storage provider is set"* only when the caller has no `isDefault` provider **and** no app-wide default is set. Admins can set an app-wide shared default (with per-user isolation) that uploads fall back to — see **Next up → App-wide default storage location**. Severity: Low.
@@ -151,18 +151,17 @@ The cross-module provenance contract is now settled. The Document Management pro
 
 ### Proposed (raised during cog-ingest testing, September 2026)
 
-#### Global (shared-for-all) documents — an admin-managed space everyone can read
+#### Global (shared-for-all) documents — full browse/visibility (storage shipped v1.7.0)
 
-**Not a multi-tenant feature.** This deployment is solo — `tenantId === userId`, used purely as the per-user isolation *key*. This is a deliberate **global** space on the shared provider: an admin uploads / ingests content that should be available to **all** users (e.g. a global knowledge base), stored **outside** any user's `u/<userId>/` namespace and readable by everyone. Needed now — for ingesting global content through the upload → cog-ingest pipeline. Today there is no such space: isolation confines every user (admins included) to `u/<userId>/`, so an admin's uploads are private to the admin.
+**Not a multi-tenant feature.** This deployment is solo — `tenantId === userId`, used purely as the per-user isolation *key*. A deliberate **global** space on the shared provider holds admin content that belongs to the whole app (e.g. a global knowledge base), stored **outside** any user's `u/<userId>/` namespace.
 
-It is a deliberate, **security-reviewed carve-out** in the per-user isolation, not a toggle. The pieces:
+**Storage shipped in v1.7.0** — see [Completed → Global uploads](#global-uploads-release-v170): an admin can `uploadGlobal(...)` (admin-only, namespace-guarded) into the `DOC_GLOBAL_PREFIX` space, and the upload → cog-ingest pipeline ingests it. The DM-side reference is admin-owned.
 
-- a **global storage prefix** (e.g. `global/`) on the shared provider, written **only by admins** (a regular user must never be able to inject global content);
+**Still planned — full global visibility in the DM browser.** Making global documents browsable / downloadable by *all* users (not just via cog-ingest's KB) is the remaining half, and it's the part that opens a shared *readable* space, so it needs the same adversarial review the isolation work had:
+
 - a **read carve-out** so any authenticated user may browse / download the global prefix — but still **not** another user's namespace: `resolveFileProvider`'s guard becomes "within `u/<userId>/` **or** within the global prefix";
 - **global-scoped `doc_document` references** (a `scope` / `isGlobal` flag) so all users see them, created admin-side;
 - **erasure**: global docs are org-owned, so they are **not** deleted when a creating admin's account is erased.
-
-Because it intentionally opens a shared readable space, it needs the same adversarial review the isolation work had. Scope decision pending (global storage for the ingest pipeline vs. full global visibility in the browser).
 
 #### Node-type upload destinations with variable templating — shipped in v1.6.0
 
@@ -377,7 +376,7 @@ interface StorageAdapter {
 
 ## Completed
 
-Everything below is shipped in V1 (release version `1.6.0`). This is the foundation the roadmap above builds on.
+Everything below is shipped in V1 (release version `1.7.0`). This is the foundation the roadmap above builds on.
 
 ### Reusable upload → ingest pipeline & parsed-artefact surface (releases v1.2.3 – v1.5.1)
 
@@ -417,6 +416,10 @@ When a document is linked to a node, the module now records that document's **ac
 ### Node-type upload destinations (release v1.6.0)
 
 The companion to the raw-location recording above: where new uploads to a node **go**. An admin maps a Structure node **type** to a folder **template** in a new self-contained `doc_node_type_upload_location` table (managed from a **Node-type upload folders** card on `/admin/documents`). The template supports `{nodeType}` / `{nodeId}` / `{nodeName}` variables — each value reduced to a single safe path segment — with `*` as a catch-all default. `uploadToDefault` gained an optional `nodeId`: when set and no explicit `opts.folder` is given, the node's type-template resolves the destination (precedence `opts.folder` > node-type template > `uploadPath` > `basePath` > root), flowing through the existing [upload contract](/document-management/integration/#the-upload-contract) so it stays nested under `u/<userId>/` and namespace-guarded on a shared+isolated default. The node's type + name are read via `serviceRegistry.getOptional('structure')` (no direct import; inert when Structure is absent), and the Structure **Upload File** action passes the `nodeId`. See [Integration → Node-type upload destinations](/document-management/integration/#node-type-upload-destinations).
+
+### Global uploads (release v1.7.0)
+
+The **storage** half of [global documents](#global-shared-for-all-documents--full-browsevisibility-storage-shipped-v170): an admin uploads content into a shared **global** space, outside any user's `u/<userId>/` namespace, for content that belongs to the whole app (e.g. a global knowledge base to ingest). New `uploadGlobal(userId, fileName, file, opts?)` service method and admin-only `POST /upload-global` store the file on the app-wide **shared default** under `DOC_GLOBAL_PREFIX` (default `global`), guarded to stay within that prefix. `opts.global` on `uploadToDefault` is the underlying trusted flag (bypasses per-user isolation — admin-gated at the route). Same `folder` / `nodeId` templating and precedence as `uploadToDefault`, and it emits the same `documents.document.uploaded` event so cog-ingest ingests global content like any other upload; the `DocumentUpload` component gains `global` (and `nodeId`) props. The DM-side reference is admin-owned — **full cross-user browse/visibility of global docs remains planned** (see [Proposed](#global-shared-for-all-documents--full-browsevisibility-storage-shipped-v170)). Adversarially verified. See [Integration → Global uploads](/document-management/integration/#global-uploads-admin).
 
 ### Core
 
