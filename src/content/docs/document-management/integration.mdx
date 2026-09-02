@@ -67,10 +67,14 @@ export interface DocumentManagementServiceInterface {
   getDocumentCount(nodeId: string, userId: string): Promise<number>;
 
   /**
-   * Upload a file to the user's default provider. The destination folder is
-   * opts.folder if given, else the provider's configured uploadPath, else its
-   * basePath, else the root. Other modules (e.g. cog-ingest) pass folder to
-   * direct where the file lands.
+   * Upload a file to the user's default provider (the user's own isDefault
+   * provider, else the admin-set app-wide shared default). opts.folder is
+   * honoured on EVERY target, resolved relative to the caller's effective
+   * writable root (the provider root, or the per-user namespace u/<userId>/ on
+   * an isolated shared default, where it is guarded against escape); omit it to
+   * fall back to the provider's uploadPath, else basePath, else the root. Parent
+   * folders are created as needed. Other modules (e.g. cog-ingest) pass folder
+   * to direct where the file lands.
    */
   uploadToDefault(
     userId: string,
@@ -219,7 +223,7 @@ export interface ProvenanceResult {
 | `getDownloadStreamByPath(providerId, userId, path)` | `Promise<{ stream: Readable; fileName: string }>` | A `Readable` (plus the derived `fileName`) for a provider path with no `doc_document` reference — how a job-worker consumer pulls the bytes for an uploaded file off the request path. |
 | `getFileInfo(documentId, userId)` | `Promise<FileInfo>` | Live metadata (name, size, MIME type, timestamps) fetched from the provider. |
 | `getDocumentCount(nodeId, userId)` | `Promise<number>` | The number of references linked to a node — cheaper than fetching them all. |
-| `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId }>` | Upload a file to the user's default provider. `opts.folder` overrides the landing folder (else the provider's `uploadPath`, else its root) — e.g. cog-ingest can route ingested files into a chosen folder. |
+| `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cog-ingest routes ingested files into an `Ingested/` folder. |
 | `putParsedArtefact(userId, input)` | `Promise<ParsedArtefact>` | **Store** the output an external parser produced for a source (this module never parses). Bytes default to a derived writable area (`DOC_ARTEFACT_PREFIX`) unless `input.target` overrides; deduped by source `contentHash`. |
 | `getParsedArtefact(userId, source, opts?)` | `Promise<ParsedArtefact \| null>` | Fetch the latest (or a given `format`/`version`) stored artefact for a source — so a consumer can re-ingest without re-parsing. |
 | `listParsedArtefacts(userId, source)` | `Promise<ParsedArtefact[]>` | Every stored artefact for a source. |
@@ -737,6 +741,48 @@ dashboardRegistry.register({
 <Aside type="tip" title="Link into the Documents area">
 If your module wants to deep-link to a document, route to `/documents/preview/:documentId`; to a provider folder, route to `/documents/browse/:providerId/*`. Storage providers are managed by each user at `/settings/document-storage`; admins control which engines are available at `/admin/documents`.
 </Aside>
+
+---
+
+## The upload contract
+
+There are two ways bytes enter a provider through this module, and one resolution rule they both obey. If you are a consumer (cog-ingest, ai-chat, an evidence importer), this section is the whole contract.
+
+**Entry points**
+
+| Caller | Provider chosen | Destination |
+|--------|-----------------|-------------|
+| `upload(providerId, userId, path, file, metadata?)` (service) / `POST /upload/:providerId?path=` | The named provider, **ownership-checked** against `userId`. | `path` names the full destination (folder + filename), as given. |
+| `uploadToDefault(userId, fileName, file, opts?)` (service) / `POST /upload?fileName=&folder=` | The user's own `isDefault` provider; **else** the admin-set app-wide shared default; else `BadRequestError`. | `opts.folder` (relative to the effective root, below), else `uploadPath`, else `basePath`, else the root. `fileName` is a basename. |
+
+**The resolution rule for `uploadToDefault`.** `opts.folder` is honoured on **every** target — it is the destination folder *relative to the caller's effective writable root*. What that root is, and how `fileName` is treated, depends on the target:
+
+| Target | Effective root | `opts.folder` | `fileName` |
+|--------|----------------|---------------|------------|
+| **Owned provider** (caller's own `isDefault`) | The provider root | Used relative to the root; replaces `uploadPath` when supplied | Joined as given (the caller owns the store) |
+| **Shared default, isolation ON** (the default policy) | The per-user namespace `u/<userId>/` | Nested **under** the namespace, and **guarded** — a value that would escape `u/<userId>/` is rejected with `ForbiddenError` | Reduced to a **basename** (any path parts / traversal stripped) |
+| **Shared default, isolation OFF** (communal opt-out) | The provider root | Used relative to the root; replaces `uploadPath` when supplied | Reduced to a **basename** |
+
+When `opts.folder` is omitted, the destination is the provider's configured `uploadPath`, else its `basePath`, else the root — on every target. Parent folders are **created as needed** (S3 is key-addressed so folders are implicit; Local and WebDAV create the parent collection before writing).
+
+<Aside type="tip" title="Why a consumer wants opts.folder to always work">
+cog-ingest routes its uploads into a dedicated folder (e.g. `Ingested/`) so it can recognise and **skip** them on a catch-all auto-ingest source — the folder is the marker that a file is already in flight, which is what makes the double-ingest guard reliable. That only holds if the folder is honoured wherever the file lands, including when the user has no provider of their own and falls through to the shared default. It is, on both the isolated and communal shared default.
+</Aside>
+
+**Side effects (both entry points).** A successful write records a `doc_recent_access` `upload` row and emits the awaited async `documents.document.uploaded` event (a storage *reference*, never bytes). `uploadToDefault` on the **shared** default additionally upserts an **owned** `doc_document` reference (idempotent on `(userId, providerId, remotePath)`) so the user can find and download their file — they cannot `createDocument` against a provider they don't own, so this trusted server-side write is the only path to a browsable reference there.
+
+<Aside type="caution" title="Document visibility is per-user in V1 — even on a communal shared default">
+The isolation toggle governs where **bytes** land, not who can **see** them. Every `doc_document` reference is `userId`-scoped and browsing the shared provider is never granted to non-owners, so a file one user uploads to the shared default is not visible to other users — even in communal (isolation-off) mode. An admin-managed area that is *readable by everyone* is a distinct, not-yet-built capability (cross-user shared visibility); see the [roadmap](/document-management/roadmap/#planned-improvements). For per-user private folders on a shared NAS, keep isolation **on** — each user (admins included) gets their own `u/<userId>/` root automatically.
+</Aside>
+
+```typescript
+// A consumer routing an upload into a chosen folder, wherever the file lands:
+const dm = serviceRegistry.get('document-management') as DocumentManagementServiceInterface;
+const { path, providerId } = await dm.uploadToDefault(userId, fileName, bytes, {
+  folder: 'Ingested',          // → owned: <root>/Ingested/…; shared+isolated: u/<userId>/Ingested/…
+  mimeType: 'application/pdf',
+});
+```
 
 ---
 
