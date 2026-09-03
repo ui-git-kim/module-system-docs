@@ -555,19 +555,24 @@ The strongest form of data sovereignty is a source whose raw files **never leave
 - **Derived data persists independently — and never on the machine.** A parsed artefact for an ephemeral source is written to a **persistent** writable store (the user's own default, else the shared app-default), never back onto the ephemeral provider (`resolveArtefactTarget`). So the searchable cog-ingest KB (extracted text + embeddings) survives the machine going offline, while the original evidence stays local. If no persistent store is configured, `putParsedArtefact` **fails loudly** rather than persisting derived data on the ephemeral source.
 - **The integrity anchor is captured while reachable.** `createDocument` computes the `contentHash` by default for an ephemeral source (see [Chain of custody](#chain-of-custody) above), so a citation remains verifiable even after the raw original is offline.
 - **Offline is not an error.** A failed connection test on an ephemeral provider sets status `unavailable` (not `error`); already-ingested and derived data stays usable.
-- **Never a durable target.** An ephemeral provider can't be a **default** upload location (per-user or app-wide), and `uploadToDefault` / `uploadGlobal` refuse to write to one — so a durable app upload can never land on a store that disappears when the machine disconnects. Enforced at every mutation door (`createProvider`, `updateProvider`, `updateAppDefault`), at the upload path as defence in depth, and — authoritatively — at the **point of use**: the default resolvers (`getDefaultProviderRow` / `getSharedDefaultRow`) never hand back an ephemeral provider, so even a stale default pointer left by a concurrent edit is inert rather than harmful.
+- **A local folder can be your default; the app-wide default stays durable.** A user may set their Local Connect folder as their **own** default (their primary browse/upload space). The **app-wide shared default** — every user's fallback and the offline-staging store — must stay durable, so `updateAppDefault` rejects an ephemeral one, `getSharedDefaultRow` refuses to hand one back, and the admin picker hides them.
+- **Offline uploads are staged durably, then organised into the folder — never onto a store that can vanish.** If you upload through the app while your Local Connect default is offline, the bytes are staged on the durable shared default (under `u/<userId>/<DOC_STAGING_PREFIX>/`, inside your namespace) and a `doc_pending_reconcile` row records the intent. On reconnect the bytes are written into your local folder and the reference **route is re-pointed** — the file is never duplicated, and a durable app upload never lands on the ephemeral store itself.
 
 <Aside type="note" title="The trade-off, made explicit">
 The raw original stays on the user's machine; only the **derived** knowledge base (extracted text + embeddings) lives in the app. That is a deliberate choice — the searchable index leaves the machine, the evidence does not — and it is what lets a legal source be both *ingestible* and *never uploaded*.
+</Aside>
+
+<Aside type="caution" title="Communal mode: repointing the default is not a revocation control">
+`resolveFileProvider` honours any reference the caller owns, regardless of which provider is the *current* app-wide default (so offline-staged bytes stay readable after an admin repoints it). With per-user isolation **on** (the default), a user can only ever hold a reference to their own `u/<userId>/` namespace, so this never crosses tenants. With isolation **off** (`defaultIsolateUsers=false`, communal mode), a user can hold a reference to a deliberately-shared file — and repointing/unsetting the app-wide default no longer severs it. To revoke access to a specific communal file, delete the reference (or the underlying bytes/provider), not the default pointer.
 </Aside>
 
 ---
 
 ## Account Erasure and Data Categories
 
-The module declares a **security manifest** (`security.registration.ts`) so the host can erase a user's data when their account is deleted. The account-deletion handler removes **every per-user table** in a single transaction — providers, documents, node links, folder bookmarks, the recent-access log, included folders, and parsed artefacts.
+The module declares a **security manifest** (`security.registration.ts`) so the host can erase a user's data when their account is deleted. The account-deletion handler removes **every per-user table** in a single transaction — providers, documents, node links, folder bookmarks, the recent-access log, included folders, parsed artefacts, and pending reconciles.
 
-Parsed artefacts get an extra step because they have **bytes on a storage provider**, not just metadata rows. Before the row deletion, the handler best-effort deletes the artefact **bytes** from storage (`purgeUserArtefactBlobs`), **confined to the user's `u/<userId>/` namespace** on shared providers so it can never touch another tenant's data. That purge **never throws** — a provider being unreachable does not block the account deletion — and the `doc_parsed_artefact` metadata rows are then removed inside the same transaction as the other per-user tables.
+Two categories have **bytes on a storage provider**, not just metadata rows, and get an extra step before the row deletion: **parsed artefacts** (`purgeUserArtefactBlobs`) and **offline-staged uploads** awaiting reconcile (`purgeUserStagedBytes`). Both best-effort delete the bytes from storage, **confined to the user's `u/<userId>/` namespace** on shared providers so they can never touch another tenant's data, and **never throw** — a provider being unreachable does not block the account deletion. The `doc_parsed_artefact` and `doc_pending_reconcile` metadata rows are then removed inside the same transaction as the other per-user tables.
 
 The category names below are exactly those declared in the manifest's `dataCategories`:
 
@@ -580,6 +585,7 @@ The category names below are exactly those declared in the manifest's `dataCateg
 | `included_folders` | `owned` | `doc_included_folder` rows |
 | `recent_access_log` | `owned` | `doc_recent_access` audit rows |
 | `parsed_artefacts` | `owned` | `doc_parsed_artefact` rows **and** the artefact bytes under the user's namespace |
+| `pending_reconcile` | `owned` | `doc_pending_reconcile` rows **and** the offline-staged upload bytes under the user's namespace |
 
 <Aside type="note" title="Best-effort byte purge, guaranteed row deletion">
 The byte purge is best-effort and namespace-confined; the metadata-row deletion is transactional and guaranteed. This ordering means a transient storage outage can leave orphaned bytes (within the user's own namespace) but never leaves a dangling reference row — and never reaches outside the deleted user's data.
