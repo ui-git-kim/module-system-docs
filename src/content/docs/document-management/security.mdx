@@ -501,7 +501,7 @@ Document Management was designed with legal and evidence workflows in mind. Thre
 
 Three controls work together to establish and preserve chain of custody:
 
-1. **Integrity** — `contentHash` (SHA-256) is computed server-side at reference creation **when the caller passes `computeHash: true`** (evidence/legal callers do). A Verify Integrity re-hash then confirms the file is byte-for-byte the file you first recorded.
+1. **Integrity** — `contentHash` (SHA-256) is computed server-side at reference creation **when the caller passes `computeHash: true`** (evidence/legal callers do), and **by default for ephemeral (Local Connect) sources** — the raw original may be offline by the time a citation is verified, so the anchor is captured while the machine is still reachable. A Verify Integrity re-hash then confirms the file is byte-for-byte the file you first recorded.
 2. **Immutability** — `isReadOnly` providers reject every write at the adapter level, so evidence cannot be modified, moved, or deleted through the module.
 3. **Access history** — `doc_recent_access` logs each `view`, `download`, `upload`, and `link` with `userId` and `accessedAt`, providing an auditable record of who did what and when.
 
@@ -547,6 +547,20 @@ model doc_document {
 The cloud database stores references and encrypted credentials — not files. Even a full database compromise exposes no file content and no usable credentials (without `DOC_ENCRYPTION_KEY`). The files, and the data sovereignty over them, remain with the storage provider.
 </Aside>
 
+### Local Connect (ephemeral providers)
+
+The strongest form of data sovereignty is a source whose raw files **never leave the user's machine at all**. Mark such a provider **ephemeral** (`doc_storage_provider.isEphemeral`) — typically a [Local Connect companion-app](/document-management/roadmap/#local-connect-companion-app) WebDAV source reachable only while the user's machine is connected. The module then guarantees, for that source:
+
+- **Raw bytes are never persisted server-side.** The module stores references and *derived* artefacts only — never raw content — for any source. The `sharp` thumbnail cache (`utils/thumbnails.ts`) is **unwired** (no route generates or serves thumbnails; the only live thumbnail path is S3's presigned URL, which returns no bytes), so no rasterised copy of a raw original is ever written to disk. A forward-guard note in that util requires any future wiring to **skip ephemeral providers**.
+- **Derived data persists independently — and never on the machine.** A parsed artefact for an ephemeral source is written to a **persistent** writable store (the user's own default, else the shared app-default), never back onto the ephemeral provider (`resolveArtefactTarget`). So the searchable cog-ingest KB (extracted text + embeddings) survives the machine going offline, while the original evidence stays local. If no persistent store is configured, `putParsedArtefact` **fails loudly** rather than persisting derived data on the ephemeral source.
+- **The integrity anchor is captured while reachable.** `createDocument` computes the `contentHash` by default for an ephemeral source (see [Chain of custody](#chain-of-custody) above), so a citation remains verifiable even after the raw original is offline.
+- **Offline is not an error.** A failed connection test on an ephemeral provider sets status `unavailable` (not `error`); already-ingested and derived data stays usable.
+- **Never a durable target.** An ephemeral provider can't be a **default** upload location (per-user or app-wide), and `uploadToDefault` / `uploadGlobal` refuse to write to one — so a durable app upload can never land on a store that disappears when the machine disconnects. Enforced at every mutation door (`createProvider`, `updateProvider`, `updateAppDefault`), at the upload path as defence in depth, and — authoritatively — at the **point of use**: the default resolvers (`getDefaultProviderRow` / `getSharedDefaultRow`) never hand back an ephemeral provider, so even a stale default pointer left by a concurrent edit is inert rather than harmful.
+
+<Aside type="note" title="The trade-off, made explicit">
+The raw original stays on the user's machine; only the **derived** knowledge base (extracted text + embeddings) lives in the app. That is a deliberate choice — the searchable index leaves the machine, the evidence does not — and it is what lets a legal source be both *ingestible* and *never uploaded*.
+</Aside>
+
 ---
 
 ## Account Erasure and Data Categories
@@ -589,6 +603,7 @@ A consolidated lookup of every control described on this page.
 | File proxying | Backend streams bytes; frontend never holds long-lived credentials | `download` / `preview` controller |
 | Short-lived presigned URLs | Preview-only, provider-issued (S3/R2) | `preview` endpoint (`{ kind: 'url' }`) |
 | Read-only enforcement | `assertWritable()` → `ReadOnlyError` (403) at the adapter | Adapters |
+| Ephemeral (Local Connect) sovereignty | Raw bytes never persisted; derived artefacts redirected off the machine; `contentHash` by default; offline ⇒ `unavailable` | `isEphemeral`, `resolveArtefactTarget`, `createDocument` |
 | Content integrity | SHA-256 `contentHash` + Verify Integrity re-hash | `utils/encryption.ts`, `doc_document` |
 | Access audit trail | `doc_recent_access` (who / what / action / when) | Database |
 | Path-traversal prevention | `safeResolve()` → `PathTraversalError` (403) | `LocalAdapter` |
