@@ -117,6 +117,10 @@ export default defineConfig({
                   label: "Authentication",
                   slug: "starter-template/auth-feature",
                 },
+                {
+                  label: "Device Tokens",
+                  slug: "starter-template/device-tokens",
+                },
                 { label: "User", slug: "starter-template/user-feature" },
                 {
                   label: "Dashboard",

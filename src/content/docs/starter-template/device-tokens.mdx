@@ -1,0 +1,181 @@
+---
+title: Device Tokens
+description: Long-lived, revocable device-token auth so headless external/desktop apps (e.g. the Local Connect companion) can call the API as a signed-in user — enrolled once from a web session
+sidebar:
+  order: 8
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+The device-token feature lets a **headless external or desktop app** — starting with the `unique-local-connect` **Local Connect companion** — call the backend API as a signed-in user, without a browser session.
+
+The web frontend authenticates with a short-lived Neon Auth JWT that the SDK refreshes transparently. A daemon has no web session and no way to obtain or refresh that JWT. Device tokens close that gap with the **enrol-once, stay-paired** model (CrashPlan / backup-agent style): the user downloads the companion from a **signed-in** location in the web app, and hands it a credential from that authenticated context.
+
+Because this lives in the starter's **auth layer** (not a module), it works everywhere: every module's routes are gated by `requireAuth`, so once that middleware also accepts a device token, **all APIs work for the companion with no module changes**.
+
+---
+
+## The two credentials
+
+| Credential | Lifetime | Purpose |
+|------------|----------|---------|
+| **Enrolment token** | Short (~10 min), single-use | Minted by a signed-in user; carries the enrolment across the download boundary. Prefix `dve_`. |
+| **Device token** (access) | Short-ish (~1 h), rotated | What the daemon sends as `Authorization: Bearer` on every API call. Prefix `dvc_`. |
+| **Refresh token** | Long (~90 d, sliding) | Rotates the device token; rotated itself on every refresh. Prefix `dvr_`. |
+
+All three are **opaque, high-entropy** (≥32 random bytes, base64url) and **stored only as SHA-256 hashes** — the plaintext is returned exactly once and never persisted or logged.
+
+---
+
+## Enrolment flow
+
+```
+Signed-in web app                 Backend                          Companion (desktop)
+─────────────────                 ───────                          ───────────────────
+"Link a device"  ─POST /auth/devices/pair (web JWT)─►  mint enrolment token
+     │ ◄── { enrolmentToken, expiresAt, deepLink }
+     │  shows a copyable code + deep link
+     ▼
+                    ─POST /auth/devices/enrol (PUBLIC)─►  verify + consume enrolment token →
+                                                          create device row →
+                                                          { deviceToken, refreshToken, userId,
+                                                            apiBaseUrl, expiresAt }
+     Companion stores deviceToken + refreshToken in the OS keychain;
+     sends deviceToken as Bearer on every API call.
+                    ─POST /auth/devices/refresh (PUBLIC)─►  rotate → { deviceToken, refreshToken, expiresAt }
+Web "Linked devices" ─GET /auth/devices · POST /auth/devices/:id/revoke (web JWT)─► list / revoke
+```
+
+---
+
+## Endpoints
+
+All live in the backend `auth` feature, mounted at `/api/v1/auth/devices`.
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `POST` | `/auth/devices/pair` | Web session | Mint a one-time enrolment token for the signed-in user. Body `{ deviceName?, platform? }` → `{ enrolmentToken, expiresAt, deepLink }`. Rate-limited per user. |
+| `POST` | `/auth/devices/enrol` | Public | Body `{ enrolmentToken, deviceName?, platform? }`. Verify + **consume** the enrolment token, create the device → `{ deviceToken, refreshToken, userId, apiBaseUrl, expiresAt }`. Rate-limited; generic errors. |
+| `POST` | `/auth/devices/refresh` | Public | Body `{ refreshToken }`. Rotate → `{ deviceToken, refreshToken, expiresAt }`; the presented refresh token is invalidated. Rate-limited. |
+| `GET` | `/auth/devices` | Web session | List the caller's devices: `{ id, name, platform, createdAt, lastSeenAt, status }` (never token material). |
+| `POST` | `/auth/devices/:id/revoke` | Web session | Revoke one device (owner-scoped). `DELETE /auth/devices/:id` is an alias. |
+
+<Aside type="note">
+  **"Web session" vs "Public".** The public endpoints (`enrol` / `refresh`) authenticate the caller by the token in the body — the companion has no session yet. The management endpoints require an interactive **web session** (a Neon Auth JWT), not a device token — see [Non-admin, web-session-only](#non-admin-web-session-only) below.
+</Aside>
+
+---
+
+## How `requireAuth` accepts device tokens
+
+`requireAuth` distinguishes the two credential kinds cheaply by prefix. A `dvc_` token skips JWKS verification and is verified by a **hashed database lookup**; anything else takes the unchanged Neon Auth JWT path.
+
+```typescript
+// backend/src/middleware/auth.middleware.ts (device branch)
+if (token.startsWith(DEVICE_TOKEN_PREFIX)) {          // 'dvc_'
+  const verified = await deviceAuthService.verifyAccessToken(token);
+  if (!verified) { res.status(401).json({ error: 'Invalid token' }); return; }
+  req.user = {
+    id: verified.userId,
+    email: verified.email,
+    role: 'user',                 // device tokens are never admin
+    tenantId: verified.tenantId,  // isolation key — set exactly like the JWT path
+    authMethod: 'device',
+  };
+  next();
+  return;
+}
+// …unchanged JWT path below…
+```
+
+`verifyAccessToken` hashes the presented token, looks up the `AuthDevice` row by its unique `deviceTokenHash`, checks it is `active` (not revoked, not expired), resolves the owner's email, and throttles the `lastSeenAt` update to at most once per minute. There is **no verification cache**, so a revoke takes effect on the very next request.
+
+### Non-admin, web-session-only
+
+A device token is deliberately **lower-trust** than a web session, and two invariants enforce it:
+
+- **Never admin.** `requireAdmin`, `requireRole` and `attachRole` all refuse to elevate an `authMethod: 'device'` principal — even if the owner is an admin in the database. (They re-derive role from the DB, so this guard is explicit, not merely a default `role: 'user'`.)
+- **Management is web-session-only.** `pair`, list and revoke require `requireWebSession` (a JWT, any signed-in user — not necessarily an admin). This stops a leaked device token from enrolling *further* long-lived devices (which would survive revoking the original) or revoking the owner's other devices.
+
+### CORS and no-Origin requests
+
+A headless client sends **no `Origin` header**, which the production CORS gate normally rejects. The gate exists to protect *ambient* (cookie) credentials from CSRF — and a Bearer token is never attached ambiently by a browser, so a device-token request carries no CSRF risk. The CORS layer therefore lets a no-Origin request bearing `Authorization: Bearer dvc_…` through, which is what makes device auth work on **every** module route with no per-route flag. The token is still fully verified by `requireAuth`.
+
+The `enrol` / `refresh` endpoints (whose callers present a token in the body, not a `dvc_` bearer) are covered by `allowNoOrigin: true` on the `/auth/devices` route registration.
+
+---
+
+## Token model
+
+- **Opaque + DB-verified** (no signing secret, so no new env var, and revocation is instant).
+- **Enrolment token:** single-use, ~10 min TTL, bound to the minting user, consumed **atomically** (a Serializable transaction marks `usedAt` so a concurrent redeem fails).
+- **Device (access) token:** ~1 h TTL; verified by hashed lookup on every request.
+- **Refresh token:** ~90 d **sliding** expiry, **rotated on every refresh** — the old refresh token's hash is overwritten, so a replayed refresh token fails.
+- **Revoke = instant:** revoking sets `status = 'revoked'`; the next request 401s. No cache.
+
+TTLs, token prefixes, entropy, rate limits and the companion deep-link scheme are named constants in `backend/src/features/auth/devices.constants.ts` — tune policy there, not inline.
+
+<Aside type="note">
+  Tokens are hashed with `hashSecret` (SHA-256) from the [Security feature](/starter-template/security-feature/). SHA-256 is unsalted, which is exactly what makes the deterministic hashed lookup possible — and it is safe here because the tokens are high-entropy random values (a leaked hash column is not brute-forceable). A future hardening could switch to a keyed HMAC with a server pepper; see the [roadmap](/starter-template/roadmap/).
+</Aside>
+
+---
+
+## Data model
+
+Two starter-owned tables (added in v2.8.0), following the schema's isolation convention (`tenantId` = the RLS/`owned()` key, `userId` = the actor; equal in solo mode):
+
+- **`AuthDevice`** — `id`, `tenantId`, `userId`, `name`, `platform`, `deviceTokenHash` (@unique), `refreshTokenHash` (@unique), `deviceTokenExpiresAt`, `refreshTokenExpiresAt`, `status`, `createdAt`, `lastSeenAt`, `revokedAt?`.
+- **`AuthDeviceEnrolment`** — `id`, `tenantId`, `userId`, `tokenHash` (@unique), `deviceName?`, `platform?`, `expiresAt`, `usedAt?`, `createdAt`.
+
+Both are declared in the `auth` feature's `securityRegistry` manifest (owned models + hashed-secret fields), and a deletion handler clears an account's device + enrolment rows during the [account-deletion cascade](/starter-template/security-feature/).
+
+<Aside type="caution" title="Downstream apps: run a migration after updating">
+  These are **new starter-owned tables**. `schema.prisma` is merge-protected, so `npm run template:update` brings them in via an auto-add block (they also ship in `create-app` for new apps). After updating, run the drift-safe migration (`npm run db:migrate`) to create the tables — see [Database & Prisma](/starter-template/database/). Skipping the migration leaves `prisma.authDevice` code without a table.
+</Aside>
+
+---
+
+## "Linked devices" settings page
+
+The web app gets a **Linked devices** settings page (registered via `settingsPagesRegistry`, id `linked-devices`) that lists the user's devices — name, platform, added, last active, status — each with a **Revoke** action and a plain-language note. A **Link a device** button mints an enrolment token and shows it as a copyable code plus a companion deep link (`unique-local-connect://enrol?token=…`) with its expiry.
+
+It is composed entirely from the shared `settings-blocks` (`SectionHeader`, `Table`, `Note`) and shadcn primitives — no hand-rolled markup — and lives in the frontend `auth` feature.
+
+---
+
+## For module authors
+
+**Nothing to do.** Because `requireAuth` populates the same `req.user` shape for a device token as for a JWT, a module's routes accept device-token requests automatically. The only difference a module can observe is `req.user.authMethod === 'device'` and the guaranteed `role: 'user'` — so admin/role-gated routes correctly reject device tokens.
+
+---
+
+## Companion integration
+
+<Steps>
+
+1. **Deliver the credential.** The `pair` response returns `{ enrolmentToken, expiresAt, deepLink }`. Deliver it to the companion via the deep link (`unique-local-connect://enrol?token=…`), a shown code the user pastes, or a bundled config file with the download.
+
+2. **Enrol.** The companion POSTs the enrolment token to `/auth/devices/enrol` and stores the returned `deviceToken` + `refreshToken` in the OS keychain. It also gets `apiBaseUrl` for subsequent calls.
+
+3. **Call the API.** Send `Authorization: Bearer <deviceToken>` on every request. All APIs (Document Management included) work as the signed-in user, at `role: 'user'`.
+
+4. **Refresh.** When the device token nears expiry (or a request 401s), POST the refresh token to `/auth/devices/refresh` and replace both stored tokens with the rotated pair.
+
+</Steps>
+
+<Aside type="tip">
+  The deep-link scheme (`unique-local-connect`) is companion-specific — an app shipping a differently-branded companion overrides `DEVICE_ENROLMENT_DEEP_LINK_SCHEME` in `devices.constants.ts`.
+</Aside>
+
+---
+
+## Security summary
+
+- Opaque ≥32-byte tokens, **hashed at rest** (SHA-256), never logged.
+- Enrolment single-use + short TTL, consumed atomically; `pair` rate-limited per user.
+- Public `enrol` / `refresh` rate-limited per IP, **generic errors** (never reveal whether a token exists), HTTPS only.
+- Device tokens are **non-admin**, owner-scoped, and individually **revocable** (instant).
+- Device rows are erased on account deletion.
+
+Later hardening (see the [roadmap](/starter-template/roadmap/)): proof-of-possession (the companion sends a device public key at enrol; tokens bound to it), an admin org-wide device policy, and an optional short verification cache.
