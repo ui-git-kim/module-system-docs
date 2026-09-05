@@ -263,7 +263,7 @@ V2 turns the renderer into a content platform. These features add new tables alo
 Pulled forward from "someday V2" to an **urgent-ish, pre-beta** priority (raised Sep 2026). The driver: a legal app where **raw documents must never leave the user's machine**, yet still need to be **ingested**. Local Connect delivers exactly this — the file stays on the user's computer; the module reads it over WebDAV **only while the machine is connected** (laptop off / tunnel down ⇒ the provider is `unavailable` and the raw is unreachable), while the **derived** data (the cog-ingest KB — extracted text + embeddings) persists independently. So the original evidence stays local with ephemeral access, and only the searchable index lives in the app.
 
 **Split of work:**
-- **Companion app** (`unique-local-connect`, separate repo) — the bulk: Electron + a local WebDAV server + Cloudflare Tunnel / Zero Trust. This is the main build and the remaining work.
+- **Companion app** (`unique-local-connect`, separate repo) — the bulk: Electron + a local WebDAV server + Cloudflare Tunnel, with authentication at the origin. **Shipped as v0.1.0** — see the [Local Connect companion](/document-management/local-connect/) pages.
 - **This module** — the DM-side support **shipped in v1.8.0 and v1.9.0**:
   - **v1.8.0** — providers can be **marked ephemeral** (`isEphemeral`); **parsed artefacts are redirected to a persistent store**, never the ephemeral source (the derived cog-ingest KB survives the machine going offline); confirmed the module **never persists raw bytes** for any source (the `sharp` thumbnail util stays unwired, with a forward-guard note); `createDocument` **captures `contentHash` by default** for ephemeral sources; offline tests set status `unavailable`. The UI shows a **Local** badge.
   - **v1.9.0** — a user's Local Connect folder can be their **own default**. A file uploaded through the app while the machine is **offline** is **staged on the durable shared default** and, on reconnect, **organised into the local folder** with the reference **route re-pointed** (never duplicated) — automatically on the next successful connection test, or via a **Sync now** action. The app-wide shared default stays durable (it's the staging store). Derived data (the KB) is still cog-ingest's, reached via the stable `documentId` wherever the file currently lives.
@@ -271,32 +271,20 @@ Pulled forward from "someday V2" to an **urgent-ish, pre-beta** priority (raised
   See the [changelog](/document-management/changelog/#v190).
 </Aside>
 
-The companion app is what gives users secure access to files on their own machine without port forwarding or self-managed security. It is a **separate repository** (`unique-local-connect`), built with **Electron + React + TypeScript**:
+The companion app — **Unique Local Connect**, a **separate repository** (`unique-local-connect`) built with **Electron + React + TypeScript** — is what gives users access to files on their own machine without port forwarding. As built (v0.1.0):
 
-- **Main process** runs a WebDAV server (`webdav-server` npm package) pointed at user-selected folders.
-- **Renderer** is a React settings UI for picking shared folders and toggling read-only mode.
-- **System tray** shows status (green when running) and provides start/stop controls.
-- **Folder picker** lets the user choose which directories to expose; a read-only toggle keeps evidence folders unaltered.
-- **Cloudflare Tunnel** publishes the local server at a stable URL with no port forwarding.
+- **A hand-rolled WebDAV server** (Class 1 + `MOVE` + `COPY` on Node's `http`, loopback-only on a fixed port, default `47831`) serves the user's chosen folders **in place**; nothing is copied. It was verified against the same `webdav` client this module uses.
+- **One provider row per shared folder**, each `isEphemeral: true` at `https://<hostname>/s/<share-id>/`, named `<Computer> · <Folder>`. Folders are **read-only by default** (the row carries `isReadOnly: true` and the UI shows the lock); one writable **uploads folder** is mandatory and becomes the user's default, so web-app uploads and offline staging always have a writable target.
+- **Cloudflare Tunnel** (a named tunnel for a stable hostname; quick tunnels for development) is transport only. **Authentication happens at the origin**: the companion mints a 256-bit bearer token, registers it as `config.token`, and checks it on every request before touching the disk — because this adapter can send only Basic or one Bearer header, Cloudflare Access service tokens cannot front the hostname for the module's requests (see [Security](/document-management/security/#cloudflare-zero-trust-access-for-local-machines)).
+- **The companion is the path-traversal boundary** for the user's disk (this module does not sanitise owned-provider paths): every path, and every `MOVE`/`COPY` destination, is confined before any filesystem call.
+- **Linking** uses the starter template's device-token enrolment (a deep link or pasted code from the signed-in web app; the companion shows the server address and asks before linking). Registration is a separate explicit step and is subject to the admin **User storage connections** policy — the device token is never admin.
+- **Delivery cadence** is owned by the companion: on connection it calls `POST /providers/:id/test` on the uploads row (which runs a delivery pass inline), then at most a bounded, progress-gated number of `/reconcile` passes, and re-tests every 10 minutes — this module has no background poller.
+- **Tray, start on login, auto-reconnect**, secrets in the OS secure store, structured redacted logs, signed builds with auto-update.
 
-Because it speaks WebDAV, the main app needs **no new adapter** — the user adds it as a standard `WebDAVAdapter` provider. The user flow:
+The user flow is documented end to end on the companion's [Setup](/document-management/local-connect/setup/) page: install → link this computer → confirm the uploads folder → share folders → create a named tunnel and check reachability → **Register this computer** → verify on `/settings/document-storage` (one connection per folder, lock icon on read-only ones). Because it speaks WebDAV, this module needed **no new adapter** and no protocol changes.
 
-<Steps>
-
-1. Download and install Local Connect, then select folders to share and click **Start** — the tray icon goes green.
-
-2. In the main app, open your **Document Storage** settings page (`/settings/document-storage`) and add a WebDAV provider:
-   - Local network: `http://localhost:8080`
-   - Remote: `https://docs.yourdomain.com` (via Cloudflare Tunnel)
-
-3. Run `POST /providers/:id/test` (the **Test Connection** button) to verify reachability and capabilities.
-
-4. Files appear in the document browser exactly like any other WebDAV provider.
-
-</Steps>
-
-<Aside type="note" title="Security is delegated to Cloudflare, not the companion app">
-The local WebDAV server does **not** implement its own authentication. Cloudflare Zero Trust Access sits in front of the tunnel and enforces auth, MFA, device posture, and audit logging before any request reaches the local server. Cloudflare Tunnel provides encryption in transit with no port forwarding. Zero Trust Access is free for up to 50 users. This matches the V1 provider-delegated security model — the module and the companion app stay out of the auth business.
+<Aside type="note" title="What this module still owes the companion">
+Five DM-side requests are recorded on the companion's [roadmap](/document-management/local-connect/roadmap/#requests-to-the-starter-template-and-document-management): await the streamed `PUT` response in `WebDAVAdapter.upload` and make the post-`PUT` stat mandatory; throw `ReadOnlyError` before staging to a read-only ephemeral default; carry a sub-code on `createProvider`'s `ForbiddenError` (`policy_disabled` / `engine_disabled` / `limit_reached`); and, on the starter side, return `deviceId` from enrol and fix the deep link's `api` parameter to the app's own origin. None blocks the companion — each is worked around today — but each workaround is weaker than the fix.
 </Aside>
 
 #### In-app document creation (Plate)

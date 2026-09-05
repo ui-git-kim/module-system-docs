@@ -1,0 +1,67 @@
+---
+title: Roadmap
+description: What comes next for the Local Connect companion — managed tunnels, sub-folder exclusions, proof-of-possession device tokens, Cloudflare Access options — and the changes it asks of the starter template and Document Management
+sidebar:
+  order: 9.6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Everything here is deliberately not in 0.1.0. Each item records the reason it matters, so the decision to build it (or not) can be made against the same facts the design was.
+
+<Aside type="note" title="Out of scope on principle">
+A backup, replication or restore mode is not on this roadmap. Raw files staying on the user's machine is the reason Local Connect exists; adding a mode that copies them out would change the data-residency promise and needs its own decision, not a roadmap line.
+</Aside>
+
+## Managed tunnel provisioning
+
+**What:** the web app creates the Cloudflare tunnel and hostname for a computer and hands the companion what it needs, so the user never opens the Cloudflare dashboard. The companion already reserves the slot (`tunnel.source = 'managed'` alongside today's `'manual'`) and treats a managed token exactly like a pasted one.
+
+**Why:** the named-tunnel steps in [Setup](/document-management/local-connect/setup/#create-a-named-tunnel) are the longest part of onboarding and the only part that involves a second product. Managed provisioning also lets the web app rotate a tunnel token itself when it suspects compromise, and confirms that the hostname it registers as `baseUrl` really belongs to the enrolling user (today nothing validates that).
+
+**Needs:** a Cloudflare API token held by the web app, per-computer tunnel and DNS records tied to the device row, and a starter or module endpoint the companion can call with its device token.
+
+## Per-folder sub-folder exclusions
+
+**What:** a tree under each shared folder where sub-folders can be unticked; excluded paths are omitted from listings and refused for every verb as if they did not exist.
+
+**Why:** users share a working folder that contains something they would rather not expose (a `.git` directory, a `node_modules`, a personal sub-folder) and today the only answer is to share the sub-folders individually, which multiplies connections — and, under a `limited` policy, counts against the cap.
+
+**Constraint:** exclusion must be enforced in the confinement step, never only in listings, so an excluded path that Document Management already stored a reference to is refused consistently.
+
+## Proof-of-possession device tokens
+
+**What:** at enrolment the companion generates a key pair in the OS secure store and sends the public key; the starter binds the device and refresh tokens to it and requires a signature over each request (or each refresh).
+
+**Why:** today the device token is a bearer secret. It is encrypted at rest and never logged, but if it is exfiltrated it works from any machine until revoked. Binding it to a key that never leaves the secure store closes that. The device-token specification lists this as the intended later hardening.
+
+**Needs:** starter-side support first; the companion then gains signing and key rotation.
+
+## Cloudflare Access options
+
+**What:** put Cloudflare Access in front of the hostname without blocking Document Management's requests. Two shapes are possible:
+
+- **Access accepts the bearer** — an Access policy that validates the same `Authorization: Bearer` the module already sends, so the edge blocks unauthenticated traffic before it reaches the computer while the module changes nothing.
+- **Header-injecting proxy** — an egress proxy on the web app's side that adds Access service-token headers (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) to requests bound for Local Connect hostnames.
+
+**Why:** the origin-auth model ([Security](/document-management/local-connect/security/#origin-authentication-on-every-request)) leaves the hostname publicly routable with the bearer token as the only gate and no edge-side audit log. Access would restore blocking at the edge, per-request logs and, for human access, MFA and device posture. It is not in 0.1.0 because Document Management's WebDAV adapter can send exactly one of Basic or one Bearer header and nothing else.
+
+## Requests to the starter template and Document Management
+
+These are changes the companion cannot make on its own. Each is recorded with the reason; none blocks 0.1.0, because the companion works around every one of them, but each workaround is weaker than the fix.
+
+| Where | Request | Why |
+|---|---|---|
+| Starter | `POST /auth/devices/enrol` should return the new device's **`deviceId`**. | The companion can then revoke exactly itself on Unlink (`DELETE /auth/devices/:id`). Today it must find its own row by name and platform, which is ambiguous after several links from the same computer. |
+| Starter | `POST /auth/devices/pair` should return a **`deepLink` whose `api` parameter is fixed to the web app's own origin**, and the web UI should present the pasted-code path (code + server address) as a first-class equal to the link. | The companion already shows and pins the origin, but a link minted server-side with the correct origin removes the only field a user has to check by eye. |
+| Document Management | `WebDAVAdapter.upload`'s streamed path should **await the `PUT` response** and make the post-`PUT` stat **mandatory**. | With the `webdav` client's write stream, `pipeline` resolves when the body is flushed, not when the response arrives; a `403`/`507` the companion sends after it starts reading the body is invisible to the module, which then re-points the reference and deletes the staged copy. The companion narrows the window by checking everything before reading a byte, but cannot close it. |
+| Document Management | `uploadToDefault` should throw `ReadOnlyError` **before staging** to a read-only ephemeral default. | Today an upload while the computer is away is staged even when the default row is read-only, and every delivery pass then fails forever. The companion prevents the configuration (a writable uploads folder is mandatory), but the module should refuse it too. |
+| Document Management | `createProvider`'s `ForbiddenError` should carry a **sub-code** — `policy_disabled`, `engine_disabled` or `limit_reached`. | All three refusals share `code: 'forbidden'` and differ only in message text, which the companion currently parses to tell the user what to do. A stable code would make the guidance reliable across module versions. |
+| Document Management docs | Replace "Cloudflare is the gatekeeper; the local server needs no auth" with the origin-authentication model. | Done for the [module's security page](/document-management/security/#cloudflare-zero-trust-access-for-local-machines) alongside this release; recorded here so the module's own docs workflow keeps it. |
+
+## Smaller items
+
+- **Basic authentication at the origin** as an alternative to Bearer, for a manual registration path through the module's Add Provider dialog (which has no token field). Not planned unless a manual path is wanted; the companion registers itself through the API.
+- **Named-tunnel setup checks** — parse `cloudflared`'s startup output for the connector id so a foreign `cloudflared` on the metrics port can never be mistaken for our own, and read the tunnel's ingress from the Cloudflare API to detect a port mismatch before the self-check does.
+- **Per-share activity in the web app** — surface the companion's request log alongside `doc_recent_access` so an evidence workflow has both ends of the audit trail in one place.
+- **Windows service / macOS launch agent** mode for computers where a user session is not always present. Today the companion runs in the user's session only, which is what keeps the secure store and the residency promise simple.

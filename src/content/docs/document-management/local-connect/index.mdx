@@ -1,0 +1,96 @@
+---
+title: Local Connect companion
+description: Unique Local Connect — the desktop companion that serves your own folders to Document Management in place, over WebDAV through a Cloudflare Tunnel, without copying a file anywhere
+sidebar:
+  order: 9.1
+  label: "Overview"
+---
+
+import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+
+**Unique Local Connect** is a small desktop app (Windows, macOS, Linux) that lets the Document Management web app browse folders on your own computer as if they were a storage provider — while the files themselves stay exactly where they are. It runs in the system tray, serves the folders you choose over **WebDAV**, publishes that server through a **Cloudflare Tunnel** at a stable HTTPS address, and registers each folder in Document Management as an ordinary `webdav` provider row flagged `isEphemeral: true`. There is no bespoke protocol: Document Management talks to the companion with the same `webdav` client it uses for ownCloud, Nextcloud or a NAS.
+
+The point of the design is **data residency**. Raw files never leave your machine; the web app reads them live, only while you are connected, and only the *derived* knowledge base (extracted text, embeddings, references) persists server-side. That is the property a legal or evidence workflow needs — ingestible, never uploaded — and it is documented from the module's side under [Security → Local Connect (ephemeral providers)](/document-management/security/#local-connect-ephemeral-providers).
+
+<Aside type="note" title="Vocabulary">
+The companion never says *sync* or *backup*, because it does neither. The only operation that moves bytes **into** your computer is **delivery**: uploads the web app accepted while your computer was away are held on the server's durable default store and delivered into your uploads folder when you reconnect.
+</Aside>
+
+## Like CrashPlan — in feel, not in data flow
+
+The operational feel is borrowed from backup agents: a set-and-forget tray app, start on login, a folder picker, a status dashboard, automatic reconnection. The data flow is deliberately the opposite.
+
+| | CrashPlan (backup) | Local Connect (this app) |
+|---|---|---|
+| Data flow | Copies file data **out** to a remote destination | Serves files **in place** over WebDAV; raw bytes **never leave the machine** |
+| Source of truth | Local files; the remote holds a replicated copy | Local files *are* the storage; nothing raw is replicated |
+| When offline | Queues changes to upload later | Document Management stages the *upload* on durable server storage and delivers it *into* the local folder on reconnect |
+| Restore | Pull a copy back from the destination | Not applicable — the files never left; the web app simply browses them live |
+
+**Adopted:** a background daemon with a tray icon, start on login, choosing which folders to expose (with sizes shown for information only), an at-a-glance dashboard (Connected / Offline / Reconnecting, the folders you share, the linked account, recent activity), auto-reconnect, and secrets kept in the operating system's secure store.
+
+**Not adopted:** backing up or replicating raw files to a remote destination, remote versioning, or any restore-from-cloud flow. A true backup mode would change the residency story and is out of scope; it will only ever be added as a separate, deliberate decision.
+
+## How it fits Document Management
+
+<CardGrid>
+  <Card title="One connection per folder" icon="document">
+    Each folder you share is registered as its own provider row, named `<Computer> · <Folder>`, whose `baseUrl` is `https://<your-hostname>/s/<share-id>/`. The id is stable, so renaming a folder in the companion never moves a stored path.
+  </Card>
+  <Card title="Ephemeral by contract" icon="seti:lock">
+    Every row is `isEphemeral: true`: the module never persists raw bytes or thumbnails from it, stores derived artefacts elsewhere, captures the integrity hash while you are reachable, and treats "offline" as `unavailable`, not an error.
+  </Card>
+  <Card title="Read-only unless you say otherwise" icon="approve-check">
+    Shared folders are read-only by default and the row carries `isReadOnly: true`, so the web app shows a lock icon and every write is refused twice — once by the module and once by the companion itself.
+  </Card>
+  <Card title="Offline staging and delivery" icon="rocket">
+    One folder — the **uploads folder** — is writable and is your default provider. Upload while your computer is away and the module stages the file on the durable shared default; on reconnect the companion asks the module to deliver it into that folder and re-point the reference.
+  </Card>
+</CardGrid>
+
+The web app's upload button, the Structure **Upload File** action and any module that calls `uploadToDefault` all write to your **default** provider, which is why the companion insists on a writable uploads folder before it registers anything (Document Management makes a user's first provider their default whether or not the flag is set). Folder routing follows the module's [upload contract](/document-management/integration/#the-upload-contract): a requested folder or node-type template *replaces* the row's `uploadPath`, so the provider root itself must be the writable folder — which is exactly what one row per share gives you.
+
+## Requirements
+
+| Requirement | Details |
+|---|---|
+| **Starter template: device-token enrolment** | The companion signs in with a long-lived, revocable **device token** minted from your signed-in web session, not a browser session. This is a starter-template [authentication feature](/starter-template/auth-feature/) that must have **landed in the starter and been migrated into your app** (two new tables, `auth_device` and `auth_device_enrolment`; downstream apps run `npm run template:update` and then a database migration). Until it has, the companion cannot link. |
+| **Document Management 1.9.0 or later** | Ephemeral providers (v1.8.0) and offline staging with delivery (v1.9.0). The integration contract the companion was built against was traced from v1.11.0. |
+| **A durable app-wide shared default** | An admin must set a **Default storage location** at `/admin/documents` backed by durable storage (S3/R2 or a WebDAV server, never a Local Connect folder). It is where uploads are staged while your computer is away; without it, an offline upload fails with a 400. |
+| **User storage connections policy not `disabled`** | The device token is a *user* credential (`role: 'user'`, never admin), so registering the companion is governed by the admin's **User storage connections** policy at `/admin/documents`. `unlimited` is the default. Under `limited`, **each shared folder counts as one connection** — with the default limit of 1 only the uploads folder fits, so raise the limit to the number of folders you intend to share. `disabled` blocks the companion entirely. See [Usage → Adding a Storage Provider](/document-management/usage/#adding-a-storage-provider). |
+| **Cloudflare** | A Cloudflare account and a zone you control, for a **named tunnel** with a stable hostname (required for anything beyond trying it out). **Quick tunnels** (`trycloudflare.com`) need no account and are supported for development only — the address changes every launch. |
+| **Supported platforms** | Windows 10 or later (x64 and arm64, per-user installer), macOS on Apple silicon and Intel (one universal build, signed and notarised), Linux x64 (AppImage or `.deb`, with GNOME Keyring or KWallet available for secure storage). |
+
+<Aside type="caution" title="What leaves your computer">
+- **Listings and, on demand, bytes.** While connected, the web app reads folder listings (names, sizes, dates) and the bytes of a file only when someone opens, previews, downloads, hashes or ingests it. Nothing is read in the background and nothing is copied anywhere as a routine.
+- **What the module keeps.** References (path, name, type, size), the SHA-256 `contentHash` captured while you are reachable, your organisation (favourites, tags, notes, node links), and any **derived** artefacts a consumer such as cog-ingest produces. Never raw content.
+- **What the companion registers.** The public hostname of your tunnel and the access token it minted for the origin — stored by the module encrypted at rest and never returned — plus the device name and platform it enrolled with.
+- **What stays local.** Your files, the device and refresh tokens, the origin token and the tunnel token (all in the OS secure store), and the companion's own logs.
+</Aside>
+
+## Where to next
+
+<CardGrid>
+  <Card title="Setup" icon="setting">
+    Install, link this computer, choose the uploads folder, share folders, create a named tunnel, register and verify.
+
+    [Read the setup guide →](/document-management/local-connect/setup/)
+  </Card>
+  <Card title="Security" icon="approve-check">
+    The trust model — origin authentication, the tunnel as transport, path confinement, secret storage, deep-link safety and token rotation.
+
+    [Read the security page →](/document-management/local-connect/security/)
+  </Card>
+  <Card title="Troubleshooting" icon="warning">
+    Offline versus unreachable, Cloudflare 530 / 502 / 401, port in use, blocked by policy, waiting uploads and where the logs are.
+
+    [Read troubleshooting →](/document-management/local-connect/troubleshooting/)
+  </Card>
+  <Card title="Changelog and roadmap" icon="rocket">
+    What 0.1.0 ships and its known constraints; what comes next and what the companion asks of the starter and the module.
+
+    [Changelog →](/document-management/local-connect/changelog/) · [Roadmap →](/document-management/local-connect/roadmap/)
+  </Card>
+</CardGrid>
+
+Related module pages: [Security → Local Connect (ephemeral providers)](/document-management/security/#local-connect-ephemeral-providers), [Security → Cloudflare and local machines](/document-management/security/#cloudflare-zero-trust-access-for-local-machines), [Integration → The upload contract](/document-management/integration/#the-upload-contract), [Configuration → WebDAV](/document-management/configuration/#webdav), [Usage → When a provider is offline](/document-management/usage/#when-a-provider-is-offline), and the module's [roadmap entry](/document-management/roadmap/#local-connect-companion-app).

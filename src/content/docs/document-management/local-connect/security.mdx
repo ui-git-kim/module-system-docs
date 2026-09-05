@@ -1,0 +1,124 @@
+---
+title: Security
+description: The Local Connect trust model — origin authentication on every request, the tunnel as encrypted transport, path confinement, OS-backed secret storage, deep-link safety, token rotation and what is logged
+sidebar:
+  order: 9.3
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+This page describes what protects your folders once they are reachable through a public hostname, who is responsible for each control, and what to do when a credential leaks. It is written to be checked against, not to reassure: where a layer is missing, it says so.
+
+## The trust model at a glance
+
+```
+Document Management (web app)
+    │  Authorization: Bearer ulc_…   (the origin token, sent on every request)
+    ▼
+Cloudflare edge  ──  HTTPS, DDoS protection, your hostname
+    │  outbound-only tunnel connection
+    ▼
+cloudflared on your computer  ──  forwards to http://127.0.0.1:47831
+    │
+    ▼
+Unique Local Connect WebDAV server
+    1. authenticate the Bearer token (timing-safe) — 401 and drop the socket otherwise
+    2. is the verb allowed?
+    3. decode and confine the path (and Destination for MOVE/COPY)
+    4. is this share read-only?
+    5. only now touch the disk
+```
+
+Three facts follow from that picture:
+
+- **The companion is the gate.** Anyone who can present the origin token can read your shared folders and write to the uploads folder. The token is the control; the hostname is public.
+- **The tunnel is transport.** It encrypts traffic to the edge and removes the need for port forwarding. It does not authenticate anyone.
+- **The companion is the only path-traversal boundary for your disk.** Document Management does not sanitise the paths it sends to a provider you own; the companion must.
+
+## Origin authentication on every request
+
+When the companion registers a folder it mints a random **256-bit** token with the prefix `ulc_`, stores it in the OS secure store, and sends it to Document Management as the row's `config.token`. The module encrypts it at rest (AES-256-GCM) and never returns it in any response. On every request the module sends `Authorization: Bearer ulc_…`; the companion compares it against fixed-length digests with a timing-safe comparison **before reading a byte of the body**, and answers `401` with `WWW-Authenticate: Bearer` — destroying the socket without draining the body — when it does not match. HTTP Basic is not offered.
+
+**Why authenticate at the origin rather than with Cloudflare Access?** Document Management's WebDAV adapter can send exactly one of two things: HTTP Basic credentials, or a single `Authorization: Bearer` header. It has no field for arbitrary headers, so it cannot send the `CF-Access-Client-Id` / `CF-Access-Client-Secret` pair a Cloudflare Access **service token** requires. Putting Access in front of the hostname would block the module's own requests. The earlier description on the module's security page — Cloudflare as the gatekeeper, the local server needing no authentication of its own — has been corrected accordingly; see [Security → Cloudflare and local machines](/document-management/security/#cloudflare-zero-trust-access-for-local-machines).
+
+**What Access would have added, and what you lose without it:** MFA and device-posture policies, a per-request audit log at the edge, and a block *before* the request reaches your computer. In the origin-auth model the hostname is publicly routable and the only gate is the bearer token. The compensating controls are the token's entropy, the loopback-only bind, the absence of Basic auth, fail-fast behaviour when the app is down, and the companion's own request log. If you want an edge-side rate limit or WAF rule on the hostname, add it in Cloudflare — it does not interfere with the module's requests.
+
+**Future options** (recorded on the [roadmap](/document-management/local-connect/roadmap/#cloudflare-access-options)): an Access policy that accepts the same bearer the module already sends, or a header-injecting proxy on the web app's side that adds the Access service-token headers. Both need work outside the companion.
+
+## The tunnel as encrypted transport
+
+`cloudflared` makes an outbound HTTPS connection from your computer to Cloudflare; nothing listens on your network. The web app talks to `https://<your-hostname>/…`, Cloudflare terminates TLS at the edge and carries the request down the tunnel, and `cloudflared` hands it to `http://127.0.0.1:47831` on the same machine — plain HTTP, but never off the loopback interface.
+
+The companion stops the tunnel deliberately when the computer sleeps or the screen locks, kills any orphaned `cloudflared` from a previous run on startup, and keeps short header and idle timeouts on the server, so a machine that is *gone* looks gone (Cloudflare 530 / error 1033) instead of leaving the web app's connection test hanging.
+
+## Loopback-only server
+
+The WebDAV server binds `127.0.0.1` only and the port is fixed (default `47831`, never auto-picked). `cloudflared`'s own metrics endpoint is also loopback-only, on a port the companion chooses and passes explicitly, and the companion only trusts readiness reports from the process it spawned. Nothing the companion runs is reachable from your LAN.
+
+## Path confinement is the companion's job
+
+Document Management resolves upload folders, node-type templates and stored paths for a provider you own **without** sanitising them, so a crafted path could only be stopped at the origin. The companion therefore confines every path — including the `Destination` header of `MOVE` and `COPY` — **before** any filesystem call, mirroring the module's own `LocalAdapter.safeResolve` and adding what a public-facing origin needs:
+
+- percent-decoding exactly once, with double-encoding (`%252e%252e`) refused;
+- `NUL` bytes, backslashes, drive letters and UNC prefixes refused;
+- `.` and `..` segments, Windows reserved names, `< > : " | ? *`, control characters and trailing dots or spaces refused on every platform;
+- a **realpath check** so a symlink or junction inside a shared folder cannot lead outside it;
+- in-progress uploads written to a temp file beside the target and renamed atomically, so a partial file never exists at the target path.
+
+A confinement failure is a `403`. Error bodies never contain filesystem paths.
+
+## Secrets live in the OS secure store
+
+Four secrets exist: the **device token** and **refresh token** (your sign-in), the **origin token** (the gate to your folders) and the **tunnel token**. All four are encrypted with Electron's `safeStorage` — **DPAPI** on Windows, the **Keychain** on macOS, **libsecret / KWallet** on Linux — under your OS user, and only their ciphertexts are written to disk. `settings.json` never holds a secret; the dashboard never receives one; no IPC call returns one.
+
+The store is **fail-closed**. If the OS backend is unavailable the companion refuses to save credentials rather than fall back to plaintext, and it checks this *before* consuming an enrolment code. On Linux the `basic_text` backend counts as unavailable — install and unlock GNOME Keyring or KWallet.
+
+The tunnel token is handed to `cloudflared` only through the `TUNNEL_TOKEN` environment variable of the child process. It never appears in a command line (which other local users can read), in a file, or in a log.
+
+## Deep links are untrusted input
+
+A `unique-local-connect://enrol?token=…&api=…` link can be crafted by anyone. A link that named an attacker's server and was acted on silently would bind your folders to their account. So:
+
+- **Only open links from your own signed-in web app.** Never open a Local Connect link received by email, chat or from a web page you did not sign in to.
+- **The companion always shows the server address and asks.** A link never triggers a network call on its own; you must confirm the address and choose Link. The address is the only trustworthy field — the email and user id in the enrolment response are display-only, because a hostile server could return any values.
+- **It refuses links for a different server while linked.** Changing web apps always requires an explicit Unlink first.
+- **The address is pinned.** The `api` value must be `https` (plain `http` is accepted only for `localhost` in development builds), carry no credentials, and is reduced to its origin. After enrolment the server must report the same origin or the tokens are discarded.
+- **Registration is separate.** Linking never registers folders; you do that deliberately.
+
+## Device tokens and revocation
+
+The device token is a non-admin credential (`role: 'user'`) issued by the starter template's device-token feature. The companion refreshes it before it expires and treats only an explicit rejection from the refresh endpoint as revocation; a network error or a server outage keeps you linked and shows *could not verify sign-in, retrying*. You revoke a device instantly from the web app's **Linked devices** page — the companion then shows *Access was revoked — link again*. Unlinking from the companion revokes the device best-effort, rotates the origin token so the connections in the web app hold a dead credential, and clears every local secret.
+
+## Token rotation and compromise recovery
+
+**Rotate access token** on the dashboard mints a new origin token, updates every registered connection with it, and re-tests them. The companion also rotates it on Unlink and on re-registration.
+
+<Aside type="danger" title="Tunnel-token compromise means origin-token compromise">
+Anyone holding the tunnel token can run another `cloudflared` connector for the same tunnel. Cloudflare treats every connector as a replica and gives no guarantee which one a request reaches, so the rogue replica receives some of Document Management's requests — and because the module sends the origin token pre-emptively on every request, the first forwarded request hands it over. Rotating the origin token first is pointless while the replica is still connected: it would simply harvest the new one.
+</Aside>
+
+Recover in this order:
+
+<Steps>
+
+1. **Rotate the tunnel token in Cloudflare** — Zero Trust → Networks → Tunnels → your tunnel → refresh the token (or delete the tunnel and create a new one with the same public hostname). This disconnects every connector, including the rogue one.
+
+2. **Paste the new token into the companion** (Settings → Tunnel) and confirm it reconnects.
+
+3. **Rotate the access token** on the dashboard. Every connection in the web app now carries a credential the attacker never saw.
+
+</Steps>
+
+## Read-only is enforced at the origin
+
+Document Management refuses writes to an `isReadOnly` row inside its adapter, but the module never issues `MOVE` or `COPY` from its own services — so any such request reaching the companion comes from whoever holds the token, not from the module. The companion therefore enforces read-only itself for **every** writing verb: `PUT`, `DELETE` and `MKCOL` on a read-only share; `MOVE` unless **both** source and destination shares are writable; `COPY` unless the destination is writable, including any existing file the copy would overwrite. Share roots and the virtual listings are never writable. Each refusal is a `403` issued before any disk access.
+
+## What is logged
+
+The companion writes structured JSON-lines logs (one file, rotated at 5 MB, three rotations kept) that you can open from the dashboard. A request line records the method, the path within the share, the share name, the status and the duration — the *what*, so you can see the web app touching your folder. What is never logged: tokens of any kind (redaction by field name, by shape — `ulc_…`, `dvc_…`, `eyJ…` — and by the `Bearer …` pattern in free text), the raw deep-link URL (only its parsed origin), process environments, or the full command line of a spawned process (arguments are logged as an array so redaction applies). Logs stay on your computer; nothing is sent anywhere.
+
+The dashboard itself runs sandboxed (`contextIsolation`, no Node integration, a strict content-security policy, navigation and `window.open` blocked, all permission requests denied). Every request it makes to the main process is validated there, folder and binary pickers run in the main process so the interface never supplies a filesystem path, and external links open only for the linked web app, this documentation site, Cloudflare's documentation and the project's releases.
+
+## The residency promise
+
+Your files never leave your computer as a copy. The web app reads a file's bytes only when a signed-in user opens, previews, downloads, hashes or ingests it, and only while you are connected; the module keeps references and *derived* artefacts, never raw content, and never caches thumbnails from an ephemeral source. The one inbound flow is delivery of uploads the web app accepted while you were away, into the folder you chose for that purpose. There is no backup, replication or restore mode, and none will be added without a separate, deliberate decision that revisits this promise.

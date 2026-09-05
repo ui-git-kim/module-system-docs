@@ -183,38 +183,37 @@ openssl rand -hex 32
 
 ## Cloudflare Zero Trust Access for Local Machines
 
-The most security-sensitive scenario is connecting to files on a user's **local machine** (V2 ships a companion desktop app that runs a WebDAV server over those folders). Document Management treats this as a standard WebDAV provider — the security is delegated entirely to Cloudflare.
+The most security-sensitive scenario is connecting to files on a user's **local machine** — the [Local Connect companion](/document-management/local-connect/) runs a WebDAV server over the folders the user chooses and publishes it through a Cloudflare Tunnel. Document Management treats it as a standard WebDAV provider flagged `isEphemeral`. Transport is delegated to Cloudflare; **authentication is not** — it happens at the origin, on the user's machine.
 
 ```
-Local Machine                    Cloudflare                     Cloud App
+Local Machine                          Cloudflare                  Cloud App
 
-Local Connect app                Zero Trust Access              document-management
-  WebDAV server ──►  Tunnel  ──►  Authentication  ──►  module connects
-  port 8080          (encrypted)  MFA enforcement      as WebDAV provider
-                                  Access policies
-                                  Audit logging
+Local Connect companion                Tunnel (encrypted,          document-management
+  WebDAV server on 127.0.0.1:47831 ◄──  outbound-only,      ◄──    WebDAV adapter sends
+  checks Authorization: Bearer          no port forwarding)        Authorization: Bearer <token>
+  on every request, before any                                     on every request
+  disk access
 ```
 
-The key insight: **Cloudflare is the gatekeeper, so the local server needs no authentication of its own.**
-
-- **Cloudflare Tunnel** carries traffic encrypted, with no port forwarding and no inbound firewall holes — the local machine makes an outbound connection only.
-- **Cloudflare Zero Trust Access** sits in front of the tunnel and requires authentication before any request reaches the local WebDAV server.
-- The **local WebDAV server does not implement its own auth** — Cloudflare authenticates first, so an unauthenticated request never reaches the origin.
-- Access policies can restrict by **user account, MFA requirement, device posture, and location**.
-- **Every access attempt is logged** by Cloudflare for auditing.
-
-<Aside type="tip" title="Free for up to 50 users">
-Cloudflare Zero Trust Access is free for up to 50 users, and Cloudflare Tunnel is free and encrypted with no port forwarding. For most single-tenant and small-team deployments, the entire access and transport security layer costs nothing and requires no self-managed infrastructure.
+<Aside type="caution" title="Corrected: the local server authenticates every request itself">
+An earlier version of this section said Cloudflare Zero Trust Access was the gatekeeper and the local server needed no authentication of its own. That cannot hold for the module's **own** requests: `WebDAVAdapter.connect` can send exactly one of HTTP Basic or a single `Authorization: Bearer` header and has no field for arbitrary headers, so it cannot present the `CF-Access-Client-Id` / `CF-Access-Client-Secret` pair an Access service token requires. An Access policy in front of the hostname would block the module. The companion therefore authenticates at the origin and treats the tunnel as transport.
 </Aside>
 
-When you add the local machine as a provider, you point the WebDAV adapter at the tunnel hostname rather than `localhost`:
+How the built model works:
+
+- The companion mints a random **256-bit bearer token** and stores it in every provider row's `config.token` (rotating it on demand, on unlink and on re-registration); the module encrypts it at rest with AES-256-GCM (above) and never returns it. The adapter sends it on every request; the companion checks it with a timing-safe comparison **before** reading a body or touching the disk, and refuses with `401` otherwise.
+- **Cloudflare Tunnel** carries traffic encrypted from the edge to the user's machine, outbound-only, with no port forwarding and no inbound firewall holes. The WebDAV server binds loopback only; the tunnel is the sole way in.
+- **Read-only** is enforced twice — by the adapter's `assertWritable()` (below) and by the companion for every writing verb, including `MOVE` and `COPY`, which the module never issues itself.
+- **Path confinement** for a Local Connect folder is the companion's responsibility: the module does not sanitise paths for providers a user owns, so the companion mirrors `safeResolve` (below) and adds the checks a public origin needs, before any filesystem call.
+- Each shared folder is its own provider row at `https://<hostname>/s/<share-id>/`, so the module's folder routing (`?folder=`, node-type templates, `uploadPath`) always lands inside that folder.
+
+What the origin-auth model gives up relative to Access — per-request audit logging at the edge, MFA and device-posture policies, and blocking before the request reaches the machine — and the two ways to get it back (an Access policy that accepts the same bearer, or a header-injecting proxy on the app's side) are recorded on the companion's [security](/document-management/local-connect/security/) and [roadmap](/document-management/local-connect/roadmap/#cloudflare-access-options) pages. Zero Trust Access remains the right control in front of the **web app's own** origins (see [Cloudflare Edge](/getting-started/cloudflare-edge/)); it is only the machine-to-machine WebDAV path that authenticates at the origin.
+
+The companion registers the provider through the API itself — you do not add it by hand. When it does, the `baseUrl` is always the tunnel hostname, never `localhost`:
 
 ```text
-# Local (same machine / LAN)
-http://localhost:8080
-
-# Remote (via Cloudflare Tunnel + Zero Trust Access)
-https://docs.yourdomain.com
+# One row per shared folder, registered by the companion
+https://kim-laptop.example.com/s/3f9a1c2b7d4e/
 ```
 
 ---
