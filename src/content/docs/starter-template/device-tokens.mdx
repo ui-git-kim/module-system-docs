@@ -1,15 +1,15 @@
 ---
 title: Device Tokens
-description: Long-lived, revocable device-token auth so headless external/desktop apps (e.g. the Local Connect companion) can call the API as a signed-in user — enrolled once from a web session
+description: Long-lived, revocable device-token auth so headless external/desktop apps can call the API as a signed-in user — a generic, companion-agnostic mechanism enrolled once from a web session
 sidebar:
   order: 8
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-The device-token feature lets a **headless external or desktop app** — starting with the `unique-local-connect` **Local Connect companion** — call the backend API as a signed-in user, without a browser session.
+The device-token feature lets a **headless external or desktop app** call the backend API as a signed-in user, without a browser session. It is a **generic, companion-agnostic** mechanism: the starter mints, verifies, and manages device tokens, while a **consumer module** that ships a companion (for example, Document Management's Local Connect) owns that companion's download, URL/deep-link scheme, and pairing UI.
 
-The web frontend authenticates with a short-lived Neon Auth JWT that the SDK refreshes transparently. A daemon has no web session and no way to obtain or refresh that JWT. Device tokens close that gap with the **enrol-once, stay-paired** model (CrashPlan / backup-agent style): the user downloads the companion from a **signed-in** location in the web app, and hands it a credential from that authenticated context.
+The web frontend authenticates with a short-lived Neon Auth JWT that the SDK refreshes transparently. A daemon has no web session and no way to obtain or refresh that JWT. Device tokens close that gap with the **enrol-once, stay-paired** model (CrashPlan / backup-agent style): the user downloads a companion from a **signed-in** location in the web app, and hands it a credential from that authenticated context.
 
 Because this lives in the starter's **auth layer** (not a module), it works everywhere: every module's routes are gated by `requireAuth`, so once that middleware also accepts a device token, **all APIs work for the companion with no module changes**.
 
@@ -33,8 +33,8 @@ All three are **opaque, high-entropy** (≥32 random bytes, base64url) and **sto
 Signed-in web app                 Backend                          Companion (desktop)
 ─────────────────                 ───────                          ───────────────────
 "Link a device"  ─POST /auth/devices/pair (web JWT)─►  mint enrolment token
-     │ ◄── { enrolmentToken, expiresAt, deepLink }
-     │  shows a copyable code + deep link
+     │ ◄── { enrolmentToken, expiresAt }
+     │  shows a copyable one-time code
      ▼
                     ─POST /auth/devices/enrol (PUBLIC)─►  verify + consume enrolment token →
                                                           create device row →
@@ -54,7 +54,7 @@ All live in the backend `auth` feature, mounted at `/api/v1/auth/devices`.
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| `POST` | `/auth/devices/pair` | Web session | Mint a one-time enrolment token for the signed-in user. Body `{ deviceName?, platform? }` → `{ enrolmentToken, expiresAt, deepLink }`. Rate-limited per user. |
+| `POST` | `/auth/devices/pair` | Web session | Mint a one-time enrolment token for the signed-in user. Body `{ deviceName?, platform? }` → `{ enrolmentToken, expiresAt }` (companion-agnostic — the code + expiry only; a consumer module builds its own deep link from the code). Rate-limited per user. |
 | `POST` | `/auth/devices/enrol` | Public | Body `{ enrolmentToken, deviceName?, platform? }`. Verify + **consume** the enrolment token, create the device → `{ deviceToken, refreshToken, userId, apiBaseUrl, expiresAt }`. Rate-limited; generic errors. |
 | `POST` | `/auth/devices/refresh` | Public | Body `{ refreshToken }`. Rotate → `{ deviceToken, refreshToken, expiresAt }`; the presented refresh token is invalidated. Rate-limited. |
 | `GET` | `/auth/devices` | Web session | List the caller's devices: `{ id, name, platform, createdAt, lastSeenAt, status }` (never token material). |
@@ -113,7 +113,7 @@ The `enrol` / `refresh` endpoints (whose callers present a token in the body, no
 - **Refresh token:** ~90 d **sliding** expiry, **rotated on every refresh** — the old refresh token's hash is overwritten, so a replayed refresh token fails.
 - **Revoke = instant:** revoking sets `status = 'revoked'`; the next request 401s. No cache.
 
-TTLs, token prefixes, entropy, rate limits and the companion deep-link scheme are named constants in `backend/src/features/auth/devices.constants.ts` — tune policy there, not inline.
+TTLs, token prefixes, entropy and rate limits are named constants in `backend/src/features/auth/devices.constants.ts` — tune policy there, not inline. The starter holds **no** companion name, download URL, or deep-link scheme (see [the module boundary](#companion-integration) below).
 
 <Aside type="note">
   Tokens are hashed with `hashSecret` (SHA-256) from the [Security feature](/starter-template/security-feature/). SHA-256 is unsalted, which is exactly what makes the deterministic hashed lookup possible — and it is safe here because the tokens are high-entropy random values (a leaked hash column is not brute-forceable). A future hardening could switch to a keyed HMAC with a server pepper; see the [roadmap](/starter-template/roadmap/).
@@ -138,7 +138,9 @@ Both are declared in the `auth` feature's `securityRegistry` manifest (owned mod
 
 ## "Linked devices" settings page
 
-The web app gets a **Linked devices** settings page (registered via `settingsPagesRegistry`, id `linked-devices`) that lists the user's devices — name, platform, added, last active, status — each with a **Revoke** action and a plain-language note. A **Link a device** button mints an enrolment token and shows it as a copyable code plus a companion deep link (`unique-local-connect://enrol?token=…`) with its expiry.
+The web app gets a **Linked devices** settings page (registered via `settingsPagesRegistry`, id `linked-devices`) that lists the user's devices — name, platform, added, last active, status — each with a **Revoke** action and a plain-language note. A **Link a device** button mints an enrolment token and shows it as a copyable **one-time code** with its expiry.
+
+The page is **companion-agnostic** — it names no specific companion and shows no deep link. A consumer module that ships a companion provides its own "download the companion + link this computer" entry point (in its own settings) and builds its own deep link from the code.
 
 It is composed entirely from the shared `settings-blocks` (`SectionHeader`, `Table`, `Note`) and shadcn primitives — no hand-rolled markup — and lives in the frontend `auth` feature.
 
@@ -146,7 +148,9 @@ It is composed entirely from the shared `settings-blocks` (`SectionHeader`, `Tab
 
 ## For module authors
 
-**Nothing to do.** Because `requireAuth` populates the same `req.user` shape for a device token as for a JWT, a module's routes accept device-token requests automatically. The only difference a module can observe is `req.user.authMethod === 'device'` and the guaranteed `role: 'user'` — so admin/role-gated routes correctly reject device tokens.
+**Nothing to do to consume device auth.** Because `requireAuth` populates the same `req.user` shape for a device token as for a JWT, a module's routes accept device-token requests automatically. The only difference a module can observe is `req.user.authMethod === 'device'` and the guaranteed `role: 'user'` — so admin/role-gated routes correctly reject device tokens.
+
+**Shipping a companion?** The starter owns the generic mechanism (mint / enrol / refresh / list / revoke + the "Linked devices" management page). Your module owns the companion-specific parts — the download, the URL/deep-link scheme, and a "download + link this computer" setup entry point in your own settings. Call the authenticated `POST /auth/devices/pair`, take `{ enrolmentToken, expiresAt }`, and build your own deep link from the code.
 
 ---
 
@@ -154,7 +158,7 @@ It is composed entirely from the shared `settings-blocks` (`SectionHeader`, `Tab
 
 <Steps>
 
-1. **Deliver the credential.** The `pair` response returns `{ enrolmentToken, expiresAt, deepLink }`. Deliver it to the companion via the deep link (`unique-local-connect://enrol?token=…`), a shown code the user pastes, or a bundled config file with the download.
+1. **Deliver the credential.** The `pair` response returns `{ enrolmentToken, expiresAt }` — a one-time code + expiry. A **consumer module** that owns the companion (e.g. Document Management) delivers it: it builds its own deep link from the code (`<its-own-scheme>://enrol?token=…`), shows the code for the user to paste, or bundles a config file with the download. The starter names no scheme.
 
 2. **Enrol.** The companion POSTs the enrolment token to `/auth/devices/enrol` and stores the returned `deviceToken` + `refreshToken` in the OS keychain. It also gets `apiBaseUrl` for subsequent calls.
 
@@ -164,8 +168,8 @@ It is composed entirely from the shared `settings-blocks` (`SectionHeader`, `Tab
 
 </Steps>
 
-<Aside type="tip">
-  The deep-link scheme (`unique-local-connect`) is companion-specific — an app shipping a differently-branded companion overrides `DEVICE_ENROLMENT_DEEP_LINK_SCHEME` in `devices.constants.ts`.
+<Aside type="tip" title="Module boundary: the starter names no companion">
+  The starter is **companion-agnostic** — `pair` returns only the one-time code + expiry, and the starter holds no companion name, download URL, or deep-link scheme. The companion download, its URL scheme, and the "link this computer" UI live in the **consumer module** that owns the companion (e.g. Document Management's Local Connect), built on top of the generic `POST /auth/devices/pair`.
 </Aside>
 
 ---
