@@ -21,6 +21,45 @@ A backup, replication or restore mode is not on this roadmap. Raw files staying 
 
 **Needs:** a Cloudflare API token held by the web app, per-computer tunnel and DNS records tied to the device row, and a starter or module endpoint the companion can call with its device token.
 
+<Aside type="note" title="Designed 6 September 2026 — not yet built">
+The design below was worked through in full (six angles: Cloudflare mechanics, schema + secrets, endpoints + auth, config/ops, security threat model, and companion contract) so it is ready to build in its own release. It is **not** shipped in v1.12.1 — that release added only the web **Local Connect card** (download + link this computer), which this design deliberately leaves unchanged. Building it needs the operator decisions in *Open questions* below, and it adds a database table, so it will be a **minor** release with a migration.
+</Aside>
+
+### The design
+
+**Shape: one tunnel per computer, remotely managed.** Each linked machine gets its own Cloudflare **named tunnel** created with `config_src: "cloudflare"` (so the module owns the config from the API, not a local file) and one **proxied CNAME** — a random, identity-free label under the operator's domain — pointing at `<tunnelId>.cfargotunnel.com`. A single shared tunnel can't route per-computer hostnames to different loopback origins, so per-device is the only workable model; Cloudflare Access is a possible later hardening, not a substitute.
+
+**The module owns its own endpoints; the starter stays companion-agnostic.** The companion still enrols through the starter (`pair` → `enrol`, unchanged) and then, holding its device token, calls Document Management directly:
+
+| Endpoint | Auth | Body | Result |
+|---|---|---|---|
+| `POST /local-connect/tunnel` | device token | `{ deviceKey, localPort, label? }` | `{ tunnelId, hostname, tunnelToken }` |
+| `DELETE /local-connect/tunnel` | device token | `{ deviceKey }` | `204` |
+
+Both are **idempotent per `(userId, deviceKey)`** — re-asking returns the same tunnel and re-points the ingress if the companion's loopback port changed; deleting a machine with no tunnel is still `204`. The call also **auto-creates or re-points the ephemeral WebDAV provider** (`isEphemeral: true`, `baseUrl = https://<hostname>`), so the companion stops calling `POST /providers`. The device only ever receives *its own* tunnel because every query is filtered by `req.user.id`; where the starter device token exposes no stable per-device id, DM mints a hashed device secret at register time to bind the row.
+
+**Cloudflare mechanics.** Create the tunnel (`POST /accounts/{account}/cfd_tunnel`), fetch its run token on demand (`GET …/cfd_tunnel/{id}/token`), write ingress (`PUT …/cfd_tunnel/{id}/configurations` → `service: http://localhost:<localPort>` plus the required `http_status:404` catch-all), and publish the CNAME (`POST /zones/{zone}/dns_records`, proxied). Teardown reverses it **DNS record → tunnel connections → tunnel**, with a status machine (`provisioning|active|revoking|revoked`) and a **reaper** that lists `?name=<prefix>-` to reconcile orphans left by a crash mid-provision. `already exists` codes (1014 tunnel, 81057 DNS) are treated as look-up-and-reuse.
+
+**Schema — one self-contained table.** A new `doc_local_connect_tunnel`: `userId`, `deviceKey`, `tunnelId`, unique `hostname`, `dnsRecordId`, `localPort`, `label`, timestamps, `@@unique([userId, deviceKey])`. Plain scalar FKs, no `@relation`, `doc_` prefix — it never touches the starter's device table. It is additive, but **every host app must run a migration** before the endpoints work (offline `migrate diff` → `migrate deploy`, never `migrate dev` on a module-bearing app).
+
+**Secrets.** `DOC_CF_API_TOKEN` lives only in the host environment — never in the database, never logged, never in a response (it goes out solely in the `Authorization` header of a Cloudflare call). The per-device **run token** is the module's to pass, not to hoard: fetch it from Cloudflare and hand it to the companion **once** over the device-authenticated response (the companion puts it straight into the OS keychain and gives `cloudflared` `TUNNEL_TOKEN` via env/stdin, never argv). If a copy is stored for rotation, it is `encryptField`-sealed and redacted. DM also mints a per-device WebDAV credential, stored encrypted in the provider config, so the now-public hostname is not open.
+
+**Config.** Five env vars — `DOC_CF_API_TOKEN`, `DOC_CF_ACCOUNT_ID`, `DOC_CF_ZONE_ID`, `DOC_LOCAL_CONNECT_DOMAIN`, and the optional `DOC_LOCAL_CONNECT_MAX_TUNNELS` (default 10, a per-user cap so a client-chosen `deviceKey` can't fill the account) — behind a master enable flag. The four core values must be set **together**; any gap makes `POST /local-connect/tunnel` answer `501 tunnel_not_configured` and the companion **falls back to today's manually-configured tunnel** (which must keep working). The resolver never throws at boot.
+
+**The card and deep link do not change.** The v1.12.1 Local Connect card, the `unique-local-connect://enrol` scheme, `pairLocalConnectDevice`, and `DOC_LOCAL_CONNECT_DOWNLOAD_URL` are all forward-compatible: the companion enrols exactly as it does now, then fetches its tunnel from DM.
+
+### Open questions for the operator
+
+These are infrastructure decisions the module can't make for you; each blocks the build:
+
+1. **Which Cloudflare account, zone and base domain** host the per-computer hostnames (e.g. `lc.uniqueicon.com.au`)?
+2. **Provision and own rotation of `DOC_CF_API_TOKEN`**, scoped to *Account · Cloudflare Tunnel · Edit* + *Zone · DNS · Edit* on that one zone — never a Global API Key. Who rotates it, and what is the leak runbook (it can mint or delete every device's tunnel)?
+3. **Dedicated zone or a subdomain?** Free Universal SSL covers only one label deep, so a two-level host like `<slug>.lc.example.com` needs `lc.example.com` delegated as its own zone (free wildcard) or a paid ACM wildcard.
+4. **Plan and quota headroom.** One tunnel + one DNS record per device against the caps: ~1,000 tunnels/account, 200 DNS records on a free zone (3,500 Pro/Business), and ~1,200 API calls/5 min (bounds enrolment bursts). This sets the fleet ceiling.
+5. **Starter dependencies** (cross-repo): does the starter's `requireAuth` expose a stable per-device id on `req.user` for `dvc_` tokens, and will it emit a companion-agnostic `auth.device.revoked` action DM can subscribe to for instant teardown? Without the latter, teardown relies on the reaper's cadence.
+6. **Security tier:** `encryptField` only encrypts at the *hardened* tier and above. Will the host apps run hardened, or should the feature gate itself off (rather than store a plaintext token) below it?
+7. **Where the reaper/cleanup cron runs** in each host app, and whether that scheduler is guaranteed present wherever DM is installed.
+
 ## Per-folder sub-folder exclusions
 
 **What:** a tree under each shared folder where sub-folders can be unticked; excluded paths are omitted from listings and refused for every verb as if they did not exist.
