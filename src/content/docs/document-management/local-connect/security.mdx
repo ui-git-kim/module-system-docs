@@ -32,7 +32,7 @@ Unique Local Connect WebDAV server
 Three facts follow from that picture:
 
 - **The companion is the gate.** Anyone who can present the origin token can read your shared folders and write to the uploads folder. The token is the control; the hostname is public.
-- **The tunnel is transport.** It encrypts traffic to the edge and removes the need for port forwarding. It does not authenticate anyone.
+- **The tunnel is transport.** It encrypts traffic to the edge and removes the need for port forwarding. It does not authenticate anyone. Document Management creates it — one per computer, on the operator's Cloudflare account — but that changes who *runs* the tunnel, not what it protects.
 - **The companion is the only path-traversal boundary for your disk.** Document Management does not sanitise the paths it sends to a provider you own; the companion must.
 
 ## Origin authentication on every request
@@ -50,6 +50,17 @@ When the companion registers a folder it mints a random **256-bit** token with t
 `cloudflared` makes an outbound HTTPS connection from your computer to Cloudflare; nothing listens on your network. The web app talks to `https://<your-hostname>/…`, Cloudflare terminates TLS at the edge and carries the request down the tunnel, and `cloudflared` hands it to `http://127.0.0.1:47831` on the same machine — plain HTTP, but never off the loopback interface.
 
 The companion stops the tunnel deliberately when the computer sleeps or the screen locks, kills any orphaned `cloudflared` from a previous run on startup, and keeps short header and idle timeouts on the server, so a machine that is *gone* looks gone (Cloudflare 530 / error 1033) instead of leaving the web app's connection test hanging.
+
+### Who provisions it, and what that trusts
+
+The tunnel is created by Document Management, on the operator's Cloudflare account, one per computer. The companion sends two things with its device token — a **machine key** (a random id it generates once and keeps in `settings.json`) and the loopback port it listens on — and receives a hostname and a `cloudflared` run token.
+
+- **The machine key is not a credential.** It identifies which of *your* tunnels to hand back; every lookup is scoped to the user the device token belongs to, so it can never name another account's tunnel. It is chosen by the client, which is why the operator can cap how many tunnels one user may hold with `DOC_LOCAL_CONNECT_MAX_TUNNELS`.
+- **The run token is a credential, and it is treated as one.** It arrives once in the provisioning response, goes straight into the OS secure store, is never returned to the dashboard, never written to `settings.json` and never logged. The companion gives it to `cloudflared` through the child process's environment only.
+- **The operator's Cloudflare API token never leaves their backend.** The companion never sees it, and could not use it if it did.
+- **Deleting is part of the contract.** Unlinking asks the module to delete this computer's tunnel and its DNS record while the device token still works, so a computer you have finished with stops being routable rather than merely stopping serving.
+
+The address is public by design: a hostname is not a secret, and it is the origin token — not obscurity — that keeps your folders closed.
 
 ## Loopback-only server
 
@@ -69,7 +80,7 @@ Refusals come in two kinds, both raised before any filesystem call. A path that 
 
 ## Secrets live in the OS secure store
 
-Four secrets exist: the **device token** and **refresh token** (your sign-in), the **origin token** (the gate to your folders) and the **tunnel token**. All four are encrypted with Electron's `safeStorage` — **DPAPI** on Windows, the **Keychain** on macOS, **libsecret / KWallet** on Linux — under your OS user, and only their ciphertexts are written to disk. `settings.json` never holds a secret; the dashboard never receives one; no IPC call returns one.
+Four secrets exist: the **device token** and **refresh token** (your sign-in), the **origin token** (the gate to your folders) and the **tunnel token** (the `cloudflared` run token the web app issued this computer). All four are encrypted with Electron's `safeStorage` — **DPAPI** on Windows, the **Keychain** on macOS, **libsecret / KWallet** on Linux — under your OS user, and only their ciphertexts are written to disk. `settings.json` never holds a secret — the machine key and the hostname in it are not secrets — the dashboard never receives one, and no IPC call returns one.
 
 The store is **fail-closed**. If the OS backend is unavailable the companion refuses to save credentials rather than fall back to plaintext, and it checks this *before* consuming an enrolment code. On Linux the `basic_text` backend counts as unavailable — install and unlock GNOME Keyring or KWallet.
 
@@ -77,39 +88,60 @@ The tunnel token is handed to `cloudflared` only through the `TUNNEL_TOKEN` envi
 
 ## Deep links are untrusted input
 
-A `unique-local-connect://enrol?token=…&api=…` link can be crafted by anyone. A link that named an attacker's server and was acted on silently would bind your folders to their account. So:
+A `unique-local-connect://enrol?token=…` link can be crafted by anyone. A link that named an attacker's server and was acted on silently would bind your folders to their account. So:
 
 - **Only open links from your own signed-in web app.** Never open a Local Connect link received by email, chat or from a web page you did not sign in to.
-- **The companion always shows the server address and asks.** A link never triggers a network call on its own; you must confirm the address and choose Link. The address is the only trustworthy field — the email and user id in the enrolment response are display-only, because a hostile server could return any values.
+- **The link does not name a web app, so you do.** What the web app mints carries the code and nothing else — there is no `api` parameter — so the companion shows *A web app wants to link this computer*, asks for the **Web app address**, and only spends the code when you press Link. The address is the only field worth trusting; the email and user id in the enrolment response are display-only, because a hostile server could return any values.
+- **An address alone can never link a computer.** A code is only ever minted from a signed-in web session, so knowing where your web app lives is not enough — and the code is single-use and short-lived.
+- **The address is validated and pinned.** It must be `https` (plain `http` is accepted only for `localhost` in development builds), carry no credentials, and is reduced to its origin. After enrolment the server must report the same origin or the tokens are discarded. A link that *does* carry an `api` parameter is still accepted, but it is held to the same rules and still confirmed by you.
 - **It refuses links for a different server while linked.** Changing web apps always requires an explicit Unlink first.
-- **The address is pinned.** The `api` value must be `https` (plain `http` is accepted only for `localhost` in development builds), carry no credentials, and is reduced to its origin. After enrolment the server must report the same origin or the tokens are discarded.
 - **Registration is separate.** Linking never registers folders; you do that deliberately.
 
 ## Device tokens and revocation
 
 The device token is a non-admin credential (`role: 'user'`) issued by the starter template's device-token feature. The companion refreshes it before it expires and treats only an explicit rejection from the refresh endpoint — a `401` or `403` on refresh, or a `401` on a token it has just refreshed — as revocation; a network error or a server outage keeps you linked, leaves the **Linked** badge in place and is retried, surfacing as *Your computer is online; the web app cannot be reached right now* rather than as a sign-in failure. You revoke a device instantly from the web app's device page — the companion then shows *Access was revoked — link again*.
 
-**Unlinking and revoking are two different things.** Unlink, in the companion, stops this computer using the connection: it takes your folders off the tunnel, rotates the origin token so the connections stored in the web app hold a dead credential, and clears every local secret. It cannot revoke the device on the server — managing the device list requires an interactive web session, so a stolen device token can never disturb your other computers — so the device row stays until you remove it under **Linked devices** in the web app. The companion says so when you unlink.
-
-## Token rotation and compromise recovery
-
-**Rotate access token**, under **Settings → Advanced**, mints a new origin token and updates every registered connection with it (it asks you to confirm first). The companion also rotates it on Unlink and on re-registration.
-
-<Aside type="danger" title="Tunnel-token compromise means origin-token compromise">
-Anyone holding the tunnel token can run another `cloudflared` connector for the same tunnel. Cloudflare treats every connector as a replica and gives no guarantee which one a request reaches, so the rogue replica receives some of Document Management's requests — and because the module sends the origin token pre-emptively on every request, the first forwarded request hands it over. Rotating the origin token first is pointless while the replica is still connected: it would simply harvest the new one.
-</Aside>
-
-Recover in this order:
+**Unlinking and revoking are two different things.** Unlink, in the companion, stops this computer using the connection. In this order, so that each step still has the credential the next one destroys:
 
 <Steps>
 
-1. **Rotate the tunnel token in Cloudflare** — Zero Trust → Networks → Tunnels → your tunnel → refresh the token (or delete the tunnel and create a new one with the same public hostname). This disconnects every connector, including the rogue one.
+1. Serving stops, taking your folders off the tunnel.
 
-2. **Paste the new token into the companion.** On the dashboard's **Tunnel** card choose **Change tunnel settings…**, replace the **Tunnel token**, save, and confirm it reconnects.
+2. A **new origin token** is minted and pushed to every registered connection, so the token Document Management held until that moment is dead — and the new one goes nowhere, because nothing on this computer will serve it.
 
-3. **Rotate the access token** under **Settings → Advanced**. Every connection in the web app now carries a credential the attacker never saw.
+3. The **managed tunnel is deleted** at the web app's end — the DNS record and the tunnel itself — so the hostname stops resolving to this computer instead of merely going quiet. A tunnel an operator pinned by hand is left alone; it is theirs, not the pairing's.
+
+4. The device and refresh tokens are removed from the secure store, and the pairing record is cleared.
 
 </Steps>
+
+What unlink **cannot** do is revoke the device on the server: listing or revoking devices needs an interactive web session, which is deliberate — it means a stolen device token can never disturb your other computers. The device row therefore stays until you remove it yourself under **Linked devices** in the web app, and the companion says so when you unlink.
+
+Your storage connections are kept on purpose, so that linking again can reuse them along with any uploads still waiting for this computer. Linking again issues a **new** tunnel and hostname, and re-registering rewrites each row's address.
+
+## Token rotation and compromise recovery
+
+**Rotate access token**, under **Settings → Advanced**, mints a new origin token and pushes it to every registered connection in one step (it asks you to confirm first). Unlink does the same rotation on its way out. Registering, or registering again, does not rotate anything — it publishes the token this computer currently holds.
+
+<Aside type="danger" title="Tunnel-token compromise means origin-token compromise">
+Anyone holding the tunnel token can run another `cloudflared` connector for the same tunnel. Cloudflare treats every connector as a replica and gives no guarantee which one a request reaches, so the rogue replica receives some of Document Management's requests — and because the module sends the origin token pre-emptively on every request, the first forwarded request hands it over. Rotating the origin token first is pointless while the replica is still connected: it would simply harvest the new one. Kill the tunnel first, then rotate.
+</Aside>
+
+The run token is issued by the web app and never shown, so the recovery is to make the tunnel itself go away:
+
+<Steps>
+
+1. **Unlink this computer** on the dashboard's **Linked account** card. That deletes the tunnel at Cloudflare, which disconnects every connector, including the rogue one, and mints a fresh origin token on the way.
+
+2. **Link this computer again** with a new code, and register again — choosing **Reuse** for each folder. The web app issues a brand-new tunnel with a **new hostname**, and each connection is re-pointed at it with the current access token.
+
+3. **Rotate the access token** under **Settings → Advanced** if you want one more change of credential after everything is back up. Every connection in the web app then carries a token the attacker never saw.
+
+</Steps>
+
+If the leak was of the **operator's** Cloudflare API token rather than one computer's run token, none of the above is enough: that token can mint or delete every device's tunnel. It is rotated in Cloudflare and replaced in `DOC_CF_API_TOKEN` — see [Configuration → Local Connect managed tunnels](/document-management/configuration/#local-connect-managed-tunnels).
+
+For a tunnel an operator pinned by hand under **Address for this computer (advanced)**, the old order still applies: refresh or delete the tunnel in Cloudflare first, paste the new token into that card, then rotate the access token.
 
 ## Read-only is enforced at the origin
 
