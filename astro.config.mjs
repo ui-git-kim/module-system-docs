@@ -383,6 +383,7 @@ export default defineConfig({
               items: [
                 { label: "Overview", slug: "document-management" },
                 { label: "Configuration", slug: "document-management/configuration" },
+                { label: "Storage Keys & Permissions", slug: "document-management/permissions" },
                 { label: "Database", slug: "document-management/database" },
                 { label: "Usage", slug: "document-management/usage" },
                 { label: "Integration", slug: "document-management/integration" },

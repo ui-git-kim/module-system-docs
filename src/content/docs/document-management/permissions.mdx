@@ -1,0 +1,188 @@
+---
+title: Storage Keys & Permissions
+description: Which S3 actions the module needs, copy-paste IAM policies for AWS S3 and Wasabi, the Cloudflare R2 API-token equivalent, and why the endpoint is required for R2/MinIO/Wasabi
+sidebar:
+  order: 3
+---
+
+import { Aside, Tabs, TabItem, Steps, Card, CardGrid, Badge } from '@astrojs/starlight/components';
+
+When you add an S3, Cloudflare R2, or S3-compatible provider you hand the app a **key** — an access key ID and secret. This page is the authoritative reference for **what that key must be allowed to do**, with copy-paste policies you can paste straight into AWS or Wasabi, the R2 equivalent (which is a token, not JSON), and the one setting people trip on first: the **endpoint is required** for R2, MinIO, and Wasabi.
+
+<Aside type="caution" title="Never use your account root key">
+Create a **dedicated key** (an IAM sub-user on AWS, a sub-user on Wasabi, a scoped API token on R2) with only the permissions below. Do **not** paste your account root / owner credentials. The key is encrypted at rest (AES-256-GCM via `DOC_ENCRYPTION_KEY`) and never returned by the API, but least privilege means a leaked or misused key can only touch the one bucket you scoped it to — not your whole account.
+</Aside>
+
+## What the module does with the key
+
+The S3 adapter (`adapters/s3.adapter.ts`) makes a small, fixed set of calls. Everything the app does at runtime maps to these S3 actions:
+
+| The app does… | S3 API call | IAM action | On the resource |
+|---|---|---|---|
+| List a folder, test the connection | `ListObjectsV2` | `s3:ListBucket` | the **bucket** |
+| Preview / download / open a file, read file info | `GetObject`, `HeadObject`, presign | `s3:GetObject` | the **objects** (`…/*`) |
+| Upload a file, create a folder | `PutObject` | `s3:PutObject` | the **objects** (`…/*`) |
+| Delete a file or folder | `DeleteObject`, `DeleteObjects` | `s3:DeleteObject` | the **objects** (`…/*`) |
+| Resolve a bucket's region | `GetBucketLocation` | `s3:GetBucketLocation` | the **bucket** |
+
+Two more actions are used **only during setup**, by the credential-first bucket picker in the **Add provider** dialog:
+
+| The picker does… | S3 API call | IAM action | On the resource |
+|---|---|---|---|
+| List the buckets the key can see | `ListBuckets` | `s3:ListAllMyBuckets` | `*` (account-wide) |
+| Create a new bucket from the app | `CreateBucket` | `s3:CreateBucket` | the new **bucket** |
+
+<Aside type="tip" title="A bucket-scoped key is fine — the picker degrades gracefully">
+`s3:ListAllMyBuckets` and `s3:CreateBucket` are **account-level** and are the only reason to grant anything beyond a single bucket. A key without them still works perfectly: the dialog simply **falls back to typing the bucket name** instead of listing them. For a locked-down production key, prefer the **scoped single-bucket** policy below and type the bucket name once.
+</Aside>
+
+## AWS S3
+
+<Steps>
+
+1. In the AWS console open **IAM → Users → Create user** (no console access needed — this is a programmatic key).
+2. Attach a policy. Use one of the three below (**Create inline policy → JSON**), replacing `YOUR_BUCKET` with your bucket name.
+3. Open the new user → **Security credentials → Create access key → Application running outside AWS**. Copy the **Access key ID** and **Secret access key**.
+4. In the app's **Add provider** dialog choose **S3**, leave **Endpoint** blank, paste the key and secret, and **Connect** (or type the bucket name if you used the scoped policy).
+
+</Steps>
+
+<Tabs>
+  <TabItem label="Scoped single bucket (recommended)">
+
+The **user policy** — read + write on exactly one bucket, nothing else. This key cannot list or create buckets, so the dialog falls back to manual bucket entry (expected).
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BucketLevel",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET"
+    },
+    {
+      "Sid": "ObjectLevel",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
+    }
+  ]
+}
+```
+
+  </TabItem>
+  <TabItem label="Read-only (evidence / legal)">
+
+For a provider you only ever browse and download from — pair it with the provider's **Read-only** toggle so the app also refuses writes at the adapter level.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET/*"
+    }
+  ]
+}
+```
+
+  </TabItem>
+  <TabItem label="Admin / bucket picker">
+
+Lets the **Add provider** dialog list every bucket and create new ones — handy for an administrator setting up the app-wide default storage. It grants account-wide S3 access, so treat this key as privileged.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"]
+    }
+  ]
+}
+```
+
+To keep least privilege you can scope this down — grant `s3:ListAllMyBuckets` on `*`, `s3:CreateBucket` on the buckets you'll make, and the runtime actions on those buckets — but the wildcard above is the quickest way to get the picker working.
+
+  </TabItem>
+</Tabs>
+
+<Aside type="note" title="Setup key vs runtime key">
+The key you enter in the dialog is the key the provider **keeps and uses at runtime**. If you want the picker's convenience *and* least privilege, the cleanest path is: create the bucket once (console, or a temporary admin key), then save the provider with the **scoped single-bucket** key. The scoped key can't list buckets, so you'll type the bucket name — a one-time cost for a key that can only ever touch that bucket.
+</Aside>
+
+## Wasabi
+
+Wasabi is S3-compatible and uses the **same policy language and `arn:aws:s3:::` ARNs as AWS** — the three JSON policies above work unchanged. You can attach them as a custom policy, or use Wasabi's built-in policies:
+
+- **`AmazonS3FullAccess`** — full access (lists and creates buckets → the picker works).
+- **`AmazonS3ReadOnlyAccess`** — browse and download only.
+
+<Steps>
+
+1. In the Wasabi console open **Users → Create User** (a **sub-user**, never root), grant **Programmatic access**, and assign a policy (a built-in above, or one of the AWS JSON policies as a custom policy).
+2. On **Access Keys**, create a key for that user and copy the key and secret.
+3. In the **Add provider** dialog choose **S3**, and set the **Endpoint** to your region's Wasabi endpoint:
+
+   ```text
+   https://s3.<region>.wasabisys.com
+   ```
+
+   e.g. `https://s3.ap-southeast-2.wasabisys.com` for Sydney. Then paste the key and secret and **Connect**.
+
+</Steps>
+
+<Aside type="danger" title="Wasabi needs its endpoint — a blank endpoint goes to AWS">
+Wasabi is **not** AWS. If you leave the endpoint blank the request is sent to Amazon S3 and fails ("could not list buckets" / signature errors). Always set `https://s3.<region>.wasabisys.com`, and use the endpoint whose `<region>` matches your bucket — the app signs the request with that region, and Wasabi validates it strictly.
+</Aside>
+
+## Cloudflare R2
+
+R2 does **not** use JSON policies. You create an **R2 API token** in the Cloudflare dashboard, which gives you an S3-compatible access key ID and secret.
+
+<Steps>
+
+1. In the Cloudflare dashboard open **R2 → Manage R2 API Tokens → Create API token**.
+2. Choose a permission:
+   - **Object Read & Write** — read/write objects in the bucket(s) you scope it to. Enough for day-to-day use; the picker's bucket **list/create** won't be available, so you'll type the bucket name.
+   - **Admin Read & Write** — also lists and creates buckets, so the in-app picker works. More privileged; prefer it only for setup.
+3. Create the token and copy the **Access Key ID** and **Secret Access Key** (shown once).
+4. In the **Add provider** dialog choose **R2**, set the **Endpoint** to your account's R2 endpoint:
+
+   ```text
+   https://<accountid>.r2.cloudflarestorage.com
+   ```
+
+   then paste the key and secret and **Connect**. The **region is `auto`** for R2 — the app fills that in; you never type it.
+
+</Steps>
+
+## MinIO and other S3-compatible stores
+
+MinIO (and most self-hosted S3-compatibles) use **the same JSON policies as AWS** — attach the scoped or read-only policy above to a MinIO user. Set the **Endpoint** to your server, e.g. `https://minio.example.com:9000`. Path-style addressing is enabled automatically whenever an endpoint is set, which is what MinIO needs.
+
+<Aside type="caution" title="Endpoint required for R2, MinIO, and Wasabi">
+The **Endpoint** field is only blank for genuine **AWS S3**. For **R2, MinIO, and Wasabi it is required** — a blank endpoint silently sends the request to AWS. When an endpoint is set the app also switches to **path-style addressing** automatically (matching `forcePathStyle: c.forcePathStyle ?? Boolean(c.endpoint)` in the adapter), which is what these providers expect.
+</Aside>
+
+## See also
+
+<CardGrid>
+  <Card title="Configuration" icon="setting">
+    Provider config shapes, the credential-encryption model, and every environment variable — see [Configuration](/document-management/configuration/).
+  </Card>
+  <Card title="Read-only providers" icon="approve-check">
+    Enforcing read-only at the adapter level for evidence/legal stores — see [Security](/document-management/security/).
+  </Card>
+</CardGrid>
