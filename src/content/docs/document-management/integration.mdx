@@ -895,6 +895,43 @@ await dm.uploadToDefault(userId, fileName, bytes, { nodeId, mimeType });
 The node's type / name is read through `serviceRegistry.getOptional('structure')` — no `@/features/structure` import, and resolution is inert (falls back to `uploadPath` / root) when Structure is not installed or the node is unreachable. The resolved template still flows through [the upload contract](#the-upload-contract): on a shared+isolated default it nests under `u/<userId>/` and is rejected if it would escape, so neither a template nor a node name can climb out of a user's namespace.
 </Aside>
 
+### Registering defaults from another module
+
+An admin sets mappings by hand — but a module that knows about certain node types (e.g. cog-ingest) can **register default folder templates** at boot, so a fresh install routes sensibly without per-type admin configuration. This is the server-side counterpart of Structure's `nodeTabRegistry`: Document Management publishes a `nodeUploadLocationRegistry` from its backend feature, and a consumer registers into it.
+
+Register from a side-effect file, reaching the registry with a **guarded `await import`** so it stays safe whether or not Document Management is installed (the same idiom the module uses for the host module registry). The `await import` also forces Document Management to load first, so registration never races module load order:
+
+```typescript
+// backend/src/features/cog-ingest/registrations/document-upload-locations.registration.ts
+// A variable specifier keeps the bundler from statically resolving an absent module.
+const DM_FEATURE = '../../document-management/index.js';
+try {
+  const { nodeUploadLocationRegistry } = await import(DM_FEATURE);
+  nodeUploadLocationRegistry.register({
+    moduleId: 'cog-ingest',            // namespaces the entry
+    nodeTypes: ['contract', 'brief'],  // exact slug(s), or '*' for a catch-all
+    folderTemplate: 'Contracts/{nodeName}',
+    order: 40,                         // higher wins among modules; default 50
+  });
+} catch {
+  // Document Management is not installed — nothing to register.
+}
+export {};
+```
+
+Add it as a side-effect import in your feature's `index.ts` (before the public exports), exactly like any other registration.
+
+**Precedence** — an admin's own mapping always wins, and a more specific match wins over a catch-all:
+
+| Order | Source |
+|-------|--------|
+| 1 | Admin mapping for the **exact** node type |
+| 2 | Module registration for the **exact** node type (highest `order`) |
+| 3 | Admin **`*`** catch-all mapping |
+| 4 | Module **`*`** catch-all registration (highest `order`) |
+
+So a module supplies defaults the admin can always override, and a module's specific default still beats an admin's generic `*`. `register()` is idempotent per `(moduleId, id)` — re-running boot never duplicates. The registry is in-memory: when a module isn't loaded, its defaults are simply absent (nothing to clean up). The admin page lists module-provided defaults read-only (**"provided by …"**) with an **Override** action. The registered `folderTemplate` flows through the **same** sanitisation and namespace guard as an admin template — it can never escape a user's namespace.
+
 ---
 
 ## Global uploads (admin)
