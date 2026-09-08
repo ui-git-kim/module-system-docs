@@ -783,6 +783,90 @@ Registered components are rendered by `ShellInit` inside `DashboardPage` (behind
 
 ---
 
+### Component Registry
+
+Added in v2.10.0. The **UI analogue of the backend `serviceRegistry.getOptional`**: a module registers a component under a global **slot id**, and any other module renders it inline — or **null-degrades** when no module has filled the slot. Modules already share services and pages through registries the shell reads; this is the piece that lets one module drop *another module's UI* into its own, with a degrade path built in.
+
+The motivating case: structure's node-type form wants to render an AI panel **only when ai-core is installed**. Instead of deep-importing ai-core's internals, ai-core fills a slot and structure renders it — or shows a fallback when ai-core is absent.
+
+#### Producer — fill a slot
+
+A `component.registration.ts`, side-effect imported from the feature's `index.ts` (the same pattern as every other registry). Lazy-load the component so it stays out of the consumer's first-paint bundle:
+
+```typescript
+// features/ai-core/component.registration.ts
+import { lazy } from 'react';
+import { componentRegistry } from '@/config/component.registry';
+
+// named export -> default shim is required for React.lazy
+const PromptEditor = lazy(() =>
+  import('./components/PromptEditor').then((m) => ({ default: m.PromptEditor })),
+);
+
+componentRegistry.register({
+  id: 'ai-core.operation-prompt-editor', // GLOBAL, single-owner: `moduleId.slot`
+  moduleId: 'ai-core',
+  component: PromptEditor,
+});
+```
+
+#### Consumer — render a slot
+
+Prefer **`<EmbeddedSlot>`** (`@/components/EmbeddedSlot`) — it wraps the foreign component in an `ErrorBoundary` (a failed `lazy()` chunk load *throws*, so it is caught here, not by Suspense) and a `Suspense`, and degrades to `fallback` when the slot is unfilled **or** the embedded component crashes:
+
+```tsx
+import { EmbeddedSlot } from '@/components/EmbeddedSlot';
+
+<EmbeddedSlot
+  id="ai-core.operation-prompt-editor"
+  props={{ operationId }}
+  fallback={<EmptyState label="AI is not installed" />}
+/>
+```
+
+Or use the bare hook where you own the wrapper:
+
+```tsx
+import { useEmbeddableComponent } from '@/config/component.registry';
+
+function PromptPanel({ operationId }: { operationId: string }) {
+  const Panel = useEmbeddableComponent<{ operationId: string }>('ai-core.operation-prompt-editor');
+  return Panel ? <Panel operationId={operationId} /> : null;
+}
+```
+
+<Aside type="note">
+**Reactivity is load-bearing.** `useEmbeddableComponent` subscribes to the registry *before* looking the slot up, so a producer that registers from a code-split chunk **after** the consumer mounts still triggers a re-render. A one-shot `componentRegistry.get(id)` would render `null` forever if the consumer won the import race.
+</Aside>
+
+#### Degrade semantics & enablement gating
+
+Degrade is registry **presence**: an *uninstalled* module never runs its registration, so its slot reads `null` and the consumer shows its fallback. Frontend registration is **unconditional** (it runs at import time), so **disabling** a still-installed module does *not* unregister its slot. If you want a slot to also disappear when its owning module is disabled, gate it at the consumer — the core stays presence-only:
+
+```tsx
+import { useModuleEnabled } from '@/features/modules';
+
+const aiReady = useModuleEnabled('ai-core');
+return aiReady
+  ? <EmbeddedSlot id="ai-core.operation-prompt-editor" props={{ operationId }} />
+  : <Fallback />;
+```
+
+<Aside type="caution">
+Don't gate every slot on `useModuleEnabled` by reflex. The module-status lists are keyed on **backend** module ids, so a frontend-only module (or an id mismatch) reads *not installed* and would be wrongly hidden. Gate only when a real backend-disable case demands it.
+</Aside>
+
+The props contract is **unchecked across the seam** (the component is stored as `ComponentType<never>` and cast to `ComponentType<P>` on read, mirroring the backend `serviceRegistry.getDynamic<T>`) — document the props each slot expects, like a service contract. Slot ids are **single-owner**; a second module claiming the same id is skipped with a `console.warn` (pass `{ allowReplace: true }` to override).
+
+| Method / Hook | Description |
+|--------|-------------|
+| `componentRegistry.register({ id, moduleId, component, order? })` | Fill a slot (first-wins; `console.warn` on duplicate id) |
+| `useEmbeddableComponent<P>(id)` | The slot's component cast to `ComponentType<P>`, or `null` if unfilled |
+| `useComponentRegistry()` | All registered slots (admin/debug listing; also the subscription source) |
+| `<EmbeddedSlot id props? loading? fallback? />` | Safe wrapper — ErrorBoundary + Suspense + null-degrade |
+
+---
+
 ## Backend Registries
 
 ### Route Registry
@@ -1244,6 +1328,7 @@ When the app imports the feature (in `main.tsx` or `app.ts`), registrations happ
 | `personalInfoFieldsRegistry` | Personal info fields | BaseRegistry |
 | `styleRegistry` | Runtime CSS + components.json contributions | BaseRegistry |
 | `shellInitRegistry` | Post-auth init components mounted in the shell | BaseRegistry |
+| `componentRegistry` | Cross-module embeddable component slots | BaseRegistry |
 | `filterRegistry` | Data transformation | Custom |
 | `actionRegistry` | Side effects | Custom |
   </TabItem>
