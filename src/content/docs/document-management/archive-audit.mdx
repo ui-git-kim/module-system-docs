@@ -38,6 +38,30 @@ At the end of a session you want to archive, run the archive-readiness prompt (b
 
 ---
 
+## 2026-09-08 — Carry `documentId` in the `documents.document.uploaded` event (v1.16.0)
+
+**Verdict:** ✅ Safe to archive / ship. No schema change. veradai: `--skip-schema` (or plain `update` if before 1.15.0).
+**Shipped this session:** v1.16.0 (**minor** — new backwards-compatible capability in the public event contract). Module commits: `fd10dcf` feat (documentId via reference factory) · `63bf3d7` release · `4b05baa` lock-sync · (docs pointer to follow). All gates green (build · type-check · check:templates · parity · conformance = the 6 by-design C2s) + esbuild 19-string syntax check. 3-dimension worktree-isolated adversarial review (generated-code type-safety · offline atomicity + v1.15.3 non-regression · contract correctness/non-breaking), each finding skeptic-verified → **0 confirmed findings** (all 3 reviewers engaged, ~13 tool-uses each).
+
+**Why:** reciprocal request from cog-ingest (`~/Downloads/cogingestaskdmcarrydocumentId.md`). Their **auto-ingest** lane subscribes to `documents.document.uploaded` and pulls bytes on a queued job, but the event always carried `documentId: null` — so an offline-staged upload could only be pulled by its staging `{providerId, remotePath}`, which 404s once reconcile moves the bytes and re-points the reference. The durable `doc_document` is the stable handle, but it was created by `uploadToRow`'s callers *after* the event fired. (Their by-reference lane — the Upload component calling `ensureReference` synchronously — was already offline-safe as of cog-ingest v1.21.92; only the event-driven lane had the gap.)
+
+**What shipped:**
+- **`uploadToRow` gained an optional reference-factory param** `createReference?: (result, contentHash) => Promise<string | null>`. It runs after the bytes are stored + hashed, BEFORE the emit, and its return becomes the event's `documentId` (was hard-coded `null`).
+- **`uploadToDefault` (shared/global):** the owned-ref `doc_document.upsert` moved into a `createRef` factory (returns `d.id`); non-shared/owned uploads pass no factory → `documentId` stays `null`. Captured `const targetProvider = provider` so the closure keeps the non-null narrowing.
+- **`stageOfflineUpload` (offline path):** the atomic `doc_document` + `doc_pending_reconcile` `$transaction` moved *into* the factory (still atomic, now before the emit), returns `doc.id`; `log.info` moved inside.
+- **`contentHash` now persisted** on these server-created refs (was `null`) — survives the reconcile re-point (`repointReference` doesn't touch it), so it's a durable invariant a consumer can key on. Chose to populate it for parity + because cog-ingest's note calls it the reconcile-invariant.
+- Docs: integration.mdx event table row + offline-uploads section; changelog v1.16.0.
+
+**Decisions:** (1) **Populate the existing event** rather than cog-ingest's fallback (a new `documents.document.referenced` event) — cog-ingest's stated preference, non-breaking (documentId already nullable), single-event contract. (2) **Minor** not patch — new consumer-facing capability in the public action contract, backwards-compatible; no schema change so still `--skip-schema`. (3) Reference-factory-before-emit rather than reordering per-caller emits — keeps the emit centralised in `uploadToRow` and preserves the offline atomic transaction. Side effect (accepted, arguably better): a ref-creation failure now suppresses the event instead of emitting a null-id event for a file whose ref failed.
+**Unfinished / WIP:** none on the DM side. Reciprocal note back to cog-ingest sent (they need **zero** further change — their listener already forwards `context.documentId` and prefers `getDownloadStream(documentId)` as of v1.21.92; the moment DM's event carries a real id, their auto-ingest lane is reconcile-proof).
+**Loose ends & follow-ups:** cog-ingest to confirm the auto-ingest lane end-to-end against a real offline-staged upload once veradai is on 1.16.0.
+**Recorded where:** changelog (v1.16.0, Added/Changed), integration.mdx (event contract + offline section), memory ([[dm-upload-contract-v154]]), this entry.
+**Open items for next session:** veradai → 1.16.0 (`--skip-schema`); cog-ingest end-to-end offline auto-ingest test; then the standing backlog — global visibility; true single-provider-many-folders; `DocumentUpload` error surfacing; safe-upload / content verification.
+
+**Reciprocal note back to cog-ingest (reply to their ask):** ✅ Done in v1.16.0 — the existing `documents.document.uploaded` event now carries a real `documentId` (durable `doc_document` id) on every path that creates a reference, including offline staging and global; `null` only for a bare upload to a user's own provider. Non-breaking. No new `documents.document.referenced` event needed. Bonus: `contentHash` is now persisted on those refs too. Requires DM ≥ 1.16.0.
+
+---
+
 ## 2026-09-07 — Streamed uploads to an S3-family default: Content-Length threading fix (v1.15.3)
 
 **Verdict:** ✅ Safe to archive / ship. No schema change since 1.15.0. veradai: `--skip-schema` if already on 1.15.0+, else plain `npx document-management update` (applies the 1.15.0 deviceId/deviceLabel migration).
