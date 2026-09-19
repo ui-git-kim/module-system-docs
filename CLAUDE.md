@@ -105,7 +105,7 @@ src/content/docs/
 │   │   ├── registries-guide.mdx
 │   │   └── ...                  # configuration, integration, developer-workflow, changelog, roadmap
 │   ├── builder/                 # index, usage, configuration, integration, developer-workflow, changelog, roadmap
-│   ├── cog-ingest/              # index, usage, configuration, integration, developer-workflow, changelog, roadmap
+│   ├── cognitive-pipeline/              # index, usage, configuration, integration, developer-workflow, changelog, roadmap
 │   ├── pickers/                 # index, usage, configuration, integration, developer-workflow, changelog
 │   └── style/                   # index, design, roadmap
 ├── colour-palette/              # Colour-palette module docs
@@ -182,7 +182,7 @@ When editing documentation:
 | Getting Started | ✅ Complete | Introduction, docs system, Neon/AWS KMS/Cloudflare setup, LLM rules |
 | Starter Template | ✅ Complete | Architecture, configuration, registries, features (auth/user/dashboard/admin/security), theme, hooks, versioning, scripts |
 | Module Starter | ✅ Complete | Building modules, file reference, create-script, database, registry guide, scaffold, CLI reference, versioning |
-| Modules | ✅ Complete | Catalogue plus structure, builder, cog-ingest, pickers, style, billing |
+| Modules | ✅ Complete | Catalogue plus structure, builder, cognitive-pipeline, pickers, style, billing |
 | Colour Palette | ✅ Complete | Colour module: palette, tonal scale, harmony map, gamut mapping, playground |
 | Document Management | ✅ Complete | Usage, configuration, database, security, integration |
 | Reference | 🔲 Partial | CLI, types, API reference |

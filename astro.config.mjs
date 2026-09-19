@@ -344,9 +344,9 @@ export default defineConfig({
               autogenerate: { directory: "modules/billing" },
             },
             {
-              label: "Cog Ingest",
+              label: "Cognitive Pipeline",
               collapsed: true,
-              autogenerate: { directory: "modules/cog-ingest" },
+              autogenerate: { directory: "modules/cognitive-pipeline" },
             },
             {
               label: "Colour Palette",
