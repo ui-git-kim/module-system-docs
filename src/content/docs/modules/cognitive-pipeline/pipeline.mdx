@@ -1,7 +1,7 @@
 ---
 title: Ingestion Pipeline
 description: The master architecture for content-driven ingestion — anything in, graph out. The config layers, the pipeline stages, producers, retrieve/match/connect, and the quality + human-in-the-loop model.
-lastUpdated: 2026-09-03
+lastUpdated: 2026-09-23
 sidebar:
   order: 1
   label: "Pipeline & Architecture"
@@ -202,6 +202,27 @@ A dedup match is **detected automatically, resolved manually** — merge / keep 
 Every AI op the pipeline uses — parse-QA, field-analysis, the field-quality judge, connection discovery, the conversation-finder, and the extraction-level read — lives in **AI Core** (app-agnostic, injection-fenced), and each declares **admin-settable variables** a source fills in (participants, medium, the target type's fields, jurisdiction, tone). Same base op, different variables → one AI Core serves every app.
 
 **The binding (how a canvas AI Op node actually runs).** An AI Op node carries a model **purpose** and a free-text **instruction**. The instruction rides as a declared AI Core **prompt variable** — a `{token}` placed in the operation's objective, whose value is supplied per run in the `variables` map, so nothing is baked into the prompt at seed time and the admin's edits to the objective always survive. The **purpose** decides which model the op runs under: model choice in AI Core is **per-purpose**, never per-op, so a node picks a purpose (which binds a model) rather than naming a model. Beyond AI Core's built-ins (`analysis` / `vision` / `embedding`) the module seeds two novel purposes — **`extraction`** (fast, cheap, multimodal — the every-ingest pass) and **`reasoning`** (deeper judgement) — each created create-if-absent and left for the admin to map to a model; until a purpose is mapped the bound op refuses at run and the caller degrades to the deterministic path. The first op on this binding is `extraction` (the extraction level's AI read); the rest migrate onto it next. *(Slice 1 shipped v1.21.94.)*
+
+## The canvas — Next lines and data wires
+
+The admin canvas draws **two kinds of line**, and the picture is what runs:
+
+- **Solid — what runs next.** A node's **Next** section sends the flow into the **top** of the node that runs after it. Several Next lines from one node send those nodes off **at the same time** (in parallel); a node with several Next lines coming in waits until all of them have finished (Collate waits for the deterministic pass and every AI Op). A node no Next line leads to **doesn't run**; the canvas flags it *Not reached*. The 18-stage order (stage → stage) is solid too, and **Acquire is the content-type router**: its Upload / In-app input / Scrape / Feed / API rows send the flow into the top of the node that handles that kind of content.
+- **Dashed — what data goes where.** A node's **output** row (or an AI Op's *Result*) wires into an **input** row of another node. A node's inputs are exactly what is wired into it; there are no toggles. Every graph node (AI Op, Function) and the *Check extraction* stage has an **Input** section with a *Drop an output here* slot.
+
+Draw a Next line by dragging a node's Next handle (the squared dot) onto another node's top, or pick one from the **+ Add next node…** list. Draw a data wire by dragging an output's dot onto a node. It becomes an input row there, whichever part of the node you drop it on. A wire that could never run (a loop, a duplicate, data into a stage with no inputs) is refused as it is drawn.
+
+**The engine runs by the Next lines.** The generic graph engine (`runNodeGraph`) follows the solid lines, decoupled from the data:
+
+- A node runs once the flow reaches it and everything it depends on has finished. Nodes that become ready together run concurrently.
+- A node's inputs are whatever values are on its data wires. A reached node always runs, even if its wires came up empty. It then has nothing to work on: an AI Op with no input makes no AI call. The canvas notes *Nothing wired in* on a node with no inputs.
+- Each job follows one route: an upload enters at Upload (Deterministic, AI Ops, Collate), a web page at Scrape (AI Ops, Collate; a web page has no raw file, so its scraped text is its deterministic text). A node only some routes reach is flagged *Only runs for uploads* (or *web pages*). A node no route reaches is flagged *Not reached*. A node caught in a loop is flagged *Waits on a loop*, because the engine waits for every step wired into a node, so steps on a loop wait forever.
+- When a node's Next lines lead to steps that wait on one another (Collate waits for the AI Op), the chip says so (*· after …*). *Run at the same time* is shown only for the steps that really start together.
+- **Check extraction** receives the text wired into its Input rows. If several results arrive, the one furthest along the flow is used. If nothing is wired in, or what is wired comes back empty (for example an AI Op with no operation chosen), the deterministic text carries on. Only wires the engine can read can be drawn: text from a step into Check extraction, and a file into the Deterministic node.
+
+A saved drawing records its format (`flow.version`) and the layout it was drawn for (`flow.extractionKey`: the level plus which routes exist). A drawing saved before Next lines existed runs off its data wires, exactly as before. The first time the canvas opens it, it derives Next lines (one per wired pair) and saves the drawing in the new format. From then on the drawing runs exactly as drawn: removing every Next line, or unwiring the whole section, means nothing in it runs, and the canvas says so. If the level or input methods change outside the canvas (for example Upload switched on in the Input tab), the saved drawing no longer fits: the engine runs the level default for it, and the canvas re-lays the section out and saves it next time it opens. A file that reaches a source without an upload route (for example a Document Management auto-ingest) also runs the level default. The stage identity changes only when what runs differs from the level default, so rewiring re-derives an unchanged document but moving a node never does.
+
+Default layout per extraction level: **Fast** — Upload → Deterministic → Check extraction. **Thorough** — Upload → Deterministic → AI Op → Check extraction (the AI Op reads the deterministic result). **Verified / Verified+** — Upload's Next sends the Deterministic node **and** each AI Op off together (each AI Op extracts independently from the raw upload); all of them lead to Collate, which reconciles them → Check extraction.
 
 ## The ingest component
 
