@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features, known issues, and future direction for AI Core
-lastUpdated: 2026-09-01
+lastUpdated: 2026-09-24
 sidebar:
   order: 15
 ---
@@ -58,6 +58,131 @@ The 20M-char media cap bounds the *string* — for a URL attachment that's the U
 **Already tracked** (perf-audit items, re-confirmed unchanged): the models list ships each row's full `catalogue` Json to the frontend cache (`listModels` has no `select`) and renders every model as a heavy unpaginated row; the operations-editor state/pagination item; the review-queue "load older" gap; the config-io `restoreSeeded` double-write.
 
 **Refuted by verification:** 2 candidates (a hook-emission `.catch` claim; an aggregate-multiplication restatement of the per-item caps).
+
+### Standards & Architecture Audit — v1.59.0 (September 2026)
+
+A second standards-and-conventions audit of the generated code ran at **v1.59.0** (2026-09-24). Six parallel auditors covered registries and wiring, schema and isolation, backend run engine, backend services and HTTP, and the admin frontend (split in two). Every non-trivial claim was re-checked against the code, the local copy of the LLM rules and the upstream module-starter template before recording.
+
+**Gates going in: all green.** `build` and `type-check` (exit 0), `check:templates`, `conformance:check`, `parity:check`, scaffold current at 1.31.19, versions in sync (package.json, `module.ts` and `dist/` all 1.59.0). **The clean sweeps hold at scale:**
+
+- Every backend relative import carries `.js` (64/64 run path, 92/92 services).
+- Zero `console.*`. Zero real `any`, and all 17 `as unknown as` are justified JSON bridges bar one optional-service lookup.
+- Zero `@relation` across 28 `ai_` tables. `modelNames` matches the schema both ways. Zero access to any non-`ai_` table. No hidden DDL, so nothing needs `tables.external`. All 31 seed inserts are `ON CONFLICT DO NOTHING` and every seed has been byte-identical since v1.23.0.
+- Zero Rule-7 typography/colour/shadow/opacity breaches across all 23 frontend files. Every imported shadcn primitive is declared and every declared one is used. All 87 query keys go through `createModuleQueryKeys('ai-core')`.
+- All 48 action emissions use `doActionAll`, and the 20 declared audit events are all emitted (none undeclared).
+- 91 routes map to 91 handlers, and all 82 admin routes are `requireAdmin`-gated.
+- The provider SDK is still confined to `providers/adapters.ts`.
+- The v1.59.0 guardrail move out of `run.ts` left no dead imports or duplicated functions.
+
+**Refuted on verification:** "module template headers must not carry `FILE:`". The local LLM rules' own module-header example includes `FILE:`, so the headers are compliant (the published page summary had dropped it).
+
+**Two earlier roadmap statements corrected by this audit:**
+
+- The Meta-audit minor item "the controller reimplements three ledger reads inline" was only two-thirds fixed in v1.38.0: `updateReviewItem` is still inline (see 3 below).
+- "`markers` and `inputTypes` are excluded from the operations editor's gates" is now fixed, but prompt variables have the same gap (see 10).
+
+The operations-editor perf item below is also half done: the editor is now full-page and the list doesn't render while it is open, so only "unpaginated" remains.
+
+#### ❌ Violations
+
+1. **The flow-step handler registry is a bare `Map`** (`run/flows.ts:45-58`). The LLM rules say a module that offers extension points to other modules must "Extend `BaseRegistry<T>` — never hand-roll a bare `Map`", with `moduleId` + `order` on every entry and the registry in `config/*.registry.ts`. `registerFlowHandler` is AI Core's one real extension point, and the host's backend `config/base.registry.ts` already provides the base class. **Fix:** `config/flow-handler.registry.ts` extending `BaseRegistry<{ id, moduleId, order?, handler }>`, keeping `registerFlowHandler(id, fn, { moduleId })` as a thin wrapper so callers don't break.
+2. **Model-choice rules live in a route handler** (`ai-core.controller.ts:377-410`). `getModelChoices` runs `prisma` queries and the allow-list / enabled / user-selectable eligibility rule inline, duplicating `resolver.ts:699-758`. If the resolver's rule changes, the picker offers models the run then refuses. **Fix:** `recordsService.getModelChoices`, with one eligibility helper shared with the resolver.
+3. **The review-item status write lives in a route handler** (`ai-core.controller.ts:1544-1595`): `prisma.ai_review_item.update` + audit log + the `review-item.updated` hook, with no service method. Nothing outside HTTP can resolve a review item consistently. **Fix:** restore `ledgerService.updateReviewItem` (404 mapping, log, hook) and delegate.
+
+#### ⚠️ Deviations and risks
+
+4. **`module.registration.ts` swallows genuine registration failures** (`registrations.ts:197-207`). The whole `register()` call sits inside the `try`. The module-starter template narrowed the `try` to the dynamic import alone, so a bad `depends`, a duplicate id or a policy error surfaces; ai-core's module-owned copy predates that. **Fix:** port the upstream shape (`let moduleRegistry; try { ({ moduleRegistry } = await import(…)) } catch {}` then `if (moduleRegistry) moduleRegistry.register(…)`).
+5. **Guardrail attachment events are missing or phantom** (`disciplines.service.ts`):
+   - `ensureGuardrail` attaches to disciplines without firing `discipline.updated` `'attached'`.
+   - `attachGuardrail` / `detachGuardrail` fire even when nothing changed.
+   - `ensureDiscipline` fires guardrail `'ensured'` for guardrails it only found.
+
+   **Fix:** emit per actual change.
+6. **Flow-run lifecycle writes fire no action hook** (`run/flows.ts` start / suspend / resume / complete / fail). A flow suspending to wait on feedback is when a human needs telling, and consumers can only poll. **Fix:** `ai-core.flow-run.{started|suspended|resumed|completed|failed}` via `doActionAll` (ids and status only), declared in `auditEvents`.
+7. **Model listing logs the provider's raw error body** (`providers/model-listing.ts:88-93`, `bodySnippet`). This breaks the module's identifiers-only logging rule, which the adapters enforce ("the upstream prose is deliberately dropped"). **Fix:** log `{ providerId, status }` only.
+8. **The config import report can return raw error text** (`config-io.service.ts:497-499`, `errText`, 35 sites). An unexpected Prisma error reaches the admin verbatim (paths, code excerpts), bypassing `sendError`. **Fix:** pass `err.message` only for the module's typed errors; otherwise report the error name/code via `summariseError`.
+9. **Two inputs escape validation:**
+   - the runtime `/retrieve` `minScore` is unbounded (`validation.ts:1070`, while the admin schema bounds it 0–1);
+   - `listEvalCases` reads `req.query.operationId` with a `typeof` check, not zod.
+
+   **Fix:** `.min(0).max(1)` and an `evalCasesQuerySchema`.
+10. **Admin screens show a false "nothing" when a read fails.** This is the module's never-silent principle.
+    - **Operations editor:** prompt variables are outside its loading/error gates ("No variables yet").
+    - **Models tab:**
+      - on a failed policy read, the Policy card says zero-retention bypass is "OFF … the safe default";
+      - Retention shows "Keep forever";
+      - Purposes shows "No purposes yet".
+    - **Guardrail editor:** hides models/input-types read errors.
+    - **Evals, Usage and Context:** show fixed or generic messages instead of the server's reason.
+    - **Variables:** a failed field-source read claims "No field source is registered".
+
+    **Fix:** `ErrorAlert` on `isError`, and "unknown" rather than a default.
+11. **Cache refresh gaps** (`hooks/useAiCore.ts`):
+    - `useDeleteTool` doesn't refresh `operations`, so the editor keeps the deleted tool and the next save is refused ("Unknown tool ids").
+    - `useRunEval` and `usePruneMaintenance` don't refresh usage / current-usage.
+    - The config-import invalidation list is hand-kept (complete today, drifted before). Invalidating the module root key is the documented idiom.
+12. **Accessibility:** about 35 form controls have no accessible name.
+    - Test-run inputs, "Add …" select triggers, search inputs, the import textarea, Context-tab selects, Evals fields.
+    - Two home-made segmented toggles have no selected state (`aria-pressed` or Tabs).
+    - Four raw `<label>` elements.
+    - A disabled `SelectItem` stands in for a group label (use `SelectGroup` + `SelectLabel`).
+    - 17 `Label` elements with no control are used as section titles (use `Heading` / `Text`).
+13. **Shared blocks not used (Rule 8):**
+    - Hand-written loading / empty / error text where `LoadingState` / `EmptyState` / `ErrorAlert` are already imported.
+    - Card look-alikes (`RuleCard` and editor shells, `rounded-md border p-*`) and hand-built label + description + switch rows where `Card` / `Row` exist.
+    - A `Button` with plain-utility layout overrides (the preset cards).
+    - `font-mono`, a hand-styled code chip, `underline` and `border-dashed` in template code.
+    - Usage totals rendered as `CardTitle` instead of the stat-value slot.
+
+    The ProviderCard `<button>` and the badge-shaped `<span>` are already tracked under Meta audit → Admin UI polish.
+14. **Hard-coded values and duplicated rules:**
+    - **Guardrail engine run budgets** (`cells: 20_000_000`, `scorerCalls: 6`, `fileScorerCalls: 3`, the 200,000 yield step) are bare literals next to named siblings.
+    - **The `[UNCLEAR]` placeholder limits** (5 tokens, 40 characters, 200 characters, default share 0.05) appear in three places: the write validator, the engine and the editor.
+    - **Scattered literals:**
+      - the characters-per-token factor and the graph fan-out cap;
+      - the 0.7 eval threshold (backend and frontend);
+      - about 15 `.max(n)` limits in `validation.ts`;
+      - the policy id `'app'` three times;
+      - `records.ts` list caps.
+    - **The port-key algorithm is implemented twice on the client** (`OperationsTab` and `input-ports.ts`, `MAX_PORT_KEY` declared twice).
+
+#### ℹ️ Notes
+
+- **Duplicated helpers:**
+  - private `summariseError` copies in `eval.ts` / `flows.ts` (the eval copy has drifted);
+  - `isRecord` defined twice;
+  - `apiErrorMessage` in 11 tab files;
+  - `lookupOptionalService` in both `run.ts` and the controller, via a cast instead of the registry's documented `has` + `getDynamic`;
+  - the JSON-schema-to-zod converter in both `run.ts` and `adapters.ts` (the two copies already differ on unknown types).
+- **Dead code:**
+  - `getTermsOption` and `getPromptVariable` (never called);
+  - 20 inferred validation types with no importers;
+  - 11 `guardrail-rules.ts` exports used only inside the file.
+- **Stale or misplaced comments:**
+  - doc comments left above the wrong function after recent inserts (controller, service, records, routes);
+  - schema comments naming `ai_guardrail.disciplineId` as the attach mechanism, and a non-existent `ai_operation.contextId`;
+  - `data-model` index lists that no longer match the schema.
+- **Code organisation:**
+  - The consumer facade's `getOperationInfo` does its own DB read and shaping, although the facade's contract says "thin delegates only". Move it to `recordsService`.
+  - `GuardrailRulesEditor.tsx` exports about 1,750 lines of pure rule logic alongside the component, which breaks React Fast Refresh. Move it to a `.ts` module, as `input-ports.ts` already does.
+- **Small fixes:**
+  - `refreshCapabilities`' event omits the models it auto-created (`added`).
+  - `eval-case` update uses an unexplained `as never` cast.
+  - Two Evals effects miss dependencies.
+- **Wording in templates:**
+  - "veradai" is hard-coded as an example owner in two generic templates.
+  - "tokenizer" appears in UI text.
+- **Schema hygiene** (additive; needs a patch migration):
+  - `ai_flow_run` (and `ai_review_item`) lack an index for the retention prune's `status + updatedAt` filter.
+  - `ai_policy` has no `createdAt`.
+  - `userId` isn't indexed on the three tenant tables (only needed if erasure ever switches to `userId`).
+- **Lifecycle:**
+  - The Prompt Model v2 DB-prep hook runs on every update of every installed module, guarded only by "`ai_guardrail_checks` exists". Add `AND NOT EXISTS ai_guardrails` or retire the hook, since no v1 host remains.
+  - `module.registration.ts` has no `init()`, so the host reports ai-core as ungateable. This is a deliberate decision to record.
+- **Docs and upstream:**
+  - CLAUDE.md's "Registries used" omits `componentRegistry`, `actionRegistry` and `moduleRegistry`.
+  - The LLM rules send captions through `<Text variant="caption">` while Building Modules approves a plain muted `<p>` element. That's an upstream docs disagreement to settle before adopting `Text` module-wide.
+  - Reserve `ai-*` module ids in the catalogue so no future module collides with ai-core's short `ai_` table names.
 
 ### Standards & Architecture Audit — September 2026
 
