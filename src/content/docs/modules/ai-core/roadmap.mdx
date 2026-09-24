@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features, known issues, and future direction for AI Core
-lastUpdated: 2026-09-24
+lastUpdated: 2026-09-25
 sidebar:
   order: 15
 ---
@@ -11,7 +11,7 @@ import { Aside } from '@astrojs/starlight/components';
 This page outlines planned features, known issues, and improvements for the AI Core module. Items are grouped by priority.
 
 <Aside type="note" title="First live call made — v1.7.0">
-The redesign was implemented as v1.1.0 (2026-07-23) and has been extended through v1.50.7. It installs into a real app, type-checks clean, its admin page renders and serves records, and — as of v1.7.0 (2026-08-01) — `run()`, `embed()` and `rerank()` have all executed end to end against live providers (Anthropic Claude Opus 4.6, Voyage). Remaining and unbuilt work is tracked on this page.
+The redesign was implemented as v1.1.0 (2026-07-23) and has been extended through v1.60.0. It installs into a real app, type-checks clean, its admin page renders and serves records, and — as of v1.7.0 (2026-08-01) — `run()`, `embed()` and `rerank()` have all executed end to end against live providers (Anthropic Claude Opus 4.6, Voyage). Remaining and unbuilt work is tracked on this page.
 </Aside>
 
 <Aside type="note">
@@ -23,6 +23,25 @@ This roadmap reflects current plans and may change based on feedback and require
 ## Known Issues
 
 The six issues recorded here from the July 2026 alignment audit all lived in the **legacy template surface**, and all were **resolved by deletion** — v1.1.0 replaced that surface wholesale (see the [Changelog](/modules/ai-core/changelog/)). These are the current known issues.
+
+### Incident — 2026-09-21: an update emptied live operations, segments, disciplines and frameworks
+
+**Status:** cause fixed in **v1.60.0**; recovering the lost records is the host owner's call (options below).
+
+**What happened.** The one-time Prompt Model v2 upgrade step (`onPrepareDatabase` in `src/module.ts`) runs before the schema migrate on any schema-changing `npx ai-core update`. Until v1.60.0 it treated a database as v1 whenever a table named `ai_guardrail_checks` existed, and then ran the v1 reset: `TRUNCATE ai_prompt_segments, ai_disciplines, ai_guardrail_checks, ai_operations` and `DELETE FROM ai_prompt_frameworks WHERE seeded = true`. The live host still carried stale v1 models (`ai_guardrail_check`, `ai_preset`) in its `schema.prisma`, outside ai-core's section (so no ai-core update ever removed them), and a hand-written migration on 2026-09-04 re-created the `ai_guardrail_checks` table to match. Its 2026-09-21 update to v1.58.0 (which added a column, so the step ran) therefore reset a live v2 database.
+
+**What was lost.** Every operation, prompt segment and discipline, plus the seeded prompt frameworks. Seeded defaults among them (4 frameworks, 4 disciplines, 7 shared segments, 4 built-in operations including the standing system prompt `ai-core/system-base`) can be rebuilt; records the admin authored cannot be rebuilt from seeds. Consumer modules re-created their own operations with default wording seconds later. ai-core has no foreign keys, so the reset did not cascade: join rows (operation segments, segment approaches/disciplines, discipline guardrails, operation tools) and model framework references still point at the lost ids — which is what lets a restore reconnect everything. Nothing else was touched (approaches, guardrails, contexts, models, flows, eval cases, usage ledger).
+
+**The fix (v1.60.0).** The reset now requires **both** the old table present **and** the v2 `ai_guardrails` table absent (`to_regclass`, same search path as the reset), so it can only act on a genuine v1 database. Proven read-only against the affected database: the old check evaluates to "reset", the new one to "do nothing", and the new step executed inside a `READ ONLY` transaction attempted no write. The step's failure warning, which could never fire, now works, and its temporary script is cleaned up even if the step throws. **Any ai-core version before v1.60.0 still carries the one-sided check** — never run an older `npx ai-core update` against a host that has an `ai_guardrail_checks` table.
+
+**Recovery options** (for the host owner; none is automatic):
+
+- **Point-in-time restore (best, time-limited).** Neon keeps a history window whose length depends on the plan. If it still covers the moment before the reset, create a *new branch* at that time (never "restore" the main branch — that would roll back the whole app), then copy back only the missing records with their original ids, reviewing the operations consumer modules have since re-created.
+- **Re-seed the defaults.** The migration runner applies seeds by name from `_module_migrations`; removing the rows for the seeds that insert frameworks, disciplines, shared segments and built-in operations and re-running the update re-applies them (`ON CONFLICT DO NOTHING`). This restores defaults only, not authored work.
+- **Re-import an earlier config export** (merge mode), trimmed to the lost records, so it does not overwrite anything rebuilt since.
+- **Remove the trigger in the host:** delete the stale `ai_guardrail_check` / `ai_preset` model blocks from the host `schema.prisma` and drop the two empty tables with a hand-written migration (never `migrate dev` on a module-bearing app). Optional once on v1.60.0, but it removes the trigger for any older ai-core build.
+
+**Follow-up:** retire the v2 upgrade step entirely (no v1 install remains; a genuine v1 upgrade would then fail loudly instead of resetting), and consider an upstream scaffold check that refuses a destructive `onPrepareDatabase` unless its own guard reports a positive v1 match.
 
 ### Resource & Memory Audit — September 2026
 
@@ -60,6 +79,32 @@ The 20M-char media cap bounds the *string* — for a URL attachment that's the U
 **Refuted by verification:** 2 candidates (a hook-emission `.catch` claim; an aggregate-multiplication restatement of the per-item caps).
 
 ### Standards & Architecture Audit — v1.59.0 (September 2026)
+
+**Resolved:** 2026-09-25 — shipped in **v1.60.0** (see the [Changelog](/modules/ai-core/changelog/)): all three violations (the flow-step handler registry on `BaseRegistry`, model choices and the review-item status write moved into services, plus `getOperationInfo` moved out of the facade), every deviation (module registration no longer hides real failures; guardrail attachment events fire exactly when something changed; the five `ai-core.flow-run.*` events; identifiers-only model-listing logs and import report; `minScore` and the eval-cases query validated; the admin screens' error branches, cache refreshes, accessible names and shared blocks; named constants), the notes' duplicates, dead code, stale comments and code moves, and the schema hygiene items (the two retention-prune indexes and `ai_policy.createdAt`). Three adversarial review rounds of the fix diff confirmed seven more defects before ship, all fixed. Round one found four: the picker and the run still spelled the model-choice rule out separately (now one function), the dial handles were still unnamed, the guardrail editor claimed a list was unknown when only a refresh had failed, and a remove button sat inside a `Badge`. Round two found three: the Variables field picker vanished on a failed refresh, header buttons lost their gap, and the import report uppercased entity names. Round three found nothing.
+
+**Done differently from the fix list above:**
+
+- **Switch rows use the plain `Switch`, not `ToggleSwitch`**, in the settings-blocks `Row` — the starter's `ToggleSwitch` cannot take an accessible name, and a control without one would undo item 12.
+- **The dial handles are named by a workaround.** The starter's `ui/slider` does not pass `aria-label` / `aria-labelledby` / `aria-valuetext` through to its thumbs, so no prop on `<Slider>` reaches the element that takes focus. `DialSlider` sets them on the rendered thumb with a ref and an effect; it switches to plain props once the starter forwards them.
+- **Three `guardrail-rules.ts` types stay exported** (`NormalisedGuardrail`, `WildcardParams`, `WildcardOutcome`): exported functions use them in their signatures, and hiding them would break a host that emits type declarations.
+- **`provider-adapters.ts` keeps its own `CHARS_PER_TOKEN`.** It caps embedding input there, a different job from the run engine's token estimate, so it was not merged into `CHARS_PER_TOKEN_ESTIMATE`.
+- **The shared JSON-schema converter reads an unknown field type as "accept anything"** (the adapter copy's behaviour) rather than "object" (the run engine's). No normal save can produce such a field; only a hand-edited row or an SQL seed could.
+
+**Deliberately deferred:**
+
+- **`userId` indexes on the three tenant tables** — only needed if erasure ever switches from `tenantId` to `userId`.
+- **Adopting `Text` for captions module-wide** — waits until the upstream docs agree (see the upstream list below). Plain muted `<p>` captions stay.
+- **No `init()` in `module.registration.ts`** — recorded as a decision, not a gap: AI Core is the foundation other modules call, so it is not switched off at runtime (see [Registering & Seeding](/modules/ai-core/registering-and-seeding/#ai-core-has-no-init--on-purpose)).
+- **Pagination of the operations list** — the one part of the performance item below still open.
+
+**Upstream follow-ups** (logged on the shared roadmaps):
+
+- The starter's `ToggleSwitch` should accept an accessible name (`aria-label` / `aria-labelledby`). It takes an `id`, but a `Row`'s title is not a `<label>`, so nothing can point at it — [Starter roadmap](/starter-template/roadmap/).
+- The starter's `components/ui/slider.tsx` should forward `aria-label`, `aria-labelledby` and `aria-valuetext` to each thumb — [Starter roadmap](/starter-template/roadmap/).
+- The LLM rules and Building Modules disagree on captions (`<Text variant="caption">` versus a plain muted `<p>`) — [Module Starter roadmap](/module-starter/roadmap/).
+- Reserve `ai-*` module ids for AI Core's family — [Modules roadmap](/modules/roadmap/).
+
+The record below is kept as found; its line references describe the v1.59.0 files.
 
 A second standards-and-conventions audit of the generated code ran at **v1.59.0** (2026-09-24). Six parallel auditors covered registries and wiring, schema and isolation, backend run engine, backend services and HTTP, and the admin frontend (split in two). Every non-trivial claim was re-checked against the code, the local copy of the LLM rules and the upstream module-starter template before recording.
 
@@ -177,7 +222,7 @@ The operations-editor perf item below is also half done: the editor is now full-
   - `ai_policy` has no `createdAt`.
   - `userId` isn't indexed on the three tenant tables (only needed if erasure ever switches to `userId`).
 - **Lifecycle:**
-  - The Prompt Model v2 DB-prep hook runs on every update of every installed module, guarded only by "`ai_guardrail_checks` exists". Add `AND NOT EXISTS ai_guardrails` or retire the hook, since no v1 host remains.
+  - The Prompt Model v2 DB-prep hook runs on every update of every installed module, guarded only by "`ai_guardrail_checks` exists". Add `AND NOT EXISTS ai_guardrails` or retire the hook, since no v1 host remains. *(Recorded here as a latent risk; verifying the fix showed it had already fired on the live host on 2026-09-21 — see [the incident](#incident--2026-09-21-an-update-emptied-live-operations-segments-disciplines-and-frameworks).)*
   - `module.registration.ts` has no `init()`, so the host reports ai-core as ungateable. This is a deliberate decision to record.
 - **Docs and upstream:**
   - CLAUDE.md's "Registries used" omits `componentRegistry`, `actionRegistry` and `moduleRegistry`.
@@ -297,6 +342,8 @@ Each golden case awaits a real model/retrieval call one after another, and each 
 No query hook sets `staleTime` or `refetchOnWindowFocus`, and Radix `TabsContent` unmounts inactive tabs, so every tab revisit remounts and background-refetches that tab's whole query set — including the effectively-immutable terms-options catalogue. **Fix:** set a sensible `staleTime` (30–60 s, longer for terms-options) and `refetchOnWindowFocus: false` on the reference-data reads; keep the volatile reads (usage, review-items, eval-results) fresh with a short `staleTime`. (Depends partly on the host app's root QueryClient defaults, which the module can't see — so set it per hook.)
 
 #### Operations editor re-renders the whole table per keystroke; list unpaginated
+
+**Status (checked at v1.60.0):** half done. The editor has been a full-page view since v1.23.0, and the operations list is not rendered while it is open, so a keystroke no longer reconciles the table. Only **pagination** of the list remains open. The record below is kept as found.
 
 **Severity:** Moderate (bites once operations grow — they carry a `userId`, so user-authored ops accumulate)
 **Where:** `pages/tabs/OperationsTab.tsx` (form state 780, table 944)
@@ -541,7 +588,7 @@ The 45 minor findings from the [Meta Audit](#meta-audit--august-2026-four-dimens
 
 **Backend correctness and hygiene**
 
-- **The controller reimplements three ledger reads inline.** `listUsage`, `listReviewItems` and `updateReviewItem` run raw `prisma` calls in the route handler while the corresponding `ledgerService` methods — the correct implementations, with clamping — go uncalled. That is business logic in a route handler, and it leaves three service methods dead.
+- ~~**The controller reimplements three ledger reads inline.**~~ **Fixed:** `listUsage` and `listReviewItems` delegate to `ledgerService` since v1.38.0; `updateReviewItem` was still inline until **v1.60.0**, which moved it into `ledgerService.updateReviewItem`. *(Was: `listUsage`, `listReviewItems` and `updateReviewItem` ran raw `prisma` calls in the route handler while the corresponding `ledgerService` methods — the correct implementations, with clamping — went uncalled.)*
 - **`deleteOperation` does not clean up `ai_eval_case` rows** whose `operationId` points at the deleted operation.
 - **Check-then-write races on natural keys.** `createModel` reads `ai_model` by the `(providerId, modelId)` unique pair then creates; the unique constraint saves correctness but the error surfaces as a raw constraint violation rather than the intended message.
 - **`updateModel` accepts a `providerId` change** (`modelUpdateSchema` is `modelCreateSchema.partial()`), which can move a model to a provider whose terms it was never assessed against.
@@ -560,9 +607,9 @@ The 45 minor findings from the [Meta Audit](#meta-audit--august-2026-four-dimens
 
 **Admin UI polish**
 
-- **Four hand-rolled primitive lookalikes**: a Badge-shaped `<span>` in the operations editor (with `Badge` imported in the same file), a card-shaped raw `<button>` in `ProviderCard`, hand-rolled empty states in `ContextTab` where `EmptyState` is available, and a raw unstyled native `<input type="file">` in `ConfigTab` amid otherwise-shadcn controls.
+- ~~**Four hand-rolled primitive lookalikes**~~ **Fixed in v1.60.0:** the Badge-shaped `<span>` in the operations editor is a `Badge` (with its remove button beside it, not inside it), the provider cards use the starter's settings-blocks `ProviderCard` inside a `ProviderGroup`, `ContextTab` uses `EmptyState`, and `ConfigTab`'s file picker is the shadcn `Input type="file"`. *(Was: a Badge-shaped `<span>`, a card-shaped raw `<button>` in `ProviderCard`, hand-rolled empty states in `ContextTab`, and a raw unstyled native `<input type="file">` in `ConfigTab`.)*
 - **Mutation errors are swallowed in two tabs** — `EvalsTab` renders only the client-side JSON parse error, and `UsageTab`'s Resolve/Dismiss buttons show nothing when the request fails.
-- **`markers` and `inputTypes` are excluded from the operations editor's loading and error gates**, so a failed request for either degrades the editor silently.
+- ~~**`markers` and `inputTypes` are excluded from the operations editor's loading and error gates**~~ **Fixed** — both are inside the gates, and **v1.60.0** added the prompt variables list, which had the same gap. *(Was: a failed request for either degraded the editor silently.)*
 - **The file-attach handlers register no `onerror` or `onabort` and perform no size or type check** before `readAsDataURL`.
 - **`ContextTab` can POST `modelId: ''`** when no enabled model exists, because `inertModelId` resolves to the empty string and `canSave` never checks it.
 - **`useRunOperation` does not invalidate `current-usage`**, though a run changes exactly the totals that query returns.
@@ -789,6 +836,10 @@ A lightweight loop over the eval harness that prunes disciplines which don't ear
 ## Completed
 
 Items that have been done.
+
+### v1.60.0 — Standards-audit fixes (September 2026)
+
+Every fix from the [v1.59.0 standards audit](#standards--architecture-audit--v1590-september-2026), all six batches. Flow-step handlers moved into `flowHandlerRegistry` on the starter's `BaseRegistry` (`registerFlowHandler` now takes `{ moduleId, order? }` — a pre-launch breaking change); model choices, the review-item status write and `getOperationInfo` moved into services, with the picker and the run sharing one model-choice rule; module registration surfaces real failures. Events fire exactly when something changed (guardrail attachments), five new `ai-core.flow-run.*` events, `capabilities-refreshed` carries `added`, and `review-item.updated` has one shape. Logs and the import report carry identifiers only; `minScore` and the eval-cases query are validated. The admin never shows a false "nothing" on a failed read, refreshes the right caches, names every form control, and uses the starter's shared blocks. Named constants, one JSON-schema converter (`providers/json-schema.ts`), shared helpers, dead code removed, the guardrail editor's rule logic in its own file. Additive schema: two retention-prune indexes and `ai_policy.createdAt`. Three adversarial review rounds of the fix diff caught seven more defects before ship, all fixed; the third round found nothing. See the [Changelog](/modules/ai-core/changelog/) and [Hooks & Events](/modules/ai-core/hooks-and-events/).
 
 ### v1.59.0 — The guardrail rule builder (September 2026)
 

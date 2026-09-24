@@ -1,7 +1,7 @@
 ---
 title: Changelog
 description: Version history and release notes for the AI Core module
-lastUpdated: 2026-09-08
+lastUpdated: 2026-09-25
 sidebar:
   order: 14
 ---
@@ -20,6 +20,58 @@ Check your installed version with `npx ai-core info`.
 </Aside>
 
 ---
+
+## v1.60.0 — 2026-09-25
+
+**Every fix from the v1.59.0 standards audit, all six batches.** The [audit](/modules/ai-core/roadmap/#standards--architecture-audit--v1590-september-2026) found places where the code bent the module's own rules: business logic in route handlers, events that fired when nothing had changed (or didn't fire when something had), admin screens that showed "nothing here" when a read had actually failed, and form controls a screen reader could not name. This release fixes all of it. Most of it you will not notice; the parts you might are the new flow-run events, clearer error messages in the admin, and one breaking change for anyone registering flow-step handlers.
+
+**Found while verifying this release — a live host lost records (cause fixed here).** The one-time Prompt Model v2 upgrade step (`onPrepareDatabase`) decided "this is a v1 database" from one fact: a table called `ai_guardrail_checks` exists. The live host app still had that table — a stale v1 model left outside ai-core's section of its `schema.prisma`, and a hand-written migration on 2026-09-04 that re-created the table to match. So its 2026-09-21 schema-changing update (v1.58.0) ran the v1 reset against a live v2 database: **operations, prompt segments, disciplines and the seeded prompt frameworks were emptied** (approaches, guardrails, contexts, models, flows, eval cases and the usage ledger were untouched; join rows still point at the lost ids). The step now requires both halves — the old table present **and** the v2 `ai_guardrails` table absent — so it can only ever act on a genuine v1 database; this was proven read-only against the affected database (old check: would reset; new check: does nothing). Earlier ai-core versions carry the old check, so run only v1.60.0 or later against a host that has an `ai_guardrail_checks` table. Recovery options for the lost records are on the [Roadmap](/modules/ai-core/roadmap/#incident--2026-09-21-an-update-emptied-live-operations-segments-disciplines-and-frameworks).
+
+**Breaking (pre-launch clean break):** `registerFlowHandler` now requires a third argument, `{ moduleId, order? }`. No consumer calls it yet. See [Hooks & Events → Flow-step handlers](/modules/ai-core/hooks-and-events/#flow-step-handlers).
+
+**Rule fixes**
+
+- **Flow-step handlers live in a real registry.** `registerFlowHandler(handlerId, fn, { moduleId, order? })` now registers into `flowHandlerRegistry` (`config/flow-handler.registry.ts`), built on the starter's `BaseRegistry` like every other registry, instead of a hand-rolled `Map`. Same behaviour — first registration wins, a duplicate warns — and every registration now names the module that owns it. The registry and its `FlowHandlerRegistration` type are exported from the feature barrel for inspection (`getAll()`).
+- **Business logic out of the route handlers.** The user model-choice list (`GET /operations/:id/model-choices`) moved into `recordsService.getModelChoices`, and it now uses the same eligibility rule as the run itself (one function in `resolver.ts`, so the picker cannot offer a model the run would refuse on the allow-list, enabled or user-selectable checks). Closing a review item moved into `ledgerService.updateReviewItem`. `getOperationInfo` moved from the service facade into `recordsService` (the facade is back to thin delegates). Responses, error texts and status codes are unchanged.
+- **Module registration no longer hides real failures.** `module.registration.ts` now matches the module-starter shape: only the optional import of the host's module registry is allowed to fail quietly (an older host has none); a genuine `register()` error — a bad `depends`, a duplicate id — now surfaces.
+
+**Honest events, logs and validation**
+
+- **Guardrail attachment events fire exactly when something changed.** Re-attaching an attached pair, or detaching one that was never attached, no longer fires `'attached'` / `'detached'`. `ensureGuardrail` now fires `'attached'` for each discipline it links the new guardrail to, and `ensureDiscipline` fires `ai-core.guardrail.updated` `'ensured'` only for guardrails it actually created (a reusable guardrail it merely found is attached, not announced).
+- **New `ai-core.flow-run.*` events** — `started`, `suspended`, `resumed`, `completed`, `failed` — each fired after the write it reports, carrying `{ userId, tenantId, flowRunId, flowId, status, stepIndex }` (plus `operationId` on `suspended`), never the flow's working state. A flow waiting on feedback can now tell someone instead of being polled. All five are declared audit events. See [Hooks & Events](/modules/ai-core/hooks-and-events/#flow-run-lifecycle-v1600).
+- **`capabilities-refreshed` now carries `added`** — the count of models the refresh created, beside `refreshed` and `stale`.
+- **`ai-core.review-item.updated` has one shape** — `{ userId, id, status, tenantId, operationId }` whether the item was just queued or later closed (the close used to leave out `tenantId` and `operationId`).
+- **Model listing no longer logs provider text.** A failed listing call logs the provider id and HTTP status only; the provider's error body is no longer read.
+- **The config import report no longer shows raw error text.** Messages written for admins (the module's own errors) still appear as before; any other failure now reads `unexpected error (…)` with its name and code only (for example a database error code), never the raw message.
+- **Two inputs are now validated.** `POST /retrieve` refuses a `minScore` outside 0–1 with a 400, as the admin form already did, and `GET /admin/eval-cases` validates its `operationId` query (a malformed one is a 400).
+- **The Prompt Model v2 upgrade step is guarded both ways** (see the incident above). Its reset now runs only on a genuine v1 database — `to_regclass('ai_guardrail_checks') IS NOT NULL AND to_regclass('ai_guardrails') IS NULL`, resolved through the same search path the reset uses — so a leftover v1 table next to a live database can never trigger it. Two smaller fixes in the same step: its "could not run" warning could never fire (it read the command result as a string), so it always claimed success; and the temporary script is now neutralised and deleted even if the step throws.
+
+**Admin screens**
+
+- **A failed read shows the error, never a false "nothing".** The operations editor now waits for, and reports a failure of, the prompt variables list (it used to say "No variables yet"). The Models tab no longer calls a policy it could not read "OFF … the safe default" or "Keep forever" — it says the state is unknown, and saving and pruning are disabled until it can be read; Purposes shows its load error. The guardrail editor reports when the models or input types failed to load, and when a refresh failed it keeps the last loaded list and says it may be out of date. Evals, Usage and Context show the server's reason instead of a fixed message, and Variables no longer claims "No field source is registered" when the check failed.
+- **Cache refresh fixes.** Deleting a tool refreshes the operations list (the editor used to keep the deleted tool, and the next save was refused); an eval run refreshes usage, review items and the usage totals; a prune also refreshes the usage totals; a config import refreshes every AI Core query.
+- **Accessibility.** Every form control now has an accessible name (about 35 had none) — including the Effort / Verbosity / Creativity / Look-up dial handles, named through a workaround until the starter's slider forwards a label. The two home-made segmented toggles report which option is selected; raw `<label>` elements became `Label`; option groups use `SelectGroup` + `SelectLabel`; standalone titles use `Heading` / `Text` instead of a `Label` with no control.
+- **Shared blocks instead of look-alikes.** `LoadingState`, `EmptyState` and `ErrorAlert` replace hand-written status text; panels and rule cards use `Card`; switch rows use the settings-blocks `Row`; the provider cards use the starter's `ProviderCard`; the config file picker is the shadcn `Input`; the usage totals use the dashboard stat-value slot; list headers put their button in `SectionHeader`'s action slot.
+- **Decorative utilities removed** — no `font-mono`, `underline`, `border-dashed` or hand-styled code chips left in the templates.
+
+**Tidy**
+
+- Bare limits became named constants (guardrail run budgets, `[UNCLEAR]` placeholder limits — named once for the server and engine, and mirrored by the same names in the editor — validation caps, the eval threshold, the policy row id).
+- **One JSON-schema converter.** The two copies (adapters and run engine) are now one, in the SDK-free `providers/json-schema.ts`; the provider SDK stays confined to `adapters.ts`. The one difference between the old copies — a field with an unknown type, now read as "accept anything" — cannot come from a normal save; only a hand-edited row or an SQL seed could hold one.
+- One `summariseError`, optional-service lookup, `apiErrorMessage` and client input-port key algorithm each, instead of copies, and the guardrail engine uses the rules module's `isRecord` instead of its own; `summariseError` now keeps a foreign error's code (such as a database error code). Dead code removed (two unused service methods, 20 unused validation types, file-internal exports). The guardrail editor's rule logic moved out of `GuardrailRulesEditor.tsx` into `guardrail-rules-state.ts`, so the component file exports only components.
+- Misplaced doc comments put back over what they describe; "tokeniser" spelling; example owner names are a neutral `my-app`.
+
+**Schema** (additive)
+
+- `ai_flow_run` and `ai_review_item` each gain `@@index([status, updatedAt])`, so the data-retention prune is an index read instead of a table scan.
+- `ai_policy` gains `createdAt`.
+- Schema comments no longer point at `ai_guardrail.disciplineId` (guardrails attach through `ai_discipline_guardrail`) or a non-existent `ai_operation.contextId`.
+
+**Upgrading:** run `npx ai-core update` **with** the schema step (not `--skip-schema`) — an additive migration adds the indexes and one column with a default. Update the backend and frontend together. If you call `registerFlowHandler`, add `{ moduleId: '<your-module-id>' }`. No config-version change.
+
+Built overnight by nine parallel implementers with disjoint file ownership, an integrator and a real host type-check (0 errors backend and frontend). Three adversarial review rounds of the fix diff (65 agents, three independent skeptics per finding) confirmed **7 more defects** before ship, all fixed. Round one found four: the picker and the run still spelled the model-choice rule out separately, the dial handles were unnamed, the guardrail editor called a list unknown when only a refresh had failed, and a remove button sat inside a `Badge`. Round two found three: the Variables field picker vanished when only a refresh failed, header buttons lost their gap, and the import report uppercased entity names. Round three found nothing.
+
+What was done differently from the audit, and what was deferred, is recorded on the [Roadmap](/modules/ai-core/roadmap/#standards--architecture-audit--v1590-september-2026).
 
 ## v1.59.0 — 2026-09-24
 

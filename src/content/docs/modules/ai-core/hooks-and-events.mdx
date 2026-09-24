@@ -1,7 +1,7 @@
 ---
 title: Hooks & Events
 description: The action hooks AI Core fires, and how a consumer subscribes and registers flow handlers
-lastUpdated: 2026-09-01
+lastUpdated: 2026-09-25
 sidebar:
   order: 7
 ---
@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
 After it is installed, AI Core talks back to consumers two ways, and they are not the same mechanism. It **fires action hooks** on the starter's `actionRegistry` that a consumer can **subscribe** to — reacting after the fact. And it accepts **flow-step handlers** a consumer **registers** — code that runs *as a step inside a flow*. Both are code, wired at import time; neither is a database record. That places this whole page on the *register* side of the module's founding distinction — see [Registering & Seeding](/modules/ai-core/registering-and-seeding/) for the line between behaviour that runs and data that persists.
 
-<Aside type="note" title="Current as of v1.52.0">
-The hooks and the handler registry described here ship in the module and type-check clean in a real app; the module's consumer surface is now exercised end-to-end against live providers. Since v1.23.0 every payload gained a `userId` naming the acting user (or `null` outside a request), record-CRUD hooks were added for the newer config tables (`policy`, `eval-case`, `input-type`, `marker`, `tool`, `prompt-variable`), and v1.51.0 gave guardrail-record writes their own `ai-core.guardrail.updated`. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+<Aside type="note" title="Current as of v1.60.0">
+The hooks and the handler registry described here ship in the module and type-check clean in a real app; the module's consumer surface is now exercised end-to-end against live providers. Since v1.23.0 every payload gained a `userId` naming the acting user (or `null` outside a request), record-CRUD hooks were added for the newer config tables (`policy`, `eval-case`, `input-type`, `marker`, `tool`, `prompt-variable`), and v1.51.0 gave guardrail-record writes their own `ai-core.guardrail.updated`. v1.60.0 added the five `ai-core.flow-run.*` lifecycle hooks, made the guardrail attachment events fire only on a real change, and moved flow-step handlers into a proper registry (`registerFlowHandler` now takes a third `{ moduleId }` argument). See the [Roadmap](/modules/ai-core/roadmap/) for status.
 </Aside>
 
 ---
@@ -30,7 +30,7 @@ Every payload also carries a **`userId`** (`string | null`) naming the acting us
 
 ## The event catalogue
 
-Two families: the **run lifecycle** hook, fired once per operation, retrieve or embed call, and the **record-CRUD** hooks, fired when an admin (or a consumer's `ensure*` call) writes a configuration record.
+Three families: the **run lifecycle** hook, fired once per operation, retrieve or embed call; the **flow-run lifecycle** hooks, fired as a flow run moves between statuses; and the **record-CRUD** hooks, fired when an admin (or a consumer's `ensure*` call) writes a configuration record.
 
 ### Run lifecycle
 
@@ -40,6 +40,22 @@ Two families: the **run lifecycle** hook, fired once per operation, retrieve or 
 
 `outcome` is one of `'ok'`, `'error'`, `'refused'` or `'abstained'`. `'abstained'` means the result was returned but flagged as not supported well enough: from a run, a guardrail held the answer back (a groundedness score below its cutoff, or a rule set to *hold the answer back* that failed); from a retrieve, the best match fell below the retrieval-abstention threshold. The payload carries no reason, so a subscriber that needs to tell them apart reads the ledger row's `feedback.reason` by `ledgerId`. It fires on the success path, the abstention path *and* the shared failure/refusal path — a refused or errored run is an outcome, not a disappearance, so it still emits. Embeds emit `'ok'` on success. The payload does **not** carry token counts; read those from `getCurrentUsage` (worked example below).
 
+### Flow-run lifecycle (v1.60.0)
+
+A [flow](/modules/ai-core/usage/#flows) run moves through persisted statuses — running, suspended (waiting on feedback), completed, failed. Each move fires a hook **after the `ai_flow_run` write that records it succeeds**, so a subscriber never hears of a status the row does not hold. The one to watch is `suspended`: it is the moment a person needs telling that a flow is waiting on them, which before v1.60.0 a consumer could only find out by polling.
+
+All five share one payload: `{ userId, tenantId, flowRunId, flowId, status, stepIndex }`, plus `operationId` on `suspended`. Identifiers and the status only — **never the flow's working state**, which is consumer memory and may carry user content. `stepIndex` is the value the run row holds after the write.
+
+| Hook | Fired when | `status` · `stepIndex` |
+|---|---|---|
+| `ai-core.flow-run.started` | `runFlow` has created the run row. | `'running'` · `0` |
+| `ai-core.flow-run.suspended` | An operation step with `waitOnFeedback` raised feedback, and the suspension (state, step references, the feedback) was persisted. Carries that step's `operationId`. | `'suspended'` · the step that suspended |
+| `ai-core.flow-run.resumed` | `resumeFlow` claimed the suspended run **and** saved the merged state. A resume that fails and is rolled back to `suspended` fires nothing. | `'running'` · still the step that suspended (work continues from the next one) |
+| `ai-core.flow-run.completed` | Every step ran and `completed` was persisted. | `'completed'` · the number of steps |
+| `ai-core.flow-run.failed` | A step threw and `failed` was persisted. If that write itself fails, nothing fires (the failure is logged instead). | `'failed'` · the step that failed |
+
+A resume that runs straight through to the end fires `resumed` then `completed`. `tenantId` is the run row's tenant; `userId` is `null` when the run was started or resumed outside a request. Each AI step inside a flow still fires its own `ai-core.run.completed` as well.
+
 ### Record CRUD
 
 Each fires fire-and-forget after the transaction commits. `action` names what happened to the record.
@@ -47,7 +63,7 @@ Each fires fire-and-forget after the transaction commits. `action` names what ha
 | Hook | Payload | `action` values |
 |---|---|---|
 | `ai-core.provider.updated` | `{ userId, id, action }` | `'updated'` |
-| `ai-core.model.updated` | `{ userId, id, action }`, or the refresh variant `{ userId, action: 'capabilities-refreshed', refreshed, stale }` (no `id`) | `'created'` · `'updated'` · `'deleted'` · `'capabilities-refreshed'` |
+| `ai-core.model.updated` | `{ userId, id, action }`, or the refresh variant `{ userId, action: 'capabilities-refreshed', refreshed, stale, added }` (no `id`; all three are counts — `added`, the models the refresh created, joined in v1.60.0) | `'created'` · `'updated'` · `'deleted'` · `'capabilities-refreshed'` |
 | `ai-core.purpose.updated` | `{ userId, id, action }` — `id` is the model-purpose id; also fires (with `action: 'updated'`) when a per-width embedding default is set or removed | `'created'` · `'updated'` · `'deleted'` |
 | `ai-core.framework.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
 | `ai-core.segment.updated` | `{ userId, key, version, action }` on write; `{ userId, key, action }` on delete — keyed by `key`, not `id` | `'upserted'` · `'ensured'` · `'deleted'` |
@@ -55,9 +71,9 @@ Each fires fire-and-forget after the transaction commits. `action` names what ha
 | `ai-core.operation.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
 | `ai-core.context.updated` | `{ userId, id, action }` — a context builder write or delete (v1.47.0) | `'upserted'` · `'deleted'` |
 | `ai-core.flow.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
-| `ai-core.discipline.updated` | `{ userId, entity, action, id }`. `entity` is `'discipline'` or `'guardrail-attachment'` (guardrail-record writes moved to `ai-core.guardrail.updated` in v1.51.0); an attach/detach carries the `disciplineId` it links, and a guardrail delete fires one `'detached'` per discipline it was attached to | discipline: `'created'` · `'updated'` · `'ensured'` · `'deleted'` — guardrail-attachment: `'attached'` · `'detached'` |
+| `ai-core.discipline.updated` | `{ userId, entity, action, id }`. `entity` is `'discipline'` or `'guardrail-attachment'` (guardrail-record writes moved to `ai-core.guardrail.updated` in v1.51.0); an attach/detach carries the `disciplineId` it links and fires only when a link was actually made or removed (v1.60.0); a guardrail delete fires one `'detached'` per discipline it was attached to, and `ensureGuardrail` one `'attached'` per discipline it newly attaches | discipline: `'created'` · `'updated'` · `'ensured'` · `'deleted'` — guardrail-attachment: `'attached'` · `'detached'` |
 | `ai-core.guardrail.updated` | `{ userId, entity: 'guardrail', action, id }` — writes to a standalone reusable guardrail's own record (v1.51.0; previously rode on `ai-core.discipline.updated`) | `'upserted'` · `'ensured'` · `'deleted'` |
-| `ai-core.review-item.updated` | `{ userId, id, status, tenantId, operationId }` from the ledger; the admin-route variant carries only `{ userId, id, status }` | the item's `status`, e.g. `'open'` |
+| `ai-core.review-item.updated` | `{ userId, id, status, tenantId, operationId }` — the same shape whether the item was just added to the queue or later resolved or dismissed (since v1.60.0; the close used to carry only `{ userId, id, status }`) | the item's `status`: `'open'` when added · `'resolved'` · `'dismissed'` |
 | `ai-core.policy.updated` | `{ userId, allowUnrecordedTerms, ledgerKeepDays, reviewKeepDays, flowRunKeepDays, evalKeepRuns, action }` — the whole policy row after the write (no `id`; it is the single `app` row). The four retention windows joined the payload in v1.52.0 — setting one authorises deletion from an audit trail, so the audit sink sees who changed it | `'updated'` |
 | `ai-core.maintenance.pruned` | `{ userId, ledgerDeleted, reviewItemsDeleted, flowRunsDeleted, evalResultsDeleted, skipped }` — one summary event per retention prune (v1.52.0); `skipped` names the tables that had no keep window configured | *(no `action` field — the event is the action)* |
 | `ai-core.eval-case.updated` | `{ userId, id, action }` | `'upserted'` · `'deleted'` |
@@ -68,6 +84,8 @@ Each fires fire-and-forget after the transaction commits. `action` names what ha
 
 <Aside type="caution" title="Guardrail events split across two hooks (v1.51.0)">
 A guardrail-record write (upsert / ensure / delete) fires **`ai-core.guardrail.updated`** — a guardrail has been standalone and reusable since v1.48.0, so its record is its own audit subject. The discipline↔guardrail **link** stays on `ai-core.discipline.updated` as `entity: 'guardrail-attachment'` with `action: 'attached' | 'detached'` and the `disciplineId` it links, because the discipline's effective guardrail set is what changed there — and deleting a guardrail fires one `'detached'` per discipline it was attached to, alongside its own `'deleted'`. **Migrating a pre-v1.51.0 subscriber:** code that subscribed to `ai-core.discipline.updated` and branched on `entity === 'guardrail'` (this page's old advice) must move that branch to `ai-core.guardrail.updated`.
+
+**Since v1.60.0 these events fire only when something changed.** Re-attaching a pair that is already attached, or detaching one that never was, fires nothing. `ensureGuardrail` now also fires `'attached'` for each discipline it links the new guardrail to (it used to fire only its own `'ensured'`), and `ensureDiscipline` fires `ai-core.guardrail.updated` `'ensured'` only for the guardrails it actually created — a reusable guardrail another seed already made is attached, not announced.
 </Aside>
 
 The `'ensured'` action on `ai-core.segment.updated` is what a consumer's `ensureSegment` seed emits on first run — the same hook the admin's own edit fires. Its mechanics live in [Registering & Seeding](/modules/ai-core/registering-and-seeding/).
@@ -138,13 +156,23 @@ A [flow](/modules/ai-core/usage/#flows) is operations in order, and it contains 
 import { serviceRegistry } from '@/config/service.registry';
 
 const aiCore = serviceRegistry.getOptional('ai-core');
-aiCore?.registerFlowHandler('my-feature/dedupe-conversations', async (state, previous) => {
-  // ... do non-AI work, return the flow's next working memory
-  return { ...state, deduped: true };
-});
+aiCore?.registerFlowHandler(
+  'my-feature/dedupe-conversations',
+  async (state, previous) => {
+    // ... do non-AI work, return the flow's next working memory
+    return { ...state, deduped: true };
+  },
+  { moduleId: 'my-feature' }, // required since v1.60.0; order? is optional
+);
 ```
 
-`registerFlowHandler(handlerId, fn)` writes into an **in-memory Map at import time**, and **first registration wins** — a duplicate `handlerId` warns and is ignored, matching the starter's registry convention. This is registering, not seeding: nothing persists, and no admin edits it. The *flow* that references the handler by id is the record that persists — configured, not coded (see [Configuration](/modules/ai-core/configuration/)).
+`registerFlowHandler(handlerId, fn, { moduleId, order? })` registers the handler into **`flowHandlerRegistry`**, a registry built on the starter's `BaseRegistry` (`config/flow-handler.registry.ts`) like every other registry. The usual registry rules apply: **first registration wins** — a duplicate `handlerId` warns and is ignored; `moduleId` is **required** and names the module that owns the handler (who to ask when it misbehaves); `order` is optional, on the starter's 0–100 scale, and only affects the order of the registry's `getAll()` listing — a flow always finds its handler by id. The registry itself is exported from the AI Core feature barrel for inspection (for example, `flowHandlerRegistry.getAll()` to list which module registered which step).
+
+This is registering, not seeding: it happens at import time, nothing persists, and no admin edits it. The *flow* that references the handler by id is the record that persists — configured, not coded (see [Configuration](/modules/ai-core/configuration/)).
+
+<Aside type="caution" title="Breaking in v1.60.0 — the third argument is required">
+Before v1.60.0, `registerFlowHandler` took two arguments and wrote into a plain in-memory `Map`. It now requires `{ moduleId }` as a third argument, so a two-argument call no longer type-checks. This is a pre-launch clean break: no consumer called it yet. Add `{ moduleId: '<your-module-id>' }` to each call.
+</Aside>
 
 The handler signature is:
 
