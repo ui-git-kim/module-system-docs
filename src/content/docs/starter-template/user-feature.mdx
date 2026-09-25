@@ -75,10 +75,11 @@ frontend/src/features/user/
 │   ├── SecurityPage.tsx            # Password, 2FA
 │   ├── PreferencesPage.tsx         # Theme, notifications
 │   ├── IntegrationsPage.tsx        # Third-party services
-│   ├── BillingPage.tsx             # Subscription (placeholder)
+│   ├── BillingPage.tsx             # Subscription (placeholder, development builds only)
 │   └── DataPrivacyPage.tsx         # GDPR exports/deletion
 └── components/
     ├── SettingsLayout.tsx          # Settings sidebar layout
+    ├── AccountDeletionGate.tsx     # "Finish deleting your account" screen
     ├── UserAvatar.tsx              # Avatar component
     └── settings/
         ├── avatar-colors.ts        # Avatar presets + contrast/default helpers
@@ -89,8 +90,11 @@ backend/src/features/user/
 ├── user.types.ts                   # Types and Zod schemas
 ├── user.service.ts                 # Business logic
 ├── user.routes.ts                  # API endpoints
+├── account-deletion.ts             # Pending-deletion lock + retry
 ├── route.registration.ts           # Route registry
-└── service.registration.ts         # Service registry
+├── service.registration.ts         # Service registry
+├── security.registration.ts        # Deletion + export handlers
+└── jobs.registration.ts            # user.deletionRetry job
 ```
 
 ---
@@ -148,6 +152,8 @@ await updateProfile({
   bio: 'About me...',
 });
 ```
+
+If a save fails, `updateProfile` (and `updatePreferences`) throw an `Error` whose message is the server's reason, ready to show (built with [`getApiErrorMessage`](/starter-template/data-fetching/#showing-api-errors)).
 
 ---
 
@@ -235,6 +241,18 @@ await updatePreferences({
   Preferences use shallow merge - only the fields you specify are updated.
 </Aside>
 
+**Size limits (v2.13.0).** Module preferences can use any key name, so the server caps them. It rejects an update with a **400** when:
+
+- a module value is more than 4 KB once saved as JSON, or a key name is longer than 100 characters;
+- one update changes more than 100 keys;
+- the merged preferences would grow past 200 keys or 64 KB in total.
+
+An update that shrinks preferences that are already too big is still accepted, so they can always be repaired. The limits live in `backend/src/features/user/user.types.ts`.
+
+<Aside type="note" title="Device tokens can't turn off security alerts">
+  A [device token](/starter-template/device-tokens/#non-admin-web-session-only) can update ordinary preferences, but not `emailSecurityAlerts`. Changing it needs a web session (**403** `code: 'web_session_required'`), so a stolen token can't silence the owner's alerts.
+</Aside>
+
 ---
 
 ## Settings Pages
@@ -247,8 +265,10 @@ await updatePreferences({
 | Security | `/settings/security` | Password, 2FA, sessions | 20 |
 | Preferences | `/settings/preferences` | Theme, notifications | 30 |
 | Integrations | `/settings/integrations` | Third-party services | 40 |
-| Billing | `/settings/billing` | Subscription (placeholder) | 50 |
+| Billing | `/settings/billing` | Subscription (placeholder, development builds only) | 50 |
 | Data & Privacy | `/settings/data` | Export, deletion | 90 |
+
+The Billing placeholder shows a made-up plan with nothing behind it, so since v2.13.0 it is registered in development builds only. Production shows a Billing page only when a billing module registers one (`id: 'billing'`, `isReplacement: true`).
 
 Custom pages slot into the sidebar by their registered `order` — e.g. the `order: 60` page in the example below lands between Billing (50) and Data & Privacy (90).
 
@@ -549,6 +569,8 @@ async function handleExport() {
 
 Rate limit: One export per hour.
 
+The download holds the profile and preferences, plus a `data` section from every export handler that features and modules register (notifications, linked devices, the `Space`, audit rows, and your modules' own data). If a handler fails, the export is still delivered and marked incomplete. See [Personal-data export](/starter-template/security-feature/#personal-data-export).
+
 ### Account Deletion
 
 Users can delete their account from Data & Privacy settings:
@@ -564,6 +586,10 @@ async function handleDelete() {
 }
 ```
 
+At the hardened and strict security tiers, deleting the account first asks for a code emailed to the user. The API client opens the **Confirm it's you** dialog and retries the request by itself, so the page needs no extra code. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
+
+If the deletion doesn't fully finish, the account is locked as "pending deletion" and retried in the background. The API answers **503** `code: 'account_deletion_incomplete'`, and while the lock holds, `useUserProfile()` reports `deletionPending: true` and `AccountDeletionGate` shows a "finish deleting your account" screen instead of the app. See [When a deletion doesn't finish](/starter-template/security-feature/#when-a-deletion-doesnt-finish).
+
 <Aside type="caution">
   Account deletion is permanent and cannot be undone. All user data is removed.
 </Aside>
@@ -577,10 +603,12 @@ async function handleDelete() {
 | `/api/v1/user` | GET | Get current user profile |
 | `/api/v1/user` | PATCH | Update profile (name, bio, avatarUrl) |
 | `/api/v1/user/preferences` | PATCH | Update preferences |
-| `/api/v1/user/export` | POST | Request data export |
-| `/api/v1/user` | DELETE | Delete account |
+| `/api/v1/user/export` | POST | Request data export (web session only) |
+| `/api/v1/user` | DELETE | Delete account (web session + step-up code) |
 
-The `DELETE` handler responds with `{ success, message, auditId }` and runs the provider-delegated deletion cascade (see `features/security`), passing the request IP and User-Agent for audit logging. The frontend `deleteAccount()` ignores the body and returns `void`.
+The `DELETE` handler responds with `{ success, message, auditId }` and runs the provider-delegated deletion cascade (see `features/security`), passing the request IP and User-Agent for audit logging. The frontend `deleteAccount()` ignores the body and returns `void`. If the cascade doesn't complete, it answers **503** `code: 'account_deletion_incomplete'` instead, and the account stays locked until a retry finishes it.
+
+Since v2.13.0, `POST /export` and `DELETE` use `requireWebSession`: a device token gets **403** `code: 'web_session_required'`. `DELETE` also uses `requireStepUp`: at the hardened and strict tiers it answers **403** `code: 'step_up_required'` until the user enters the emailed code (the frontend handles this for you). While an account is pending deletion, `GET /api/v1/user` and the other profile endpoints answer **403** `code: 'account_deletion_pending'`.
 
 ---
 
@@ -776,13 +804,13 @@ languageOptionsRegistry.register({
 ### Avatar Not Updating
 
 1. Verify `avatarUrl` is being saved correctly
-2. Check for base64 size limits
+2. Check the size limit: `avatarUrl` is capped at 512 KB (the client shrinks images to 256px before upload)
 3. Ensure `UserAvatar` is receiving correct props
 
 ### Preferences Lost
 
 1. Preferences use shallow merge - don't overwrite entire object
-2. Check Zod validation isn't rejecting unknown fields
+2. Check the update isn't rejected by the [size limits](#user-preferences) (a 400 with the reason)
 3. Verify backend returns updated preferences
 
 ---

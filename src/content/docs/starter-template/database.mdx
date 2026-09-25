@@ -245,7 +245,7 @@ npx prisma studio
 
 ### Core Models
 
-The template includes eight core models. The three foundational ones — `User`, `AppSettings`, and `Space` — are shown below; the template also ships **`Notification`** (the in-app notification transport), **`InstalledModule`** (the module system's install-state table), **`EmailConfig`** (the admin email-provider singleton), and (v2.8.0) **`AuthDevice`** + **`AuthDeviceEnrolment`** (the [device-token](/starter-template/device-tokens/) auth tables — per-tenant, storing only token hashes):
+The template includes nine core models. The three foundational ones — `User`, `AppSettings`, and `Space` — are shown below; the template also ships **`Notification`** (the in-app notification transport), **`InstalledModule`** (the module system's install-state table), **`EmailConfig`** (the admin email-provider singleton), (v2.8.0) **`AuthDevice`** + **`AuthDeviceEnrolment`** (the [device-token](/starter-template/device-tokens/) auth tables — per-tenant, storing only token hashes), and (v2.13.0) **`AuthDeviceRetiredToken`** (see [below](#authdeviceretiredtoken-refresh-token-reuse-detection)):
 
 ```prisma
 // User - integrates with Neon Auth
@@ -298,6 +298,27 @@ model Space {
 ```
 
 `Space` is the user's account boundary — their **[space](/getting-started/product-model/)** — auto-provisioned 1:1 with the user in `getOrCreateProfile` (`Space.id === User.id === tenantId` in solo mode). It holds only foundation-owned lifecycle state; provider billing data (Stripe customer id, plan) lives in the billing module, keyed on `tenantId`. See [User-data isolation](#user-data-isolation-neon-rls).
+
+Since v2.13.0, `deletionState: 'pending_deletion'` means an account deletion has started but not finished. The `Space` is marked **before** anything is deleted and kept until the whole deletion completes, so a sign-in halfway through can't re-create the account. `getOrCreateProfile` refuses such an account with **403** `account_deletion_pending`. See [When a deletion doesn't finish](/starter-template/security-feature/#when-a-deletion-doesnt-finish).
+
+### AuthDeviceRetiredToken (refresh-token reuse detection)
+
+Added in v2.13.0. Every refresh token a device has rotated away from is kept here, as a hash. If any of them is presented again more than 30 seconds after it was rotated out, someone copied the token, so the device is revoked. (A replay inside those 30 seconds is only rejected, which covers a client retrying a lost response.) See [Device tokens](/starter-template/device-tokens/#token-model).
+
+```prisma
+model AuthDeviceRetiredToken {
+  tokenHash String   @id              // SHA-256 of a rotated-out refresh token
+  deviceId  String                    // the AuthDevice it belonged to (no FK)
+  tenantId  String                    // isolation key (== userId in solo mode)
+  rotatedAt DateTime @default(now())  // when it was rotated out
+
+  @@index([deviceId])
+  @@index([tenantId])
+  @@index([rotatedAt])
+}
+```
+
+Rows are pruned once the token could no longer have been valid (the refresh-token lifetime after rotation). Like the other device tables, it has no foreign key to `User` and stores only token hashes. `template:update` adds the model and commits the migration for you.
 
 ## Module Database Guidelines
 

@@ -65,22 +65,37 @@ frontend/src/features/auth/
 ├── routes.config.tsx             # Auth routes (/auth/:pathname)
 ├── lib/
 │   ├── client.ts                 # Neon Auth client instance
-│   └── getAuthToken.ts           # Token retrieval for API calls
+│   ├── getAuthToken.ts           # Token retrieval for API calls
+│   └── sign-out.ts               # signOutAndClear()
 ├── hooks/
 │   └── useSession.ts             # Session hook + TypeScript types
 ├── components/
 │   ├── AuthProtectedRoute.tsx    # Route guard component
-│   └── AuthBackground.tsx        # Decorative auth-page background
+│   ├── AuthBackground.tsx        # Decorative auth-page background
+│   └── StepUpHost.tsx            # "Confirm it's you" code dialog (v2.13.0)
+├── services/
+│   ├── devices.service.ts        # Device-token API (Linked devices)
+│   └── step-up.service.ts        # Step-up start/verify API (v2.13.0)
 └── pages/
     ├── AuthPage.tsx              # Thin router — switches on pathname
     ├── SignInPage.tsx            # Email + password + Google OAuth
     ├── SignUpPage.tsx            # Name + email + password + Google OAuth
     ├── ForgotPasswordPage.tsx    # Request password-reset email
-    └── ResetPasswordPage.tsx     # Submit new password with token
+    ├── ResetPasswordPage.tsx     # Submit new password with token
+    └── LinkedDevicesPage.tsx     # Linked devices settings page
+
+frontend/src/lib/
+└── step-up.ts                    # Step-up grant store + API-client bridge (v2.13.0)
 
 backend/src/middleware/
-└── auth.middleware.ts            # JWT verification + role checks
+├── auth.middleware.ts            # JWT + device-token verification, role checks, requireWebSession
+└── step-up.middleware.ts         # requireStepUp (v2.13.0)
+
+backend/src/features/auth/
+└── step-up.routes.ts             # POST /api/v1/auth/step-up/start + /verify (v2.13.0)
 ```
+
+Not shown: the rest of the device-token files (`devices.types.ts`, `hooks/useDevices.ts`, `settings-pages.registration.ts`, and the backend `devices.*` and `*.registration.ts` files). They are covered on the [Device Tokens](/starter-template/device-tokens/) page.
 
 Added in v1.23.0: the five `*Page.tsx` files under `pages/` and `AuthBackground.tsx`. Before v1.23.0, `AuthPage.tsx` rendered Neon's pre-built `<AuthView>` component and `AccountSettings.tsx` wrapped Neon's `<AccountView>`. See the [v1.23.0 changelog](/starter-template/changelog/#v1230) for the rewrite rationale.
 
@@ -141,6 +156,7 @@ All protected routes are wrapped with `AuthProtectedRoute` in `routes.tsx`:
 
 ```tsx
 // frontend/src/routes.tsx
+import { RouteErrorFallback } from '@/components/RouteErrorFallback';
 import { AuthProtectedRoute, authRoutes } from '@/features/auth';
 import { DashboardPage, dashboardRoutes } from '@/features/dashboard';
 
@@ -155,6 +171,9 @@ export const router = createBrowserRouter([
         <DashboardPage />
       </AuthProtectedRoute>
     ),
+    // A render error shows a "Something went wrong" page with a Reload
+    // button, not React Router's stack trace (v2.13.0)
+    errorElement: <RouteErrorFallback />,
     children: [
       ...dashboardRoutes,
       ...userRoutes,
@@ -271,10 +290,14 @@ The `api.ts` client is the bridge between frontend and backend. Understanding it
 // frontend/src/lib/api.ts
 import axios from 'axios';
 import { appConfig } from '@/config/app.config';
+import {
+  getStepUpGrant, clearStepUpGrant, isStepUpRequired, requestStepUp, STEP_UP_GRANT_HEADER,
+} from '@/lib/step-up';
 
 // Pre-configured Axios instance
 export const api = axios.create({
   baseURL: appConfig.apiUrl,
+  timeout: 30000,
   headers: { 'Content-Type': 'application/json' },
 });
 
@@ -287,20 +310,49 @@ api.interceptors.request.use(async (config) => {
     config.headers.Authorization = `Bearer ${token}`;
   }
 
+  // A live step-up grant rides along (v2.13.0)
+  const grant = getStepUpGrant();
+  if (grant) {
+    config.headers[STEP_UP_GRANT_HEADER] = grant;
+  }
+
   return config;
 });
 
-// Response interceptor: logs 401 errors
+// Response interceptor: logs 401 errors, handles step-up
 api.interceptors.response.use(
   (response) => response,
-  (error) => {
+  async (error) => {
     if (error.response?.status === 401) {
       console.warn('API request unauthorized:', error.config?.url);
     }
+
+    // 403 step_up_required: ask for the emailed code, then retry once
+    const config = error.config;
+    if (config && isStepUpRequired(error) && !config._stepUpRetried) {
+      clearStepUpGrant();
+      if (await requestStepUp()) {
+        config._stepUpRetried = true;
+        return api.request(config);
+      }
+    }
+
     return Promise.reject(error);
   }
 );
 ```
+
+### Step-up: the "Confirm it's you" dialog
+
+Some actions are guarded by a fresh emailed code at the hardened and strict tiers: deleting your account, and the admin's role changes, user removal, security settings and (once email works) email settings. The server answers those with **403** `code: 'step_up_required'` until the code is entered. Added in v2.13.0.
+
+The API client handles this for every page:
+
+1. It calls `requestStepUp()` from `@/lib/step-up`, which asks the mounted **`<StepUpHost>`** to open the dialog. `DashboardPage` mounts it once, so every page inside the app shell has it (bare routes outside the shell don't).
+2. The dialog emails the code (`POST /api/v1/auth/step-up/start`), the user enters it, and `POST /api/v1/auth/step-up/verify` returns a **grant**, a pass valid for 5 minutes.
+3. The client retries the original request once, with the grant in the `X-Step-Up-Grant` header. Later guarded requests in those 5 minutes go straight through.
+
+If the user cancels, the caller sees the original 403. If `<StepUpHost>` isn't mounted, guarded requests just fail with their 403. The grant is kept in memory only (never in browser storage) and `signOutAndClear()` forgets it. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions) for the server side, the limits, and how to guard your own routes.
 
 ### How Modules Use the API Client
 
@@ -537,6 +589,8 @@ A device token is deliberately **lower-trust** than a web session:
 
 - It is **never** admin. `requireAdmin` / `requireRole` / `attachRole` refuse to elevate a `authMethod: 'device'` principal, even if the owner is an admin in the database.
 - The device-**management** endpoints (`pair` / list / revoke) require an interactive web session (`requireWebSession`), so a leaked device token cannot enrol further devices or revoke the owner's other devices.
+- Since v2.13.0, **account-wide actions** need a web session too: deleting the account, the full personal-data export, and turning off security-alert emails. A device token gets **403** `code: 'web_session_required'` ([details](/starter-template/device-tokens/#non-admin-web-session-only)).
+- A device token can never pass a [step-up](#step-up-the-confirm-its-you-dialog) check: `requireStepUp` always refuses it.
 
 <Aside type="note">
   Full detail — the enrolment flow, endpoints, token model, security properties, and the "Linked devices" settings page — is on the dedicated [Device Tokens](/starter-template/device-tokens/) page.
@@ -875,15 +929,21 @@ import {
   ConflictError,        // 409
   TooManyRequestsError, // 429
   InternalError,        // 500
+  ServiceUnavailableError, // 503
 } from '../../lib/errors.js';
 
 // Throw in services or route handlers:
 throw new NotFoundError('Subscription not found');
 throw new ForbiddenError('Only plan owners can cancel');
 throw new TooManyRequestsError('Too many requests', 60); // 60s retry-after
+
+// Optional machine-readable code (v2.13.0), sent to the client as `code`
+throw new ForbiddenError('Upgrade to use exports', 'plan_upgrade_required');
 ```
 
-The global error handler in `error.middleware.ts` catches these and returns the appropriate HTTP response. Stack traces are only included in development mode.
+The global error handler in `error.middleware.ts` catches these and returns the appropriate HTTP response, `{ error, code? }`. Stack traces are only included in development mode.
+
+`AppError`, `UnauthorizedError`, `ForbiddenError` and `ServiceUnavailableError` accept a `code` as their last argument. The client can then react to the reason without parsing the message. Codes the template sends include `step_up_required`, `web_session_required`, `account_deletion_pending` and `account_deletion_incomplete`.
 
 ---
 
@@ -962,6 +1022,8 @@ async getOrCreateProfile(userId: string, email: string) {
 <Aside type="note">
   The first user to sign up automatically becomes an admin. All subsequent users get the `user` role.
 </Aside>
+
+Since v2.13.0, `getOrCreateProfile` first checks whether the account has a deletion that didn't finish. If it does, it refuses with **403** `code: 'account_deletion_pending'` rather than re-creating the profile, so a sign-in mid-deletion can't bring the account back. See [When a deletion doesn't finish](/starter-template/security-feature/#when-a-deletion-doesnt-finish).
 
 ---
 
@@ -1206,13 +1268,13 @@ A module that wants a different look can register CSS through the `styleRegistry
 
 ## Sign Out
 
-Use `signOutAndClear()` — it calls `authClient.signOut()`, then clears the TanStack Query cache in a `finally`. That frees the previous account's cached profile (including a base64 avatar), notifications, and settings immediately, and closes a same-tab privacy gap where the old data would otherwise linger (until `gcTime`) and be briefly readable after a user switch. The starter wires it into `NavUser` and the `DataPrivacyPage`. Callers own any navigation afterwards.
+Use `signOutAndClear()` — it calls `authClient.signOut()`, then clears the TanStack Query cache in a `finally`. That frees the previous account's cached profile (including a base64 avatar), notifications, and settings immediately, and closes a same-tab privacy gap where the old data would otherwise linger (until `gcTime`) and be briefly readable after a user switch. Since v2.13.0 it also forgets any [step-up](#step-up-the-confirm-its-you-dialog) grant, so it can't carry over to the next account. The starter wires it into `NavUser`, the `DataPrivacyPage` and the `AccountDeletionGate` screen. Callers own any navigation afterwards.
 
 ```tsx
 import { signOutAndClear } from '@/features/auth';
 
 async function handleSignOut() {
-  await signOutAndClear();       // signOut() + queryClient.clear()
+  await signOutAndClear();       // signOut() + queryClient.clear() + clearStepUpGrant()
   window.location.href = '/auth/sign-in';
 }
 ```
@@ -1294,7 +1356,8 @@ The provider-delegated hardening, in order of impact:
 1. **Prevent XSS — the root cause.** Set a strict **Content-Security-Policy on the frontend HTML at the edge / hosting layer (Cloudflare)** — this is the CSP that matters, because the SPA document is what executes scripts. Keep React's auto-escaping (never `dangerouslySetInnerHTML` on untrusted input). Cloudflare WAF + bot management reduce the surface that delivers XSS. *(The backend API also sets a locked-down `default-src 'none'` CSP via helmet, but that only hardens the JSON API — it is not the XSS defence for the app.)*
 2. **Rely on Neon Auth's short-lived + auto-refreshing tokens.** The theft window is minutes; never extend token lifetime. Token refresh is the provider's job — don't reimplement it.
 3. **Use Neon Auth's own cookie/session mode where the deployment topology allows it** (e.g. same-origin app + API, or Neon's server SDK) — *Neon's* httpOnly cookie handling, not a cookie system you build.
-4. **MFA + step-up via Neon Auth, by tier.** MFA is available at `standard`, enforced for admins at `hardened`, mandatory at `strict`; step-up re-auth for sensitive actions at `hardened+`. All configured on the Neon side, surfaced by `securityProfile` — see the [Security feature](/starter-template/security-feature/).
+4. **MFA via Neon Auth, by tier.** MFA is available at `standard`, enforced for admins at `hardened`, mandatory at `strict`. It is configured on the Neon side and surfaced by `securityProfile` — see the [Security feature](/starter-template/security-feature/).
+5. **Step-up for sensitive actions at `hardened+` (built into the starter).** The Neon Auth token can't say how recently the person signed in, so since v2.13.0 the starter asks for a code emailed to the signed-in address before the most sensitive actions (see [Step-up](#step-up-the-confirm-its-you-dialog)). It needs a working email provider in production.
 
 <Aside type="note" title="What the starter deliberately does NOT do">
 No bespoke session table, no app-issued auth cookies, no hand-rolled CSRF, no custom token storage. An earlier draft started a custom cookie/session/CSRF layer; it was **reverted** as DIY security. We delegate to Neon Auth and harden the edges. See the [security roadmap](/starter-template/roadmap/#security-floor-v200).
@@ -1370,6 +1433,8 @@ Neon Auth is still marked **beta** on Neon's side. Watch the changelog on [https
 | Add role-specific routes | `routeRegistry.register({ ..., middleware: [requireRole('editor')] })` |
 | Register public routes (no auth) | `routeRegistry.registerPublic({ path, method, handler })` |
 | Check role in a handler | Use `attachRole` middleware, then check `req.user?.role` |
+| Refuse device tokens on an account-wide action | `requireWebSession` from `auth.middleware.js` |
+| Ask for an emailed code before a sensitive action | `requireStepUp` from `step-up.middleware.js` (after the auth/admin check) |
 | Access another feature's service | `serviceRegistry.get('user')` |
 | Validate request body | `validate(MyZodSchema)` middleware |
 

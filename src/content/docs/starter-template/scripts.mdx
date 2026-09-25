@@ -23,7 +23,9 @@ The starter template includes shell scripts for creating new apps and keeping th
 | `npm run release:{patch,minor,major}` | Bump the **app's** version (not the template's) in apps cloned from this starter | [Version Tracking](#app-version) |
 | `npm run security:setup-kms` | Interactive AWS KMS field-encryption setup (prompts for KMS/IAM values, generates the wrapped data key, writes to `backend/.env`) | [Field encryption with AWS KMS](/getting-started/aws-kms-setup/) |
 | `npm run ensure-pgvector` | Declare pgvector in the Prisma generator/datasource — non-interactive, idempotent, **declaration only** | [Ensure pgvector](#ensure-pgvector) |
-| `node scripts/audit-gate.mjs` | Allowlist-aware `npm audit` gate for CI — splits known (Neon/better-auth chain) vs new advisories; warn-only unless `AUDIT_GATE_ENFORCE=true` | [Audit gate](#audit-gate) |
+| `npm run install:all` | Install the foundation packages in root, frontend and backend, then `prisma generate` (runs the template-owned `scripts/install-all.mjs`) | [Foundation install list](#foundation-install-list) |
+| `node scripts/shadcn-baseline.mjs` | List, check or install the template's baseline shadcn components (the one list in `scripts/shadcn-baseline.json`) | [shadcn baseline](#shadcn-baseline) |
+| `node scripts/audit-gate.mjs` | Allowlist-aware `npm audit` gate for CI — splits known (allowlisted) vs new advisories; warn-only unless `AUDIT_GATE_ENFORCE=true` | [Audit gate](#audit-gate) |
 
 ---
 
@@ -66,19 +68,20 @@ Creates a new app from the template, preserving git history for future updates.
 2. **Clones the template:**
    - Preserves full git history (enables updates)
    - Removes `origin` remote (local-only by default)
-   - Removes template-only files and docs submodule
+   - Adds the `template-upstream` remote as **pull-only** (push disabled, so your app can't be pushed into the template)
+   - Removes template-only files, the template's `.claude/` folder and the docs submodule
 
-3. **Installs dependencies:**
+3. **Installs dependencies** with `scripts/install-all.mjs` (the same list `npm run install:all` uses):
    - Root dependencies (concurrently)
    - Frontend dependencies (React, Vite, Tailwind, etc.)
    - Backend dependencies (Express, Prisma, etc.)
 
 4. **Initialises shadcn/ui:**
    - Runs `shadcn init`
-   - Adds required components (sidebar, dropdown-menu, etc.)
+   - Adds the baseline components listed in [`scripts/shadcn-baseline.json`](#shadcn-baseline)
 
 5. **Configures environment:**
-   - Creates `.env` files for frontend and backend
+   - Creates `.env` files for frontend and backend. On macOS/Linux they are owner-only (`0600`), because they hold secrets
    - Sets database adapter to `neon`
 
 6. **Sets up database:**
@@ -174,17 +177,18 @@ If the update touches any `componentsJson` contributions (module-starter changes
 1. **Checks prerequisites:**
    - Git installed
    - In a git repository
-   - Working directory is clean
+   - Working directory is clean (a preview only warns, because it changes nothing)
 
 2. **Sets up template remote:**
    - Adds `template-upstream` remote (if not exists)
-   - Configures as pull-only (push disabled)
+   - Configures as pull-only (push disabled) — on every run, so older apps get it too
 
 3. **Fetches updates:**
    - Fetches from `template-upstream/main`
 
 4. **Self-updates:**
    - If the update script itself changed, it updates and re-runs
+   - A preview (`template:check`) runs the new script from a temporary copy instead, so your checkout is never touched
 
 5. **Shows available changes:**
    - Lists commits that will be merged
@@ -201,10 +205,13 @@ If the update touches any `componentsJson` contributions (module-starter changes
 
 8. **Post-merge tasks:**
    - Checks for new schema models
-   - Auto-adds missing models (e.g., AppSettings)
-   - Preserves `npm link` symlinks across `install:all` (snapshot + restore)
+   - Auto-adds missing models (e.g., AppSettings, AuthDeviceRetiredToken)
+   - Adds new template fields and indexes to models you already have (`scripts/sync-schema-fields.mjs`)
+   - Runs the template-owned `scripts/install-all.mjs`, preserving `npm link` symlinks (snapshot + restore)
    - Reconciles foundation npm scripts into your `package.json` (so new `deps:*` aliases reach older apps)
    - Reconciles foundation env keys into your `.env` files (appends missing security knobs; never overwrites)
+   - Installs any missing baseline shadcn components
+   - Commits the schema, the generated migration and any newly installed shadcn components together, in one commit
    - Provides next steps
 
 ### Configuration
@@ -288,16 +295,20 @@ In addition, the excluded template-only paths `docs/` (the docs submodule), `.cl
 
 ### Schema Updates
 
-The script automatically adds new models from the template:
+The script automatically adds new models from the template. It also adds new template **fields and indexes** to models you already have (`scripts/sync-schema-fields.mjs`). That matters for multi-file schemas, and for a `schema.prisma` that hit a merge conflict and was kept as yours: neither gets new fields through the git merge. It only ever adds; anything it can't add safely is listed for you to check by hand.
+
+It then applies the change with the drift-safe migration and commits the schema and the new migration **together**, so the migration always ships with the schema change it belongs to:
 
 ```bash
-# If AppSettings model is added to template but missing from your schema:
-[INFO] Adding AppSettings model to schema...
-[OK] Added AppSettings model
-
-# You'll need to run the migration:
-cd backend && npm run db:migrate
+# If AuthDeviceRetiredToken is in the template but missing from your schema:
+[INFO] Adding AuthDeviceRetiredToken model to schema...
+[OK] Added AuthDeviceRetiredToken model
+...
+[OK] Database migration applied
+[INFO] Committed the schema/migration changes (and any installed shadcn components): ...
 ```
+
+If the migration step fails, the **Next Steps** list at the end says how to apply it (`cd backend && npx prisma migrate deploy`).
 
 ---
 
@@ -339,7 +350,7 @@ The script walks `.module-manifests.json` and for every **enabled** module (acco
     ./scripts/sync-components.sh --skip-reinstall  # Update components.json but don't reinstall
     ```
 
-    **Requires `jq`** — install via `brew install jq` (macOS) or `apt install jq` (Debian/Ubuntu).
+    **Requires `jq`** — install via `brew install jq` (macOS) or `apt install jq` (Debian/Ubuntu) — **and bash 4 or newer.** macOS still ships bash 3.2, so the script stops with a clear message there: `brew install bash`, or use the PowerShell twin (`npm run components:sync`).
   </TabItem>
 </Tabs>
 
@@ -350,6 +361,29 @@ The script is idempotent: running it when nothing has changed is a no-op (compon
 ### In-app version
 
 An admin-UI reinstall flow (confirmation dialog, streamed progress) is [planned as a follow-up](/starter-template/roadmap/#in-app-component-reinstall-for-style-registry). For now, this is a terminal-only operation.
+
+---
+
+## shadcn baseline
+
+<Badge text="v2.13.0" variant="tip" /> The template's own code imports a fixed set of shadcn primitives (the **baseline**). Their names live in **one** file, `scripts/shadcn-baseline.json`, read through `scripts/shadcn-baseline.mjs`:
+
+- **create-app** installs them after `shadcn init`.
+- **`template:update`** installs any that are missing from your app.
+- **The template's CI** generates them, so the bare template (which ships no `components/ui/` files) can type-check and build.
+
+Run it from the app root:
+
+```bash
+node scripts/shadcn-baseline.mjs list            # print the baseline
+node scripts/shadcn-baseline.mjs missing         # print the ones missing from frontend/src/components/ui
+node scripts/shadcn-baseline.mjs add             # install all of them (needs frontend/components.json)
+node scripts/shadcn-baseline.mjs add --missing   # install only the missing ones
+```
+
+`add --ci-init` is for CI: when there is no `frontend/components.json`, it runs a non-interactive `shadcn init` (the manifest's `ciInit` base and preset) plus the components. An app's existing `components.json` is never touched.
+
+To add a primitive to the baseline, add it to `shadcn-baseline.json`, and update the count on the [shadcn Component Catalogue](/starter-template/shadcn-components/#what-the-template-ships).
 
 ---
 
@@ -450,6 +484,28 @@ Apps on template versions older than v1.65.0 pick the script up on their next `n
 
 ---
 
+## Foundation install list
+
+<Badge text="v2.13.0" variant="tip" /> `npm run install:all` runs `scripts/install-all.mjs`: the **one** list of foundation packages for root, frontend and backend. create-app installs from it, and `template:update` runs it again after a merge. It ends with `prisma generate`.
+
+Most packages install at `@latest`. A few are held on purpose until the template adopts the next major:
+
+| Package | Held at | Why |
+|---------|---------|-----|
+| `prisma`, `@prisma/client`, `@prisma/adapter-neon`, `@prisma/adapter-pg` | `^7` | `@latest` is the Prisma 8 release candidate, whose CLI can't generate a 7.x client |
+| `@tanstack/react-table` | `^9.2.4` | The [`DataTable`](/starter-template/data-table/) is built on the v9 API |
+| `recharts` | `^3` | The shadcn chart primitive's major |
+
+The script is template-owned, so the list always reaches your app. It used to live inline in the root `package.json`, which is yours: a merge conflict there kept your old copy and froze the app on a stale list. `sync-package-scripts.mjs` now points `install:all` at the script.
+
+Flags, for running it directly (`node scripts/install-all.mjs`):
+
+- `--no-generate` — skip the final `prisma generate`.
+- `--silent` — hide npm's progress and warnings (`--loglevel=error`). npm's own error still prints, so a failure is never unexplained.
+- `--keep-going` — run every step even after a failure, then exit 1 and name each failed step. By default it stops at the first failure.
+
+---
+
 ## Dependency Updates
 
 Keep the root, frontend and backend dependencies up to date. The updater is a cross-platform **Node** script (`scripts/update-deps.mjs`) — it runs the same on Windows, macOS and Linux with no PowerShell dependency. Four modes cover everything from a quick peek to a full major-version sweep to a `node_modules`-free lockfile refresh.
@@ -464,7 +520,7 @@ Keep the root, frontend and backend dependencies up to date. The updater is a cr
 npm run deps:check          # Preview pending updates (no changes)
 npm run deps:update         # Safe: npm update in root/frontend/backend (respects semver ^ and ~)
 npm run deps:update:latest  # Bump everything to latest via npm-check-updates (may break)
-npm run deps:lockfile       # Regenerate lockfiles from package.json — no node_modules install
+npm run deps:lockfile       # Refresh lockfiles within semver ranges — no node_modules install
 npm run deps:relink         # Re-create npm-link symlinks from the last snapshot
 ```
 
@@ -475,9 +531,13 @@ npm run deps:relink         # Re-create npm-link symlinks from the last snapshot
 | `deps:check` | n/a (read-only) | `npm outdated` + `npx npm-check-updates` | No | No |
 | `deps:update` | Yes — won't cross majors | `npm update` | Yes (skips packages without it) | Yes |
 | `deps:update:latest` | **No** — jumps to latest | `npx npm-check-updates -u` + `npm install` | Yes | Yes |
-| `deps:lockfile` | Yes | `npm install --package-lock-only` | **No** | Yes |
+| `deps:lockfile` | Yes | `npm update --package-lock-only` + `npm install --package-lock-only`, checked with `npm ci --dry-run` | **No** | Yes |
 
 `deps:check` is informational — it prints what's pending and always exits 0 (it's a preview, not a CI drift gate).
+
+The other modes **fail loudly** (v2.13.0): every npm step's exit code is checked, and a failed step is listed in a red summary and the script exits 1. The script never prints "Done" over a failed install. If `deps:update:latest` fails, `npm-check-updates` may already have rewritten `package.json` with majors that were not installed, so check `git diff` before committing.
+
+`deps:lockfile` moves every locked version to the newest one its range allows (v2.13.0). A plain lock-only install kept stale in-range pins forever, including ones with a published security fix. It then checks the result with `npm ci --dry-run`. If `npm ci` would reject the lock, it repairs it with a full install in a temporary copy (never your checkout's `node_modules`), or tells you to run `npm install` in that folder.
 
 ### npm-link preservation
 
@@ -510,11 +570,11 @@ npm run deps:relink         # Re-create npm-link symlinks from the last snapshot
 
 ### Reaching host apps
 
-All three `package.json` files (root, `frontend/`, `backend/`) are **user-owned**, so `template:update` never overwrites them — which means foundation scripts added to the template never reached apps created before they existed (`npm run deps:update` → `Missing script`; from v1.38/v1.43, the sub-package `type-check`/`test` scripts the CI workflow calls). To fix that, `template:update` runs `scripts/sync-package-scripts.mjs` after merging, which ensures the foundation script set exists and points at the canonical commands in **all three files** (v1.54.0 — previously root-only): root gets the `deps:*` aliases, `security:setup-kms`, [`ensure-pgvector`](#ensure-pgvector) (v1.65.0), `predev`/`prebuild` and the `test*` + `type-check*` wrappers; `frontend/` gets `type-check`/`test`/`test:watch`; `backend/` gets `type-check`/`pretest`/`test`/`test:watch`. Only those foundation keys are touched — and they are forced to canonical; your own scripts are left alone.
+All three `package.json` files (root, `frontend/`, `backend/`) are **user-owned**, so `template:update` never overwrites them — which means foundation scripts added to the template never reached apps created before they existed (`npm run deps:update` → `Missing script`; from v1.38/v1.43, the sub-package `type-check`/`test` scripts the CI workflow calls). To fix that, `template:update` runs `scripts/sync-package-scripts.mjs` after merging, which ensures the foundation script set exists and points at the canonical commands in **all three files** (v1.54.0 — previously root-only): root gets the `deps:*` aliases, `install:all` (pointed at [`scripts/install-all.mjs`](#foundation-install-list), v2.13.0), `security:setup-kms`, [`ensure-pgvector`](#ensure-pgvector) (v1.65.0), `predev`/`prebuild` and the `test*` + `type-check*` wrappers; `frontend/` gets `type-check`/`test`/`test:watch`; `backend/` gets `type-check`/`pretest`/`test`/`test:watch`. Only those foundation keys are touched — and they are forced to canonical; your own scripts are left alone.
 
 `ensure-pgvector` is reconciled for a specific reason: modules **probe for it**. A vector-using module checks `scripts["ensure-pgvector"]` in the app's root `package.json` to decide whether the app can declare pgvector, so the key's presence is itself the capability signal.
 
-**Env keys** have the same problem: `.env` is user-owned, so new foundation knobs the template introduces (e.g. `SECURITY_PROFILE`, `SECURITY_ENCRYPTION_KEY`, the deletion-cascade `NEON_AUTH_*`) never reach existing apps. `template:update` also runs `scripts/sync-env.mjs`, which **appends** any missing foundation key to `frontend/.env` / `backend/.env` — the security tier active (matching the code default), secrets as commented placeholders to fill if needed. It only ever appends; existing values are never touched, and `.env` stays git-ignored (nothing is committed). You don't hand-add these per app.
+**Env keys** have the same problem: `.env` is user-owned, so new foundation knobs the template introduces (e.g. `SECURITY_PROFILE`, `SECURITY_ENCRYPTION_KEY`, the `SECURITY_KMS_*` key-custody settings) never reach existing apps. `template:update` also runs `scripts/sync-env.mjs`, which **appends** any missing foundation key to `frontend/.env` / `backend/.env` — the security tier active (matching the code default), secrets as commented placeholders to fill if needed. It only ever appends; existing values are never touched, and `.env` stays git-ignored (nothing is committed). You don't hand-add these per app.
 
 <Aside type="tip">
   If `template:update` stops on a merge conflict, the post-merge reconcilers don't run. After resolving the conflict, run `node scripts/sync-package-scripts.mjs`, `node scripts/sync-env.mjs` (and `npm run deps:relink` if needed) to finish.
@@ -524,7 +584,7 @@ All three `package.json` files (root, `frontend/`, `backend/`) are **user-owned*
 
 1. `npm run deps:check` — see what's pending across all three packages.
 2. `npm run deps:update` — apply safe, semver-respecting updates. Commit.
-3. When you're ready to take breaking bumps: `npm run deps:update:latest`, run the app, fix fallout, then bump the template version (`template:version:minor` for new baseline, `template:version:major` if your downstream modules will break).
+3. When you're ready to take breaking bumps: `npm run deps:update:latest`, run the app, fix fallout. If you're working in the template repo, bump the template version afterwards: `template:version:patch` (patch is the default for dependency bumps — see [When to Bump](#when-to-bump)).
 
 <Aside type="tip">
   When shadcn/ui components update, re-running `npx shadcn@latest add <component>` may prompt to overwrite. After updating, check that required providers (e.g. `TooltipProvider`) are still mounted — the template already mounts `TooltipProvider` at the root in `main.tsx`, so tooltip additions "just work".
@@ -534,7 +594,7 @@ All three `package.json` files (root, `frontend/`, `backend/`) are **user-owned*
 
 ## Audit gate
 
-<Badge text="v2.3.0" variant="tip" /> `scripts/audit-gate.mjs` is a CI-oriented, allowlist-aware wrapper over `npm audit`. A plain `npm audit` gate is unusable on this stack — the Neon → better-auth chain carries advisories that can't be fixed downstream (the version tracks Neon's *managed* auth server), so it would fail forever and get ignored. The gate splits high/critical advisories into **known** (on `.audit-allowlist.json`) vs **NEW**, and surfaces only new risk.
+<Badge text="v2.3.0" variant="tip" /> `scripts/audit-gate.mjs` is a CI-oriented, allowlist-aware wrapper over `npm audit`. A plain `npm audit` gate is unusable on this stack — some advisories can't be fixed in this repo (Prisma 7's `deepmerge-ts` chain, whose only npm fix is a Prisma downgrade), so it would fail forever and get ignored. The gate splits high/critical advisories into **known** (on `.audit-allowlist.json`) vs **NEW**, and surfaces only new risk.
 
 ```bash
 node scripts/audit-gate.mjs                 # audits backend + frontend (default)
@@ -543,7 +603,8 @@ node scripts/audit-gate.mjs --enforce       # fail on a NEW advisory (see below)
 ```
 
 - **Warn-only by default.** It reports and warns but never fails unless `--enforce` (or the CI variable `AUDIT_GATE_ENFORCE=true`) is set — so a mis-tuned allowlist can't break CI on first propagation. Validate the allowlist in a cloned app, then enforce.
-- **The allowlist** (`.audit-allowlist.json` at the repo root) matches by affected package name (`modules`) or GHSA id (`ghsa`), and ships pre-seeded with the Neon/better-auth chain. Curate it as advisories are triaged.
+- **The allowlist** (`.audit-allowlist.json` at the repo root) matches by affected package name (`modules`) or GHSA id (`ghsa`). Since v2.13.0 it holds only two accepted items: the Prisma `deepmerge-ts` chain, and `GHSA-g38m-r43w-p2q7`, kept by id because Neon's managed auth server still runs better-auth 1.4.18. The client-side Neon/better-auth chain audits clean on `@neondatabase/neon-js` ^0.7.0-beta, so it was removed; a new advisory there now shows as NEW. Curate the list as advisories are triaged.
+- **Fails closed** (v2.13.0). An audit that could not run (no lockfile, a registry or network error) is a **failed** audit, never a clean one. It is always reported, and under `--enforce` it exits 2.
 - **Runs in CI** as the `audit` job in `.github/workflows/ci.yml` — see [Testing & CI](/starter-template/testing/#the-dependency-audit-gate). There is no `npm run` alias; invoke it via `node` directly.
 
 <Aside type="note" title="The gate is a mirror, not a fix">
@@ -591,6 +652,8 @@ The update script displays version information:
     ```
   </TabItem>
 </Tabs>
+
+The commit contains **only** the version files (`VERSION`, `package.json`, `backend/package.json`). Work you have already staged stays staged for its own commit instead of riding along under the bump message (v2.13.0). The app `release:*` scripts do the same with `package.json`.
 
 ### When to Bump
 
@@ -698,7 +761,7 @@ Both scripts follow the same structure and can be customized.
 - update-template.ps1 (Windows PowerShell)
 - update-template.sh (macOS/Linux Bash)
 - update-template.bat (Windows batch wrapper for update-template.ps1)
-- .audit-allowlist.json (advisories the audit gate knowingly accepts — the Neon/better-auth chain)
+- .audit-allowlist.json (advisories the audit gate knowingly accepts — the Prisma deepmerge-ts chain + Neon's server-side better-auth advisory)
 - scripts/
   - bump-version.sh (Template version bumping)
   - bump-version.ps1 (Template version bumping)
@@ -715,6 +778,10 @@ Both scripts follow the same structure and can be customized.
   - update-deps.sh (Shim → update-deps.mjs)
   - update-deps.ps1 (Shim → update-deps.mjs)
   - link-modules.mjs (Snapshot/restore npm-link symlinks)
+  - install-all.mjs (The foundation install list — what `npm run install:all`, create-app and template:update run)
+  - shadcn-baseline.json (The one list of baseline shadcn components)
+  - shadcn-baseline.mjs (List / check / install the baseline — used by create-app, template:update and CI)
+  - sync-schema-fields.mjs (Add template model fields/indexes an app's Prisma schema is missing)
   - sync-package-scripts.mjs (Reconcile foundation npm scripts into a host app — root + frontend + backend)
   - sync-deps.mjs (Reconcile foundation dependencies + overrides into a host app)
   - sync-env.mjs (Reconcile foundation env keys into a host app's .env)

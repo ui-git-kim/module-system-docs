@@ -17,6 +17,78 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v2.13.0
+
+**Security audit fixes, plus a "confirm it's you" code for sensitive actions**
+
+This release fixes every finding of the [2026-09-25 cleanup & security audit](/starter-template/roadmap/#known-issues--2026-09-25-cleanup--security-audit) (17 moderate and 36 minor). It also adds **step-up re-verification**: at the hardened and strict tiers, deleting an account, removing a user, changing a role and editing the security settings now ask for a code emailed to the signed-in address.
+
+<Aside type="caution" title="Before you update">
+- **Production apps need outbound email.** Step-up is on at the hardened tier, which is the default. Without an email provider, the guarded actions are refused in production. Configure email on the admin Email page (or `EMAIL_PROVIDER` + `EMAIL_FROM`), or set `SECURITY_SESSION_STEP_UP=false`.
+- **Run the migration.** A new `AuthDeviceRetiredToken` table (refresh-token reuse detection). `template:update` adds the model, then generates **and commits** the migration; deploy it with the app.
+- **Removed exports (clean break):** `AdminMasterDetail`, `AdminListPanel`, `AdminDetailPanel` and `AdminSortableGroup` (and their prop types) from `@/features/admin`; the frontend `features/security` folder; the system-admin `getErrors` / `getActivity` getters. The fleet was checked, and nothing uses them.
+- **`VITE_SECURITY_PROFILE` is gone.** Nothing read it. Delete it from `frontend/.env`.
+</Aside>
+
+### Step-up re-verification (new)
+
+See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
+
+- **`requireStepUp`** (`middleware/step-up.middleware.ts`) guards `DELETE /api/v1/user`, admin `DELETE /users/:userId`, admin `PATCH /users/:userId/role` and admin `PUT /security/env`. Once email works, saving the admin **email settings** needs a code too: the provider decides where codes go, so a hijacked admin session must not be able to redirect them. Without a valid pass it answers **403** `code: 'step_up_required'`. At the standard tier it lets requests through. Device tokens are always refused.
+- **`POST /api/v1/auth/step-up/start`** emails a 6-digit code (5 minutes, single use, burnt after 5 wrong tries). A new code replaces the old one only once its email is sent, so a failed resend leaves the earlier code usable. **`/verify`** exchanges it for a 5-minute grant (`expiresIn`, timed on the browser's own clock), sent back in the `X-Step-Up-Grant` header. Codes and grants are hashed and bound to the user. Both endpoints are rate-limited per user.
+- **Frontend:** the API client catches `step_up_required`, opens the **Confirm it's you** dialog (`<StepUpHost>`, mounted in the shell), and retries the request once. Pages need no changes. The grant is kept in memory only and cleared on sign-out.
+- In production with no email provider, `start` answers **503** `step_up_email_unavailable`, and the startup posture check warns (`auth.step-up-delivery`). In development the code is written to the server log.
+- Modules can guard their own routes with `requireStepUp`. The security barrel exports `startStepUp`, `verifyStepUp` and `hasValidStepUpGrant`.
+
+### Device tokens
+
+- Device tokens can no longer **delete the account**, **export all its data** or **turn off security-alert emails**. Those need a web session (**403** `code: 'web_session_required'`).
+- **Refresh-token reuse detection.** Every rotated-out refresh token is kept (hashed) in the new `AuthDeviceRetiredToken` table. Presenting **any** of them again revokes the device and fires `device.refreshReuse`, so a thief who refreshes twice is still caught. A replay within 30 seconds (a client retrying a lost response) is only rejected, and a refresh that collides with a concurrent one is retried.
+- A background prune removes expired enrolments, long-dead devices and retired tokens past the refresh lifetime.
+- `device.paired`, `device.enrolled`, `device.refreshed`, `device.refreshReuse` and `device.revoked` hooks. All but `device.refreshed` reach the audit trail. See [Device tokens](/starter-template/device-tokens/#token-model).
+
+### Server hardening
+
+- **Origin gate:** a request from a disallowed origin (or with no Origin in production) gets a direct **403**. It used to become a 500 that skipped the rate limiter and flooded the error console and the audit trail.
+- **Preference caps:** module preference values, key names and key count are bounded, and the stored preferences are capped at 64 KB. `avatarUrl` is capped at 512 KB.
+- **SMTP password pinning:** the stored SMTP password is reused (for test and save) only for the same host, port, TLS mode and username. Pointing the settings at a new server needs the password re-entered.
+- Errors can carry a machine-readable **`code`** (`AppError`, `UnauthorizedError`, `ForbiddenError`, `ServiceUnavailableError`). The error middleware sends it for client-safe errors.
+- The admin Security page's `.env` rewrite keeps the file's permissions (a new file gets `0600`). `NEON_AUTH_SECRET_KEY` is gone from its secrets list, because nothing reads it.
+
+### Audit trail & personal data
+
+- **Who did it:** role changes and settings edits record the acting admin (`actorId`) and what changed (`changedFields`). Security `.env` edits (`security.envUpdated`), email-provider changes (`email.configUpdated`) and module enable/disable now reach the durable audit trail. See [Hooks](/starter-template/hooks/#available-backend-hooks).
+- **Complete personal-data export:** `securityRegistry.registerExportHandler()` and `collectDataExport()` mirror the deletion handlers. The export now includes notifications, linked devices, the `Space` and the account's activity-mode audit rows (the ones the erasure deletes). See [Personal-data export](/starter-template/security-feature/#personal-data-export).
+- **A deletion that doesn't finish is never reported as done.** The account is locked as `pending_deletion` before the cascade and refused (**403** `account_deletion_pending`) until it completes. The lock holds for the whole cascade and is removed only after the auth identity, so a sign-in mid-deletion can't re-create the account. A `user.deletionRetry` job retries automatically, and the frontend shows a "finish deleting your account" screen. An incomplete run answers **503** `account_deletion_incomplete` with a message the user can read. See [When a deletion doesn't finish](/starter-template/security-feature/#when-a-deletion-doesnt-finish).
+
+### Frontend
+
+- **Route errors** show a friendly "Something went wrong" page with a Reload button (`RouteErrorFallback`), never React Router's stack trace. A stale chunk after a redeploy gets "This app has been updated". Every route error is reported to Sentry once.
+- **`getApiErrorMessage(err, fallback)`** in `@/lib/api` turns a failed call into a message fit to show (the server's `error`, with validation details). The DataTable confirm dialog, bulk actions, profile, preferences, privacy and admin pages use it. DataTable bulk actions without a confirm now show their failures.
+- The Security settings page and Linked devices show an error when loading fails, not "no sessions" or "no devices". Revoke failures are shown, and a wrong current password no longer reports "Password changed".
+- **Theme:** one `lib/color-scheme.ts` for `main.tsx`, the header toggle and Preferences. Blocked site storage no longer blanks the app, and Preferences no longer undoes the header toggle.
+- Branding and module-status loads no longer cache a failure as success, so a failed branding fetch can't wipe the admin's style overrides.
+- Dead UI removed: the Cookie settings row, the "Enable Marketing Pages" toggle (hidden, column kept) and the placeholder Billing page outside development. The Language preference's description is now accurate.
+
+### Update & create scripts
+
+- **`install:all`** is template-owned (`scripts/install-all.mjs`), so the Prisma `^7`, TanStack v9 and Recharts v3 holds reach every app, even after a `package.json` conflict.
+- **`template:check`** is truly read-only: it runs the upstream updater from a temporary copy and never checks files out.
+- **`template:update`** commits the schema, the generated migration and any newly installed shadcn components in one commit. **`scripts/sync-schema-fields.mjs`** adds template fields an app's models are missing, for multi-file schemas and conflict-resolved ones too.
+- **One shadcn baseline list:** `scripts/shadcn-baseline.json` (read by `scripts/shadcn-baseline.mjs`) drives create-app, `template:update` and the CI.
+- **create-app:** the Neon snippet is parsed again on macOS/Linux, `.env` files are created `0600`, `.claude/` is removed from new apps, `template-upstream` can't be pushed to, and the `.ps1` twin catches up with the `.sh` (package-name cleaning, install failure reporting).
+- `deps:*` fail loudly, `deps:lockfile` bumps in-range pins, the Vite shadow check only deletes git-ignored files, and the version bump commits only its own files. A quiet `install-all` (create-app) still prints npm's error when an install fails.
+
+### Dependencies & CI
+
+- `@neondatabase/neon-js` **^0.7.0-beta** (better-auth 1.6.x client, audits clean), `nodemailer` **^10.0.10**, a `mysql2` override, and all three lockfiles refreshed. The audit allowlist keeps only the Prisma `deepmerge-ts` chain and `GHSA-g38m-r43w-p2q7` (Neon's managed server still runs better-auth 1.4.18).
+- The **audit gate fails closed**: an `npm audit` error is a failed audit.
+- **CI runs again for the template repo** on push and pull request, and now type-checks and builds the bare template by generating the shadcn baseline. Apps stay opt-in (`CI_AUTO_RUN=true`).
+
+**Propagation:** backend, frontend, scripts and one new column → **minor** (a new security subsystem and a new registry API).
+
+---
+
 ## v2.12.1
 
 **DataTable remembers each table's column choices**

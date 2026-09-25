@@ -52,7 +52,7 @@ Anything not on this list is provider- or library-backed, never hand-built.
 
 ## Security tier (`securityProfile`)
 
-The headline knob is `SECURITY_PROFILE` (backend env) / `VITE_SECURITY_PROFILE` (frontend), one of `standard | hardened | strict`. It resolves to a full `SecurityConfig` via per-tier defaults plus optional per-knob env overrides — an app changes posture through configuration, never by editing code.
+The headline knob is `SECURITY_PROFILE` (backend env), one of `standard | hardened | strict`. The tier is enforced on the server; the frontend has no tier setting. It resolves to a full `SecurityConfig` via per-tier defaults plus optional per-knob env overrides — an app changes posture through configuration, never by editing code.
 
 ```typescript
 import { securityConfig } from '../security/index.js';
@@ -239,6 +239,85 @@ Self-service deletion (`user.service.deleteUser`) and admin deletion (`admin.ser
 </Aside>
 
 See the [Registry Reference](/starter-template/registries/#securityregistry-backend) for the deletion-handler API and the full `DeletionReport` shape.
+
+### When a deletion doesn't finish
+
+The cascade is best-effort, so a handler can fail (a database hiccup, a KMS or R2 outage) after the core `User` row is already gone. Without a record of that, the next sign-in would re-create the user with the same id and quietly re-attach the leftover rows. Since v2.13.0, `features/user/account-deletion.ts` prevents this:
+
+- The account's `Space` is marked `deletionState: 'pending_deletion'` **before** anything is destroyed, and marked again after a run that did not complete.
+- A pending account is refused: `GET /api/v1/user` answers **403** with `code: 'account_deletion_pending'`. The frontend's `AccountDeletionGate` then shows a "finish deleting your account" screen instead of the app.
+- A `user.deletionRetry` job re-runs the idempotent cascade automatically (first retry after 5 minutes). Deleting again, by the user or an admin, also retries it straight away.
+- A run that did not complete is never reported as "deleted". The API answers **503** with `code: 'account_deletion_incomplete'` and a message the client can show.
+- The `space.account` deletion handler keeps a pending `Space` for the whole cascade. Only after a **completed** run, auth identity included, is the `Space` deleted, which clears the marker. Deleting it mid-cascade would leave a moment with no user and no marker, in which a sign-in could re-create the account.
+
+## Personal-data export
+
+The export (GDPR Articles 15 and 20, `POST /api/v1/user/export`) is the counterpart of the deletion cascade: every feature or module that stores personal data registers an **export handler**, and `collectDataExport(subject)` merges their output, keyed by handler id. Added in v2.13.0.
+
+```typescript
+// features/<module>/security.registration.ts
+import { securityRegistry } from '../security/index.js';
+import { owned } from '../../lib/owned.js';
+import { prisma } from '../../lib/prisma.js';
+
+securityRegistry.registerExportHandler({
+  id: 'billing.invoices',
+  moduleId: 'billing',
+  description: "The account's invoices",
+  async run(ctx) {
+    return prisma.invoice.findMany({ where: owned(ctx.subject.tenantId) });
+  },
+});
+```
+
+`run` returns anything JSON-serialisable; its output lands in the download under the handler's `id`. A handler that throws doesn't stop the export: it is listed in `failed` and the export is delivered marked incomplete. Export only what belongs to the person, and never secrets or hashes (the device handler leaves out every token hash). The template registers handlers for notifications, linked devices and enrolments, the `Space`, and the account's activity-mode audit rows (newest 10,000; nothing when the audit log lives only in memory).
+
+## Step-up re-verification (sensitive actions)
+
+A signed-in session left open on a shared computer shouldn't be enough to delete an account or promote a user. The Neon Auth token can't say how recently the person signed in, so at the **hardened** and **strict** tiers (`sessionStepUp`, the default tier is hardened) sensitive actions ask for a **6-digit code emailed to the signed-in address**. Added in v2.13.0.
+
+Guarded out of the box:
+
+| Action | Route |
+|--------|-------|
+| Delete your own account | `DELETE /api/v1/user` |
+| Remove a user (admin) | `DELETE /api/v1/admin/users/:userId` |
+| Change a user's role (admin) | `PATCH /api/v1/admin/users/:userId/role` |
+| Edit the security `.env` knobs (admin) | `PUT /api/v1/admin/security/env` |
+| Change the email settings (admin, once a provider is live) | `PUT /api/v1/admin/email/config` |
+
+**How it works:**
+
+1. A guarded route without a valid pass answers **403** with `code: 'step_up_required'`. It is 403, not 401, so a client never mistakes it for an expired session.
+2. The frontend's API client catches that and opens the **Confirm it's you** dialog (`<StepUpHost>`, mounted in the app shell). The dialog calls `POST /api/v1/auth/step-up/start`, which emails the code.
+3. The person enters it. `POST /api/v1/auth/step-up/verify` exchanges the code for a **grant**, a pass valid for 5 minutes.
+4. The client retries the original request once with the grant in the `X-Step-Up-Grant` header. Further guarded actions in those 5 minutes go straight through.
+
+**Limits:**
+
+- A code lasts 5 minutes, works once, and is burnt after 5 wrong guesses. A new code replaces the old one once its email is sent; if the resend fails, the earlier code still works.
+- Per user, `start` is limited to 5 requests and `verify` to 20 in 15 minutes.
+- Codes and grants are stored hashed and bound to the user. Wrong or expired codes all get the same answer.
+- Device tokens can never step up and are always refused on guarded routes.
+
+**The email settings are guarded too, once email works.** The email provider decides where codes are delivered. So once a provider is live, saving the admin email settings (`PUT /api/v1/admin/email/config`) needs a code sent through the **current** provider. Otherwise a hijacked admin session could point email at its own server and read the codes. With no provider ready the save stays open, so a new deploy can still set email up.
+
+**Stored in server memory, on purpose.** Like the rate limiters, codes and grants live in the process. A restart, or a request that lands on a second instance, simply asks for a fresh code. Nothing is ever accepted that the server didn't issue.
+
+<Aside type="caution" title="Step-up needs outbound email in production">
+In production, if no email provider is configured, `start` refuses with **503** (`code: 'step_up_email_unavailable'`) instead of locking the action behind a code nobody receives. The [startup posture check](#cloudflare-edge--the-startup-posture-guardrail) warns about this (`auth.step-up-delivery`). Configure email on the admin Email page (or `EMAIL_PROVIDER` + `EMAIL_FROM`), or turn step-up off with `SECURITY_SESSION_STEP_UP=false`. In development, with no provider, the code is written to the server log.
+</Aside>
+
+**Guard your own routes** with `requireStepUp`, after the auth or admin check:
+
+```typescript
+import { requireWebSession } from '../../middleware/auth.middleware.js';
+import { requireStepUp } from '../../middleware/step-up.middleware.js';
+
+router.delete('/archive', requireWebSession, requireStepUp, handler);
+```
+
+At the standard tier `requireStepUp` lets requests through (device tokens are still refused). Pages need no changes: any request made through `@/lib/api` gets the dialog and the retry automatically.
 
 ## Cloudflare edge & the startup posture guardrail
 

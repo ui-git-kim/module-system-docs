@@ -20,7 +20,7 @@ The `template-upstream` remote points to your local copy of the template (pull-o
 | `template-upstream` | Template repository for updates | No (disabled) |
 | `origin` | Your app's repository | Yes |
 
-The create script sets up `template-upstream` automatically. Push is disabled to prevent accidentally pushing your app code back to the template.
+The create script sets up `template-upstream` automatically. Push is disabled to prevent accidentally pushing your app code back to the template. `template:update` switches push off again on every run, so apps created before v2.13.0 (when create-app didn't yet do this) are covered too.
 
 ---
 
@@ -31,7 +31,7 @@ The create script sets up `template-upstream` automatically. Push is disabled to
     ```bash
     npm run template:check
     ```
-    This fetches the latest template and shows available commits.
+    This fetches the latest template and shows available commits. It is **read-only** (v2.13.0): if the update script itself has changed, the new version runs from a temporary copy, so nothing in your checkout is changed or staged. Uncommitted changes only produce a warning here.
   </TabItem>
   <TabItem label="Manual">
     ```bash
@@ -144,7 +144,9 @@ Since v1.23.1 the update script force-syncs every template-changed file to the t
 | `.env`, `.env.local` | Secrets |
 | `README.md`, `CLAUDE.md` | Per-app readmes and Claude Code instructions |
 
-Since v1.24.5 these same user-owned files are auto-resolved in the **conflict branch** too — if git raises a merge conflict on one of them, the script keeps your local (`--ours`) side automatically. So you won't have to hand-resolve `globals.css`, `package.json`, your schema or `.env` files every release; the pattern-matched `backend/prisma/schema/*.prisma` and `backend/prisma/migrations/*` paths are resolved the same way.
+Since v1.24.5 these same user-owned files are auto-resolved in the **conflict branch** too — if git raises a merge conflict on one of them, the script keeps your local (`--ours`) side automatically. So you won't have to hand-resolve `globals.css`, `package.json`, your schema or `.env` files every release; the pattern-matched `backend/prisma/schema/*.prisma` and `backend/prisma/migrations/*` paths are resolved the same way. If you **deleted** one of these files (for example a multi-file schema app's `backend/prisma/schema.prisma`) and the template changed it, the deletion is kept too (v2.13.0) — the template's copy no longer comes back.
+
+Keeping your side of the root `package.json` or the schema no longer leaves your app on a stale install list or missing columns: the foundation install list lives in the template-owned `scripts/install-all.mjs`, and new template fields reach your models through `scripts/sync-schema-fields.mjs` (see [Post-merge reconciliation](#post-merge-reconciliation)).
 
 <Aside type="note" title="Need to opt out of more files?">
 If your app has legitimately customised a template-owned file and you want the update script to leave it alone, the [`.template-ignore` escape hatch](/starter-template/roadmap/#template-ignore-for-per-app-merge-customisation) is roadmapped as the long-term answer. Until it ships, flag the path you need — if it's a genuine user-owned category we missed, it should join the allow-list in a patch release.
@@ -237,7 +239,7 @@ The conflict-exit message prints the exact resume command, and Continue is idemp
 ## After Updating
 
 <Aside type="tip" title="Most of this is automated since v1.22.1">
-`update-template.{sh,ps1}` now runs `npm run install:all` (which finishes with `prisma generate`) and, whenever the template changed the Prisma schema at all — a new model **or** a new field on an existing model (the silent-DB-drift case) — applies it **drift-safely** (`scripts/prisma-migrate-safe.mjs`: `migrate diff` → migration file → `migrate deploy`, named `template_update_v<version>`; never `migrate dev`, so a vector app is never reset) for you. The migration fires if `backend/prisma/schema.prisma` or anything under `backend/prisma/schema/` changed between the merge-base and the template's HEAD, not only when a brand-new model is added. The manual steps below are the fallback path if the script's auto-run fails or you ran the merge by hand.
+`update-template.{sh,ps1}` now runs the foundation install (`scripts/install-all.mjs` directly since v2.13.0, which finishes with `prisma generate`) and, whenever the template changed the Prisma schema at all — a new model **or** a new field on an existing model (the silent-DB-drift case) — applies it **drift-safely** (`scripts/prisma-migrate-safe.mjs`: `migrate diff` → migration file → `migrate deploy`, named `template_update_v<version>`; never `migrate dev`, so a vector app is never reset) for you. The migration fires if `backend/prisma/schema.prisma` or anything under `backend/prisma/schema/` changed between the merge-base and the template's HEAD, not only when a brand-new model is added. Since v2.13.0 it then **commits** the schema, the new migration folder and any newly installed shadcn components in one commit (`chore: schema, migration + components from template v<version>`), so the migration always ships with the schema change it belongs to. Anything still uncommitted at the end is listed under **Next Steps**. The manual steps below are the fallback path if the script's auto-run fails or you ran the merge by hand.
 </Aside>
 
 <Steps>
@@ -271,11 +273,13 @@ The conflict-exit message prints the exact resume command, and Continue is idemp
 
 ### Post-merge reconciliation
 
-As part of the post-merge pipeline, the update script runs a few reconciliation steps — dependency reconciliation just *before* `install:all`, the rest just after — so that template infrastructure added since your app was created reaches the user-owned files it lives in:
+As part of the post-merge pipeline, the update script runs a few reconciliation steps — schema and dependency reconciliation just *before* `install:all`, the rest just after — so that template infrastructure added since your app was created reaches the user-owned files it lives in:
 
-- **Foundation npm scripts** — `node scripts/sync-package-scripts.mjs` reconciles the template's foundation scripts into your user-owned `package.json` files and commits them automatically (`chore: sync foundation npm scripts from template`). Root: the `deps:*` family, `security:setup-kms`, `predev`/`prebuild`, and the `test*` + `type-check*` wrappers. **From v1.54.0 it also reconciles the sub-packages** — `frontend/package.json` (`type-check`, `test`, `test:watch`) and `backend/package.json` (`type-check`, `pretest`, `test`, `test:watch`) — so the CI workflow and root wrappers stop hitting "Missing script: type-check" on apps created before those scripts existed. Managed keys are **forced to the canonical command** (CI depends on their exact behaviour); everything else in `scripts` is yours and never touched. Note the deliberate contrast with dependency reconciliation below: script *commands* are template-owned (canonical), dependency *versions* are user-owned (presence-only).
-- **Foundation env keys** — `node scripts/sync-env.mjs` appends any missing foundation keys to `frontend/.env` and `backend/.env` without overwriting existing values: `VITE_SECURITY_PROFILE` (frontend) and `SECURITY_PROFILE`, `SECURITY_ENCRYPTION_KEY`, `NEON_AUTH_PROJECT_ID` / `NEON_AUTH_SECRET_KEY`, `SECURITY_KMS_*`, `SECURITY_EDGE` / `SECURITY_POSTURE_ENFORCE`, and `SECURITY_ADMIN_ALLOW_ENV_WRITE` (backend). Secrets land as commented placeholders. `.env` files are gitignored, so nothing is committed — the new keys just appear in your working tree to review and fill in.
-- **Foundation dependencies** (v1.51.0+) — `node scripts/sync-deps.mjs` runs *before* `install:all` and appends any foundation dependency your user-owned `package.json` files are missing (currently `vitest` as a devDependency in `frontend/` and `backend/`, added by template v1.43). Presence-only: a dep you already list — in either `dependencies` or `devDependencies`, at any version — is never touched; version bumping stays with `deps:update`. Additions are committed automatically (`chore: sync foundation dependencies from template`). **From v1.54.0 the same run also reconciles foundation `overrides`** — pins for transitive dependencies, currently `@types/express-serve-static-core` at `~5.0.0` in `backend/package.json` (5.1.x widened `ParamsDictionary` values to `string | string[]`, breaking `type-check` in handlers that destructure `req.params`). Equally presence-only: an override you already declare for the same package is never touched, and deleting the override after retyping your own handlers is permanent — it won't come back.
+- **Foundation npm scripts** — `node scripts/sync-package-scripts.mjs` reconciles the template's foundation scripts into your user-owned `package.json` files and commits them automatically (`chore: sync foundation npm scripts from template`). Root: the `deps:*` family, `install:all` (pointed at the template-owned `scripts/install-all.mjs` since v2.13.0), `security:setup-kms`, `predev`/`prebuild`, and the `test*` + `type-check*` wrappers. **From v1.54.0 it also reconciles the sub-packages** — `frontend/package.json` (`type-check`, `test`, `test:watch`) and `backend/package.json` (`type-check`, `pretest`, `test`, `test:watch`) — so the CI workflow and root wrappers stop hitting "Missing script: type-check" on apps created before those scripts existed. Managed keys are **forced to the canonical command** (CI depends on their exact behaviour); everything else in `scripts` is yours and never touched. Note the deliberate contrast with dependency reconciliation below: script *commands* are template-owned (canonical), dependency *versions* are user-owned (presence-only).
+- **Foundation env keys** — `node scripts/sync-env.mjs` appends any missing foundation keys to `frontend/.env` and `backend/.env` without overwriting existing values: `VITE_SENTRY_DSN` (frontend) and `SECURITY_PROFILE`, `SECURITY_ENCRYPTION_KEY` (generated when the tier needs one and no key custody is set), `SECURITY_KMS_*`, `SECURITY_EDGE` / `SECURITY_POSTURE_ENFORCE`, `SECURITY_ADMIN_ALLOW_ENV_WRITE`, `SECURITY_AUDIT_SINK`, `SENTRY_DSN`, `EMAIL_PROVIDER`, `JOBS_RUNNER` and the `MODULES_*` policy keys (backend). Secrets land as commented placeholders. `.env` files are gitignored, so nothing is committed — the new keys just appear in your working tree to review and fill in.
+- **Foundation dependencies** (v1.51.0+) — `node scripts/sync-deps.mjs` runs *before* `install:all` and appends any foundation dependency your user-owned `package.json` files are missing (currently `vitest` as a devDependency in `frontend/` and `backend/`, `recharts` `^3.0.0` in `frontend/`, and `nodemailer` `^10.0.10` in `backend/`). Presence-only: a dep you already list — in either `dependencies` or `devDependencies`, at any version — is never touched; version bumping stays with `deps:update`. Additions are committed automatically (`chore: sync foundation dependencies from template`). **From v1.54.0 the same run also reconciles foundation `overrides`** — pins for transitive dependencies, currently in `backend/package.json`: `@types/express-serve-static-core` at `~5.0.0` (5.1.x widened `ParamsDictionary` values to `string | string[]`, breaking `type-check` in handlers that destructure `req.params`), and since v2.13.0 `mysql2` at `^3.22.0` (the Prisma 7 CLI pins an older `mysql2` with high-severity advisories). Equally presence-only: an override you already declare for the same package is never touched, and deleting the override after retyping your own handlers is permanent — it won't come back.
+- **Schema models and fields** — whole foundation models your schema lacks are added (v2.13.0 adds `AuthDeviceRetiredToken`, the table behind [refresh-token reuse detection](/starter-template/device-tokens/#token-model)). Since v2.13.0, `node scripts/sync-schema-fields.mjs` also adds new template **fields and indexes** to models you already have. Before, a multi-file schema, or a `schema.prisma` kept as yours after a conflict, never received them, so backend code could query a column your database didn't have. It only ever adds; a field whose type differs, or a relation field, is listed for you to check by hand. The migration step then turns the additions into a real migration.
+- **shadcn baseline** — any baseline component missing from `frontend/src/components/ui/` is installed, from the one list in `scripts/shadcn-baseline.json` (see [shadcn baseline](/starter-template/scripts/#shadcn-baseline)).
 - **npm-link symlinks** — the script snapshots your `npm link`-ed local modules (`node scripts/link-modules.mjs snapshot`) before `install:all` and restores them afterward (`restore`), so the broad reinstall doesn't prune your linked local modules. The manual fallback is `npm run deps:relink`.
 
 **One-update lag caveat:** an update run executes your app's *locally checked-out* `update-template` script — the merge brings the new reconcilers, but the old script orchestrating that run doesn't know about them yet. Apps whose script predates a reconciler leg (v1.51.0 for `sync-deps`; v1.54.0 for the sub-package script legs) get the files merged but not applied/committed on that first update. Either update twice, or finish manually: `node scripts/sync-deps.mjs && node scripts/sync-package-scripts.mjs`, then commit the `package.json` changes.
@@ -313,7 +317,7 @@ Use `git rm` instead for any of these files git still tracks (committed before t
 
 Since v1.51.0 the update script detects this at the end of every completed update run **and** on the "already up to date" fast path — exactly where a diagnostic re-run lands — printing a warning that names the offending file(s) with a per-file removal command chosen by tracked-ness.
 
-Since v1.53.0 you rarely need to act at all: a `predev`/`prebuild` guard (`scripts/check-vite-shadow.mjs`) runs automatically before `npm run dev` / `npm run build` and **removes** a shadowing compiled config when git confirms it's untracked (the gitignored `tsc` artifact — nothing versioned is lost). A *tracked* `vite.config.js` (a deliberate choice) or a non-git checkout is left alone with a warning. Existing apps pick the guard up on their next `template:update` (it's reconciled into the user-owned `package.json` by `sync-package-scripts.mjs`).
+Since v1.53.0 you rarely need to act at all: a `predev`/`prebuild` guard (`scripts/check-vite-shadow.mjs`) runs automatically before `npm run dev` / `npm run build` and **removes** a shadowing compiled config only when git reports it as **ignored** (the gitignored `tsc` artifact — nothing versioned is lost). Since v2.13.0 anything else is kept with a warning: a *tracked* `vite.config.js` (a deliberate choice), an untracked file that isn't gitignored (for example a hand-written `vite.config.mjs` you are trying out), or a non-git checkout. Existing apps pick the guard up on their next `template:update` (it's reconciled into the user-owned `package.json` by `sync-package-scripts.mjs`).
 
 ### Template remote missing
 
@@ -355,7 +359,7 @@ These files exist in the template but should never exist in apps. The update scr
 
 - `create-app.ps1`, `create-app.sh`, `create-app.bat` — one-time scaffolding scripts
 - `docs/` — the module-system docs submodule, only meaningful in the template repo
-- `.claude/` — user-specific Claude Code config
+- `.claude/` — user-specific Claude Code config (since v2.13.0 create-app removes it from new apps too)
 - `.template-archive/` — reserved for the upcoming archive-on-removal feature
 
 When git detects any of these as "modify/delete" conflicts (most commonly `docs` when its submodule pointer bumps on the template side), the script resolves them automatically by removing the path — including stripping the submodule registration from `.gitmodules` for `docs`.
@@ -397,10 +401,11 @@ The first merge requires the `--allow-unrelated-histories` flag. The script dete
 The update scripts can update themselves. When this happens:
 
 1. New script version is fetched from template
-2. Script commits its own update
-3. Script pushes the commit
-4. Waits briefly (prevents race conditions)
-5. Re-executes with original arguments
+2. Script commits its own update — locally only, never pushed (it goes out with your next normal push)
+3. Waits briefly (prevents race conditions)
+4. Re-executes with original arguments
+
+A preview (`template:check`) does none of this: it runs the new script from a temporary copy and leaves your checkout untouched.
 
 This ensures you always run the latest update logic.
 

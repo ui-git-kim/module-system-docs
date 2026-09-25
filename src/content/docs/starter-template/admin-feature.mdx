@@ -20,8 +20,8 @@ The admin panel is accessible at `/admin` and is only visible to users with the 
 
 - **Overview** — the `/admin` landing page: live user/database/module/error stats, a merged "needs attention" list (service findings + module issues), and the most recent console entries (rebuilt from a placeholder in v1.56.0)
 - **Users & Access** — **Users**: view, modify roles (server-side paged since v1.55.0), and delete users
-- **Appearance** — **Branding** (app name, logo, marketing pages — formerly "App Settings"), **Navigation** (the side/top navigation layout, nav items, sections, user menu, and the dashboard-in-nav toggle), **Toolbar** (show/hide header toolbar items), **Widgets** (dashboard-widget visibility, added v1.56.0)
-- **Platform** — **Security** (live posture + env-backed knobs, v1.37.0), **Modules** (registered modules, dependencies, migrations — read-only, v1.50.0), **Email** (provider status + test delivery, v1.58.0), **System** (database health + service status), **Console** (errors, activity, audit history — split from System in v1.59.0)
+- **Appearance** — **Branding** (app name, logo — formerly "App Settings"), **Navigation** (the side/top navigation layout, nav items, sections, user menu, and the dashboard-in-nav toggle), **Toolbar** (show/hide header toolbar items), **Widgets** (dashboard-widget visibility, added v1.56.0)
+- **Platform** — **Security** (live posture + env-backed knobs, v1.37.0), **Modules** (registered modules, dependencies, migrations, v1.50.0; enable/disable since v2.4.1, and each change is recorded in the audit trail with the admin who made it since v2.13.0), **Email** (provider status + test delivery, v1.58.0), **System** (database health + service status), **Console** (errors, activity, audit history — split from System in v1.59.0)
 - **Extensions** — everything modules register without a `section`
 
 <Aside type="tip">
@@ -84,7 +84,7 @@ frontend/src/features/admin/
 │   ├── DashboardWidgetsPage.tsx    # Dashboard widget visibility (v1.56.0)
 │   ├── SystemAdminPage.tsx         # Database health + service status
 │   ├── ConsoleAdminPage.tsx        # Errors, activity, audit history (v1.59.0)
-│   └── ModulesAdminPage.tsx        # Registered modules — read-only (v1.50.0)
+│   └── ModulesAdminPage.tsx        # Registered modules + enable/disable
 ├── hooks/
 │   ├── useDashboardOverrides.ts    # Dashboard widget visibility overrides
 │   ├── useSecurityAdmin.ts         # Security overview + env-update
@@ -133,7 +133,8 @@ The **Branding** page (id `settings`, `/admin/settings` — retitled from "App S
 | **App Name** | Displayed in the navigation brand (sidebar header or top bar) and page titles |
 | **Logo** | Custom logo (uploaded as base64 or URL) |
 | **Logo Display Mode** ("Brand Display") | Logo only, logo + name, or name only |
-| **Enable Marketing Pages** | Feature flag for public pages |
+
+The **Enable Marketing Pages** toggle was removed from this page in v2.13.0, because nothing read it. The `enableMarketingPages` column stays in `AppSettings` for the planned Landing Layout, which will own its setting.
 
 The **Show Dashboard in Nav** toggle moved to the **Navigation** admin page in v1.56.0 (it always persisted via the same `AppSettings` record — only its home changed).
 
@@ -258,6 +259,12 @@ The backend enforces these rules:
 - Cannot delete your own account from admin panel
 - Cannot demote yourself if you're the last admin
 
+Since v2.13.0:
+
+- **Changing a role or removing a user asks for a code.** At the hardened and strict security tiers, both need a code emailed to the admin. The **Confirm it's you** dialog opens by itself, and the action goes through once the code is entered. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
+- **A removal that doesn't finish is never reported as done.** The account is locked as "pending deletion" and retried in the background, and the API answers **503** `code: 'account_deletion_incomplete'`. Delete the user again to retry straight away. See [When a deletion doesn't finish](/starter-template/security-feature/#when-a-deletion-doesnt-finish).
+- **The audit trail records who did it.** Role changes and settings edits carry the acting admin (`actorId`), and settings edits also list what changed (`changedFields`). See [Hooks](/starter-template/hooks/#admin-service-hooks).
+
 ---
 
 ## Security
@@ -271,10 +278,12 @@ It reads the **live resolved posture** — it does not duplicate any logic. The 
 - **Posture checks** — every finding from the startup guardrail with its severity (`ok` / `info` / `warn` / `error`) and remediation.
 - **Resolved configuration** — the active `SecurityConfig` (tier + the resolved knobs).
 - **Key provider** — whether field-encryption key custody is ready (env key present, or KMS wired).
-- **Secrets** — `SECURITY_ENCRYPTION_KEY`, the KMS / AWS credentials, the Neon Auth secret — as **set / not-set only**. Values are never read into the response or shown.
+- **Secrets** — `SECURITY_ENCRYPTION_KEY` and the KMS / AWS credentials — as **set / not-set only**. Values are never read into the response or shown. (`NEON_AUTH_SECRET_KEY` was dropped from this list in v2.13.0: nothing reads it. The deletion cascade removes the auth identity only through a deleter you wire with `setAuthIdentityDeleter`.)
 - **Module manifests** — what each registered module declared to the security registry.
 
 **What it edits:** the **non-secret** knobs only — the tier (`SECURITY_PROFILE`), the per-knob overrides, `SECURITY_EDGE`, `SECURITY_POSTURE_ENFORCE`, trust-proxy / request-timeout / rate-limit. Each edit is written to `backend/.env` via an allow-listed, atomic upsert and is **audit-logged**.
+
+Since v2.13.0, saving an edit asks for an emailed code at the hardened and strict tiers ([step-up](/starter-template/security-feature/#step-up-re-verification-sensitive-actions)). Each edit also reaches the durable audit trail through the `security.envUpdated` hook, which lists the keys changed but never their values. The rewrite keeps the file's permissions, so a `chmod 600` survives, and a new `.env` is created owner-only (`0600`).
 
 <Aside type="caution" title="Edits are restart-required and dev-first">
 Security config is resolved **once at bootstrap** (`securityConfig` is computed at import), so an edit only takes effect after the backend restarts — the UI says so. Secrets are **never** editable here (use `npm run security:setup-kms` / your env manager). In **production** the editor is **refused** unless `SECURITY_ADMIN_ALLOW_ENV_WRITE=true`, because managed-env deploys (PM2 / Docker / systemd) read real env vars, not `backend/.env`. In development it is always enabled.
@@ -489,10 +498,12 @@ The `/settings` endpoint returns **everything** the frontend needs to render the
 | `/api/v1/admin/style-overrides` | **PUT** | Replace the full style registry overrides map |
 | `/api/v1/admin/dashboard-overrides` | PATCH | Update dashboard widget overrides |
 | `/api/v1/admin/users` | GET | List all users |
-| `/api/v1/admin/users/:userId/role` | PATCH | Update user role |
-| `/api/v1/admin/users/:userId` | DELETE | Delete user |
+| `/api/v1/admin/users/:userId/role` | PATCH | Update user role (step-up) |
+| `/api/v1/admin/users/:userId` | DELETE | Delete user (step-up) |
 | `/api/v1/admin/security/overview` | GET | Security posture, config, key/edge status, secret status, module manifests |
-| `/api/v1/admin/security/env` | PUT | Edit the non-secret, env-backed security knobs (allow-listed; restart required) |
+| `/api/v1/admin/security/env` | PUT | Edit the non-secret, env-backed security knobs (allow-listed; restart required; step-up) |
+
+Routes marked **step-up** also use `requireStepUp` (v2.13.0). At the hardened and strict tiers they answer **403** `code: 'step_up_required'` until the admin enters an emailed code; the frontend's API client handles this for you. The admin email settings (`PUT /api/v1/admin/email/config`) are guarded the same way once a provider is live. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
 
 <Aside type="note">
 The two `/admin/security/*` endpoints are **admin-only for reads too** (not public-read like `/settings`) — the posture reveals where the app's security is weak, so it must not be exposed to non-admins. See the [Security](#security) section.
@@ -522,7 +533,7 @@ model AppSettings {
   logoDisplayMode      String   @default("logo-and-name")
   showDashboardInNav   Boolean  @default(true)
   navigationLayout     String   @default("side")  // "side" | "top" (v2.12.0)
-  enableMarketingPages Boolean  @default(false)
+  enableMarketingPages Boolean  @default(false)  // No admin control since v2.13.0 (kept for the Landing Layout)
   navigationOverrides  Json     @default("{}")  // Items + sections
   toolbarOverrides     Json     @default("{}")  // Toolbar hidden
   styleOverrides       Json     @default("{}")  // Style registry enable/disable

@@ -157,7 +157,7 @@ const UpdateProfileSchema = z.object({
   name: z.string().max(255).optional(),
   bio: z.string().max(5000).optional(),
   avatarUrl: z.string()
-    .max(7 * 1024 * 1024)
+    .max(AVATAR_URL_MAX_LENGTH)   // 512 KB (v2.13.0); avatars are downscaled to 256px before upload
     .refine(/* URL or base64 image */)
     .optional(),
 }).strict();
@@ -181,8 +181,14 @@ const UpdatePreferencesSchema = z.object({
   emailProductUpdates: z.boolean().optional(),
   emailWeeklyDigest: z.boolean().optional(),
   emailMarketing: z.boolean().optional(),
-}).strict();
+})
+  // Module-registered keys pass through, each value at most 4 KB of JSON
+  .catchall(ModulePreferenceValueSchema)
+  // At most 100 keys per update; key names at most 100 characters
+  .superRefine(/* key count + key length */);
 ```
+
+Since v2.13.0 the stored preferences are also capped as a whole: an update that would grow them past 200 keys or 64 KB is rejected with a 400 (an update that shrinks an oversized blob still works). A device token can't change `emailSecurityAlerts`.
 
 ---
 
@@ -229,6 +235,7 @@ declare global {
         email: string;      // User's email (JWT 'email' claim)
         role?: UserRole;    // Populated by requireAdmin/requireRole/attachRole
         tenantId?: string;  // Isolation key for data scoping (RLS + owned()); set by requireAuth, equals id in solo apps
+        authMethod?: 'jwt' | 'device'; // Web session or device token; requireWebSession / requireStepUp refuse 'device'
       };
     }
   }
@@ -311,9 +318,37 @@ Base class for all operational errors.
 class AppError extends Error {
   public readonly statusCode: number;
   public readonly isOperational: boolean;
-  constructor(message: string, statusCode?: number, isOperational?: boolean);
+  public readonly code?: string;  // v2.13.0 — machine-readable reason, e.g. 'step_up_required'
+  constructor(message: string, statusCode?: number, isOperational?: boolean, code?: string);
 }
 ```
+
+### Error Response
+
+Failed requests are answered with JSON of this shape (a description, not an exported type):
+
+```typescript
+interface ErrorResponse {
+  error: string;               // The message (a generic one for unexpected errors in production)
+  code?: string;               // v2.13.0 — only for client-safe errors that carry one
+  details?: Record<string, string[]>; // Validation failures: field → messages (validate middleware)
+  retryAfterSeconds?: number;  // Rate-limit errors only
+  stack?: string;              // Development only
+}
+```
+
+The `code` lets the frontend react without reading the message. Codes the template sends:
+
+| `code` | Status | Meaning |
+|--------|--------|---------|
+| `step_up_required` | 403 | Needs a fresh emailed code ([step-up](/starter-template/security-feature/#step-up-re-verification-sensitive-actions)) |
+| `step_up_invalid_code` | 400 | The code was wrong or expired |
+| `step_up_email_unavailable` | 503 | The code couldn't be emailed in production (usually no email provider). 400 if the account has no email address |
+| `web_session_required` | 403 | A device token tried an action that needs a web session |
+| `account_deletion_pending` | 403 | The account's deletion hasn't finished ([details](/starter-template/security-feature/#when-a-deletion-doesnt-finish)) |
+| `account_deletion_incomplete` | 503 | This deletion run didn't finish; retrying is safe |
+
+On the frontend, show a failed call with `getApiErrorMessage(err, fallback)` from `@/lib/api`. It returns the server's `error` (with any validation `details` folded in), or `fallback` when the response has no usable message.
 
 ### Error Subclasses
 
@@ -328,7 +363,67 @@ class AppError extends Error {
 | `InternalError` | 500 | `Internal server error` |
 | `ServiceUnavailableError` | 503 | `Service temporarily unavailable` |
 
-`TooManyRequestsError` has an additional `retryAfterSeconds` property.
+`TooManyRequestsError` has an additional `retryAfterSeconds` property. `UnauthorizedError`, `ForbiddenError` and `ServiceUnavailableError` take an optional second argument, the `code` (v2.13.0):
+
+```typescript
+throw new ForbiddenError('This account is being deleted', 'account_deletion_pending');
+```
+
+---
+
+## Security Types
+
+Exported from the backend security barrel (`features/security/index.js`). Added in v2.13.0.
+
+### Step-up
+
+Returned by `POST /api/v1/auth/step-up/start` and `/verify`. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
+
+```typescript
+interface StepUpChallenge {
+  challengeId: string;
+  expiresAt: string;   // ISO time; the code lasts 5 minutes
+  sentTo: string;      // Masked recipient, e.g. "k***@example.com"
+}
+
+interface StepUpGrant {
+  grant: string;       // Sent back in the X-Step-Up-Grant header
+  expiresAt: string;
+  expiresIn: number;   // Seconds left (the browser times it on its own clock)
+}
+```
+
+The frontend declares the same two shapes in `features/auth/services/step-up.service.ts`.
+
+### Data export
+
+The personal-data export handler contract. See [Personal-data export](/starter-template/security-feature/#personal-data-export).
+
+```typescript
+interface DataExportSubject {
+  tenantId: string;    // Isolation key (== userId in solo apps)
+  userId: string;
+  email?: string;
+}
+
+interface DataExportContext {
+  subject: DataExportSubject;
+  at: Date;            // One capture time for the whole export
+}
+
+interface DataExportHandler {
+  id: string;          // Unique; also this handler's key in the export
+  moduleId: string;
+  description?: string;
+  run(ctx: DataExportContext): Promise<unknown>; // JSON-serialisable; never secrets or hashes
+}
+
+interface DataExportCollection {   // Returned by collectDataExport()
+  data: Record<string, unknown>;   // Handler output, keyed by handler id
+  handlers: number;                // How many handlers ran
+  failed: Array<{ handlerId: string; moduleId: string }>;
+}
+```
 
 ---
 
@@ -392,7 +487,7 @@ const envSchema = z.object({
   SECURITY_PROFILE: z.enum(['standard', 'hardened', 'strict']).default('hardened'),
   SECURITY_MFA_REQUIRED: z.enum(['true', 'false']).optional().transform(/* -> boolean | undefined */),
   SECURITY_FIELD_ENCRYPTION: z.enum(['true', 'false']).optional().transform(/* -> boolean | undefined */),
-  SECURITY_SESSION_STEP_UP: z.enum(['true', 'false']).optional().transform(/* -> boolean | undefined */),
+  SECURITY_SESSION_STEP_UP: z.enum(['true', 'false']).optional().transform(/* -> boolean | undefined */),  // emailed code before sensitive actions (requireStepUp); on at hardened/strict (v2.13.0)
   SECURITY_AUDIT_MODE: z.enum(['activity', 'compliance']).optional(),
   SECURITY_KEY_PROVIDER: z.enum(['env', 'kms']).optional(),
   SECURITY_KMS_PER_TENANT: z.enum(['true', 'false']).optional().transform(/* -> boolean | undefined */),  // per-tenant KMS data keys + crypto-shred (v1.64.0)

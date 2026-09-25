@@ -12,7 +12,11 @@ Delivery is delegated to expert providers (Resend, SendGrid, AWS SES, or any SMT
 </Aside>
 
 <Aside type="note" title="Auth emails are not sent through this seam">
-Verification, password-reset and change-email messages are sent by **Neon Auth itself**; a custom SMTP provider for those is configured in the **Neon dashboard**, not here (see [Authentication](/starter-template/auth-feature/)). This seam serves everything else: notifications, billing receipts, and module-sent mail.
+Verification, password-reset and change-email messages are sent by **Neon Auth itself**; a custom SMTP provider for those is configured in the **Neon dashboard**, not here (see [Authentication](/starter-template/auth-feature/)). This seam serves everything else: notifications, billing receipts, module-sent mail, and the step-up codes (below).
+</Aside>
+
+<Aside type="caution" title="Production needs a provider for step-up codes (v2.13.0)">
+The "Confirm it's you" codes for [step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions) are sent through `sendEmail()`. Step-up is on at the hardened tier, the default. In production, if a code can't be sent (for example no provider, so the console default returns `sent: false`), asking for a code fails with **503** `code: 'step_up_email_unavailable'`, so the guarded actions can't go ahead. The startup posture check warns about a missing provider (`auth.step-up-delivery`). Configure a provider, or set `SECURITY_SESSION_STEP_UP=false`. In development an unsent code is written to the server log instead.
 </Aside>
 
 ## How it works
@@ -98,7 +102,7 @@ The **Email** page (admin sidebar → Platform) configures and tests the seam wi
 Pick a provider and enter its details; the backend validates, **encrypts the secret at rest**, and wires the provider **live on save — no restart**:
 
 - **Microsoft 365 / Google** — one-click presets that pre-fill the SMTP host/port and guide you to an **app password** (Microsoft needs *Authenticated SMTP* enabled + MFA; Google needs 2-Step Verification + an App Password). Under the hood these use the SMTP path. Basic-auth SMTP is being phased out by both — **OAuth2 sign-in is [on the roadmap](/starter-template/roadmap/)** for tenants that block it.
-- **Custom SMTP** — any host: connection security (STARTTLS on 587 / implicit TLS on 465), port, username, password. **Test connection** verifies the server (Nodemailer's `verify()`) *without sending*.
+- **Custom SMTP** — any host: connection security (STARTTLS on 587 / implicit TLS on 465), port, username, password. **Test connection** verifies the server (Nodemailer's `verify()`) *without sending*. The stored password is reused (for a test or a save) only for the **same host, port, TLS mode and username** it was saved with (v2.13.0). Point the settings at a different server and you must type the password again, so a hijacked admin session can't send the saved password to a server it controls.
 - **Resend / SendGrid** — a from address + the API key.
 - **Amazon SES** — a from address + region (SES authenticates via the AWS credential chain, so no secret is stored).
 
@@ -119,7 +123,14 @@ Nodemailer is installed by `create-app` for new apps and reconciled into existin
 - **Status** — the `getEmailProviderStatus()` probe (provider / source / ready, plus remediation detail); never sends.
 - **Test delivery** — `POST /api/v1/admin/email/test` sends a test **to the signed-in admin's own address only** (the body carries no recipient, so it cannot be used as a relay) and renders the returned `EmailResult` verbatim, including honest non-delivery.
 
-All endpoints — `GET .../email/status`, `GET`/`PUT .../email/config`, `POST .../email/test-connection`, `POST .../email/test` — are **admin-gated** and live in the backend email feature (`email.routes.ts`); the sending seam itself stays service-only. Config writes are zod-validated, refuse when the environment owns the config, and never accept or return a plaintext secret beyond the single write-only field. Deliberately **not** included: an outbound log viewer (delivery state belongs to the provider) and template previews (module territory).
+All endpoints — `GET .../email/status`, `GET`/`PUT .../email/config`, `POST .../email/test-connection`, `POST .../email/test` — are **admin-gated** and live in the backend email feature (`email.routes.ts`); the sending seam itself stays service-only. Config writes are zod-validated, refuse when the environment owns the config, and never accept or return a plaintext secret beyond the single write-only field.
+
+Since v2.13.0, saving the config (`PUT .../email/config`) also:
+
+- **needs a step-up code once a provider is live.** The provider decides where step-up codes go, so a hijacked admin session must not be able to point email at its own server. The code is sent through the **current** provider. With no provider ready the save stays open, so a new deploy can still set email up. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
+- **is recorded in the audit trail** with the admin who saved it, through the `email.configUpdated` hook (below).
+
+Deliberately **not** included: an outbound log viewer (delivery state belongs to the provider) and template previews (module territory).
 
 ## Custom adapters
 
@@ -144,6 +155,7 @@ setEmailProvider(myProvider);
 |------|------|-------|
 | `email.outbound` | filter | Before send — transform the outgoing `EmailMessage` (e.g. append a footer) |
 | `email.sent` | action | After a successful send, with `{ message, result }` — fire-and-forget, never delays the send path |
+| `email.configUpdated` | action | After an admin saves the email config (v2.13.0), with `{ actorId, provider, secretChanged, hostChanged }` — flags only, the secret never travels. Recorded in the durable audit trail |
 
 ```typescript
 import { filterRegistry } from '../../config/filter.registry.js';
@@ -165,4 +177,4 @@ Run `npm run template:update` — the merge brings the feature in, and `sync-env
 - **Queuing and retry** — `sendEmail` is a direct call. Durable retry arrives with the background-jobs seam (roadmap) or via your provider.
 - **Auth emails** — Neon Auth sends its own (see the note above).
 
-The seam's *sending* path is stateless (no per-message rows). Its only stored state is the optional app-wide `EmailConfig` singleton (admin-set provider config, secret encrypted at rest) — app config, not account data, so it carries no `tenantId` and needs no deletion handler. Its security manifest declares the `email.sent` audit event and the encrypted `EmailConfig.secretCiphertext` field.
+The seam's *sending* path is stateless (no per-message rows). Its only stored state is the optional app-wide `EmailConfig` singleton (admin-set provider config, secret encrypted at rest) — app config, not account data, so it carries no `tenantId` and needs no deletion handler. Its security manifest declares the `email.sent` and `email.configUpdated` audit events and the encrypted `EmailConfig.secretCiphertext` field.

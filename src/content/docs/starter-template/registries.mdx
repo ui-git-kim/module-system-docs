@@ -302,7 +302,7 @@ settingsPagesRegistry.register({
 ```
 
 <Aside type="note">
-**Replaceable Pages:** `billing` (placeholder exists for modules to replace)
+**Replaceable Pages:** `billing`. Since v2.13.0 the placeholder is registered in development builds only, so a production app shows a Billing page only when a billing module registers one.
 
 **Non-Extensible Pages:** `security`, `data` (for security/compliance reasons)
 </Aside>
@@ -877,8 +877,9 @@ The props contract is **unchecked across the seam** (the component is stored as 
 Register API routes with versioning.
 
 ```typescript
-import { routeRegistry } from '@/config/route.registry';
-import { billingRoutes } from './billing.routes';
+// Backend imports are relative with a .js extension (no '@/' alias)
+import { routeRegistry } from '../../config/route.registry.js';
+import { billingRoutes } from './billing.routes.js';
 
 routeRegistry.register({
   path: '/billing',
@@ -930,8 +931,19 @@ interface RouteConfig {
 | `mountAll(app, authMiddleware)` | Mount all routes to Express app |
 | `getByFeature(feature)` | Get routes by feature name |
 | `getByVersion(version)` | Get routes by API version |
-| `allowsNoOrigin(path)` | v1.54.0 — whether a request path opted into no-Origin access (consulted by the production CORS gate) |
+| `allowsNoOrigin(path)` | v1.54.0 — whether a request path opted into no-Origin access (consulted by the production origin gate) |
 | `generateDocs()` | Generate route documentation |
+
+`requiresAuth` (the default) already applies `requireAuth` when the routes are mounted, so don't list it again in `middleware` — it would run twice.
+
+**Guarding sensitive routes** (v2.13.0): add these per route, inside your router, after the auth or admin check.
+
+- `requireWebSession` (`middleware/auth.middleware.js`) refuses [device tokens](/starter-template/device-tokens/). Use it on routes that delete or export a whole account's data.
+- `requireStepUp` (`middleware/step-up.middleware.js`) asks for a code emailed to the signed-in address at the hardened and strict tiers. Use it on sensitive actions. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
+
+```typescript
+router.delete('/archive', requireWebSession, requireStepUp, handler);
+```
 
 ---
 
@@ -959,7 +971,7 @@ serviceRegistry.register('user', userService, {
 
 // Access from another feature
 const userSvc = serviceRegistry.get('user');
-const profile = await userSvc.getProfile(userId);
+const profile = await userSvc.getOrCreateProfile(userId, email);
 ```
 
 **Type Augmentation:**
@@ -1014,12 +1026,12 @@ const plugin = serviceRegistry.getDynamic<MyPluginService>('my-plugin');
 
 ## securityRegistry (backend)
 
-The registry modules declare their **security manifest** into. The foundation (the [security feature](/starter-template/security-feature/)) reads it to apply RLS policies + ownership scoping, field encryption, hashed-secret handling, audit subscriptions, and deletion cascades — so nothing security-relevant is left to per-module discipline. A module with **no** manifest still inherits the floor (RLS + ownership) but can't use the declared controls until it declares them.
+The registry modules declare their **security manifest** into. The foundation (the [security feature](/starter-template/security-feature/)) reads it to apply RLS policies + ownership scoping, field encryption, hashed-secret handling, audit subscriptions, deletion cascades, and the personal-data export — so nothing security-relevant is left to per-module discipline. A module with **no** manifest still inherits the floor (RLS + ownership) but can't use the declared controls until it declares them.
 
 Register in a side-effect `security.registration.ts`, imported from the feature's `index.ts` (same pattern as every other registry).
 
 ```typescript
-import { securityRegistry } from '@/features/security';
+import { securityRegistry } from '../security/index.js';
 
 securityRegistry.register({
   moduleId: 'billing',
@@ -1050,17 +1062,19 @@ securityRegistry.register({
 | `getCredentialTypes()` | De-duplicated declared credential types |
 | `registerDeletionHandler(handler)` | Register a deletion handler for the [deletion cascade](/starter-template/security-feature/#deletion-cascade) (skips on duplicate `id`) |
 | `getDeletionHandlers()` | All deletion handlers, sorted by `order` (the cascade groups them by classification) |
+| `registerExportHandler(handler)` | v2.13.0 — register a handler for the [personal-data export](/starter-template/security-feature/#personal-data-export) (skips on duplicate `id`) |
+| `getExportHandlers()` | v2.13.0 — all export handlers, in registration order |
 | `findTierViolations(active)` | Modules whose `minimumTier` exceeds the active tier |
-| `clear()` | Remove all manifests + deletion handlers (testing) |
+| `clear()` | Remove all manifests + deletion and export handlers (testing) |
 
 ### Deletion handlers
 
 Modules contribute account/tenant erasure via deletion handlers (added in v1.32.0). The `classification` selects the cascade phase + semantics; `order` sequences handlers within a phase (default 50). Handlers must be **idempotent** and must throw — or return `{ action: 'failed' }` — on non-completion.
 
 ```typescript
-import { securityRegistry } from '@/features/security';
-import { owned } from '@/lib/owned';
-import { prisma } from '@/lib/prisma';
+import { securityRegistry } from '../security/index.js';
+import { owned } from '../../lib/owned.js';
+import { prisma } from '../../lib/prisma.js';
 
 securityRegistry.registerDeletionHandler({
   id: 'billing.invoices',
@@ -1074,7 +1088,24 @@ securityRegistry.registerDeletionHandler({
 });
 ```
 
-Apps trigger the cascade with `deleteAccount(subject, opts)` (the user + admin deletion paths already do). It returns a `DeletionReport` — `{ status, results, authIdentity, bundle, totals }` — and never throws. See the [Security feature → Deletion cascade](/starter-template/security-feature/#deletion-cascade) for the order, the auth-identity seam, and the compliance bundle.
+Apps trigger the cascade with `deleteAccount(subject, opts)` (the user + admin deletion paths already do). It returns a `DeletionReport` — `{ status, results, authIdentity, bundle, totals }` — and never throws. See the [Security feature → Deletion cascade](/starter-template/security-feature/#deletion-cascade) for the order, the auth-identity seam, and the compliance bundle. Since v2.13.0 a run that doesn't complete leaves the account locked as pending deletion and retries it — see [When a deletion doesn't finish](/starter-template/security-feature/#when-a-deletion-doesnt-finish).
+
+### Export handlers
+
+The personal-data export (`POST /api/v1/user/export`) mirrors the deletion cascade (added in v2.13.0). Register an export handler wherever you register a deletion handler for `owned` data, so the export covers everything the deletion can find.
+
+```typescript
+securityRegistry.registerExportHandler({
+  id: 'billing.invoices',            // also the key of this section in the download
+  moduleId: 'billing',
+  description: "The account's invoices",
+  async run(ctx) {
+    return prisma.invoice.findMany({ where: owned(ctx.subject.tenantId) });
+  },
+});
+```
+
+`run(ctx)` gets `ctx.subject` (`{ tenantId, userId, email? }`) and `ctx.at`, and returns anything JSON-serialisable. Never return secrets, token hashes or ciphertext. `collectDataExport(subject)` (from the security barrel) runs every handler one at a time and returns `{ data, handlers, failed }`; it never throws. A handler that throws is listed in `failed`, and the export is delivered marked incomplete. See [Personal-data export](/starter-template/security-feature/#personal-data-export).
 
 ---
 
@@ -1138,7 +1169,7 @@ const displayName = filterRegistry.apply(
   </TabItem>
   <TabItem label="Backend">
 ```typescript
-import { filterRegistry } from '@/config/filter.registry';
+import { filterRegistry } from '../../config/filter.registry.js';
 
 // Synchronous filter
 filterRegistry.register(
@@ -1224,7 +1255,7 @@ actionRegistry.doAction('user.loggedIn', { user, method: 'email' });
   </TabItem>
   <TabItem label="Backend">
 ```typescript
-import { actionRegistry } from '@/config/action.registry';
+import { actionRegistry } from '../../config/action.registry.js';
 
 // Sync action
 actionRegistry.addAction('user.created', 'audit', (ctx) => {
@@ -1340,7 +1371,7 @@ When the app imports the feature (in `main.tsx` or `app.ts`), registrations happ
 |----------|---------|------|
 | `routeRegistry` | API routes | Custom |
 | `serviceRegistry` | Cross-feature services | Custom |
-| `securityRegistry` | Module security manifests | Custom |
+| `securityRegistry` | Module security manifests, deletion and export handlers | Custom |
 | `filterRegistry` | Data transformation | Custom |
 | `actionRegistry` | Side effects | Custom |
   </TabItem>

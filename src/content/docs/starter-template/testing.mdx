@@ -20,6 +20,13 @@ The template ships a minimum test suite ([Vitest](https://vitest.dev)) and a Git
 | **Module registry** — first-writer-wins, validation, stable enumeration, and the dependency presence-check (range recording) | `backend/src/features/modules/modules.test.ts` | No |
 | **Module init ordering** — dependency policy + boot-order enforcement of module `init()` | `backend/src/features/modules/modules.init.test.ts` | No |
 | **Admin module actions** — enable/disable write-guards (env / production gating) | `backend/src/features/modules/modules.admin-actions.test.ts` | No |
+| **Step-up re-verification** — a code verifies once, wrong codes burn it, codes and grants expire; `requireStepUp` answers 403 `step_up_required` until a grant arrives; the browser retries once with the grant | `backend/src/features/security/step-up.test.ts`, `frontend/src/lib/__tests__/step-up.test.ts` | No |
+| **Device tokens** — single-use enrolment, rotation, refresh-token reuse detection, retention prune; a device token is never admin and never passes a web-session-only route | `backend/src/features/auth/devices.service.test.ts`, `backend/src/middleware/auth.middleware.test.ts` | No |
+| **Route guards** — device tokens refused on account deletion, export and security-alert settings; step-up on deletion and on email settings; preference and avatar size caps | `backend/src/features/user/user.routes.test.ts`, `backend/src/features/email/email.routes.test.ts` | No |
+| **Account deletion + export** — an unfinished erasure is never reported as done and can't re-create the account; the personal-data export collects every handler | `backend/src/features/user/account-deletion.test.ts`, `backend/src/features/user/security.registration.test.ts`, `backend/src/features/security/export.test.ts` | No |
+| **Audit trail** — security hooks reach the audit sink and record the acting admin | `backend/src/features/admin/audit.registration.test.ts` | No |
+| **Origin gate + SMTP secret** — a refused origin gets a direct 403; the stored SMTP password is only reused for the same server | `backend/src/middleware/origin.middleware.test.ts`, `backend/src/features/email/email.config.test.ts` | No |
+| **Frontend helpers** — `getApiErrorMessage` and the light/dark colour-scheme helpers (including blocked storage) | `frontend/src/lib/__tests__/api-error.test.ts`, `frontend/src/lib/__tests__/color-scheme.test.ts` | No |
 | **BaseRegistry lifecycle** — register / unregister / order / admin overrides | `frontend/src/config/__tests__/base-registry.test.ts` | No |
 
 <Aside type="note" title="On “module install/uninstall”">
@@ -38,12 +45,18 @@ The **cross-user isolation** test is DB-backed and **skips unless `TEST_USE_DB=1
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every push + PR with four jobs:
+`.github/workflows/ci.yml` has four jobs:
 
 - **backend** — `npm install` → `prisma generate` → typecheck → unit tests.
-- **frontend** — `npm install` → **test** (always). Typecheck + build (and lint) run only in a **complete app**: the bare template ships without the shadcn `components/ui/*` (generated per app) and without an eslint config, so those steps are gated on their presence — the template's own CI stays green while a cloned app gets the full pipeline.
+- **frontend** — `npm install` → **test** → typecheck + build. A cloned app builds against its own shadcn `components/ui/*`. The bare template ships none (they are generated per app), so there CI first generates the [shadcn baseline](/starter-template/scripts/#shadcn-baseline) with a non-interactive `shadcn init`. A template change that breaks the type-check or build is caught in the template, not in every app after `template:update`. The build uses placeholder `VITE_API_URL` / `VITE_NEON_AUTH_URL` values unless you set repository variables with those names (CI builds are never deployed). Lint runs only where an eslint config exists (the template ships none).
 - **audit** — an allowlist-aware `npm audit` gate across backend + frontend. **Warn-only** unless enabled (see below).
 - **isolation** — the DB-backed test against a **throwaway Neon branch**. **Opt-in** (see below).
+
+### When CI runs
+
+- **The template repo:** on every push to `main` and every pull request (v2.13.0). None of the default jobs need secrets (the isolation job stays opt-in).
+- **A cloned app:** auto-runs stay **off** until you opt in. Add the repository variable **`CI_AUTO_RUN`** = `true` once the app's GitHub settings are ready (see the isolation job below). Until then, pushes don't fail on missing settings.
+- **Anywhere:** you can start the whole pipeline by hand from the **Actions** tab (`workflow_dispatch`).
 
 ### Enabling the Neon-branch isolation job
 
@@ -51,6 +64,7 @@ The **cross-user isolation** test is DB-backed and **skips unless `TEST_USE_DB=1
 
 1. In the repo's **Settings → Secrets and variables → Actions**, add secrets `NEON_API_KEY` (Neon account settings → API keys) and `NEON_PROJECT_ID` (your Neon project).
 2. Add a **repository variable** `RUN_DB_TESTS` = `true`.
+3. In a cloned app, also add `CI_AUTO_RUN` = `true` so the pipeline runs on push (see [When CI runs](#when-ci-runs)).
 
 </Steps>
 
@@ -62,9 +76,11 @@ Isolation is enforced by **Postgres RLS**, not app code — so the test only mea
 
 ### The dependency-audit gate
 
-The **audit** job runs `npm audit` across `backend` and `frontend` through `scripts/audit-gate.mjs`. A plain `npm audit` gate is unusable here — the Neon → better-auth chain carries advisories that can't be fixed downstream (the version tracks Neon's *managed* auth server), so it would fail forever and get ignored. Instead the gate reads **`.audit-allowlist.json`** and splits high/critical advisories into **known** (allowlisted) vs **NEW**, reporting only new risk.
+The **audit** job runs `npm audit` across `backend` and `frontend` through `scripts/audit-gate.mjs`. A plain `npm audit` gate is unusable here — some advisories can't be fixed in this repo (Prisma 7's `deepmerge-ts` chain, whose only npm fix is a Prisma downgrade), so it would fail forever and get ignored. Instead the gate reads **`.audit-allowlist.json`** and splits high/critical advisories into **known** (allowlisted) vs **NEW**, reporting only new risk.
 
-It is **warn-only by default** — it never fails CI unless you set the repository variable **`AUDIT_GATE_ENFORCE`** = `true`. The pre-seeded allowlist covers the Neon/better-auth chain (see [Dependency vulnerabilities](/starter-template/roadmap/#dependency-vulnerabilities)); curate it as advisories are triaged, then flip `AUDIT_GATE_ENFORCE` on once it's clean. Run it locally with `node scripts/audit-gate.mjs`.
+It is **warn-only by default** — it never fails CI unless you set the repository variable **`AUDIT_GATE_ENFORCE`** = `true`. The allowlist holds the Prisma `deepmerge-ts` chain and `GHSA-g38m-r43w-p2q7`, the better-auth advisory that Neon's managed auth server still carries (see [Dependency vulnerabilities](/starter-template/roadmap/#dependency-vulnerabilities)); curate it as advisories are triaged, then flip `AUDIT_GATE_ENFORCE` on once it's clean. Run it locally with `node scripts/audit-gate.mjs`.
+
+The gate **fails closed** (v2.13.0): an audit that could not run (no lockfile, a registry or network error) is reported as a failed audit, never as clean. With `AUDIT_GATE_ENFORCE` on, that fails the job.
 
 <Aside type="caution" title="First run surfaces what the lockfiles carry">
 The gate is a mirror, not a fix — on first run it reports every high/critical advisory in the committed lockfiles, including stale-lockfile pins that already have patched versions in range. Refresh with `npm run deps:lockfile`, then allowlist (or fix) what genuinely remains before enforcing.
