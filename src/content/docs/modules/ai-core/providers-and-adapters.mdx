@@ -50,9 +50,9 @@ export interface ProviderAdapter {
 | Type | What it carries |
 |---|---|
 | `GenerateRequest` | `instructions`, `input`, `parameters: ResolvedParameters`, optional `schema` (structured output), optional `tools: ResolvedTool[]` (provider-native), optional `attachments: MediaAttachment[]`, optional `signal` |
-| `GenerateResult` | `text`, optional `structured`, optional `toolCalls` (name + count, by reference), optional `toolSources` (url + title), optional `stepCount`, `usage: NormalizedUsage`, `warnings: ProviderWarning[]`, `finishReason`, optional `rawFinishReason`, optional `reportedModelId`, optional `cacheApplied`, `latencyMs` |
-| `NormalizedUsage` | `inputTokens?`, `outputTokens?`, `totalTokens?`, `cacheReadTokens?`, `cacheWriteTokens?`, `reasoningTokens?`, and the provider-native `raw?` passed through for the ledger |
-| `GenerateRequest.cache?` | a resolved `CacheDirective` (`{ instructions?, inputBreak?, ttl }`) — owned offsets, not an SDK type; absent = no caching |
+| `GenerateResult` | `text`, optional `structured`, optional `toolCalls` (name + count, by reference), optional `toolSources` (url + title), optional `stepCount`, `usage: NormalizedUsage`, `warnings: ProviderWarning[]`, `finishReason`, optional `rawFinishReason`, optional `reportedModelId`, optional `cacheHandled` (`explicit` · `automatic` · `none`; absent = no caching was asked for), `latencyMs` |
+| `NormalizedUsage` | `inputTokens?`, `outputTokens?`, `totalTokens?`, `cacheReadTokens?`, `cacheWriteTokens?`, `cacheWriteLongTokens?` (v1.67.0 — of the writes, those kept for the long lifetime, when the provider reports the split), `reasoningTokens?`, and the provider-native `raw?` passed through for the ledger |
+| `GenerateRequest.cache?` | a resolved `CacheDirective` (v1.67.0: `{ mode: 'explicit' \| 'automatic', systemBreaks, inputBreaks, keep: 'short' \| 'long', cacheKey }`, each break `{ at, keep }`) — owned character offsets, not an SDK type; absent = no caching, and the request is exactly the one sent before caching existed |
 | `ProviderWarning` | `kind` (`unsupported` · `compatibility` · `deprecated` · `other`) and a `detail` string |
 | `EmbedResult` | `embeddings: number[][]`, optional `tokens`, `coverage: EmbedCoverage[]`, `warnings`, `latencyMs` |
 | `EmbedCoverage` | `index`, `covered`, `total`, `unit: 'characters'` — what portion of each input the vector covers |
@@ -118,8 +118,9 @@ The adapters are written against AI SDK v7. A generation call goes through `gene
 ```ts
 const options = {
   model,
-  ...promptPart,                              // { prompt }, or { messages } when caching is on OR media is attached
-  ...(hasSystem ? { instructions: req.instructions } : {}), // omitted entirely when the assembled system prompt is empty — never an empty block
+  ...promptPart,                              // { prompt }, or { messages } when a cache directive is mapped explicitly or media is attached
+  ...(hasSystem ? { instructions } : {}),     // the system prompt as one string, or system messages split at cache points; omitted entirely when empty — never an empty block
+  ...(providerOptions ? { providerOptions } : {}), // request-level cache options (OpenAI cache key / retention, Anthropic automatic marker); none without a directive
   maxOutputTokens: req.parameters.maxOutputTokens,
   temperature: req.parameters.temperature,
   topP: req.parameters.topP,
@@ -147,12 +148,21 @@ The structured value is validated upstream in the run engine, not trusted from t
 - **Warnings are never swallowed.** `mapWarnings` turns each SDK warning into a `ProviderWarning`; an unlabelled one becomes `"unspecified provider warning"` rather than vanishing.
 - **Tool activity is captured by reference, never by content.** When the model used a provider-native tool, `toolCalls` records each tool's name and call count and `toolSources` the source URLs it was handed back (url and title only); `stepCount` records how many search-and-read rounds the run took. The search query sent and the page content returned never cross this boundary.
 
-### Prompt caching (v1.9.0)
+### Prompt caching (v1.9.0, reworked in v1.67.0)
 
-When an operation carries a `cache` policy, the run hands the adapter a resolved `CacheDirective` and the adapter places `providerOptions.anthropic.cacheControl` breakpoints the provider caches by prefix: a **top-level** one for the system prompt (under AI SDK v7 the system prompt travels through the `instructions` option — a `system`-role message is rejected outright — so its cache marker rides top-level, never on a message) and/or a **part-level** one on the context-prefix text part. Two things keep it honest:
+When a call's cache plan places anything, the run hands the adapter a `CacheDirective`: the character offsets where each cached part of the system prompt and of the input ends, how long to keep each one, and a cache key. How a provider honours it is a provider fact, so the mapping lives only in `adapters.ts`:
 
-- **Anthropic-only, and it says so.** Only the Anthropic adapter honours explicit caching. If a cache directive reaches any other adapter the call still runs, `GenerateResult.cacheApplied` comes back `false`, and a `ProviderWarning` is attached — the run then names `prompt-cache-unsupported` in feedback. Caching is never faked.
-- **No new data, no content in the ledger.** The cached prefix is the *same* prompt the call already sends; caching adds no data the provider did not already receive, and the prefix text is never written to logs or the ledger — only the `cacheWriteTokens` / `cacheReadTokens` counts are.
+| Provider | What is sent |
+|---|---|
+| **Anthropic**, explicit (the default for Claude models) | The system prompt goes as consecutive system messages and the input as consecutive text parts, split at the offsets. Each part that ends at a cache point carries its own `providerOptions.anthropic.cacheControl` (`ttl` `5m`, or `1h` for the long lifetime). **Never a top-level `cacheControl` in this mode** — the provider reads a top-level one as its automatic caching, which marks the *last* block of the request (the part that changes on every call). Before v1.67.0 the system prompt's marker rode top-level, so it cached the wrong block; that bug is fixed. |
+| **Anthropic**, automatic (only when an admin sets a Claude model to automatic) | The plain request plus the top-level marker, always the short lifetime (it lands on the last block). |
+| **OpenAI** | Every request carries `providerOptions.openai.promptCacheKey` — a hash of the operation and the tenant, no content, so each customer's traffic is routed to its own cache where possible (a routing hint: OpenAI may still serve a busy key from other machines, and only a byte-identical start of a prompt ever matches). Automatic (the default): the plain request, plus `promptCacheRetention: '24h'` for the long lifetime. Explicit (GPT-5.6 and later, set by an admin): a `promptCacheBreakpoint` on the system message (OpenAI never splits it) and on each input part that ends at a cache point, with `promptCacheOptions` (`mode: 'implicit'`, and `ttl: '30m'` for the long lifetime). |
+| **Google** | Nothing is sent: Gemini caches repeated prefixes by itself. Explicit stored caches are not used. |
+| Any other provider | Nothing is sent, `cacheHandled` is `none` and a `ProviderWarning` is attached; the run names `prompt-cache-unsupported` in feedback. |
+
+`GenerateResult.cacheHandled` says which of these happened (`explicit`, `automatic` or `none`; absent when no directive was given). Splitting never rewrites the text: the parts re-join to exactly the prompt. With no directive — an operation with caching off, or the app-wide switch off — the request is exactly the one sent before caching existed: the instructions as one string and no provider options of any kind. Cache reads and writes come back in `NormalizedUsage` (`cacheReadTokens`, `cacheWriteTokens`, and for Anthropic `cacheWriteLongTokens`, read from `usage.cache_creation.ephemeral_1h_input_tokens`).
+
+- **No new data, no content in the ledger.** The cached prefix is the *same* prompt the call already sends; caching adds no data the provider did not already receive, and the prefix text is never written to logs or the ledger — only the token counts and a content-free cache plan are. Where the cache points go is decided by the run's planner, not here — see [Prompt caching](/modules/ai-core/prompt-assembly/#prompt-caching-v1670).
 - **The reported model id** — the id the provider says actually served the call — is captured from the response and returned as `reportedModelId`, so the ledger records what really ran, not just what was requested.
 
 Embeddings go through `embedMany` and reranking through `rerank`, each wrapped the same way: timed, typed on failure, warnings surfaced. Embedding coverage is measured against a character budget derived from the resolved model's `maxInputTokens` (roughly four characters per token): an over-length input is reported as *partially* covered and the run surfaces `partial-embedding-coverage`, and full coverage is claimed only when the model declares no input ceiling. Where the SDK still exposes no signal — rerank token usage — AI Core reports the honest unknown (`undefined` tokens) rather than manufacturing a number.

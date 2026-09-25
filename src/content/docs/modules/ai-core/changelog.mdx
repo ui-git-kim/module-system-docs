@@ -21,6 +21,47 @@ Check your installed version with `npx ai-core info`.
 
 ---
 
+## v1.67.0 — 2026-09-26
+
+**Admin-configured prompt caching.** An admin now decides what each operation caches and for how long, and AI Core shows what caching saves and why it fell short. This is a **minor** release: new columns, one new table, one seed. Operations that existed before it keep exactly what they had.
+
+**What you'll see in the admin:**
+
+- **Prompt caching on each operation.** The operation editor has a **Prompt caching** section: *How to cache* (**Off**, **Automatic** or **Choose the parts** — foundation, instructions, shared context, per-user context, caller material) and *How long to keep cached parts* (**Mixed**, **Short** or **Long**). A **new operation starts on Automatic**. Under it, a **Cache health** strip shows how much of the input came from the cache over the operation's recent runs and, in plain words, why caching fell short and what to change.
+- **A Prompt caching card on the Models tab** with one switch for the whole app. Off, AI Core asks for no caching and marks no cache points, and every prompt is built exactly as before caching existed. OpenAI and Gemini may still cache a repeated start of a prompt by themselves (the ledger shows those reads).
+- **Cache facts on each model** (language models): *Prompt cache support*, *Smallest cacheable prompt (tokens)*, *Cache points per request* and *Can keep a cache for the long lifetime*, filled in for the seeded models and blank (the provider's default) for the rest. Pricing gains a **Long cache write** price.
+- **How often a variable changes** on the Variables tab (*Stays the same*, *Different for each user*, *Changes once a day*, *Can change on every call*), with a **Changes** column. The built-in `date`, `user_name` and `communication_style` are set; existing custom variables start at *Can change on every call*.
+- **A Caller material block** on a background context's canvas sets where the caller's own material sits (without one it comes last, as before), and a **Prompt order** list under the canvas shows the order and where caching stops.
+- **The preview** splits the prompt into cache bands and adds a **Stability check** (the prompt built again a day later, and with other variable values).
+- **A Prompt cache card on the Usage tab** — the last 30 days, all users: read from and written to the cache, the share of input from the cache and an estimated saving. The **By operation** table gains **From cache (%)** and the ledger a hidden **Cache plan** column.
+
+**How it works.** A prompt splits into five layers; each piece is known to stay the same for everyone, for each user, for a caller's batch, or to change on every run. The planner places a cache point at the end of each layer that stays the same and is big enough for the model, up to the model's limit, and never reorders anything. Anthropic gets a cache marker on each part that ends at a cache point; OpenAI gets a prompt-cache key that includes the tenant (and cache points on models an admin sets to explicit); Google caches by itself. The full picture is in [Prompt Assembly → Prompt caching](/modules/ai-core/prompt-assembly/#prompt-caching-v1670).
+
+**Flagged material can now be cached.** With caching on, the injection-risk fence tag is keyed per content (HMAC-SHA256 under a secret key, over the tenant, the label and the content) instead of drawn at random per call, so the same material repeats and can be cached — and it still can't close its own span. Set `AI_CORE_FENCE_KEY` (32 or more characters, the same on every server), or AI Core generates a key once and keeps it in the new `ai_secrets` table, which no route, admin screen or export ever reads. If neither works, the run uses the random tag and names `prompt-cache-fence-random`. With caching off, the random tag is used exactly as before.
+
+**Existing operations.** An operation with no cache setting (almost all of them, and every seeded one) stays off: its prompt and its request are byte-for-byte what they were. An operation saved with the older `{ instructions?, context?, ttl? }` setting keeps caching and is read as **Choose the parts**, and it now gets the corrected mechanics: keyed fence tags, the declared-marker list and cache markers on the right blocks (below). Its cache health may name a layer as skipped; saving it in the editor keeps its setting unless the cache setting itself is changed.
+
+**Fixed: the Anthropic system-prompt cache marker was on the wrong block.** Since v1.11.3 the instructions' cache marker was sent as a top-level `providerOptions.anthropic.cacheControl`, which Anthropic reads as its automatic caching of the **last** block of the request — the part that changes on every call — so the instructions were not what got cached. Each part that ends at a cache point now carries its own marker, and a top-level marker is never sent in that mode.
+
+**Cost.** A cache write kept for the long lifetime (an hour on Anthropic) is now priced at the model's **Long cache write** price, or its ordinary cache-write price when it has none — the gap v1.66.0 listed. A refresh fills the long price for Anthropic models at twice the input price.
+
+**Feedback your app may see** (all in `feedback.missing`, and only for an operation that asks for caching): `prompt-cache-disabled-app-wide`, `prompt-cache-unsupported` (no longer sent for OpenAI or Google, which cache by themselves), `prompt-cache-fence-random`, `prompt-cache-no-effect`, `cache-instructions-unstable:<variable>` / `:marker:<id>` / `:notice:injection-risk`, `cache-context-unstable:<variable>`, `cache-layer-skipped:<layer>:<reason>` and `cache-layer-changes-every-call:<layer>`. **Retired:** `prompt-cache-defeated-by-injection-nonce`. See [Service API → Feedback](/modules/ai-core/service-api/).
+
+**For developers:**
+
+- `ensureOperation`'s `cache` takes the new `{ mode, layers?, keep? }` shape (the older shape is still accepted). **Omitting it now means Automatic** on create, and `null` means off. New exported types: `CacheSetting`, `CacheMode`, `CacheLayer`, `CacheKeep`; `CachePolicy` is now either shape.
+- The config export writes the new cache shape, a variable's `changes` and a context's `caller` block, and is stamped **6.5** whenever it holds an operation; the importer accepts 6.0 to 6.5. The fence key and the model cache facts are never exported.
+- Provider layer (both owned types, confined to it): `GenerateResult.cacheApplied` is replaced by `cacheHandled` (`explicit` · `automatic` · `none`), and `CacheDirective` is now `{ mode, systemBreaks, inputBreaks, keep, cacheKey }`. `NormalizedUsage` gains `cacheWriteLongTokens`.
+- New admin routes: `GET /admin/operations/:id/cache-health` and `GET /admin/usage/cache-summary`. The preview's `inputCacheBreak` is replaced by a `cache` object. `PUT /admin/policy` takes `promptCachingEnabled`, and `ai-core.policy.updated` carries it. See [Service API → Admin HTTP routes](/modules/ai-core/service-api/#admin-http-routes).
+- `getCurrentUsage` reads the cache token counts from the new ledger columns (falling back to `usage` for a row without them).
+- Test-run results in the admin still show the raw cache feedback codes; the plain words are in Cache health and the preview.
+
+**Data.** New table `ai_secrets` (the generated fence key; read only by the fence code, never returned by a route, shown, logged or exported). `ai_policy` gains `promptCachingEnabled` (default on). `ai_model` gains `cacheSupport`, `cacheMinTokens`, `cacheMaxBreakpoints` and `cacheLongLifetime` (blank = the provider's default), and its `pricing` Json may hold `cacheWriteLongPer1M`. `ai_prompt_variable` gains `changes` (default `per-call`). `ai_usage_ledger` gains `cacheReadTokens`, `cacheWriteTokens` and `cachePlan`. The data seed `seed-43` only fills values still unset: the seeded models' cache facts, `date` (daily) and `user_name` / `communication_style` (per user), the cache token counts of past ledger rows from their `usage`, and Anthropic models' long cache-write price (twice the input price). See [Data Model](/modules/ai-core/data-model/).
+
+**Upgrading:** run `npx ai-core update` **with the schema step** (don't use `--skip-schema`): it adds the table and columns and runs the seed. It is additive — no data is removed. **Existing operations are unchanged** until an admin turns caching on for them (an operation saved with the older cache setting keeps caching, with the corrected mechanics above). Optionally set `AI_CORE_FENCE_KEY` (32 or more characters, the same on every server) before the first run that caches flagged material; otherwise AI Core generates its own key. The app-wide switch starts on, so operations you create from now on cache automatically.
+
+---
+
 ## v1.66.0 — 2026-09-26
 
 **Admin-set spending limits.** AI Core now works out what each call costs and lets an admin cap it. This is a **minor** release: new columns, one new table and one clean break for in-process callers (below).
@@ -1233,6 +1274,10 @@ This closes the top follow-up from the v1.12.0 live smoke test. An admin editor 
 **Fix: caching the system prompt (`cache.instructions`) under AI SDK v7.** The v1.9.0 caching path built a `role: 'system'` message so a `cacheControl` marker could ride on it — but AI SDK v7 rejects system-role messages outright (`AI_InvalidPromptError`, *"use the instructions option instead"*). Any operation with `cache.instructions: true` **and** a non-empty system prompt therefore threw at call time. Surfaced by a live verification run against Anthropic.
 
 - **The fix.** The system prompt now always travels through the `instructions` option (never a message), and its cache breakpoint is placed with a **top-level** `providerOptions.anthropic.cacheControl` — the one place AI SDK v7 attaches a marker to the system prompt. It coexists with the existing part-level context breakpoint, so the two-breakpoint contextual-retrieval shape still holds. Verified live: the system prompt is written to cache and read back on the next call (`cacheWriteTokens` → `cacheReadTokens`).
+<Aside type="caution" title="Corrected in v1.67.0">
+Anthropic reads a top-level `cacheControl` as its automatic caching, which marks the **last** block of the request, not the system prompt — so this fix stopped the error but cached the wrong block. v1.67.0 sends the system prompt as system messages, each part that ends at a cache point carrying its own marker, and never a top-level marker in that mode.
+</Aside>
+
 - **`cache.context` was unaffected.** The context breakpoint is a user-content part marker and already worked end-to-end (it is what cognitive-pipeline's contextualise step uses); only the separate system-prompt breakpoint was broken.
 
 Adapter-only change (`providers/adapters.ts`); no schema change. A host picks it up with `npx ai-core update`.
