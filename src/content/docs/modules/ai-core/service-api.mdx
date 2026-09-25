@@ -1,7 +1,7 @@
 ---
 title: Service API
 description: The full aiCoreService surface a consumer programs against, method by method
-lastUpdated: 2026-09-25
+lastUpdated: 2026-09-26
 sidebar:
   order: 6
 ---
@@ -104,6 +104,8 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 - `malformed-framework-record` — the resolved model's prompt framework record is malformed.
 - `model-lacks-image-input` — media was attached but the model's **fetched** capabilities say it does not accept image input. An unknown capability proceeds; only a known-false one refuses.
 - `usage-limit-reached` (v1.61.0) — the host's [usage gate](#usage-gate-and-rate-limit-v1610) said no. Checked before any provider work, so a refused call spends nothing.
+- `spend-limit-reached` (v1.66.0) — one of AI Core's own [spending limits](#spending-limits-v1660) has been reached (the user's daily or monthly limit, or the app's monthly one). The message has no dollar amounts and says when the limit resets; `detail` is `{ limit, limitUsd, spentUsd, resetsAt, operationId, kind }`. When more than one limit has been reached, it names the one that resets last.
+- `model-unpriced` (v1.66.0) — a spending limit is on and the operation's model has no price, even after AI Core tried to fetch one from models.dev. The message names the model; `detail` carries `modelRecordId`, `modelName`, `providerId`, `modelId`, `operationId` and `lookup` (how the price lookup ended).
 
 **Example**
 
@@ -503,7 +505,7 @@ runEval(operationId: string, opts: RunOptions & { tags?: string[] }): Promise<Ev
 
 **Returns** — an `EvalReport`: `{ runId, operationId, cases, metrics: EvalMetricSummary[], results, persisted }`. Each metric summary states `meanScore` (nulls excluded), the passed count over the **evaluable** count, and the `unevaluable` count — a partial eval is always reported as partial, never as a clean pass. `persisted: false` says the result rows could not be written, so the `runId` is not treated as a durable handle.
 
-**Transparency & boundaries** — the harness runs the real pipeline, so a sensitive operation's terms gate applies exactly as it does live (a resolution refusal surfaces as it would on any call). `ai_eval_result` rows store scores, the underlying run's ledger id and named notes — **never content**. Judge metrics run internal (recursion-guarded) and inherit the evaluated operation's sensitivity.
+**Transparency & boundaries** — the harness runs the real pipeline, so a sensitive operation's terms gate applies exactly as it does live (a resolution refusal surfaces as it would on any call). `ai_eval_result` rows store scores, the underlying run's ledger id and named notes — **never content**. Judge metrics run as AI Core's own nested calls (recursion-guarded) and inherit the evaluated operation's sensitivity.
 
 ```ts
 const ai = serviceRegistry.getOptional('ai-core');
@@ -526,9 +528,12 @@ getCurrentUsage(args: { tenantId: string; since?: Date }): Promise<CurrentUsage>
 
 **Returns** — a [`CurrentUsage`](#currentusage): totals (`operations`, `inputTokens`, `outputTokens`) plus a per-operation breakdown in `byOperation`. Unknown token counts contribute zero to the sums but are never invented.
 
+Since v1.66.0 it also returns `cost` (US dollars, the sum of the rows that have a cost), `uncostedOperations` (calls that reached, or may have reached, a model but have no cost: no price, no usage reported, or written before v1.66.0), and `cacheReadTokens` / `cacheWriteTokens` — both overall and per operation. Refusals, and failures before a model was chosen, are left out of `uncostedOperations` because they made no provider call.
+
 ```ts
 const usage = await ai?.getCurrentUsage({ tenantId, since: startOfMonth });
-// usage.operations, usage.inputTokens, usage.outputTokens, usage.byOperation[]
+// usage.operations, usage.inputTokens, usage.outputTokens, usage.cost,
+// usage.uncostedOperations, usage.byOperation[]
 ```
 
 ---
@@ -593,7 +598,21 @@ The methods above are the **backend** consumer surface. On the **frontend**, a c
 
 ## Usage gate and rate limit (v1.61.0)
 
-Two brakes on spending, both new in v1.61.0. The **usage gate** is yours: an optional check your app registers, which AI Core asks before any paid work. The **rate limit** is AI Core's own: a fixed cap on how fast one user can call the paid HTTP routes.
+Three brakes on spending. The **spending limits** (v1.66.0) are AI Core's own US dollar limits, set by an admin. The **usage gate** is yours: an optional check your app registers, which AI Core asks before any paid work. The **rate limit** is AI Core's own cap on how fast one user can call the paid HTTP routes; since v1.66.0 an admin sets it.
+
+### Spending limits (v1.66.0)
+
+An admin sets these on the **Usage** tab's **Spending** card ([Configuration → Spending limits](/modules/ai-core/configuration/#spending-limits-v1660)): a limit per user per day, per user per month, and for the whole app per month, all in US dollars and all off until set. Days and months are **UTC** calendar periods.
+
+- **Where they are checked:** at the same points as the usage gate, and **before** it — the start of `run`, `embed`, `embedMultimodal`, `rerank`, `retrieve`, and once per `runFlow` / `resumeFlow`. A reached limit refuses the call with `RefusedError('spend-limit-reached')` (409). The message has no dollar amounts and says when the limit resets, for example "You've reached your AI usage limit for today. It resets at 00:00 UTC on 27 September 2026."
+- **What counts:** every call a user's request starts — the run itself, a context's query embeddings, each flow step, and an evaluation's judge. Reranks are counted (Voyage bills them per token and reports the count). Google embeddings report no token usage, so their tokens are estimated from the characters sent and the row's `costBasis` is `'estimated'`. Not counted: provider tool fees such as web search, and calls whose provider reported no usage. A flow step and AI Core's own nested calls are counted but never refused part-way; the call that started them was checked. **Overshoot:** a check reads the totals as they stand and sets nothing aside, so calls that start at the same time each pass the same check before any of them is counted, and a flow already started runs every step. Together they can take a total past its limit by up to the cost of that many calls. The per-minute rate limit (per server process, on the HTTP routes) is what bounds this for HTTP requests; in-process calls are not rate-limited, and with it blank nothing bounds either.
+- **Warnings:** at the warn percentage (80% by default) the call still runs, `feedback.missing` gets `spend-warning:<limit>:<percent>` (for example `spend-warning:user-day:85`), and the `ai-core.spend.threshold-crossed` event fires once per limit per period.
+- **Cost:** each ledger row's cost is worked out once, when it is written, from the model's price at that moment — input, output, cache reads and writes, a separate reasoning price and higher long-prompt prices where the model has them (applied to each provider request whose own prompt is over the threshold; each step of a tool call counts on its own). The totals are kept in `ai_spend_totals`, so a check is one cheap read.
+- **A model with no price:** while any limit is on, a call whose model has no price first has its price fetched from models.dev (the lookup the Models tab's Refresh uses). If it still has none, the call is refused with `model-unpriced`, naming the model. `runFlow` and `resumeFlow` do the same for the model of every operation step still to run, before any step runs (a resume refused this way stays suspended and can be resumed once the model is priced). A nested call on an unpriced model is not blocked part-way; it is named in `feedback.missing` as `spend-unpriced-model:<modelRecordId>` and its cost stays unknown. An admin can enter a price of 0 for a free or local model.
+- **Admin tests** (the Test run on the Operations list and each evaluation case) count toward the app's monthly limit only, never the admin's own daily or monthly limits. `runEval` checks the app's monthly limit once before it starts; each case is then checked as its own call (limits, its model's price and your usage gate), and a case refused on any of them is noted `eval-case-refused:<reason>` rather than recorded as a failure. A judge whose model has no price is noted on its case as `judge:spend-unpriced-model:<modelRecordId>`.
+- **A cancelled request:** while any limit is on or a usage gate is registered, a user who disconnects part-way does not stop a provider call that has already been sent. It runs to its deadline so what it cost is counted; work not yet started still stops (no new provider call is sent once the signal has fired, and a flow starts none of its remaining steps).
+
+**Breaking change for in-process callers (v1.66.0).** `RunOptions.internal` is gone. It let any caller skip the usage gate, and it would have skipped the spending limits too. AI Core now marks its own nested calls with a private marker that callers can't set, so every call from another module is checked like any other. Pre-launch, this is a clean break: drop `internal` from your options (TypeScript will flag it).
 
 **The usage gate.** AI Core depends on nothing, so it can't call your billing module. Instead, your host app registers an object under the service name `aiCoreUsageGate`, and AI Core looks it up on each call:
 
@@ -602,8 +621,11 @@ import { serviceRegistry } from '@/config/service.registry';
 import type { AiCoreUsageGate } from '@/features/ai-core'; // backend/src/features/ai-core/index.ts
 
 const gate: AiCoreUsageGate = {
-  async check({ userId, tenantId, kind, operationId }) {
+  async check({ userId, tenantId, kind, operationId, adminTest, spend }) {
     // kind: 'run' | 'embed' | 'rerank' | 'retrieve' | 'flow'
+    // adminTest: true for the Test run or an evaluation case (v1.66.0)
+    // spend: AI Core's own figures — spend.userDay / userMonth / appMonth, each
+    //   { limit, applies, limitUsd, spentUsd, periodStart, resetsAt } (v1.66.0)
     const usage = await aiCore.getCurrentUsage({ tenantId, since: startOfMonth });
     return usage.outputTokens < myMonthlyLimit
       ? { allow: true }
@@ -614,13 +636,14 @@ serviceRegistry.registerDynamic('aiCoreUsageGate', gate);
 ```
 
 - **Where it is checked:** at the start of `run` (`'run'`), `embed` and `embedMultimodal` (`'embed'`), `rerank` (`'rerank'`), `retrieve` (`'retrieve'`), and once per `runFlow` / `resumeFlow` (`'flow'`), before any provider call. Each operation step of a flow is checked again as `'run'`, and each eval case as the call it makes (`'run'`, or `'retrieve'` for a retrieval case). AI Core's own nested calls (an eval judge, a context builder's sub-step, a rerank inside a retrieval) are not checked again: the call that started them already was.
+- **Order (v1.66.0):** AI Core's own spending limits are checked first; the gate is asked only when none of them refused. It receives `adminTest` and AI Core's `spend` figures, so a billing module can build on them rather than add up the ledger itself.
 - **When it says no:** the call throws `RefusedError('usage-limit-reached')` (409), with your `reason` in the message and `{ kind, operationId }` in `detail`. A refused run, embed, rerank or retrieval still gets a ledger row, like every refusal (a refused flow start writes no run row).
 - **When it throws:** the call fails. A gate that breaks never counts as a yes, because a spend brake that opens when it fails is no brake.
 - **No gate registered:** everything is allowed, as before.
 
-`assertUsageAllowed({ userId, tenantId, kind, operationId? })` is exported from the feature barrel with the `AiCoreUsageGate` and `AiCoreUsageKind` types. It runs the same check, for a consumer that wants to ask before starting its own work.
+`assertUsageAllowed({ userId, tenantId, kind, operationId? })` is exported from the feature barrel with the `AiCoreUsageGate` and `AiCoreUsageKind` types (and, since v1.66.0, `SpendSnapshot`, `SpendLimitState`, `SpendLimitKind` and `CostBasis`). It runs the same check — AI Core's spending limits, then the gate — for a consumer that wants to ask before starting its own work. Since v1.66.0 it returns `{ warnings }`: the `spend-warning:<limit>:<percent>` slugs for any limit past its warn percentage. It refuses with `spend-limit-reached` or `usage-limit-reached`.
 
-**The rate limit.** Each signed-in user may make **30 requests per 60 seconds** across the seven paid runtime routes (`/run`, `/embed`, `/embed-multimodal`, `/rerank`, `/retrieve`, `/flows/:flowId/run`, `/flow-runs/:id/resume`). Past that, the route answers **429** with a `Retry-After` header and the usual error body: `code: 'rate_limited'`, `reason: 'rate-limit-reached'`, and `detail: { limit, windowSeconds, retryAfterSeconds }`. Admin routes and the two free reads (`model-choices`, `usage/current`) are not limited, and neither are in-process `aiCore.*` calls. The counts live in each server process's memory: several processes allow that many times the limit in total, and a restart resets them. For a real spend rule, use the usage gate.
+**The rate limit.** Each signed-in user may make a set number of requests per 60 seconds across the seven paid runtime routes (`/run`, `/embed`, `/embed-multimodal`, `/rerank`, `/retrieve`, `/flows/:flowId/run`, `/flow-runs/:id/resume`). It is **30 by default**; since v1.66.0 an admin changes it on the Spending card, and a blank value turns it off. Past the limit, the route answers **429** with a `Retry-After` header and the usual error body: `code: 'rate_limited'`, `reason: 'rate-limit-reached'`, and `detail: { limit, windowSeconds, retryAfterSeconds }`. Admin routes and the two free reads (`model-choices`, `usage/current`) are not limited, and neither are in-process `aiCore.*` calls. The counts live in each server process's memory: several processes allow that many times the limit in total, and a restart resets them. It is a brake on runaway loops, not a budget: the spending limits (and your usage gate) are the budget.
 
 ---
 
@@ -727,6 +750,10 @@ interface RunOptions {
 }
 ```
 
+**`internal` was removed in v1.66.0.** It let any caller skip the usage gate (and would have skipped the spending limits). AI Core marks its own nested calls with a private marker instead, so a call from another module is always checked. See [Spending limits](#spending-limits-v1660).
+
+**`signal` while a spending limit is on or a usage gate is registered (v1.66.0).** Aborting stops work not yet started — a call whose signal has already fired sends nothing to the provider (it fails with a `ProviderCallError` and its ledger row is `no-call`), and a flow starts none of its remaining steps — but a provider call already sent runs to its deadline, so what it cost is counted, by AI Core's limits and in the figures your gate reads. With no limit on and no gate registered, aborting ends the call at once.
+
 `CommunicationStyle` is `{ tone?, length?, vocabulary?, structure?, sentiment? }` — each a short string (a preset, `'adaptive'`, or the user's own words). The app fetches these from the user's stored settings (`User.preferences`, mapping `aiStyleTone → tone`, …) and passes them. `sentiment` is hidden — the app (or a later AI step) sets it, and it renders as a "current mood" line. See the [Changelog](/modules/ai-core/changelog/) for the full shape.
 
 **Preferences are context, not instructions (v1.61.0).** The preferences are the user's own words, and over HTTP they come straight from the request body, so they are never placed in the prompt as instructions. Wherever they appear — a context's **Preferences** block, or the built-in `{communication_style}` variable — they are sanitised and fenced as material (the block under the `supplied-material` marker, the variable in the same self-describing fence every injection-risk variable gets). A plain lead-in just outside the fence tells the model they are the user's stated communication preferences and to adapt its tone, length, vocabulary and structure to them wherever they don't conflict with its instructions. So the model still follows them; they just can't override the operation. `{communication_style}` is fenced on every run whatever its variable record says, and a run that uses it reports `prompt-variable-fenced`. The fence changes on every call, so `{communication_style}` in an **instruction** segment stops instruction caching from hitting (`cache-instructions-unstable:communication_style`); the context builder's Preferences block keeps the instructions cacheable. See [Prompt Assembly](/modules/ai-core/prompt-assembly/#marking-content-and-injection-risk).
@@ -771,7 +798,7 @@ interface Feedback {
 ```
 
 - **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `abstained-guardrail-rule-failed`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `markers-preamble-unavailable`, `guardrail-rule-failed`, and so on. **Every reason that means a guardrail held the answer back starts `abstained-`** (today `abstained-guardrail-rule-failed`, a code rule set to *hold the answer back*) — use `isHeldBack(feedback)` from the barrel rather than one exact string. (`retrieve()` also uses the prefix for a weak retrieval, `abstained-weak-retrieval`, which is not a guardrail hold and which `isHeldBack` does not count.) A held answer is still returned in full; your app decides what to show.
-- **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line). It can also carry a gap that is not itself a `reason` — for example `prompt-cache-unsupported`, named when an operation configured to cache resolves to a provider that cannot honour it (the call runs uncached rather than pretending otherwise). Gaps added in v1.61.0 include `dial-unmapped:<dial>` (the model's parameter rules have no mapping for a dial the operation sets, so nothing was sent for it), `tool-unavailable:<id>` (a tool the operation opted into is disabled or deleted), `cache-instructions-unstable:<variable>` / `cache-context-unstable:<variable>` (a fenced variable stops a cache the operation asks for from hitting), `output-truncated-by-caller-cap`, and two that come from a context and so carry its prefix: `context:retrieval-node-ids-unsupported:<tag>` and `foundation:foundation-segment-injection-risk:<key>` — the full list is in the [Changelog](/modules/ai-core/changelog/). Gaps added in v1.63.0:
+- **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line). It can also carry a gap that is not itself a `reason` — for example `prompt-cache-unsupported`, named when an operation configured to cache resolves to a provider that cannot honour it (the call runs uncached rather than pretending otherwise). Gaps added in v1.61.0 include `dial-unmapped:<dial>` (the model's parameter rules have no mapping for a dial the operation sets, so nothing was sent for it), `spend-warning:<limit>:<percent>` and `spend-unpriced-model:<modelRecordId>` (v1.66.0, see [Spending limits](#spending-limits-v1660)), `tool-unavailable:<id>` (a tool the operation opted into is disabled or deleted), `cache-instructions-unstable:<variable>` / `cache-context-unstable:<variable>` (a fenced variable stops a cache the operation asks for from hitting), `output-truncated-by-caller-cap`, and two that come from a context and so carry its prefix: `context:retrieval-node-ids-unsupported:<tag>` and `foundation:foundation-segment-injection-risk:<key>` — the full list is in the [Changelog](/modules/ai-core/changelog/). Gaps added in v1.63.0:
   - `discipline-check-lead-in-unavailable:<key>` — a guardrail measure rendered but the disciplines lead-in record (`discipline-check-strong` or `discipline-check-soft`) or the `discipline-check-mandatory` record is missing, so that line was not stated. It also sets `reason` to `discipline-check-lead-in-unavailable` when no earlier reason is set. See [Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section).
   - `guardrail-rule-retired:<guardrailId>/<ruleId>:scored` — a stored guardrail rule that asked another AI to judge the answer (a scored rule, or the old groundedness check, whose rule id is `classic-1`). It never runs. It goes in `missing` only, never in `reason`, and holds nothing back.
   - `guardrail-empty:<guardrailId>` — a guardrail with neither a measure nor a code check. It replaces `guardrail-rules-empty`.
@@ -840,11 +867,19 @@ interface CurrentUsage {
   operations: number;
   inputTokens: number;
   outputTokens: number;
+  cost: number;                 // v1.66.0 — US dollars, the sum of rows with a cost
+  uncostedOperations: number;   // v1.66.0 — calls with no cost (no price, no usage reported, or before v1.66.0)
+  cacheReadTokens: number;      // v1.66.0
+  cacheWriteTokens: number;     // v1.66.0
   byOperation: Array<{
     operationId: string;
     operations: number;
     inputTokens: number;
     outputTokens: number;
+    cost: number;
+    uncostedOperations: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
   }>;
 }
 ```
@@ -854,6 +889,8 @@ interface CurrentUsage {
 ## Admin HTTP routes
 
 The admin page's own routes (record CRUD, the usage ledger, the review queue and eval history) are not part of this service surface; they need an admin and exist for the admin page. Since v1.65.0 `GET /admin/usage` and `GET /admin/review-items` return one page, `{ items, total, page, pageSize }`, when asked with `?page` or `?pageSize`, and the same bare array as before otherwise. `GET /admin/eval-runs` and `POST /admin/review-items/resolve` are new. The parameters, sort fields and limits are in [Configuration → Admin list endpoints](/modules/ai-core/configuration/#admin-list-endpoints-v1650).
+
+Since v1.66.0: `GET /admin/spend/summary` (the Spending card's totals), `POST /admin/spend/fetch-prices` (fill missing model prices from models.dev), and `POST /admin/operations/:id/test-run` (the Operations list's Test run row action — an admin test, counted toward the app's monthly limit only). `PUT /admin/policy` takes the rate and spending limits, and `GET /admin/usage` rows carry `cost`, `costBasis` and `adminTest`.
 
 ---
 
