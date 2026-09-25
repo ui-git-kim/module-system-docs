@@ -57,7 +57,7 @@ export interface ProviderAdapter {
 | `EmbedResult` | `embeddings: number[][]`, optional `tokens`, `coverage: EmbedCoverage[]`, `warnings`, `latencyMs` |
 | `EmbedCoverage` | `index`, `covered`, `total`, `unit: 'characters'` — what portion of each input the vector covers |
 | `RerankResult` | `ranking: RerankEntry[]` (each `{ originalIndex, score }`), optional `tokens`, `latencyMs` |
-| `MediaAttachment` | `mediaType`, `data` (base64 bytes, or an https URL **the module downloads itself** — bounded at 25MB per attachment / 50MB per request under a 20s timeout, redirects refused — and hands to the SDK as bytes, v1.52.0; only Voyage's multimodal-embed path still passes the provider an `image_url` to fetch), optional `name` |
+| `MediaAttachment` | `mediaType`, `data` (base64 bytes, or an https URL **the module downloads itself** — bounded at 25MB per attachment / 50MB per request under a 20s timeout, redirects refused — and hands to the SDK as bytes, v1.52.0; since v1.61.0 at most 20 links per call sharing one 60s deadline, the resolved address checked at connect time, and size limits applied after decompression — see [Downloading attachment links](#downloading-attachment-links-v1610); only Voyage's multimodal-embed path still passes the provider an `image_url` to fetch), optional `name` |
 | `ResolvedParameters` | `maxOutputTokens?`, `temperature?`, `topP?`, `topK?`, `stopSequences?`, `seed?` — the values after explicit validation |
 | `ResolvedTool` | `id`, `name`, `kind` (`provider-native` · `function`), `providerToolId` (the provider tool key, e.g. `web_search`; `null` for a function tool), `config`, `egress` (`true` when using the tool sends content to a third party — the sensitivity gate covers it) |
 
@@ -165,15 +165,29 @@ An operation can opt into provider-native tools as `ResolvedTool` records (see [
 
 | Provider | Web search | Web fetch |
 |---|---|---|
-| Anthropic | `web_search` → `webSearch_20250305` (passes `maxUses`, `allowedDomains`, `blockedDomains`) | `web_fetch` → `webFetch_20250910` (adds `maxContentTokens`) |
-| OpenAI | `web_search` → `webSearch` (provider defaults; config passthrough is a follow-up) | not hosted — skipped |
-| Google | `web_search` → `googleSearch` | `web_fetch` → `urlContext` |
+| Anthropic | `web_search` → `webSearch_20250305` (applies `maxUses`, `allowedDomains`, `blockedDomains`) | `web_fetch` → `webFetch_20250910` (also applies `maxContentTokens`) |
+| OpenAI | `web_search` → `webSearch` (applies `allowedDomains` and `blockedDomains` since v1.61.0; not `maxUses`) | not hosted — skipped |
+| Google | `web_search` → `googleSearch` (applies no options) | `web_fetch` → `urlContext` (applies no options) |
 | Voyage | — (embeddings and reranking only) | — |
 
-Two rules keep the translation honest:
+Three rules keep the translation honest:
 
 - **A tool the provider cannot host is skipped, not faked.** OpenAI hosts no URL-fetch tool, so a `web_fetch` opt-in resolved onto an OpenAI model is dropped with a log line **and** a named `ProviderWarning` (`tool "…" is not hosted by provider …`) — an answer produced without a tool the operation was configured to use is a degraded answer, so the run names the shortfall rather than leaving it in a server log the caller never sees. Anthropic is the verified path.
+- **A tool option the provider cannot apply is never dropped silently (v1.61.0).** Each option set on the tool record that the provider does not apply becomes a named `ProviderWarning` in the run's feedback, and the tool still runs without it (for example `maxUses` on OpenAI). A **domain restriction** is different: if `allowedDomains` or `blockedDomains` cannot be applied (any Google tool, say), the tool is **skipped** with a warning, because a tool never runs without the restriction it was configured with. A value with the wrong shape — a `maxUses` of 0, a domain list holding a non-string — counts as not applied. A tool the operation opted into that is now disabled or deleted is reported as `tool-unavailable:<id>` in feedback and in the admin preview.
 - **The search-and-read loop is bounded.** A tool run takes more than one step (the model searches, reads what comes back, then answers), so the SDK loop is allowed up to `TOOL_STEP_CAP` (5) steps via `stopWhen: stepCountIs(TOOL_STEP_CAP)`. This is a cost safety bound — each step is another model call — not an autonomous agent loop; the tool's own config (e.g. web search `maxUses`) is the finer, admin-set control.
+
+### Call timeouts (v1.61.0)
+
+Before v1.61.0 a provider call ended only when the caller disconnected, so a provider that accepted a request and then stalled held it open indefinitely. Every call now has its own deadline, combined with the caller's signal: **10 minutes** for a generation (long structured outputs and web-search tool loops legitimately take minutes), and **2 minutes** for an embedding, a multimodal embedding or a rerank. A call that runs out of time fails as a **retryable** `ProviderCallError` saying it did not finish in time. A caller that goes away is never reported as a timeout.
+
+### Downloading attachment links (v1.61.0)
+
+When a media attachment is a link, the module downloads it itself (since v1.52.0) and hands the provider the bytes. v1.61.0 tightens that download:
+
+- **What counts as a link** is decided the same way the AI SDK decides it, by parsing the value as a URL, so no unusual spelling of `https:` gets past the checks and on to the SDK. Only `https` links are fetched; plain `http` and every other scheme are refused. A value with no scheme is base64, and a `data:` URL is inline.
+- **Public hosts only, checked twice.** The address in the link is checked when the request arrives: private, loopback, link-local and internal ranges are refused, including IPv6 forms that carry an IPv4 address inside them (IPv4-mapped, IPv4-compatible, NAT64, 6to4) and host names ending in a dot. Then, at the moment the server connects, **every address the name resolves to** is checked again, so a public name that points at an internal address (or changes to one) is refused. Downloads use `node:https` with no pooled connections, so every connection goes through that check.
+- **Counted and time-boxed.** At most **20 links** per request and per provider call. Each download keeps its 20-second and 25MB limits, and all the downloads in one call share a **60-second** deadline. The error names which limit was hit.
+- **Decompressed before measuring.** A gzip, deflate or brotli response is unpacked and the size limits apply to the unpacked bytes; an unknown encoding is refused. Redirects are still refused.
 
 ---
 

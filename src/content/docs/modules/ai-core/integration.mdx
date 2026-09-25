@@ -1,7 +1,7 @@
 ---
 title: Integration
 description: The consumer contract, content from outside, feedback, retrieval, and what AI Core does not own
-lastUpdated: 2026-08-23
+lastUpdated: 2026-09-25
 sidebar:
   order: 4
 ---
@@ -41,6 +41,7 @@ This page describes AI Core as implemented in module v1.47.0 (August 2026). The 
 | Handle shortfalls | The structured `feedback` field on every return |
 | Declare content origin | Origin and verification state on every segment |
 | Extend the libraries | Consumers seed their own operations, prompt segments, markers, and eval cases |
+| Enforce a spend limit | Register an optional `aiCoreUsageGate` in the host app (v1.61.0) — see [Billing and spend limits](#billing-and-spend-limits-v1610) |
 
 ---
 
@@ -96,6 +97,14 @@ Their operations, their prompts, their disciplines, their pipelines, their UI. A
 ### The foundation depends on nothing
 
 AI Core's `depends` list is empty. It is the foundation of the AI stack, and **nothing may make AI Core depend on a consumer**. The one place this bites in practice is billing: billing integration is a callback — AI Core owns its usage counter and hands billing `getCurrentUsage` — never a dependency in either direction. See the [Developer Workflow](/modules/ai-core/developer-workflow/) for the ledger and usage design.
+
+### Billing and spend limits (v1.61.0)
+
+Counting is only half of billing; the other half is being able to say **no**. Before v1.61.0 nothing enforced a limit: any signed-in user could loop the paid routes. There are now two brakes.
+
+**The usage gate — your rule, asked before every paid call.** Your host app (which knows both AI Core and billing) registers an `AiCoreUsageGate` under the service name `aiCoreUsageGate`. AI Core asks it before any provider work — a run, an embed, a rerank, a retrieval, and once per flow run or resume — passing `{ userId, tenantId, kind, operationId? }`. Return `{ allow: true }` to go ahead, or `{ allow: false, reason }` to refuse: the call fails with `RefusedError('usage-limit-reached')` naming your reason, and spends nothing. The gate can read `getCurrentUsage` to compare against a plan's allowance. If the gate throws, the call fails — a broken brake never lets spending through. With no gate registered, nothing changes. AI Core still depends on nothing: the gate is a callback found by name, like the retrieval and field-source services. The shape and an example are in [Service API → Usage gate and rate limit](/modules/ai-core/service-api/#usage-gate-and-rate-limit-v1610).
+
+**The rate limit — AI Core's own speed brake.** Each signed-in user may make 30 requests a minute to the seven paid runtime routes. Past that, the route answers **429** with a `Retry-After` header and `reason: 'rate-limit-reached'`, so your frontend can say when to try again. Admin routes and in-process calls are not limited. The counts are kept per server process, so it is a brake on runaway loops, not a budget: put real spending rules in the usage gate.
 
 ---
 
@@ -221,6 +230,8 @@ Instructions in the prompt telling the model to ignore injected instructions. De
 
 AI Core ships a review queue as a battery, the way it seeds voices — a table and a component a consumer can use or ignore. It is not a mechanism, not a destination, not routing. Just something in the box, editable like every other ships-with record.
 
+Since v1.61.0 one user cannot flood it. An answer cut short only by the caller's own `maxOutputTokens` is reported (`output-truncated-by-caller-cap`) but not queued, since the caller chose that. Over HTTP a made-up marker id is refused with a 400 instead of queueing a gap. A tenant can hold at most 500 open items; past that, new items are logged (`review-queue-full`) rather than queued. The admin can clear what is on screen with a two-step **Dismiss all shown**.
+
 ---
 
 ## Retrieval
@@ -265,6 +276,8 @@ await aiCore.run('answer-question', input, {
 ```
 
 Built-in `{date}`/`{time}` and `{communication_style}` (from `preferences`) are filled by AI Core; everything else arrives in `variables`. A declared token with no value follows its admin-set behaviour (a fallback string, or skip), and the outcome is named in feedback. Only **declared** tokens substitute, so a JSON format segment is never touched. A variable flagged **injection risk** in the admin is sanitised and nonce-fenced before it lands — so a longer field is safe to inline — but genuinely untrusted bulk content still belongs in a **marked input/context** item, not a variable.
+
+**`{communication_style}` is context, not instructions (v1.61.0).** The preferences are the user's own words, so AI Core always fences them as material, whatever the variable record says, with a plain lead-in telling the model to adapt its tone, length, vocabulary and structure to them where they don't conflict with its instructions. One cost to know: a fenced value changes on every call, so `{communication_style}` in an **instruction** segment stops that operation's instruction caching from hitting (the run reports `cache-instructions-unstable:communication_style`). If the operation caches its instructions, use a context builder's **Preferences** block instead — it carries the same preferences on the input side and keeps the instructions cacheable.
 
 ### Registering a field source (optional)
 
@@ -392,7 +405,7 @@ The slot is registered by a side-effect registration in the AI Core feature barr
 | Pipeline configuration | cognitive-pipeline |
 | Conversations, messages, memory, personas | chat |
 | Domain content — any app's operations, prompts, disciplines | that app |
-| Metering | nobody — AI Core counts, billing asks |
+| Metering | nobody — AI Core counts, billing asks (and, through the optional usage gate, can say no) |
 | Making the database unreadable to its owner | the starter template's security layer, not AI Core |
 
 **[Cognitive Pipeline](/modules/cognitive-pipeline/) is a consumer.** It manages cog-db-engine. Its pipeline steps call AI Core operations. That is the entire relationship. AI Core has no view on cog-db-engine and must not acquire one.

@@ -38,7 +38,7 @@ This page describes AI Core as implemented in module v1.52.0 (September 2026). T
 | [`getCurrentUsage`](#getcurrentusage) | The billing callback — AI Core counts, billing asks | `Promise<CurrentUsage>` |
 | [`getOperationInfo`](#getoperationinfo) | Public metadata about a job | `Promise<OperationInfo>` |
 
-`registerFlowHandler` **registers** code that runs; `ensureOperation` and `ensureSegment` **seed** records that persist. That distinction is the architecture — the mechanics of both live in [Registering & Seeding](/modules/ai-core/registering-and-seeding/), which this page links to rather than repeats.
+`registerFlowHandler` **registers** code that runs; `ensureOperation` and `ensureSegment` **seed** records that persist. That distinction is the architecture — the mechanics of both live in [Registering & Seeding](/modules/ai-core/registering-and-seeding/), which this page links to rather than repeats. The paid methods sit behind two spending brakes (v1.61.0): an optional usage gate your app registers, and a per-user rate limit on the HTTP routes — see [Usage gate and rate limit](#usage-gate-and-rate-limit-v1610).
 
 ---
 
@@ -88,7 +88,7 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 | `NotFoundError` | The operation id does not exist. An unknown job name is the caller's 404 — a bad request, not a refusal. |
 | `RefusedError` | The operation exists but cannot run under its declared constraints. See the reasons below. |
 | `UnsupportedModelKindError` | The operation resolved to a model whose kind is not `language`. |
-| `BadRequestError` | A dial mapped to a parameter the model's rules reject as out of range (for example a rejecting `temperature` bound). |
+| `BadRequestError` | A dial mapped to a parameter the model's rules reject as out of range (for example a rejecting `temperature` bound). Over HTTP only (`callerSupplied` runs, v1.61.0): a caller segment names a marker id the catalogue does not hold. |
 | `ProviderCallError` | The upstream provider call failed; carries a `retryable` flag and, where known, the provider status. |
 | `ProviderUnavailableError` | The resolved model's provider has no API key configured or is disabled at the adapter layer. |
 
@@ -103,6 +103,7 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 - `prompt-segment-unavailable` — the operation references prompt segments that are missing or disabled (a silently dropped segment would change behaviour with no record).
 - `malformed-framework-record` — the resolved model's prompt framework record is malformed.
 - `model-lacks-image-input` — media was attached but the model's **fetched** capabilities say it does not accept image input. An unknown capability proceeds; only a known-false one refuses.
+- `usage-limit-reached` (v1.61.0) — the host's [usage gate](#usage-gate-and-rate-limit-v1610) said no. Checked before any provider work, so a refused call spends nothing.
 
 **Example**
 
@@ -303,7 +304,7 @@ An operation step declared with `waitOnFeedback` suspends the flow when its feed
 | `NotFoundError` | The flow id does not exist. |
 | `RefusedError` | `flow-disabled`; `flow-steps-invalid` (no runnable, or a malformed, step); `flow-handler-not-registered` (a handler step names a handler nobody registered — refused loudly, never silently skipped); `flow-state-too-large` (v1.52.0 — the working state exceeds 1M chars serialised, checked where it grew: at the step folding it into a prompt, or right after the handler step that inflated it); plus any `RefusedError` bubbling out of an operation step. |
 
-Any error inside the step loop marks the run row `failed` and rethrows — a failed flow is a loud outcome, never a quietly abandoned row.
+Any error inside the step loop marks the run row `failed`, clears its state and rethrows — a failed flow is a loud outcome, never a quietly abandoned row. (A **resumed** run is the one exception, below.) The whole flow is checked once against the [usage gate](#usage-gate-and-rate-limit-v1610) as `kind: 'flow'`, and each operation step is checked again as `'run'`. Over HTTP (`POST /flows/:flowId/run`), a caller segment naming an unknown marker id is refused with 400 before the run row is created.
 
 ---
 
@@ -332,7 +333,9 @@ resumeFlow(
 | Error | When |
 |---|---|
 | `NotFoundError` | No **suspended** run with that id exists **for the caller's tenant**. Tenant isolation: a cross-tenant or non-suspended id is reported as not found — no acknowledgement it exists elsewhere. |
-| `RefusedError` | The same step-loop refusals as `runFlow` — plus `flow-state-too-large` can fire **before** the step loop here (v1.52.0): the stored state merged with `resolution` can exceed what either could alone, and an over-budget merge is refused before anything persists, leaving the run suspended and resumable. |
+| `RefusedError` | The same step-loop refusals as `runFlow` — plus `flow-state-too-large` can fire **before** the step loop here (v1.52.0): the stored state merged with `resolution` can exceed what either could alone, and an over-budget merge is refused before anything persists, leaving the run suspended and resumable. `usage-limit-reached` is checked before the run is claimed, so it too leaves the run suspended. |
+
+**A passing failure keeps the run resumable (v1.61.0).** If an operation step fails on a resumed run for a reason worth retrying, the run goes back to `suspended` at that step, with its state and your earlier resolution kept, instead of failing. The error is still thrown to you. `suspendedFeedback.reason` is `step-failed-retryable`, and `missing` holds one of `step-aborted` (the call was cut off, for example by a disconnect), `provider-call-retryable` (a `ProviderCallError` with `retryable` set, including a timeout) or `usage-limit-reached`. `ai-core.flow-run.suspended` fires as usual. Call `resumeFlow` again to retry the step. A new run started with `runFlow` still fails as before: you have no run id until it returns, so there would be nothing to resume.
 
 <Aside type="caution" title="Resumed steps see only working memory">
 The original input segments are not persisted (the run row and the ledger hold references and working memory, never request content). A resumed operation step therefore sees only the flow's `state`, and the first resumed step starts with a `null` previous result. A flow that needs input material after a suspension must carry the parts that matter in `state` via a handler step.
@@ -359,14 +362,17 @@ registerFlowHandler(
 | `options.moduleId` | **Required** (since v1.60.0). The module registering the handler — recorded on the registration so you can see who owns each step. |
 | `options.order` | Optional, on the starter's 0–100 registry scale. Only sorts the registry's `getAll()` listing; a flow always looks its handler up by id. |
 
-`FlowHandler` receives the flow's working memory and the previous step's result, and returns the next state:
+`FlowHandler` receives the flow's working memory, the previous step's result and (since v1.61.0) a trusted context, and returns the next state:
 
 ```ts
 type FlowHandler = (
   state: Record<string, unknown>,
   previous: unknown,
+  ctx: FlowHandlerContext, // { userId, tenantId, flowRunId, flowId } — from the session
 ) => Promise<Record<string, unknown>>;
 ```
+
+**Take identity from `ctx`, never from `state`.** `state` starts as the caller's `initialState`, which over HTTP is the request body. `ctx` is built by AI Core from the session and the run row. A two-argument handler still works. `FlowHandlerContext` is exported from the feature barrel. See [Hooks & Events → Flow-step handlers](/modules/ai-core/hooks-and-events/#flow-step-handlers).
 
 The handlers live in **`flowHandlerRegistry`** — AI Core's own registry, built on the starter's `BaseRegistry` and keyed by `handlerId` (it replaced a plain in-memory `Map` in v1.60.0). Registration is **first-registration-wins**: a duplicate id logs a warning and is ignored — it does not throw. The registry is exported from the feature barrel for read-side inspection (`flowHandlerRegistry.getAll()`). Nothing here persists; a flow step referencing an unregistered handler is refused at run time (`flow-handler-not-registered`), not at registration. This is the **register** side of the [register-vs-seed distinction](/modules/ai-core/registering-and-seeding/).
 
@@ -375,7 +381,8 @@ The handlers live in **`flowHandlerRegistry`** — AI Core's own registry, built
 const ai = serviceRegistry.getOptional('ai-core');
 ai?.registerFlowHandler(
   'cognitive-pipeline/dedupe',
-  async (state, previous) => {
+  async (state, previous, ctx) => {
+    // ctx.userId / ctx.tenantId for anything that needs to know who this is
     return { ...state, deduped: dedupe(state.items) };
   },
   { moduleId: 'cognitive-pipeline' },
@@ -484,8 +491,12 @@ The built-in markers (`source`, `example`, `conversation-history`) seed on insta
 Evaluate an operation offline over its enabled golden cases. Retrieval is an operation, extraction is an operation — and quality is measurable: `runEval` runs the **real pipeline** for each case, computes the metrics the operation is configured for (`ai_operation.evalConfig`), and reports per-metric aggregates plus every case result. It is a battery consumers may use or ignore.
 
 ```ts
-runEval(operationId: string, opts: RunOptions): Promise<EvalReport>
+runEval(operationId: string, opts: RunOptions & { tags?: string[] }): Promise<EvalReport>
 ```
+
+**Filter by tag (v1.61.0).** Pass `tags` to run only the enabled cases carrying **any** of them; leave it out (or empty) to run every enabled case. A case holds at most 50 tags of 1–200 characters each. The admin route `POST /admin/operations/:id/eval` takes the same filter as its body, `{ tags?: string[] }`.
+
+**One at a time, and cancellable (v1.61.0).** A second eval of the same operation while one is running is refused with `RefusedError('eval-already-running')` (409); the check is per server process. `opts.signal` reaches every case: once it aborts, cases not yet run are skipped, and a case or judge that was cut off is noted `eval-aborted` rather than recorded as a failure. The admin route wires the signal to the request, so closing the page stops the remaining provider work. Each case is also checked against the [usage gate](#usage-gate-and-rate-limit-v1610) as the call it makes (`'run'`, or `'retrieve'` for a retrieval case).
 
 **Metrics** — deterministic: `exact-match` (canonical comparison for structured output), `context-precision`, `context-recall` (retrieval, set-based). Judge-based: `faithfulness` (reuses the groundedness judge) and `answer-correctness` (a seeded correctness judge). Each metric scores `[0,1]` **or null with a named note** — a metric that cannot run (no reference, a judge outage, a case that failed) is never a silent 0 and never a pass.
 
@@ -563,7 +574,7 @@ interface OperationVariable {
 
 **Named input ports (v1.57.0).** `inputPorts` surfaces an operation's [input contract](#runinput--consumersegment) to consumers, so a caller can wire its own outputs to an operation's inputs **by name** — auto-bind by `handling` (a raw upload → an `upload` port, deterministic text → a `text` port), or draw a connect UI. To send data to a port, set a run segment's `inputKey` to the port's `key`; the port then defines the framing. `inputPorts` is empty when the operation declares no contract (it then takes a single default text input).
 
-**Declared prompt variables (v1.58.0).** `variables` surfaces which `{token}` [prompt variables](/modules/ai-core/integration/) an operation declares (admin-authored in the editor's Variables block), so a consumer reads what to supply in `RunOptions.variables` and how each is treated. Skip any with `builtin: true` — AI Core fills `date` / `time` / `communication_style` itself. **The trust boundary:** a `/run` request body comes from the **client** (the app's own frontend, but editable by the end user), so over HTTP only variables with `source: 'caller'` accept a value; `user` / `field-source` / `builtin` variables are app- or AI-Core-filled and a client value for them is refused (and named `prompt-variable-caller-blocked:<name>` in feedback), so a client cannot spoof e.g. `user_name` into the prompt. Trusted in-process `aiCore.run()` consumers apply all variables. `variables` is empty when the operation declares none.
+**Declared prompt variables (v1.58.0).** `variables` surfaces which `{token}` [prompt variables](/modules/ai-core/integration/) an operation declares (admin-authored in the editor's Variables block), so a consumer reads what to supply in `RunOptions.variables` and how each is treated. Skip any with `builtin: true` — AI Core fills `date` / `time` / `communication_style` itself. **The trust boundary:** a `/run` request body comes from the **client** (the app's own frontend, but editable by the end user), so over HTTP only variables with `source: 'caller'` accept a value; `user` / `field-source` / `builtin` variables are app- or AI-Core-filled and a client value for them is refused (and named `prompt-variable-caller-blocked:<name>` in feedback), so a client cannot spoof e.g. `user_name` into the prompt. Trusted in-process `aiCore.run()` consumers apply all variables. `variables` is empty when the operation declares none. Since v1.61.0 an HTTP `variables` key must look like a variable name (letters, digits, `_`, `.`, `-`, at most 200 characters) or the request is a 400, and feedback names at most five refused variables, counting the rest as `prompt-variable-caller-blocked-more:<n>`. `communication_style` is always reported with `injectionRisk: true`, because every run fences it (see [`RunOptions`](#runoptions)).
 
 **Throws** — `NotFoundError` when the operation does not exist.
 
@@ -572,6 +583,39 @@ interface OperationVariable {
 ## Editing an operation's prompt from a consumer UI
 
 The methods above are the **backend** consumer surface. On the **frontend**, a consumer that wants to let a user edit an operation's prompt does not call a service at all — it embeds AI Core's own editor. Since v1.53.0 AI Core registers `<OperationPromptEditor>` into the starter component registry under the slot `ai-core.operation-prompt-editor`; a consumer renders it with `useEmbeddableComponent` / `<EmbeddedSlot>` and hands it an operation id. It renders the single-operation block builder inline; each record block ("Approaches", "Disciplines", …) has a "+ New …" button that opens a records dialog on that block's tab for creating the disciplines/segments/contexts/tools the op composes — editing the prompt through AI Core's admin surface (admin-gated, `requireAdmin` on the write) with no data-layer coupling. See [Integration → Embedding the prompt editor](/modules/ai-core/integration/#embedding-the-prompt-editor).
+
+---
+
+## Usage gate and rate limit (v1.61.0)
+
+Two brakes on spending, both new in v1.61.0. The **usage gate** is yours: an optional check your app registers, which AI Core asks before any paid work. The **rate limit** is AI Core's own: a fixed cap on how fast one user can call the paid HTTP routes.
+
+**The usage gate.** AI Core depends on nothing, so it can't call your billing module. Instead, your host app registers an object under the service name `aiCoreUsageGate`, and AI Core looks it up on each call:
+
+```ts
+import { serviceRegistry } from '@/config/service.registry';
+import type { AiCoreUsageGate } from '@/features/ai-core'; // backend/src/features/ai-core/index.ts
+
+const gate: AiCoreUsageGate = {
+  async check({ userId, tenantId, kind, operationId }) {
+    // kind: 'run' | 'embed' | 'rerank' | 'retrieve' | 'flow'
+    const usage = await aiCore.getCurrentUsage({ tenantId, since: startOfMonth });
+    return usage.outputTokens < myMonthlyLimit
+      ? { allow: true }
+      : { allow: false, reason: 'monthly AI allowance used' };
+  },
+};
+serviceRegistry.registerDynamic('aiCoreUsageGate', gate);
+```
+
+- **Where it is checked:** at the start of `run` (`'run'`), `embed` and `embedMultimodal` (`'embed'`), `rerank` (`'rerank'`), `retrieve` (`'retrieve'`), and once per `runFlow` / `resumeFlow` (`'flow'`), before any provider call. Each operation step of a flow is checked again as `'run'`, and each eval case as the call it makes (`'run'`, or `'retrieve'` for a retrieval case). AI Core's own nested calls (a guardrail scorer, a rerank inside a retrieval) are not checked again: the call that started them already was.
+- **When it says no:** the call throws `RefusedError('usage-limit-reached')` (409), with your `reason` in the message and `{ kind, operationId }` in `detail`. A refused run, embed, rerank or retrieval still gets a ledger row, like every refusal (a refused flow start writes no run row).
+- **When it throws:** the call fails. A gate that breaks never counts as a yes, because a spend brake that opens when it fails is no brake.
+- **No gate registered:** everything is allowed, as before.
+
+`assertUsageAllowed({ userId, tenantId, kind, operationId? })` is exported from the feature barrel with the `AiCoreUsageGate` and `AiCoreUsageKind` types. It runs the same check, for a consumer that wants to ask before starting its own work.
+
+**The rate limit.** Each signed-in user may make **30 requests per 60 seconds** across the seven paid runtime routes (`/run`, `/embed`, `/embed-multimodal`, `/rerank`, `/retrieve`, `/flows/:flowId/run`, `/flow-runs/:id/resume`). Past that, the route answers **429** with a `Retry-After` header and the usual error body: `code: 'rate_limited'`, `reason: 'rate-limit-reached'`, and `detail: { limit, windowSeconds, retryAfterSeconds }`. Admin routes and the two free reads (`model-choices`, `usage/current`) are not limited, and neither are in-process `aiCore.*` calls. The counts live in each server process's memory: several processes allow that many times the limit in total, and a restart resets them. For a real spend rule, use the usage gate.
 
 ---
 
@@ -658,6 +702,8 @@ interface MediaAttachment {
 }
 ```
 
+**Link rules (v1.61.0).** `data` is read as a link the same way the AI SDK reads it, so any spelling of an `https:` URL is treated as a link and checked; any other scheme is refused (a value with no scheme is base64, and `data:` is inline). A link must point to a public host: private, loopback, link-local and internal addresses are refused, including IPv6 forms that carry an IPv4 address inside them and names ending in a dot (`localhost.`). The address a name resolves to is checked again at the moment the server connects, so a public name that points at an internal address is refused too. At most **20 links per request** (on `/run`, flow runs and multimodal embed, and again per provider call). All the downloads for one call share a **60-second** deadline, on top of 20 seconds and 25MB per file. A compressed response is unpacked first, and the size limits apply to the unpacked bytes.
+
 ### `RunOptions`
 
 ```ts
@@ -671,14 +717,18 @@ interface RunOptions {
   flowRunId?: string;
   memory?: string[];                    // caller-supplied Memory context (untrusted; injection-fenced)
   session?: string[];                   // caller-supplied Session context (untrusted; injection-fenced)
-  preferences?: CommunicationStyle;     // caller-supplied communication-style prefs (trusted; a 'preferences' context block renders them)
+  preferences?: CommunicationStyle;     // caller-supplied communication-style prefs (context, not instructions: sanitised + fenced)
   variables?: Record<string, string>;   // prompt-variable values; only declared tokens substitute (at prompt assembly)
 }
 ```
 
-`CommunicationStyle` is `{ tone?, length?, vocabulary?, structure?, sentiment? }` — each a short string (a preset, `'adaptive'`, or the user's own words). The app fetches these from the user's stored settings (`User.preferences`, mapping `aiStyleTone → tone`, …) and passes them; a context's **Communication style** block renders them as trusted, plain guidance. `sentiment` is hidden — the app (or a later AI step) sets it. See the [Changelog](/modules/ai-core/changelog/) for the full shape.
+`CommunicationStyle` is `{ tone?, length?, vocabulary?, structure?, sentiment? }` — each a short string (a preset, `'adaptive'`, or the user's own words). The app fetches these from the user's stored settings (`User.preferences`, mapping `aiStyleTone → tone`, …) and passes them. `sentiment` is hidden — the app (or a later AI step) sets it, and it renders as a "current mood" line. See the [Changelog](/modules/ai-core/changelog/) for the full shape.
 
-**`maxOutputTokens` is a tighten-only cap.** It may **lower** the operation's configured output limit, never raise it. A request above the configured cap is not honoured, and the refusal to raise is recorded as a `parameterTransform` in the ledger — so the cap is honest either way. `userSelectedModelRecordId` must be in the operation's allow-list, or the call refuses (`model-not-in-allow-list`).
+**Preferences are context, not instructions (v1.61.0).** The preferences are the user's own words, and over HTTP they come straight from the request body, so they are never placed in the prompt as trusted guidance. Wherever they appear — a context's **Preferences** block, or the built-in `{communication_style}` variable — they are sanitised and fenced as material (the block under the `supplied-material` marker, the variable in the same self-describing fence every injection-risk variable gets). A plain lead-in just outside the fence tells the model they are the user's stated communication preferences and to adapt its tone, length, vocabulary and structure to them wherever they don't conflict with its instructions. So the model still follows them; they just can't override the operation. `{communication_style}` is fenced on every run whatever its variable record says, and a run that uses it reports `prompt-variable-fenced`. The fence changes on every call, so `{communication_style}` in an **instruction** segment stops instruction caching from hitting (`cache-instructions-unstable:communication_style`); the context builder's Preferences block keeps the instructions cacheable. See [Prompt Assembly](/modules/ai-core/prompt-assembly/#marking-content-and-injection-risk).
+
+**HTTP callers (`callerSupplied`).** The `/run` and flow-run routes set an internal `callerSupplied` flag, because the request body comes from the client. It changes two things: only variables with `source: 'caller'` take a value (see [`getOperationInfo`](#getoperationinfo); a flow-run body carries no variables, so there only the marker check applies), and a caller segment that names a marker id the catalogue does not hold is refused with **400** instead of degrading to a named gap (a disabled marker still degrades). A caller segment's `marker` must also be a kebab or `owner/`-namespaced id over HTTP. In-process `aiCore.run()` calls leave the flag unset.
+
+**`maxOutputTokens` is a tighten-only cap.** It may **lower** the operation's configured output limit, never raise it. A request above the configured cap is not honoured, and the refusal to raise is recorded as a `parameterTransform` in the ledger — so the cap is honest either way. Since v1.61.0, a model whose parameter rules say it does not accept `maxOutputTokens` gets no cap at all (the drop is recorded as an `unsupported` change), and when your own cap is what cut the answer short, the run reports `output-truncated-by-caller-cap` and `complete-output` without setting a `reason` — so it does not land on the review queue. `userSelectedModelRecordId` must be in the operation's allow-list, or the call refuses (`model-not-in-allow-list`).
 
 ### `RunResult`
 
@@ -717,7 +767,7 @@ interface Feedback {
 ```
 
 - **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `abstained-below-groundedness`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `markers-preamble-unavailable`, `guardrail-rule-failed`, and so on. **Every reason that means a guardrail held the answer back starts `abstained-`** (`abstained-below-groundedness`, `abstained-guardrail-rule-failed`) — use `isHeldBack(feedback)` from the barrel rather than one exact string. (`retrieve()` also uses the prefix for a weak retrieval, `abstained-weak-retrieval`, which is not a guardrail hold and which `isHeldBack` does not count.) A held answer is still returned in full; your app decides what to show.
-- **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line). It can also carry a gap that is not itself a `reason` — for example `prompt-cache-unsupported`, named when an operation configured to cache resolves to a provider that cannot honour it (the call runs uncached rather than pretending otherwise).
+- **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line). It can also carry a gap that is not itself a `reason` — for example `prompt-cache-unsupported`, named when an operation configured to cache resolves to a provider that cannot honour it (the call runs uncached rather than pretending otherwise). Gaps added in v1.61.0 include `dial-unmapped:<dial>` (the model's parameter rules have no mapping for a dial the operation sets, so nothing was sent for it), `tool-unavailable:<id>` (a tool the operation opted into is disabled or deleted), `cache-instructions-unstable:<variable>` / `cache-context-unstable:<variable>` (a fenced variable stops a cache the operation asks for from hitting), `output-truncated-by-caller-cap`, and two that come from a context and so carry its prefix: `context:retrieval-node-ids-unsupported:<tag>` and `foundation:foundation-segment-injection-risk:<key>` — the full list is in the [Changelog](/modules/ai-core/changelog/).
 - **`confidence` / `threshold`** — reported when known, even when the run passes. `confidence` is read from a top-level `confidence` field on structured output and **reported for transparency only** — it is the weakest signal (the model grading its own work) and **never drives abstention**. `threshold` is the cutoff the measured groundedness score was compared against, or `null` when no grounding check ran.
 - **`groundedness`** — the **measured** external-support score (in `[0,1]`) from a grounding guardrail: how well the output is supported by its sources, computed outside the model's own say-so. A groundedness score below its cutoff is one of the two things that hold an answer back (reason `abstained-below-groundedness`); the other is any guardrail rule set to *hold the answer back* that fails (`abstained-guardrail-rule-failed`). `confidence` is reported alongside but never moves the outcome. It is an input to feedback, never a certificate that the output is true. Opt an operation into it by adding the `ai-core/ground-claims` discipline in its Disciplines block.
 - **`ruleScores`** — one entry per guardrail **rule** that scores: each scored rule whose scorer was called (its rating), and each *close to the source* rule whose comparison decided the result (its character accuracy). An entry has `score: null` (and `passed: null`, or `false` for a comparison that failed past what could be measured) when nothing was measured — the scorer failed, refused, could not judge or returned no score — and the rule's line in `missing` names why, so test `score !== null`, not the array's presence. The field is absent when no such rule ran, so feedback from older guardrails is unchanged. Only a rule marked as measuring the answer's groundedness also feeds `groundedness`. See [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/#a-guardrail-is-a-list-of-rules-v1590).
