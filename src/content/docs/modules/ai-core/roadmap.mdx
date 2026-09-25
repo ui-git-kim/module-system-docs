@@ -556,15 +556,13 @@ The minor findings from the [v1.60.1 audit](#cleanup--security-audit--v1601-sept
 
 #### Guardrail rule builder — follow-ups (v1.59.0)
 
-The rule builder shipped without these, each deliberately left for a later pass:
+The rule builder shipped without these, each deliberately left for a later pass. **v1.63.0 closed every scorer follow-up** by retiring the scorer from guardrails (a guardrail no longer asks another AI to judge the answer): *protect an operation a guardrail uses as its scorer*, *one download of a linked file for the scorer*, *per-item scorer calls*, *evals use the same scorer plumbing*, and the scorer's catalogue check on files no longer apply. What remains:
 
-- **Protect an operation a guardrail uses as its scorer.** Switching off or deleting it today makes every run reaching the discipline refuse (loudly, with `scorerGaps` naming the rule). Refusing the switch-off or delete — naming the guardrails that use it — would stop that before it happens.
-- **One download of a linked file.** A file sent as a link is fetched again for a scorer (named: `guardrail-rule-scorer-file-refetched`), so the scorer may see different bytes and the download cost doubles. Resolve it once and hand both calls the same bytes.
-- **Guardrail ids and versions in the ledger**, and a link from a scorer's own ledger row to the run it scored.
-- **Per-item scorer calls** for *each item in a list* (today all items go to the scorer in one call, and the issues it names are mapped back by index).
+- **Guardrail ids and versions in the ledger.**
+- **Curate the shipped guardrail set.** The seeded `guardrail-groundedness` (on `ai-core/ground-claims`) is the retired groundedness check: every run reaching it names `guardrail-rule-retired:guardrail-groundedness/classic-1:scored`. Seeded data was deliberately not rewritten; the owner decides what ships in its place (a measure, a code check, or neither).
+- **AI-judged checks as flow steps.** A check that needs a second model's judgement is a separate operation run as a flow step (see [Long-Term](#ai-judged-checks-as-flow-steps)).
 - **Very large comparisons.** Character comparison is bounded (200,000 characters, a per-run work budget) and yields to the event loop, and every pattern runs under a time limit (at most 200 ms per list, one second per run); a worker thread would let very long documents be compared in full rather than reported as over budget.
-- **Evals use the same scorer plumbing**, so an eval can exercise a file-reading scored rule.
-- **A modality check before the primary call** (today only a scorer run checks its files against the model's catalogue).
+- **A modality check before the primary call** against the model's catalogue (the scorer's version of this check was removed with the scorer in v1.63.0; the primary call still refuses a known-false image capability, `model-lacks-image-input`).
 
 #### Drop the vestigial columns on `ai_operation` and `ai_guardrail`
 
@@ -603,7 +601,7 @@ Done. Installed into a real starter app, migrations and seeds applied, admin pag
 - **Input contract / `ai_input_type` (v1.35–v1.36).** `data-model` (the `ai_input_type` table + the `ai_operation.inputItems` column); `glossary` (an "Input type / input contract" term); `hooks-and-events` (`ai-core.input-type.updated`).
 - **Context-builder block model (v1.28–v1.32).** `data-model` (`ai_operation.contextBlocks` / `contextMarker` columns); `glossary` (a "Context builder / context block" term + the `contextBudget` dial); `integration` (the Context-builder context-supply path + `RunOptions.memory` / `session`); `prompt-model` (the per-op `op.<id>.objective` slot + the `supplied-material` marker).
 - **`description` admin-note field** on approaches and disciplines (v1.36.0) — `prompt-model`, `disciplines-and-guardrails` and `json-reference` all omit it.
-- **`disciplines-and-guardrails`** — the model-scored guardrail `config` shape needs its `builtin` key shown (the run engine dispatches on `config.builtin`).
+- ~~**`disciplines-and-guardrails`** — the model-scored guardrail `config` shape needs its `builtin` key shown.~~ Moot since v1.63.0: model-scored guardrails are retired.
 - **`registering-and-seeding`** — the consumer seed surface also has `ensureMarker` / `ensureEvalCase`; the `ai-core.run.completed` payload carries `userId`.
 - **`hooks-and-events`** — the review-item ledger payload also carries `operationId`.
 - **`developer-workflow`** — the Registries row omits `moduleRegistry`.
@@ -664,7 +662,7 @@ The 45 minor findings from the [Meta Audit](#meta-audit--august-2026-four-dimens
 - **Check-then-write races on natural keys.** `createModel` reads `ai_model` by the `(providerId, modelId)` unique pair then creates; the unique constraint saves correctness but the error surfaces as a raw constraint violation rather than the intended message.
 - **`updateModel` accepts a `providerId` change** (`modelUpdateSchema` is `modelCreateSchema.partial()`), which can move a model to a provider whose terms it was never assessed against.
 - **A guardrail's admin-supplied `denominator.pattern` is compiled and run with the `g` flag over the whole concatenated context.** A catastrophically backtracking pattern is an admin-authored foot-gun on the run path.
-- **`runEval` loads every enabled golden case with no `take` cap** and runs the real pipeline over all of them — one provider call per case, plus one per model-scored guardrail.
+- **`runEval` loads every enabled golden case with no `take` cap** and runs the real pipeline over all of them — one provider call per case, plus a judge call per judge metric (guardrails run in code only since v1.63.0).
 - **Breadth saturation is not named.** `runOneRetrieval` names an empty result and a clamped breadth, but a retrieval returning exactly `topK` hits — the signal that material was probably cut off — passes unremarked, which sits awkwardly beside the module's never-silent rule.
 - **`onPrepareDatabase` leaves its TRUNCATE script behind.** Every install and update writes `prisma/.ai-core-v2-prompt-model-prep.sql` into the host app and never removes it.
 
@@ -672,7 +670,7 @@ The 45 minor findings from the [Meta Audit](#meta-audit--august-2026-four-dimens
 
 - **Six indexes are strict prefixes of another index on the same table** — `ai_usage_ledger` and `ai_flow_run` among them — so they cost writes on the tables that grow fastest and buy nothing.
 - **The same guardrail rows are fetched twice per language run** — `validateDisciplineSet` already loads them during resolution.
-- **The `ai_operation` row is read twice per run**, and again for every nested run (scorers, rerank, context builders).
+- **The `ai_operation` row is read twice per run**, and again for every nested run (eval judges, rerank, context builders).
 - **`assembleContext` runs its retrieval blocks and its per-embedding-model query vectors in sequential `for … await` loops** where the work is independent.
 - **`exportConfig` reads every prompt segment — including the `content @db.Text` column — plus both membership join tables twice**, when `listSegments` already returns what it needs.
 
@@ -702,11 +700,11 @@ The prompt taxonomy was reviewed end to end against authoritative prompt-enginee
 The reshaped tables (segments, disciplines, guardrails, operations) are **reset to the v2 built-ins** by the `onPrepareDatabase` hook — custom, non-seeded rows in those tables are **not** preserved, so export them via the Config tab first. Markers, eval cases and the model / provider / flow / ledger layer keep their shape (presets were dropped in v1.23.0). Requires scaffold ≥ 1.31.14 (it self-heals a failed module migration and regenerates the client). A future data-preserving migration path — export the custom rows and re-import them after the reset — is on the backlog below.
 </Aside>
 
-**Still open (deferred — all low, narrow; the resolver still refuses at run time):** a few config-io **replace-mode** edge cases — a scorer operation or an eval case left orphaned by a *self-inconsistent hand-authored* replace, and create-path seeded-provenance under a transient DB failure. None can produce a silently-wrong prompt: `validateDisciplineSet` re-checks the resolved discipline set on every call and refuses loudly.
+**Still open (deferred — all low, narrow; the resolver still refuses at run time):** a few config-io **replace-mode** edge cases — an eval case left orphaned by a *self-inconsistent hand-authored* replace, and create-path seeded-provenance under a transient DB failure. None can produce a silently-wrong prompt: `validateDisciplineSet` re-checks the resolved discipline set on every call and refuses loudly.
 
 #### ~~Guardrail-check execution~~ (shipped — v1.12.0)
 
-**Done.** The rule-and-check pairing now EXECUTES. **Source verification** (a deterministic builtin, no model call) verifies every extracted item verbatim against the source and, where an independent denominator exists, whether everything the source contains was returned — saying so plainly where no count exists. A real **groundedness scorer** (a `grounding` check) runs a nested judge that decomposes the output into claims and produces a measured support score, which **abstention now compares against instead of the model's self-reported confidence**; where only self-report is available, the run *names* that provenance. Opt-in per operation through a discipline; a batteries-included judge is seeded, bound to a model by requirements. This subsumed **Groundedness Scorers** (below). See the [Changelog](/modules/ai-core/changelog/). Follow-ups: an admin editor for custom checks, and an `ensureCheck` consumer seed for a custom source-verification path.
+**Done.** The rule-and-check pairing now EXECUTES. **Source verification** (a deterministic builtin, no model call) verifies every extracted item verbatim against the source and, where an independent denominator exists, whether everything the source contains was returned — saying so plainly where no count exists. A real **groundedness scorer** (a `grounding` check) runs a nested judge that decomposes the output into claims and produces a measured support score, which **abstention now compares against instead of the model's self-reported confidence**; where only self-report is available, the run *names* that provenance. Opt-in per operation through a discipline; a batteries-included judge is seeded, bound to a model by requirements. This subsumed **Groundedness Scorers** (below). (v1.63.0 retired the groundedness scorer from guardrails; source verification runs on.) See the [Changelog](/modules/ai-core/changelog/). Follow-ups: an admin editor for custom checks, and an `ensureCheck` consumer seed for a custom source-verification path.
 
 #### ~~Markers — generalising framing~~ (shipped — v1.15.0)
 
@@ -763,7 +761,7 @@ A generic, portable harness that measures an operation's quality offline over a 
 
 #### ~~Groundedness Scorers~~ (shipped — v1.12.0)
 
-**Done** as part of guardrail-check execution (above). A `grounding` check runs a nested judge (claim decomposition + entailment) and produces a measured score in `[0,1]` that the abstention threshold compares against and that lands in the new `feedback.groundedness` — an input to feedback, never a certificate the output is true. Pluggable per operation via the check's `config`. The provider-native-citation and dedicated-grounding-service implementations remain open as alternative scorer types.
+**Done** as part of guardrail-check execution (above). A `grounding` check runs a nested judge (claim decomposition + entailment) and produces a measured score in `[0,1]` that the abstention threshold compares against and that lands in the new `feedback.groundedness` — an input to feedback, never a certificate the output is true. Pluggable per operation via the check's `config`. **Retired from guardrails in v1.63.0:** a guardrail no longer asks another AI to judge the answer, and `feedback.groundedness` is gone. The judge lives on in the eval harness (`faithfulness`); a run-time second-model check belongs in a flow step (see [AI-judged checks as flow steps](#ai-judged-checks-as-flow-steps)).
 
 #### Tools
 
@@ -872,11 +870,11 @@ The design's own open questions (§21), carried here so they stay visible.
 
 #### Discipline Authority Enforcement
 
-The design's original question — can a registry reject a registration that conflicts with another registry's contents? — was answered in July 2026: registration-time rejection is unsound for **code registries** in the starter's ESM side-effect model, where a rule may register before the rule it conflicts with. The implementation landed somewhere stronger than the startup-barrier fallback the design reached for: disciplines are **database records**, which have no such ordering problem, so v1.1.0 enforces the hierarchy at **write time** — admin CRUD refuses violations transactionally — and re-validates at **resolution time**, where `aiCore.run` refuses an invalid set (see [Usage](/modules/ai-core/usage/)). **Superseded in v1.22.0:** the discipline `tier` and the additive authority hierarchy were **removed entirely** — the question of ordering across authorities no longer arises. What write-time and resolution-time `validateDisciplineSet` now guards is discipline-*set integrity* (every discipline known, each owning a guardrail, each model-scored guardrail naming a live scorer operation). What remains open is the CI lint for seed discipline/guardrail integrity, recorded under Known Issues. The principle underneath held throughout: **prose asks; code holds.**
+The design's original question — can a registry reject a registration that conflicts with another registry's contents? — was answered in July 2026: registration-time rejection is unsound for **code registries** in the starter's ESM side-effect model, where a rule may register before the rule it conflicts with. The implementation landed somewhere stronger than the startup-barrier fallback the design reached for: disciplines are **database records**, which have no such ordering problem, so v1.1.0 enforces the hierarchy at **write time** — admin CRUD refuses violations transactionally — and re-validates at **resolution time**, where `aiCore.run` refuses an invalid set (see [Usage](/modules/ai-core/usage/)). **Superseded in v1.22.0:** the discipline `tier` and the additive authority hierarchy were **removed entirely** — the question of ordering across authorities no longer arises. What write-time and resolution-time `validateDisciplineSet` now guards is discipline-*set integrity* (every discipline known, each owning a guardrail; since v1.63.0 a guardrail depends on no operation, so there is no scorer to check). What remains open is the CI lint for seed discipline/guardrail integrity, recorded under Known Issues. The principle underneath held throughout: **prose asks; code holds.**
 
-#### Which Groundedness Scorer per Operation
+#### AI-judged checks as flow steps
 
-The mechanism is settled and pluggable; which implementation runs on which operation is a per-operation decision that needs measurement, not a design argument.
+Since v1.63.0 a guardrail never asks another AI to judge the answer: the measure goes into the prompt, and code checks what can be checked for certain. A check that genuinely needs a second model — groundedness, transcription fidelity against a scanned page — is **another operation**, run as the next step of a [flow](/modules/ai-core/service-api/#runflow) and routed on its answer (a `waitOnFeedback` step pauses when it reports a reason). Open: ready-made checking operations and a documented flow pattern for them, and — as before — which implementation (provider-native citations, claim decomposition plus entailment, a dedicated grounding service) suits which operation, which needs measurement, not a design argument.
 
 #### Image and Video Provider Data-Handling Terms
 
@@ -908,6 +906,10 @@ A lightweight loop over the eval harness that prunes disciplines which don't ear
 
 Items that have been done.
 
+### v1.63.0 — Guardrails are measures in the prompt (September 2026)
+
+A discipline says what to do; its guardrail says how the AI knows it has done it, and both go into the same prompt. A guardrail's `promptText` became its **measure** (*How you know you've done it*), rendered under each discipline it is attached to, with one admin-editable lead-in (Strong or Soft per operation, `ai_operation.disciplineCheck`) and a Mandatory line for important disciplines; *Must remember* repeats important measures. Code checks became optional, and a measure-only guardrail is complete. The scored rule and the groundedness check are retired — refused on write, kept by import, named `guardrail-rule-retired` at run time, never run — which removed `feedback.groundedness`, `guardrail-scorer-missing` and the scorer machinery. The guardrail editor's presets became readable cards. See the [Changelog](/modules/ai-core/changelog/) and [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/).
+
 ### v1.61.0 — Cleanup & security audit fixes (September 2026)
 
 Every finding from the [v1.60.1 cleanup & security audit](#cleanup--security-audit--v1601-september-2026). Security: attachment links checked at connect time (IPv6-embedded and trailing-dot hosts refused), capped at 20 per request under a shared 60s deadline; an optional host usage gate (`aiCoreUsageGate`, refusal `usage-limit-reached`) and a per-user rate limit (30 a minute, 429) on the paid routes; flow-step handlers get a trusted `ctx`; flagged shared segments fenced as material; classic guardrail checks bounded; review-queue flooding closed; provider call timeouts; the actor in every audit log line. Preferences became fenced context by owner decision (with `cache-instructions-unstable:<variable>` reporting the caching cost). Settings: `verificationPasses` removed; a Parameter rules editor with default Consistency mapping and `dial-unmapped:<dial>`; approach fields save; context-slot segments render; retrieval filters apply; tool limits and missing tools reported; eval tags filter runs. Robustness: context query embeddings ledgered as `context:<id>`; a resumed flow suspends on a retryable failure; stale running flow runs reaped by the prune; evals abort on disconnect and refuse to double-run; config import validates every record. Admin: one two-step Delete everywhere, Previous eval runs, markers only where they apply. No migration. Nine review rounds of the fix diff (14, 5, 3, 3, 1, 2, 5, 3, 1 problems found, all fixed). See the [Changelog](/modules/ai-core/changelog/).
@@ -922,7 +924,7 @@ Every fix from the [v1.59.0 standards audit](#standards--architecture-audit--v15
 
 ### v1.59.0 — The guardrail rule builder (September 2026)
 
-A guardrail is a list of rules — *check this, against that, this way* — built in the admin from presets, replacing the three fixed check types (which run on as **classic** rules, verified identical across 80,000 generated configurations). Rules read the whole answer even as plain text, compare against the text or the **files** sent to an input, run code checks (including character-level *matches / close to the source* with `[UNCLEAR]` placeholders) or ask a scorer that is handed the file, and can report, flag or hold the answer back. `feedback.ruleScores`, `isHeldBack`, config 6.1. Driven by a transcription-fidelity discipline no earlier check could verify. See the [Changelog](/modules/ai-core/changelog/) and [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/#a-guardrail-is-a-list-of-rules-v1590).
+A guardrail is a list of rules — *check this, against that, this way* — built in the admin from presets, replacing the three fixed check types (which run on as **classic** rules, verified identical across 80,000 generated configurations). Rules read the whole answer even as plain text, compare against the text or the **files** sent to an input, run code checks (including character-level *matches / close to the source* with `[UNCLEAR]` placeholders) or ask a scorer that is handed the file, and can report, flag or hold the answer back. `feedback.ruleScores`, `isHeldBack`, config 6.1. Driven by a transcription-fidelity discipline no earlier check could verify. See the [Changelog](/modules/ai-core/changelog/) and [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/#code-checks-optional--a-list-of-rules).
 
 ### v1.58.2 — Guardrails check against a named input (September 2026)
 

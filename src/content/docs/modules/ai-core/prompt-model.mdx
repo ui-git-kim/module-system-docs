@@ -28,7 +28,7 @@ An operation **composes an ordered list of segments** (the `ai_operation_segment
 Two kinds of **"how"** are their own records, related *into* segments:
 
 - **approach** — an *unmeasured* how: expertise, persona, reasoning, tone. Keyed by its `key`.
-- **discipline** — a *measured* how: a rule that owns one-or-more **guardrails** (the checks that prove it held). Its `id` **is** its key. Measurability plus a guardrail is the only thing separating a discipline from an approach.
+- **discipline** — a *measured* how: a rule that owns one-or-more **guardrails** (each saying how the model knows it has followed the rule, and optionally checking it in code). Its `id` **is** its key. Measurability plus a guardrail is the only thing separating a discipline from an approach.
 
 The **"what"** slots (objective · goals · tasks · context · examples · format · edge-cases) carry plain authored text in the segment's `content` field.
 
@@ -56,7 +56,7 @@ Two mechanisms cut across both sides:
 | Slot type | Side | What it is |
 |---|---|---|
 | **approaches** | instructions | Holds the operation's **approach** records — the unmeasured "how" (expertise, persona, reasoning, tone). Content comes from the related records, not the segment. |
-| **disciplines** | instructions | Holds the operation's **discipline** records — the measured "how", each surfaced with its guardrails' prompts (the model is told the rule *and* that it will be checked). |
+| **disciplines** | instructions | Holds the operation's **discipline** records — the measured "how", each surfaced with its guardrails' **measures** (the model is told what to do *and* how it knows it has done it, and checks its answer before finishing). |
 | **objective** | instructions | What this operation is for. Plain authored content. |
 | **goals** | instructions | The operation's goals — authored "what"-side content, rendered as an auto-numbered list. |
 | **tasks** | instructions | The operation's tasks — authored "what"-side content, rendered as an auto-numbered list. |
@@ -90,7 +90,7 @@ There is **no `scope` field**. A "system prompt" is just an operation flagged **
 
 An explicit `systemPromptOperationId` is held to the same bar as the default: the target must still exist, still be `systemWide` and still be enabled, or the fold falls back to the default — and every way this comes up empty (`system-prompt-operation-missing`, `…-not-system-wide`, `…-disabled`, `no-system-prompt-available`) is **named**, never silent.
 
-The one exception keeps scoring honest: on an **internal/scorer run** (a model-scored guardrail calling its scorer operation) the system-prompt fold is **skipped**, so a judge's prompt is exactly its own segments — never the app's standing system prompt, which would bias the score it produces.
+The one exception keeps scoring honest: on an **internal/nested run** (an eval judge, a context builder's sub-step) the system-prompt fold is **skipped**, so a judge's prompt is exactly its own segments — never the app's standing system prompt, which would bias the score it produces.
 
 ---
 
@@ -166,21 +166,22 @@ Multiple segments of a type render in order, joined, inside one wrapper. Adding 
 
 ## Discipline ↔ guardrail — the spine
 
-The pairing is the reason the module exists, so it is worth restating here and reading in full on its own page. A **discipline** is the rule about *how* the AI must work; a **guardrail** is the check that the rule was followed. **The brake is both halves — a rule with no check is only a request.** Owning at least one guardrail is exactly what makes a record a discipline rather than an approach.
+The pairing is the reason the module exists, so it is worth restating here and reading in full on its own page. A **discipline** says *what to do* — the rule about *how* the AI must work; a **guardrail** says *how you know you've done it*. Both go into the same prompt, so the model checks its own answer against the guardrail's measure before it finishes. **The brake is both halves — a rule with no guardrail is only a request.** Owning at least one guardrail is exactly what makes a record a discipline rather than an approach.
 
-In v2 the guardrail is its **own table** (`ai_guardrail`, renamed from `ai_guardrail_check`): `kind` (`deterministic | model-scored`), `config` (Json), an optional `promptText`, attached to disciplines through `ai_discipline_guardrail` (v1.48.0). A discipline may own one **or many**. Since v1.59.0 its `config` is a list of **rules**, each of which runs in code or asks a **scorer operation** — there is no first-class "judge" concept; the groundedness/correctness judges are just ordinary operations a rule invokes. See [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/).
+In v2 the guardrail is its **own table** (`ai_guardrail`, renamed from `ai_guardrail_check`): its **measure** (`promptText`), optional code checks (`config`, a list of **rules** since v1.59.0) and a derived `kind`, attached to disciplines through `ai_discipline_guardrail` (v1.48.0). A discipline may own one **or many**. Since v1.63.0 a guardrail never asks another model to judge the answer — a check that needs a second model is a separate operation in a flow, and the seeded judges are ordinary operations the eval harness uses. See [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/).
 
 The invariant is enforced by one function, `validateDisciplineSet`, at **two moments**:
 
 - **Write time** — when a `disciplines` segment's members change (`records.upsertSegment`).
 - **Resolution time** — the run resolver re-validates the resolved discipline set on **every call** and refuses loudly, so a raced admin write can never cause a silent bad run.
 
-The violation kinds are machine-readable: `unknown-discipline`, `discipline-without-guardrail`, `guardrail-scorer-missing`. There is **no `tier` and no authority hierarchy** — both were removed; a single most-important rule is restated at the tail via `important` on its membership instead.
+The violation kinds are machine-readable: `unknown-discipline`, `discipline-without-guardrail`. There is **no `tier` and no authority hierarchy** — both were removed; a single most-important rule is restated at the tail via `important` on its membership instead.
 
-The two guardrails that ship as executing examples:
+The guardrail that ships as an executing example:
 
-- **Source verification** *(deterministic)* — every extracted item appears verbatim in the source, counted against an independent denominator. The cheapest, strongest check for legal work.
-- **Groundedness** *(model-scored)* — a real score of how well each claim is supported by the evidence, which **answer abstention** acts on **instead of the model's own self-reported confidence**. The self-reported `confidence` field is still reported for transparency but never drives abstention. Since v1.59.0 any guardrail rule can also be set to *hold the answer back* when it fails (reason `abstained-guardrail-rule-failed`) — abstention is always a measured guardrail result, never the model's say-so.
+- **Source verification** *(code)* — every extracted item appears verbatim in the source, counted against an independent denominator. The cheapest, strongest check for legal work.
+
+Any guardrail code rule can be set to *hold the answer back* when it fails (reason `abstained-guardrail-rule-failed`) — abstention is always a measured guardrail result, never the model's say-so; the self-reported `confidence` field is reported for transparency but never drives it. (The seeded **groundedness** guardrail asked a judge operation to score the answer; it was retired in v1.63.0 and is named, never run.)
 
 See [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/) for the slimmed discipline record, the guardrail kinds, and where the invariant is enforced.
 
@@ -195,8 +196,8 @@ See [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/) for
 | Framework (order + wrapping, on the model) | ✅ | unchanged |
 | approach records (unmeasured how) | ✅ `ai_approach` | absorbs the old `voice` / `method` / `role` types |
 | discipline records + guardrail *pairing* | ✅ `ai_discipline` + `ai_guardrail` | slimmed; `tier`/authority hierarchy removed |
-| guardrail *execution* | ✅ rules (v1.59.0) — code checks and scored rules; the older source-verification / assertion-rules / groundedness configs run as classic rules | scored rules call a scorer operation |
-| `systemWide` operations | ✅ replaces `scope` | a named, reusable system prompt; each operation folds in the one it selects (`systemPromptOperationId`) or the default; skipped on scorer runs |
+| guardrail *execution* | ✅ the **measure** in the prompt (v1.63.0) plus optional code rules (v1.59.0); the older source-verification / assertion-rules configs run as classic rules | scored rules and the groundedness check are retired (v1.63.0) — named, never run |
+| `systemWide` operations | ✅ replaces `scope` | a named, reusable system prompt; each operation folds in the one it selects (`systemPromptOperationId`) or the default; skipped on nested runs (eval judges, context-builder sub-steps) |
 | `important` on membership | ✅ | restated at the tail under the `key-rules` marker |
 | markers catalogue + examples | ✅ | shipped v1.15.0; example is content in the `example` marker |
 | injection-risk axis (sanitise + nonce fence) | ✅ | per-item `injectionRisk` flag; hardening v1.19.0 |
@@ -209,7 +210,7 @@ See [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/) for
 ---
 
 <Aside type="caution" title="v2 is a clean break">
-The config JSON is **6.x** (6.0, or 6.1 / 6.2 when the document holds rules-format guardrails or flagged input items): the importer reads the current major only (no legacy reader). A *merge* import updates and reports but never deletes; a *replace* import also deletes non-seeded omitted rows behind named delete-guards, and seeded provenance round-trips. **Contexts are their own exported/imported entity** (carrying their `kind`); operations reference a context by id, so contexts import **before** operations and delete **after** them. Operations are **model-agnostic** — they carry requirements, not a model.
+The config JSON is **6.x** (6.0, or 6.1 / 6.2 / 6.3 when the document holds rules-format guardrails, flagged input items or a Soft disciplines lead-in): the importer reads the current major only (no legacy reader). A *merge* import updates and reports but never deletes; a *replace* import also deletes non-seeded omitted rows behind named delete-guards, and seeded provenance round-trips. **Contexts are their own exported/imported entity** (carrying their `kind`); operations reference a context by id, so contexts import **before** operations and delete **after** them. Operations are **model-agnostic** — they carry requirements, not a model.
 
 Upgrading a **populated v1 install** is likewise a clean break: the reshaped tables (segments, disciplines, guardrails, operations) are **reset to the v2 built-ins** by the `onPrepareDatabase` hook — custom, non-seeded rows are **not** preserved, so export via the Config tab first. Markers, eval cases, and the model/provider/flow/ledger layer keep their shape and are left intact. Requires scaffold ≥ 1.31.14.
 </Aside>
