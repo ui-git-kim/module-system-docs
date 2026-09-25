@@ -180,6 +180,10 @@ export default defineConfig({
                   label: "Typography",
                   slug: "starter-template/typography",
                 },
+                {
+                  label: "Data Table",
+                  slug: "starter-template/data-table",
+                },
               ],
             },
             {
