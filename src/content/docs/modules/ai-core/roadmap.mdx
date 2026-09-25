@@ -24,6 +24,34 @@ This roadmap reflects current plans and may change based on feedback and require
 
 The six issues recorded here from the July 2026 alignment audit all lived in the **legacy template surface**, and all were **resolved by deletion** — v1.1.0 replaced that surface wholesale (see the [Changelog](/modules/ai-core/changelog/)). These are the current known issues.
 
+### Cleanup & Security Audit — v1.60.1 (September 2026)
+
+A cleanup and security audit of the generated code at **v1.60.1** (2026-09-25): eight read-only lenses (authorisation, input handling, secrets/data, frontend security, backend slop, frontend slop, dead config, robustness), every finding checked by two independent skeptics (three for anything rated critical). **54 raised → 40 upheld (38 distinct after merging duplicates), 14 refuted. No critical findings.** The moderate ones are below; the minor ones are under [Planned Improvements](#cleanup--security-audit--minor-findings-v1601).
+
+**Clean going in:** `npm audit` has only the known low, dev-only esbuild advisory; `depcheck` found nothing unused; CI already runs type-check, `check:templates`, conformance, parity, build and `npm audit --audit-level=high`; the templates contain no `dangerouslySetInnerHTML`, `innerHTML`, `eval`, `new Function`, `console.log`, browser token storage, `postMessage` or unsafe raw SQL; `.env` is ignored and untracked. Every admin route is `requireAdmin`-gated, identity always comes from the session, and no cross-account read or write path was found.
+
+**Refuted on verification (don't re-raise without new evidence):** client-supplied style preferences as a security hole (a user can only affect their own runs and can already store any text through the host's preferences route — kept as a minor design question instead); new prompt variables defaulting to caller-supplied; the web-tool sensitivity checkbox; flows lacking a per-step sensitivity floor; provider logos loading from models.dev; model pricing being unused; classic groundedness checks bypassing the scorer budget; and five cleanup claims (a 2,600-line component, copy-pasted tab blocks, private helper copies, dead public types, a refetch per framework import).
+
+#### 🟡 Security
+
+1. **The attachment-URL safety check can be bypassed** (`validation.ts` ~933, `isBlockedAttachmentHost`). IPv4-mapped IPv6 literals (`https://[::ffff:10.0.0.5]/…`), NAT64 / IPv4-compatible forms and host names ending in a dot (`https://localhost./…`) pass both the wire check and the adapter re-check, so the server connects to internal addresses. **Fix:** strip a trailing dot; convert mapped/compatible/NAT64 IPv6 to IPv4 before the private-range test (or use `node:net` `BlockList`); ideally also check the resolved address at connect time (an undici `connect.lookup` hook), which also closes the DNS-rebinding gap the comment admits.
+2. **URL attachments are uncounted, with no overall deadline** (`provider-adapters.ts` ~464). One `/run` may carry up to 2,000 URL attachments, each downloaded in turn with its own 20s timeout — about ten hours of outbound fetching per request, a request reflector. **Fix:** cap URL attachments per request (e.g. 20) in the same `superRefine` as the total-media budget, and give all downloads one shared deadline (`AbortSignal.any` with a 60s timeout).
+3. **No per-user rate or spend limit on the paid runtime endpoints** (`routes.ts` ~25; the 2026-08-26 audit's M1, still open). Any signed-in user can loop `/run` on an operation with scored guardrails; each request can reach about 12 provider calls, and the billing callback `getCurrentUsage` is never enforced. **Fix:** an optional host-registered usage gate checked before provider work (keeps `depends` empty), plus a per-user limiter on the runtime routes.
+4. **Older-format guardrail source matching has no time budget** (`guardrail-engine.ts` ~685). A classic assertion rule with `appears-in-source` over a list re-normalises the whole source for every item, so a large request can block the Node event loop for tens of seconds. **Fix:** normalise the sources once per run and charge the classic paths against the run budget (reporting `over-budget` by name), or apply the modern size caps to them.
+5. **A shared segment's "Injection risk" switch and "Marked as" marker are saved but never read** (`run.ts` ~811). A segment an admin flags as risky (e.g. a pasted third-party FAQ in an Examples slot) goes into the system message unsanitised and unfenced. **Fix:** honour the flag (sanitise + nonce-fence it as input-side material, state its marker), or remove both controls and refuse `injectionRisk: true` on shared segments.
+
+#### 🟡 Settings that do nothing
+
+6. **Editing an approach's description, heading or tag is silently thrown away** (`controller.ts` ~742). The update handler merges only name and prompt text, so the save "succeeds" but nothing changes and `<role>`-style wrapping never applies. **Fix:** pass the parsed body through with only the required fields defaulted (the pattern `upsertMarker`/`upsertTool` use), so no future column can be dropped the same way.
+7. **The "Double-check its work" (`verificationPasses`) dial has no runtime reader** (`tab-operations.ts` ~305). Runs make one call regardless; the ledger records the requested value as if it applied. **Fix:** remove the dial until a verification pass exists, or report `dial-not-implemented:verificationPasses` and label it "not yet active".
+8. **Effort and Response length (and Consistency on newly added models) depend on `parameterRules`, which nothing in the admin or config import can set** (`resolver.ts` ~1260). On most models these dials send nothing and say nothing; re-pointing a purpose to a refreshed model silently drops the scorers' temperature-0 consistency. **Fix:** a Parameter rules section in the model editor, default consistency mapping for new language models, and `dial-unmapped:<dial>` in feedback when a dial has no mapping.
+9. **Shared `context`-slot segments composed on an operation never render, but the ledger records them as used** (`assembler.ts` ~496). **Fix:** render them as authored context ahead of the caller's, or refuse context-slot keys on operations with a named error — and build `segmentVersions` only from segments that actually rendered.
+10. **Context-retrieval Status and Node-ids filters are ignored for some methods** (`run.ts` ~2955): Status is never passed to chunk searches or graph expansion, and Node ids does nothing for `lexical-node` — with no warning. **Fix:** pass `status` through; hide Node ids for `lexical-node` or report `retrieval-node-ids-unsupported`.
+
+#### 🟡 Billing / audit trail
+
+11. **Context-builder query embeddings are paid calls with no ledger row** (`run.ts` ~3503), so `getCurrentUsage` undercounts and the egress (for sensitive operations too) is not recorded. **Fix:** ledger the embedding (its own row, or a `contextUsage` entry on the parent row that usage sums).
+
 ### Incident — 2026-09-21: an update emptied live operations, segments, disciplines and frameworks
 
 **Status:** cause fixed in **v1.60.0**; recovering the lost records is the host owner's call (options below).
@@ -483,6 +511,45 @@ The first real install confirmed exactly this class: `ErrorAlert`'s real prop is
 
 ### Short-Term
 
+#### Cleanup & security audit — minor findings (v1.60.1)
+
+The minor findings from the [v1.60.1 audit](#cleanup--security-audit--v1601-september-2026), grouped by where the fix lands.
+
+**Safety & correctness**
+
+- **Flow-step handlers get no trusted identity** (`types.ts` ~858). A handler receives only `(state, previous)`, and `state` comes from the request body — so the first consumer handler that needs "who is this?" will read it from client-controlled state. Latent (no consumer registers a handler yet). Fix: a third `ctx { userId, tenantId, flowRunId, flowId }` argument built from the session, and docs saying identity comes from `ctx`, never `state`.
+- **Style preferences are rendered as trusted guidance** (`controller.ts` ~241; `run.ts` ~3369, ~648). A decision rather than a hole: a user can steer only their own runs, and can already store any text through the host's preferences route. But the comment claiming built-in variables "cannot be spoofed" is wrong for `{communication_style}`. Decide whether a user's own words should act as instructions (today) or be fenced as user content; either way correct the comment and the service-api page.
+- **Config import skips the field checks the admin routes enforce** (`config-io.ts` ~1389) — e.g. a variable named `user name` or a source of `Caller` imports "successfully" and then never works. Fix: run each item through its create schema and report failures per item.
+- **A resumed flow that hits a retryable provider error or a client disconnect is failed permanently**, wiping its state and the reviewer's resolution (`flows.ts` ~374). Fix: put it back to `suspended` at the same step on a retryable/abort error.
+- **Flow runs left `running` after a crash can never be resumed or pruned** and keep their state indefinitely (`maintenance.ts` ~85). Fix: the prune reaps stale `running` runs (fixed window, e.g. 24h) to `failed` with state cleared.
+- **Any user can flood the review queue** with open items (`maxOutputTokens: 1`, or made-up marker ids) (`run.ts` ~1754). Fix: a truncation caused only by the caller's own cap records `complete-output` without queueing review; cap/validate caller marker ids.
+- **Provider calls have no timeout of their own** — they end only on client disconnect (`provider-adapters.ts` ~572). Fix: a named `PROVIDER_CALL_TIMEOUT_MS` combined with the request signal.
+- **The admin eval run ignores client disconnect and can run twice at once** (`controller.ts` ~1284). Fix: `abortOnClose(res)` like the runtime handlers, plus an in-flight guard per operation.
+- **Tool limits (`allowedDomains`, `blockedDomains`, `maxUses`) are silently dropped on OpenAI/Google** (`provider-adapters.ts` ~856; the provider-coverage half is already under Tools). Fix: report each unapplied key as a provider warning in feedback.
+- **A disabled tool is silently dropped from operations that opted into it** (`records.ts` ~4520). Fix: `tool-unavailable:<id>` in feedback.missing and the preview.
+- **A discipline's version goes up on every save**, even a description-only or no-op save, so the ledger claims a different rule ran (`disciplines.ts` ~345). Fix: bump only when prompt-reaching fields change.
+
+**Audit trail & wording**
+
+- **Audit log lines for sensitive admin actions don't say who acted** (e.g. turning on the zero-retention override, replace imports, prunes) (`records.ts` ~3990). Fix: add the actor id to every `audit: true` log via one helper.
+- **The preview and resolver log send admins to `ai.config.ts` for the zero-retention override**, which now lives in the `ai_policy` record (Models tab → Policy) (`run.ts` ~2056; `resolver.ts` ~1000). Fix the wording.
+
+**Admin screens**
+
+- **Two-step delete stays armed indefinitely** (no Cancel, not cleared on edit or filter change), copied into ~10 tabs in four shapes (`tab-markers.ts` ~80 and siblings). Fix: one shared confirm-delete button that disarms on blur/Escape/unmount; optionally a shared browse-list shell.
+- **The "unset" select sentinel is a valid record id**, so a record named `unset` can never be picked (`tab-operations.ts` ~118 and three other tabs). Fix: one non-kebab sentinel (e.g. `__unset__`) in `record-id.ts`.
+- **Config export throws away the server's reason** and can run twice on a double-click (`tab-config.ts` ~151). Fix: a `useExportConfig` mutation with `ErrorAlert` and a disabled button while running.
+- **Context marker pickers appear where the runtime ignores them** (foundation blocks; the overall marker with no background context) (`tab-context.ts` ~907).
+- **Look-up dials can't be set in the admin, and Behaviour dials appear on embedding operations where nothing reads them** (`tab-operations.ts` ~3985).
+- **Eval history is unreachable** — `useEvalResults` has no screen (`hooks.ts` ~836). Add a "Previous runs" list or remove the hook/service/endpoint.
+- **Eval case tags are stored but nothing reads them** (`eval.ts` ~247). Add a tag filter to eval runs, or document tags as labels only.
+
+**Code tidy**
+
+- PUT handlers use four different merge patterns, and the controller header describes only one (`controller.ts` ~1201) — the hand-listed pattern is what dropped the approach fields above.
+- Duplicate narrowing helpers (`isRecord`, `asRecord`, `toStringArray`, two diverging `canonicalJson`s) remain across files, under a comment claiming there is one copy (`guardrail-rules.ts` ~126).
+- `disciplinesService.getGuardrailsForDisciplines` is dead (`disciplines.ts` ~452); four legacy config interfaces in `ai-core.types.ts` are never used (~886); `upsertSegment`'s update branch is unreachable next to `updateSegment` (`services.ts` ~251); pass-through ternaries in `upsertTool`/`upsertMarker` (`records.ts` ~4555).
+
 #### Guardrail rule builder — follow-ups (v1.59.0)
 
 The rule builder shipped without these, each deliberately left for a later pass:
@@ -608,12 +675,12 @@ The 45 minor findings from the [Meta Audit](#meta-audit--august-2026-four-dimens
 **Admin UI polish**
 
 - ~~**Four hand-rolled primitive lookalikes**~~ **Fixed in v1.60.0:** the Badge-shaped `<span>` in the operations editor is a `Badge` (with its remove button beside it, not inside it), the provider cards use the starter's settings-blocks `ProviderCard` inside a `ProviderGroup`, `ContextTab` uses `EmptyState`, and `ConfigTab`'s file picker is the shadcn `Input type="file"`. *(Was: a Badge-shaped `<span>`, a card-shaped raw `<button>` in `ProviderCard`, hand-rolled empty states in `ContextTab`, and a raw unstyled native `<input type="file">` in `ConfigTab`.)*
-- **Mutation errors are swallowed in two tabs** — `EvalsTab` renders only the client-side JSON parse error, and `UsageTab`'s Resolve/Dismiss buttons show nothing when the request fails.
+- ~~**Mutation errors are swallowed in two tabs**~~ *(fixed — EvalsTab and UsageTab show the server's reason; confirmed at v1.60.1)*
 - ~~**`markers` and `inputTypes` are excluded from the operations editor's loading and error gates**~~ **Fixed** — both are inside the gates, and **v1.60.0** added the prompt variables list, which had the same gap. *(Was: a failed request for either degraded the editor silently.)*
-- **The file-attach handlers register no `onerror` or `onabort` and perform no size or type check** before `readAsDataURL`.
-- **`ContextTab` can POST `modelId: ''`** when no enabled model exists, because `inertModelId` resolves to the empty string and `canSave` never checks it.
-- **`useRunOperation` does not invalidate `current-usage`**, though a run changes exactly the totals that query returns.
-- **Two surfaces exist only in the API.** The input-type catalogue has full CRUD, a service and hooks, but `useUpsertInputType` and `useDeleteInputType` have no consumer in any tab — so input types are read-only in practice. Flows have full admin CRUD endpoints and four unconsumed hooks but no tab, which is the concrete shape of the Flows gap noted under [Review-Queue UI Polish](#review-queue-ui-polish).
+- ~~**The file-attach handlers register no `onerror` or `onabort` and perform no size or type check**~~ *(fixed — per-file and total caps plus `onerror`/`onabort`; confirmed at v1.60.1)*
+- ~~**`ContextTab` can POST `modelId: ''`**~~ *(fixed — context builders bind no model, and a vector retrieval without an embedding model blocks the save; confirmed at v1.60.1)*
+- ~~**`useRunOperation` does not invalidate `current-usage`**~~ *(fixed; confirmed at v1.60.1)*
+- **One surface exists only in the API.** *(The input-type half is fixed — the Input types tab now creates, edits and deletes them.)* Flows have full admin CRUD endpoints and four unconsumed hooks but no tab, which is the concrete shape of the Flows gap noted under [Review-Queue UI Polish](#review-queue-ui-polish).
 
 **Tooling gap surfaced by this audit**
 
