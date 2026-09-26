@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
 
 AI Core talks to model providers through an interface it owns, not through the Vercel AI SDK directly. The SDK is a transport detail, confined to a single file. Everything else in the feature — the resolver, the run engine, the ledger — types against AI Core's own `ProviderAdapter` contract and never learns what package moves the bytes. This page is the boundary: the owned interface, how the SDK is contained, the REST model-listing path that sits beside it, and how a new provider or model is added.
 
-<Aside type="note" title="Current as of v1.52.0">
-This page describes AI Core as implemented in module v1.46.0 (August 2026). The module installs into a real app, type-checks clean there, and the language, embedding, multimodal-embedding and rerank adapters — plus provider-native tools (web search and web fetch) — have been exercised end-to-end against live providers. Still unbuilt (marked inline): the image/video adapters below (Black Forest Labs / Replicate) — see the [Roadmap](/modules/ai-core/roadmap/).
+<Aside type="note" title="Last checked against v1.70.0">
+This page describes AI Core as checked against module v1.70.0 (September 2026). The module installs into a real app, type-checks clean there, and the language, embedding, multimodal-embedding and rerank adapters — plus provider-native tools (web search and web fetch) — have been exercised end-to-end against live providers. Still unbuilt (marked inline): the image/video adapters below (Black Forest Labs / Replicate) — see the [Roadmap](/modules/ai-core/roadmap/).
 </Aside>
 
 ---
@@ -156,13 +156,35 @@ When a call's cache plan places anything, the run hands the adapter a `CacheDire
 |---|---|
 | **Anthropic**, explicit (the default for Claude models) | The system prompt goes as consecutive system messages and the input as consecutive text parts, split at the offsets. Each part that ends at a cache point carries its own `providerOptions.anthropic.cacheControl` (`ttl` `5m`, or `1h` for the long lifetime). **Never a top-level `cacheControl` in this mode** — the provider reads a top-level one as its automatic caching, which marks the *last* block of the request (the part that changes on every call). Before v1.67.0 the system prompt's marker rode top-level, so it cached the wrong block; that bug is fixed. |
 | **Anthropic**, automatic (only when an admin sets a Claude model to automatic) | The plain request plus the top-level marker, always the short lifetime (it lands on the last block). |
-| **OpenAI** | Every request carries `providerOptions.openai.promptCacheKey` — a hash of the operation and the tenant, no content, so each customer's traffic is routed to its own cache where possible (a routing hint: OpenAI may still serve a busy key from other machines, and only a byte-identical start of a prompt ever matches). Automatic (the default): the plain request, plus `promptCacheRetention: '24h'` for the long lifetime. Explicit (GPT-5.6 and later, set by an admin): a `promptCacheBreakpoint` on the system message (OpenAI never splits it) and on each input part that ends at a cache point, with `promptCacheOptions` (`mode: 'implicit'`, and `ttl: '30m'` for the long lifetime). |
+| **OpenAI** | Every request carries `providerOptions.openai.promptCacheKey` — a hash of the operation and the tenant, no content, so each customer's traffic is routed to its own cache where possible (a routing hint: OpenAI may still serve a busy key from other machines, and only a byte-identical start of a prompt ever matches). How long to keep it depends on the model's generation (v1.70.0 — see below). Automatic (the default): the plain request, plus the long lifetime when asked for. Explicit (set by an admin): a `promptCacheBreakpoint` on the system message (OpenAI never splits it) and on each input part that ends at a cache point, plus the long lifetime when asked for. |
 | **Google** | Nothing is sent: Gemini caches repeated prefixes by itself. Explicit stored caches are not used. |
 | Any other provider | Nothing is sent, `cacheHandled` is `none` and a `ProviderWarning` is attached; the run names `prompt-cache-unsupported` in feedback. |
+
+**OpenAI's lifetime by generation (v1.70.0).** OpenAI changed the setting with GPT-5.6: earlier models take `prompt_cache_retention` (`in_memory` or `24h`), and GPT-5.6 and later take `prompt_cache_options.ttl`, whose only value is `30m` (also its default). The installed SDK passes both straight through and marks the old one deprecated for GPT-5.6 and later. The adapter reads the generation from the model id (`gpt-N` or `gpt-N.M`; GPT-5.6 and later means N above 5, or 5 with M of 6 or more; o-series and other ids count as earlier), and for the long lifetime sends:
+
+| Model | Automatic | Explicit |
+|---|---|---|
+| GPT-5.6 and later | `promptCacheOptions: { ttl: '30m' }`, never `promptCacheRetention` | `promptCacheOptions` (`mode: 'implicit'`, `ttl: '30m'`), as before |
+| Earlier models | `promptCacheRetention: '24h'`, as before | `promptCacheRetention: '24h'`, never `promptCacheOptions` |
+
+Before v1.70.0, automatic mode sent `promptCacheRetention: '24h'` to every OpenAI model, including GPT-5.6 and GPT-6 models an admin had marked able to keep a long cache, and explicit mode sent the GPT-5.6-only `promptCacheOptions` to earlier models. Explicit breakpoints on models before GPT-5.6 are unchanged, and whether those models accept them is not verified (see the [Roadmap](/modules/ai-core/roadmap/)).
 
 `GenerateResult.cacheHandled` says which of these happened (`explicit`, `automatic` or `none`; absent when no directive was given). Splitting never rewrites the text: the parts re-join to exactly the prompt. With no directive — an operation with caching off, or the app-wide switch off — the request is exactly the one sent before caching existed: the instructions as one string and no provider options of any kind. Cache reads and writes come back in `NormalizedUsage` (`cacheReadTokens`, `cacheWriteTokens`, and for Anthropic `cacheWriteLongTokens`, read from `usage.cache_creation.ephemeral_1h_input_tokens`).
 
 - **No new data, no content in the ledger.** The cached prefix is the *same* prompt the call already sends; caching adds no data the provider did not already receive, and the prefix text is never written to logs or the ledger — only the token counts and a content-free cache plan are. Where the cache points go is decided by the run's planner, not here — see [Prompt caching](/modules/ai-core/prompt-assembly/#prompt-caching-v1670).
+- **How the instructions reach each provider** — AI Core hands the SDK the instructions as system text (one string, or system messages split at cache points), and the SDK sends them on each provider's own channel. Nothing in AI Core chooses this; checked against the installed `@ai-sdk/openai` 4.0.27, `@ai-sdk/anthropic` 4.0.27 and `@ai-sdk/google` 4.0.31 on 2026-09-26. `providers/model-generations.ts` (v1.70.0, SDK-free) mirrors these rules so the framework editor can show them per model, and changes nothing that is sent:
+
+  | Provider and model | Channel (`instructionChannel`) |
+  |---|---|
+  | Anthropic | the request's `system` parameter (`system-parameter`) |
+  | OpenAI reasoning models — o-series, and `gpt-N` with N of 5 or more unless it is a chat id with no minor version (`gpt-5-chat-latest`; `gpt-5.1-chat-latest` counts as reasoning) — through the Responses API | a `developer` message (`developer-message`) |
+  | Earlier OpenAI models and those chat ids | a `system` message (`system-message`) |
+  | Google Gemini | `systemInstruction` (`system-instruction`) |
+  | Google `gemma-*` | folded into the first user turn (`first-user-message`) — Gemma has no system instruction |
+  | Any other provider | the provider's standard way (`provider-default`) |
+
+  OpenAI's top-level `instructions` field is never used, so a cache breakpoint always rides inside the developer or system message.
+- **No assistant turn, ever.** Every generation sends the instructions and one user message (the `prompt` form, or `messages` with a single `user` entry). No adapter prefills an assistant turn, which Claude 4.6 and later reject and Gemini 3.5 Flash-Lite is reported to reject. Structured output uses each provider's native schema support, never a prefill. In a tool round the SDK adds the model's tool calls and their results, and the last message is always a tool result.
 - **The reported model id** — the id the provider says actually served the call — is captured from the response and returned as `reportedModelId`, so the ledger records what really ran, not just what was requested.
 
 Embeddings go through `embedMany` and reranking through `rerank`, each wrapped the same way: timed, typed on failure, warnings surfaced. Embedding coverage is measured against a character budget derived from the resolved model's `maxInputTokens` (roughly four characters per token): an over-length input is reported as *partially* covered and the run surfaces `partial-embedding-coverage`, and full coverage is claimed only when the model declares no input ceiling. Where the SDK still exposes no signal — rerank token usage — AI Core reports the honest unknown (`undefined` tokens) rather than manufacturing a number.

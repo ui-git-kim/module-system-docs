@@ -12,8 +12,8 @@ This is the reference for `aiCoreService` — the single object AI Core register
 
 > **Consumers name jobs, never models.** No model id string appears anywhere in this surface.
 
-<Aside type="note" title="Current as of v1.52.0">
-This page describes AI Core as implemented in module v1.52.0 (September 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and every method here — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and the `ensure*` seed helpers — has been exercised end-to-end against live providers. Since v1.23.0 the surface has grown provider-native Tools (web search / fetch), the operation input contract and its `ai_input_type` catalogue, first-class Contexts (the `ai_context` table, in `foundation` and `background` kinds — a context is its own record binding no model, not an operation), and the module-level zero-retention override (`ai_policy`). The semantic cache and a re-embedding migration remain planned; where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
+<Aside type="note" title="Last checked against v1.52.0">
+This page describes AI Core as checked against module v1.52.0 (September 2026). Sections marked with a later version were written for that version. The module installs into a real app, type-checks clean there, its admin page serves these records, and every method here — `run`, `embed`, `rerank`, `retrieve`, `runEval`, and the `ensure*` seed helpers — has been exercised end-to-end against live providers. Since v1.23.0 the surface has grown provider-native Tools (web search / fetch), the operation input contract and its `ai_input_type` catalogue, first-class Contexts (the `ai_context` table, in `foundation` and `background` kinds — a context is its own record binding no model, not an operation), and the module-level zero-retention override (`ai_policy`). The semantic cache and a re-embedding migration remain planned; where a method touches them it is marked inline. See the [Roadmap](/modules/ai-core/roadmap/) for status.
 </Aside>
 
 ---
@@ -842,6 +842,25 @@ interface RunAudit {
   rawFinishReason: string | null;
   latencyMs: number;
   degraded: boolean;                // true when the provider returned warnings
+  promptLayout?: PromptLayoutReport; // v1.70.0 — what the framework's layout settings did; only when it has any
+}
+
+interface PromptLayoutReport {      // counts and flags only, never content
+  documentsNested: number;          // marked context items wrapped in the nesting element
+  lookalikeTagItems: number;        // nested flagged items whose text looks like the framework's closing tags (left untouched)
+  examplesWrapped: number;          // examples segments wrapped in the example tag
+  examplesLeftAsWritten: string[];  // keys of examples segments their author had already wrapped
+  longContext: LongContextReport | null; // null when the framework sets no long-material rule
+}
+
+interface LongContextReport {
+  materialTokens: number;           // estimated (characters / 4); files attached as parts not counted
+  thresholdTokens: number;          // the threshold that applied (0 when the admin preview forced the rule)
+  objective: boolean;               // the objective was stated again
+  anchor: boolean;                  // the anchor phrase was written
+  question: boolean;                // the caller's question was repeated at the end
+  placement: 'before-question' | 'end' | null;
+  reason: 'below-threshold' | 'no-question' | 'nothing-to-add' | null; // null = something was added
 }
 
 interface ParameterTransform {
@@ -851,6 +870,8 @@ interface ParameterTransform {
   rule: string;   // e.g. 'caller-cap-tighten-only', 'temperature.max=1'
 }
 ```
+
+`promptLayout` is present only when the model's framework has [layout settings](/modules/ai-core/prompt-frameworks/#layout-settings-v1700); the same report is stored in the ledger's `promptLayout` column (`null` when there are none). A run on a framework with no layout settings returns exactly the audit it did before v1.70.0.
 
 `NormalizedUsage` carries optional `inputTokens`, `outputTokens`, `totalTokens`, `cacheReadTokens`, `cacheWriteTokens`, `reasoningTokens` and a passthrough `raw` — **absent counts stay undefined, never reported as zero.** When an operation caches its prompt, `cacheWriteTokens` is the one-time write and `cacheReadTokens` the discounted reuse — both land in the ledger so the saving is visible. `ResolvedParameters` is the narrow set actually sent (`maxOutputTokens`, `temperature`, `topP`, `topK`, `stopSequences`, `seed`).
 
@@ -924,6 +945,15 @@ Since v1.69.0 (model turn-off dates, prompt-framework fixes):
 - `POST /admin/operations/:id/preview` returns `frameworkMissing`, true when the model points at a framework that no longer exists.
 - The framework routes refuse a wrapping key that is not one of the 13 slot names, and any field in a wrapping entry other than `kind` and `tag`, each by name (400). The framework routes, the operation routes (a `sectionWrapping` tag), and the approach and discipline routes (their per-item `tag`) all refuse an XML tag that is not a valid XML name, by name (400). `PUT /admin/frameworks/:id` with content identical to the stored framework writes nothing and keeps it Seeded.
 - The Models tab's new **Edit** on a model purpose uses the existing `PUT /admin/purposes/:id`, unchanged: it takes `name`, `description`, `defaultModelId` and `enabled`, never the id or kind, and it leaves a built-in purpose's `seeded` flag as it is.
+
+Since v1.70.0 (the framework editor, layout settings and evidence):
+
+- `GET /admin/frameworks` rows carry `layout` and `evidence` (`null` when unset). `POST /admin/frameworks` and `PUT /admin/frameworks/:id` take both: left out, the stored value is kept; `null` clears it. Unknown fields inside either are refused by name, and a nesting or example tag that would repeat the `context` or `examples` part's own XML tag is refused (400). Any real change clears `seeded`; an identical save writes nothing. The rules are in [Prompt Frameworks → The layout and evidence fields](/modules/ai-core/prompt-frameworks/#the-layout-and-evidence-fields).
+- `DELETE /admin/frameworks/:id` (existing) is now used by the editor. While models use the framework it is refused with the count and one model's name (`…is used by N models, for example "X". Move them first.`).
+- **`POST /admin/frameworks/preview`** (new) lays out an operation with a framework **draft** — the editor's unsaved framework — instead of the model's own. Body: `{ operationId, framework: { name?, segmentOrder, wrapping, layout?, evidence?, notes? }, segments?, variables?, longMaterial? }`, checked like a framework save. `longMaterial: true` applies the long-material rule whatever the material's size (threshold 0, said in the notes). The draft is used whatever model the operation resolves to, and that model's full override is ignored (the notes say so when it has one); the cache facts come from the resolved model. Returns the same shape as the operation preview. Nothing is saved, sent to a model or charged.
+- `POST /admin/operations/:id/preview` and the framework preview return `promptLayout` (the [layout report](#runaudit), or `null` when the framework has no layout settings) and add plain notes saying what the layout did.
+- `GET /admin/models` rows carry `instructionChannel` for language models (`system-parameter`, `developer-message`, `system-message`, `system-instruction`, `first-user-message` or `provider-default`; `null` for other kinds) — how the AI SDK sends the instructions to that model, as information only.
+- Models are bound to a framework with the existing `PUT /admin/models/:id` (`{ frameworkId }`); the editor's **Add models** and **Move to…** call it once per model. No new event: framework writes fire `ai-core.framework.updated` (`'upserted'` or `'deleted'`) and model changes `ai-core.model.updated`, as before.
 
 ---
 
