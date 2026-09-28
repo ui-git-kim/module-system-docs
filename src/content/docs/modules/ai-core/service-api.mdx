@@ -1,7 +1,7 @@
 ---
 title: Service API
 description: The full aiCoreService surface a consumer programs against, method by method
-lastUpdated: 2026-09-26
+lastUpdated: 2026-09-28
 sidebar:
   order: 6
 ---
@@ -79,7 +79,9 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 
 **Returns** — a [`RunResult`](#runresult): `result` (`{ text, structured }`), `feedback` (the structured account of what the run could not do), and `audit` (audit-by-reference: the ledger id, the model actually used, parameters sent with any transforms, usage, warnings).
 
-**A shortfall is not an exception.** A schema-validation failure, an answer a guardrail held back, a truncated output, an unavailable markers preamble — these all **return** normally with the outcome named in `feedback.reason` (for example `schema-validation-failed`, `abstained-guardrail-rule-failed`, `output-truncated-by-length-limit`). The structured output is preserved even on abstention. The system may do less than it was asked; the feedback says so on the same return.
+**The result has the same shape since v1.72.0.** A Task operation now asks the model for [JSON answer sections](/modules/ai-core/prompt-assembly/#json-answer-sections-v1720) — the answer plus, when a discipline has a measure, a check report — but AI Core takes the report off before it returns, so your app gets exactly what it got before: `result.text` for an operation with no output fields, `result.structured` (and its JSON in `result.text`) for one with them. The report itself never reaches your app. A fail in it is named in `feedback` when the operation says to tell the app (`self-check-failed:D2`), and a missing or unreadable report is always named (see [`Feedback`](#feedback)). Nothing to change in your code.
+
+**A shortfall is not an exception.** A schema-validation failure, an answer a guardrail held back, a truncated output, an unavailable markers preamble, a self-check the model says it failed — these all **return** normally with the outcome named in `feedback.reason` (for example `schema-validation-failed`, `abstained-guardrail-rule-failed`, `output-truncated-by-length-limit`). The structured output is preserved even on abstention. The system may do less than it was asked; the feedback says so on the same return.
 
 **Throws** — a genuine failure to run. Every throwing path still writes a ledger row before it rethrows: refusals and provider errors are outcomes, not disappearances.
 
@@ -406,7 +408,7 @@ The third `options` argument is new and `moduleId` is required, so a two-argumen
 ensureOperation(spec: EnsureOperationSpec): Promise<{ created: boolean; operation: ai_operation }>
 ```
 
-**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` binding (`{ purpose }` — a built-in role like `'analysis'` or one introduced with [`ensurePurpose`](/modules/ai-core/registering-and-seeding/#ensurepurpose--introduce-a-novel-purpose); an embedding op adds `{ dimensions }` for the vector width), and the optional operation shape (`description`, `dials`, `segmentKeys`, `category`, `systemWide`, `schema`, `cache`, `evalConfig`, `sensitivity`, the declared input contract `inputItems`, and provider-hosted tool opt-ins `toolIds`). `category` (v1.64.0) says what kind of job this is — `'task'` (the default), `'check'`, `'system-prompt'` or `'router'`; see [Operation categories](/modules/ai-core/configuration/#operation-categories-v1640). `systemWide: true` makes the operation a system prompt that other operations select — the same fact as `category: 'system-prompt'`. Send one, or both agreeing: a spec where the two disagree is refused with a `BadRequestError` (400) whose message starts `operation-category-conflict`, on **every** install — the check runs before the existing-row lookup, so it is not skipped where the operation already exists. `cache` is a prompt-caching policy (`{ instructions?, context?, ttl? }`) — a create-time default the admin owns thereafter.
+**Parameters** — an [`EnsureOperationSpec`](/modules/ai-core/registering-and-seeding/#ensureoperation--ensureoperationspec): `id` (namespace it with the consumer module id), a `model` binding (`{ purpose }` — a built-in role like `'analysis'` or one introduced with [`ensurePurpose`](/modules/ai-core/registering-and-seeding/#ensurepurpose--introduce-a-novel-purpose); an embedding op adds `{ dimensions }` for the vector width), and the optional operation shape (`description`, `dials`, `segmentKeys`, `category`, `systemWide`, `schema`, `cache`, `evalConfig`, `sensitivity`, the declared input contract `inputItems`, and provider-hosted tool opt-ins `toolIds`). `category` (v1.64.0) says what kind of job this is — `'task'` (the default), `'check'`, `'system-prompt'` or `'router'`; see [Operation categories](/modules/ai-core/configuration/#operation-categories-v1640). `systemWide: true` makes the operation a system prompt that other operations select — the same fact as `category: 'system-prompt'`. Send one, or both agreeing: a spec where the two disagree is refused with a `BadRequestError` (400) whose message starts `operation-category-conflict`, on **every** install — the check runs before the existing-row lookup, so it is not skipped where the operation already exists. `cache` is a prompt-caching policy (`{ instructions?, context?, ttl? }`) — a create-time default the admin owns thereafter. Since v1.72.0 the spec also takes `answerFormat` (`'json-sections'`, the default, or `'plain-text'` — pick Plain text for an operation that writes long free-form text) and `selfCheckFailure` (`'tell-app'`, the default, or `'record-only'`); see [Answer format and the check report](/modules/ai-core/configuration/#answer-format-and-the-check-report-v1720). Both are exported from the barrel as the types `AnswerFormat` and `SelfCheckFailureAction`. `disciplineCheck` (v1.63.0) is still accepted and ignored: the tone of the lead-ins now follows importance. A `schema` on a System prompt operation (`category: 'system-prompt'` or `systemWide: true`) is refused with a `BadRequestError` whose message starts `system-prompt-output-schema`, because a System prompt never answers on its own.
 
 **Returns** — `{ created, operation }`. `created` is `false` when the operation already existed (returned untouched) and `true` when it was seeded. The seeded row carries `seeded: true` so its provenance is visible in the admin.
 
@@ -419,6 +421,8 @@ The bound purpose resolves to a concrete model **at run time** — the host admi
 | `IntegrityError` | The bound purpose does not exist (introduce a novel one with `ensurePurpose` first). Also raised by the delegated write-time integrity checks (disciplines, segments, schema). A *missing default model* behind a purpose is **not** a seed-time error — it refuses at run time instead. |
 | `NotFoundError` / `BadRequestError` | Surfaced from the underlying write when a referenced record is missing or a schema is malformed. |
 | `BadRequestError` (`operation-category-conflict`) | The spec sends a `category` and a `systemWide` that disagree (v1.64.0). A value outside the four categories is refused the same way as `operation-category-unknown`. |
+| `BadRequestError` (`system-prompt-output-schema`) | The spec gives a System prompt operation an output schema (v1.72.0). Send the schema on the operation that runs, or none. |
+| `BadRequestError` | `answerFormat` or `selfCheckFailure` is not one of its two values (v1.72.0). |
 
 ```ts
 await ai?.ensureOperation({
@@ -776,6 +780,8 @@ interface RunResult<T = unknown> {
 }
 ```
 
+Unchanged in v1.72.0. With [JSON answer sections](/modules/ai-core/prompt-assembly/#json-answer-sections-v1720), `result` holds the answer section only: a string answer is `text` (with `structured` null), an answer with fields is `structured` — validated against the operation's schema, as before — with `text` being that answer as JSON (so a key the schema doesn't declare, which the SDK drops, is not in it). The check report is never part of the result. On **Plain text**, `text` is the model's text as written, as before.
+
 ### `Feedback`
 
 The structured field on every operation return — the never-prose contract. **The consumer writes the words; AI Core reports the facts.** Every field, as returned:
@@ -798,9 +804,9 @@ interface Feedback {
 }
 ```
 
-- **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `abstained-guardrail-rule-failed`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `markers-preamble-unavailable`, `guardrail-rule-failed`, and so on. **Every reason that means a guardrail held the answer back starts `abstained-`** (today `abstained-guardrail-rule-failed`, a code rule set to *hold the answer back*) — use `isHeldBack(feedback)` from the barrel rather than one exact string. (`retrieve()` also uses the prefix for a weak retrieval, `abstained-weak-retrieval`, which is not a guardrail hold and which `isHeldBack` does not count.) A held answer is still returned in full; your app decides what to show.
+- **`reason`** — `null` means the run has nothing to report. A non-null value is a named outcome: `schema-validation-failed`, `self-check-failed` (v1.72.0), `self-check-report-incomplete` (v1.72.0), `abstained-guardrail-rule-failed`, `output-truncated-by-length-limit`, `partial-embedding-coverage`, `coverage-unknown`, `markers-preamble-unavailable`, `guardrail-rule-failed`, and so on. **Every reason that means a guardrail held the answer back starts `abstained-`** (today `abstained-guardrail-rule-failed`, a code rule set to *hold the answer back*) — use `isHeldBack(feedback)` from the barrel rather than one exact string. (`retrieve()` also uses the prefix for a weak retrieval, `abstained-weak-retrieval`, which is not a guardrail hold and which `isHeldBack` does not count.) A held answer is still returned in full; your app decides what to show.
 - **`missing`** — the specific gaps behind the reason (a truncated field, a schema path, a per-value coverage line). It can also carry a gap that is not itself a `reason` — for example `prompt-cache-unsupported`, named when an operation that asks for caching resolves to a model that cannot cache (the call runs uncached rather than pretending otherwise; since v1.67.0 OpenAI and Google models no longer get it, because they cache by themselves). Gaps added in v1.61.0 include `dial-unmapped:<dial>` (the model's parameter rules have no mapping for a dial the operation sets, so nothing was sent for it), `spend-warning:<limit>:<percent>` and `spend-unpriced-model:<modelRecordId>` (v1.66.0, see [Spending limits](#spending-limits-v1660)), `tool-unavailable:<id>` (a tool the operation opted into is disabled or deleted), `cache-instructions-unstable:<variable>` / `cache-context-unstable:<variable>` (reworked in v1.67.0 — see the prompt-cache gaps below), `output-truncated-by-caller-cap`, and two that come from a context and so carry its prefix: `context:retrieval-node-ids-unsupported:<tag>` and `foundation:foundation-segment-injection-risk:<key>` — the full list is in the [Changelog](/modules/ai-core/changelog/). Gaps added in v1.69.0 (both in `missing` only, never in `reason`): `retrieval-model-turned-off` — a context's retrieval embeds its query with a model past its turn-off date, so that retrieval was skipped (named like the other `retrieval-model-*` gaps); and `framework-missing:<id>` — the model points at prompt framework `<id>`, which no longer exists, so the prompt was laid out plain (a configuration fault the admin fixes on the Models tab; the call itself still runs). Gaps added in v1.63.0:
-  - `discipline-check-lead-in-unavailable:<key>` — a guardrail measure rendered but the disciplines lead-in record (`discipline-check-strong` or `discipline-check-soft`) or the `discipline-check-mandatory` record is missing, so that line was not stated. It also sets `reason` to `discipline-check-lead-in-unavailable` when no earlier reason is set. See [Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section).
+  - `discipline-check-lead-in-unavailable:<key>` — a guardrail measure rendered but a lead-in record it needed is missing, so that line was not stated: `discipline-check-soft` (above the disciplines), `discipline-check-mandatory`, or — since v1.72.0 — `discipline-check-strong` (above the restated important rules, unless the model's framework has its own). It also sets `reason` to `discipline-check-lead-in-unavailable` when no earlier reason is set. See [Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section).
   - `guardrail-rule-retired:<guardrailId>/<ruleId>:scored` — a stored guardrail rule that asked another AI to judge the answer (a scored rule, or the old groundedness check, whose rule id is `classic-1`). It never runs. It goes in `missing` only, never in `reason`, and holds nothing back.
   - `guardrail-empty:<guardrailId>` — a guardrail with neither a measure nor a code check. It replaces `guardrail-rules-empty`.
 
@@ -816,6 +822,19 @@ interface Feedback {
   - `cache-layer-changes-every-call:<layer>` — Choose the parts only: a chosen layer was cached although it changes on every call, so each call pays to write it and nothing is read back.
 
   `prompt-cache-defeated-by-injection-nonce` is retired: with caching on, flagged material no longer stops caching, because its fence tag is keyed per content.
+
+  Self-check and answer-section gaps (v1.72.0). See [Disciplines & Guardrails → The check report](/modules/ai-core/disciplines-and-guardrails/#the-check-report-v1720). What the model found is never in `feedback`.
+  - `self-check-failed:<numbers>` — the model's check report marks these disciplines as failed, e.g. `self-check-failed:D2` or `self-check-failed:D2,D4` (the numbers the prompt gave them). Only when the operation's fail setting is **Tell the app** (the default); it also sets `reason` to `self-check-failed` when no earlier reason is set, so test for the `self-check-failed:` prefix in `missing` rather than for the reason. With **Record only** nothing is added.
+  - `self-check-report-missing` — the prompt asked for a check report and none came back.
+  - `self-check-report-malformed:<n>` — `n` entries could not be read (an entry with a known number and result but no `found` text counts, and its fail still counts).
+  - `self-check-report-duplicate:<numbers>` — a discipline was reported more than once.
+  - `self-check-not-reported:<numbers>` — measured disciplines the report left out.
+
+    The four report problems are named whatever the fail setting, and set `reason` to `self-check-report-incomplete` when no earlier reason is set. The answer is still returned.
+  - `answer-sections-unavailable:<why>` — the operation answers in JSON sections, but its model can't give a JSON answer on this call, so it ran as Plain text with no check report: `structured-output` (the model's facts say it gives no structured output) or `tools` (a Google model before Gemini 3 with the operation's tools). `missing` only.
+  - `answer-cut-short:<finish reason>` — a text answer in JSON sections was cut off by an early stop other than the output limit (for example `answer-cut-short:tool-calls`, the tool-step limit); what was written comes back. A cut at the output limit is named by `output-truncated-by-length-limit` / `output-truncated-by-caller-cap` and `complete-output`, as before v1.72.0.
+  - `answer-sections-suppressed-by-override` — a Task that answers in JSON sections runs on a model with a full framework override, so no sections were asked for and no check report was made. `missing` only.
+  - `composition:answer-format-unknown:<value>` / `composition:self-check-failure-unknown:<value>` — the stored setting is not a known value (a hand-edited row), so the default was used.
 - **`confidence` / `threshold`** — reported when known, even when the run passes. `confidence` is read from a top-level `confidence` field on structured output and **reported for transparency only** — it is the weakest signal (the model grading its own work) and **never drives abstention**. `threshold` is the cutoff a measured value was compared against: only `retrieve()` sets it (its retrieval-strength floor), so on a `run` it is always `null`.
 - **`groundedness`** — **removed in v1.63.0.** It carried the score a guardrail's groundedness judge gave the answer; a guardrail no longer asks another AI to judge the answer, so the field is gone (the ledger's `groundedness` column stays, always null). The only thing that holds an answer back now is a guardrail code rule set to *hold the answer back* that fails (`abstained-guardrail-rule-failed`). See [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/#no-second-ai-inside-a-guardrail--retired-rules).
 - **`ruleScores`** — one entry per *close to the source* code rule whose comparison decided the result (its character accuracy) — the only rule that produces a score. An entry has `score: null` and `passed: false` when the comparison failed past what could be measured, and the rule's line in `missing` names why, so test `score !== null`, not the array's presence. The field is absent when no such rule ran. See [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/#code-checks-optional--a-list-of-rules).
@@ -826,7 +845,7 @@ Anything with a non-null `reason` also lands on the shipped review queue. The fe
 
 ### `RunAudit`
 
-Audit-by-reference, returned with every run. The **ledger holds no prompt or response content** — references, versions, parameters and counts only — so this summary is the defensible account of what actually ran, keyed by `ledgerId`.
+Audit-by-reference, returned with every run. The **ledger holds no prompt or response content** — references, versions, parameters and counts only, apart from the model's own notes in its check report (v1.72.0; withheld on a sensitive run) — so this summary is the defensible account of what actually ran, keyed by `ledgerId`.
 
 ```ts
 interface RunAudit {
@@ -958,6 +977,15 @@ Since v1.70.0 (the framework editor, layout settings and evidence):
 - `POST /admin/operations/:id/preview` and the framework preview return `promptLayout` (the [layout report](#runaudit), or `null` when the framework has no layout settings) and add plain notes saying what the layout did.
 - `GET /admin/models` rows carry `instructionChannel` for language models (`system-parameter`, `developer-message`, `system-message`, `system-instruction`, `first-user-message` or `provider-default`; `null` for other kinds) — how the AI SDK sends the instructions to that model, as information only.
 - Models are bound to a framework with the existing `PUT /admin/models/:id` (`{ frameworkId }`); the editor's **Add models** and **Move to…** call it once per model. No new event: framework writes fire `ai-core.framework.updated` (`'upserted'` or `'deleted'`) and model changes `ai-core.model.updated`, as before.
+
+Since v1.72.0 (tone follows importance, emphasis, JSON answer sections):
+
+- `POST /admin/operations/:id/test-run` returns the `RunResult` plus `checkReport`: the model's check report as kept with the run, with what it found (cut to 2,000 characters), or `null` when the call asked for none. It is `{ asked, entries: [{ number, disciplineId, result, found }], failed, problems, failAction, foundWithheld, foundTruncated }`. Only this admin route returns it; `run` and `POST /run` never do.
+- `GET /admin/usage` rows carry `checkReport` (the same shape; `found` is `null` on a sensitive run, with `foundWithheld: true`).
+- The operation routes take and return `answerFormat` (`json-sections` · `plain-text`) and `selfCheckFailure` (`tell-app` · `record-only`); another value is a 400. A schema on a System prompt operation is refused with 400 `system-prompt-output-schema: …`. `disciplineCheck` is still accepted and no longer read or written.
+- The framework routes take `layout.emphasis` (`{ importantLabel, strongLeadIn }`, see [Prompt Frameworks → Emphasis](/modules/ai-core/prompt-frameworks/#emphasis-v1720)), and evidence may name the settings `importantLabel` and `strongLeadIn`.
+- The operation preview adds notes on the JSON sections (which disciplines the check report covers), on a model that can't give them, on an override that suppresses them, and, when a framework sets its own important label, a reminder to keep the Mandatory line in step.
+- No new route and no new event.
 
 Since v1.71.0 (Voyage kept current, terms catalogue refreshed):
 
