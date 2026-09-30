@@ -323,6 +323,21 @@ All ❌ and ⚠️ items above were corrected in the 2026-08-09 documentation pa
 
 The 📝 completeness gaps (the undocumented `ai_policy` / Tools / input-type / Context-builder subsystems, plus missing columns, hooks and glossary terms) are tracked under [Planned Improvements → Documentation completeness follow-ups (v1.40 pass)](#documentation-completeness-follow-ups-v140-pass).
 
+### Performance Audit — September 2026 (v1.77.0)
+
+A speed audit of the **generated** code at v1.77.0 (2026-09-30), read directly against the templates, with one read-only timing against a live install (veradai, Neon Postgres in Sydney through its pooler, measured from the development machine): **about 21–28 ms per database round trip**. Nothing is refused or wrong below; these are waits.
+
+| # | Severity | Where | What is slow | Fix |
+|---|---|---|---|---|
+| 1 | At scale | `run/resolver.ts` `resolveOperation`; `records.service.ts` `getSegmentCompositionForOperation`; `spend.service.ts` `costForLedger` / `ensureModelPriced` | Each AI call makes about 20 database round trips, most one after another: about 9 in resolution, 4 in prompt building (already batched), plus usage, fence, marker and input-type reads before the call, and 3 to 5 after it. At the measured 21–28 ms that is about half a second of waiting per call; on a server next to the database, about 50 ms. | Resolution runs three independent chains one after another: the system-prompt composition, purpose → model → provider, and tools. Start all three once the operation is read (about 9 steps → about 5). Keep a short in-process cache, like the 30-second policy cache, for records that rarely change: providers, input types, markers, framing wording, frameworks. Reuse the model row resolution already read instead of reading it twice more for its price. |
+| 2 | At scale (felt as soon as a context has two or more retrievals) | `run/run.ts` `assembleContext` (the query-embedding loop and the retrieval-block loop) | Retrieval blocks, and query embeddings for different models, run one after another, so every run using that context waits for each search in turn. Already listed under Meta Audit minor findings; re-confirmed and raised here. | Run them together (`Promise.all`), keeping result and gap order by block index. |
+| 3 | At scale | `run/run.ts` `assertFlowOperationsPriced` | With spending limits on, starting a flow resolves each of its operations one after another (about 9 round trips each) before step 1. | Resolve them together. |
+| 4 | At scale | `pages/tabs/ModelsTab.tsx` `ModelsTable` (and the Approaches & Disciplines, Context, Variables and other tabs' tables) | Typing in a record editor re-draws that tab's hidden list on every keystroke: about 70 rows on the Models tab, about 50 on Approaches & Disciplines. The Operations list is already protected (`memo`). | Wrap each list component in `memo` and keep its props stable (the Models tab passes a new Refresh button element on every render). |
+| 5 | Hygiene | `records.service.ts` `refreshCapabilities` | **Refresh model data** asks each provider for its model list one after another. | Fetch the provider listings together, then apply them in order. |
+| 6 | Hygiene (unmeasured) | `pages/tabs/OperationsTab.tsx` | The operation editor is one very large component, so every keystroke re-renders every block. Probably fine; not profiled. | Profile it in the browser; split the blocks into memoised children only if typing lags. |
+
+**Checked and fine:** the usage ledger, spend totals and review queue are indexed for how they are read; the rate limit is in memory; no screen polls; the admin page, each tab and the embeddable editor load lazily; the prompt builder already batches its reads; the review-item write does not block a run; admin reference data is cached for five minutes. Still open from August: the config import double write.
+
 ### Performance Audit — August 2026
 
 A full performance audit of the **generated** code (v1.22.2, every template) ran a parallel finder pass with adversarial verification: 53 candidates, **46 confirmed, 7 refuted**. The three "unbounded list render" scares were refuted — the usage ledger, review queue and eval-results lists are all already capped server-side (50 / 200 / 1000 rows via `clampLimit` + zod), so the frontend never receives the whole table (~~a *functional* "load older" gap remains, tracked under Review-Queue UI Polish, not a perf bug~~ — closed in v1.65.0: the usage ledger, review queue and eval runs page on the server). The one critical and the confirmed moderate items are recorded here; the best-practice remainder is under [Performance — best-practice cleanups](#performance--best-practice-cleanups-august-2026-audit).
@@ -339,6 +354,8 @@ Shipped in **v1.22.3** (behaviour-preserving; generated-code type-correctness st
 `getCurrentUsage` issues an unbounded `findMany` over every `ai_usage_ledger` row for the tenant (or since a date) and sums tokens in JS. The `where` is well indexed; the cost is transferring and iterating an ever-growing row set on every call — O(rows). This is the function handed to billing's `requireLimit`, so it runs on/near the hot path, and its latency and memory grow with the tenant's accumulated usage. The code comment already flags the DB aggregate as "a later optimisation". **Fix:** aggregate in the database — a raw-SQL `SUM((usage->>'inputTokens')::bigint) … GROUP BY operationId` (no schema change; the usage JSON keys are `inputTokens`/`outputTokens`), or add numeric `inputTokens`/`outputTokens` columns populated in `record()` and use `prisma.aggregate` / `groupBy`.
 
 #### Resolve/assemble issues ~7 serialised DB round trips per run
+
+**Status (re-checked at v1.77.0):** the prompt-building half is done (four batched steps); resolution still runs about 9 steps one after another. See [Performance Audit — September 2026](#performance-audit--september-2026-v1770), finding 1.
 
 **Severity:** Moderate
 **Where:** `run/run.ts` (≈986, 1065, 1513/2498), `run/resolver.ts` (266), `records.service.ts` `getSegmentCompositionForOperation` (1149)
@@ -717,7 +734,7 @@ The 45 minor findings from the [Meta Audit](#meta-audit--august-2026-four-dimens
 - **Six indexes are strict prefixes of another index on the same table** — `ai_usage_ledger` and `ai_flow_run` among them — so they cost writes on the tables that grow fastest and buy nothing.
 - **The same guardrail rows are fetched twice per language run** — `validateDisciplineSet` already loads them during resolution.
 - **The `ai_operation` row is read twice per run**, and again for every nested run (eval judges, rerank, context builders).
-- **`assembleContext` runs its retrieval blocks and its per-embedding-model query vectors in sequential `for … await` loops** where the work is independent.
+- **`assembleContext` runs its retrieval blocks and its per-embedding-model query vectors in sequential `for … await` loops** where the work is independent. *(Re-confirmed and raised at v1.77.0: [Performance Audit — September 2026](#performance-audit--september-2026-v1770), finding 2.)*
 - **`exportConfig` reads every prompt segment — including the `content @db.Text` column — plus both membership join tables twice**, when `listSegments` already returns what it needs.
 
 **Admin UI polish**
