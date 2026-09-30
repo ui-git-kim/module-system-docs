@@ -83,7 +83,9 @@ export interface DocumentManagementServiceInterface {
     opts?: { folder?: string; mimeType?: string; nodeId?: string }
     // staged:true when the default is an offline Local Connect folder and the
     // bytes were held on the durable shared default for reconcile on reconnect.
-  ): Promise<UploadResult & { providerId: string; staged?: boolean }>;
+    // documentId: the owned reference created with a shared-default / staged
+    // upload (use it directly); null for an upload to the caller's own provider.
+  ): Promise<UploadResult & { providerId: string; documentId: string | null; staged?: boolean }>;
 
   /**
    * Store a parsed artefact (external-parser output such as Docling JSON /
@@ -819,6 +821,15 @@ cognitive-pipeline routes its uploads into a dedicated folder (e.g. `Ingested/`)
 
 **Side effects (both entry points).** A successful write records a `doc_recent_access` `upload` row and emits the awaited async `documents.document.uploaded` event (a storage *reference*, never bytes). `uploadToDefault` on the **shared** default additionally upserts an **owned** `doc_document` reference (idempotent on `(userId, providerId, remotePath)`) so the user can find and download their file — they cannot `createDocument` against a provider they don't own, so this trusted server-side write is the only path to a browsable reference there.
 
+**The returned `documentId`.** `uploadToDefault` / `uploadGlobal` (and `POST /upload` / `POST /upload-global`) return that server-created reference's id as `documentId` — for a **shared-default**, **global** or **offline-staged** upload. A caller that needs a reference (to link the file to a node, tag it, request ingest) must use it **directly**: calling `createDocument` with the returned `providerId` would `404`, because that provider is the shared/staging store the caller does not own, and `createDocument`'s ownership check is deliberate (`resolveFileProvider`'s owned-reference read carve-out relies on a user never being able to forge a reference to a provider they don't own). `documentId` is `null` only for an upload to the caller's **own** provider, where no reference is created — that is the one case to call `createDocument` yourself:
+
+```typescript
+const up = await dm.uploadToDefault(userId, fileName, bytes, { nodeId });
+const documentId =
+  up.documentId ??
+  (await dm.createDocument(userId, { providerId: up.providerId, remotePath: up.path })).id;
+```
+
 <Aside type="caution" title="Document visibility is per-user in V1 — even on a communal shared default">
 The isolation toggle governs where **bytes** land, not who can **see** them. Every `doc_document` reference is `userId`-scoped and browsing the shared provider is never granted to non-owners, so a file one user uploads to the shared default is not visible to other users — even in communal (isolation-off) mode. An admin-managed area that is *readable by everyone* is a distinct, not-yet-built capability (cross-user shared visibility); see the [roadmap](/document-management/roadmap/#planned-improvements). For per-user private folders on a shared NAS, keep isolation **on** — each user (admins included) gets their own `u/<userId>/` root automatically.
 </Aside>
@@ -837,7 +848,7 @@ const { path, providerId } = await dm.uploadToDefault(userId, fileName, bytes, {
 `uploadToDefault` (and `uploadGlobal`) transparently handle the case where the caller's **default provider is a Local Connect (ephemeral) folder that is currently offline** — it is the same call, with nothing extra for a consumer to do:
 
 - **Online** → the file is written to the local folder on the user's machine.
-- **Offline** → the bytes are **staged** to `u/<userId>/<DOC_STAGING_PREFIX>/…` on the durable shared default, an owned `doc_document` reference is created pointing at the staged bytes, and a `doc_pending_reconcile` row records the intent. The call returns `{ …UploadResult, providerId, staged: true }` where **`providerId` and `path` are the durable staging location** (immediately readable), and it emits `documents.document.uploaded` with that **durable** provider id **and the staged reference's `documentId`**. So an ingest consumer pulls the bytes from durable storage, never from the disconnected machine — and an event-driven (auto-ingest) consumer that keys on `documentId` gets a handle that survives the reconnect re-point below (the transient staging `path` does not).
+- **Offline** → the bytes are **staged** to `u/<userId>/<DOC_STAGING_PREFIX>/…` on the durable shared default, an owned `doc_document` reference is created pointing at the staged bytes, and a `doc_pending_reconcile` row records the intent. The call returns `{ …UploadResult, providerId, documentId, staged: true }` where **`providerId` and `path` are the durable staging location** (immediately readable), and it emits `documents.document.uploaded` with that **durable** provider id **and the staged reference's `documentId`**. So an ingest consumer pulls the bytes from durable storage, never from the disconnected machine — and an event-driven (auto-ingest) consumer that keys on `documentId` gets a handle that survives the reconnect re-point below (the transient staging `path` does not).
 - **On reconnect** → `reconcilePendingForProvider` moves the staged bytes into the local folder and **re-points** the reference (no duplication). The consumer's recorded `documentId` stays valid; only the raw route moves. See [Security → Local Connect](/document-management/security/#local-connect-ephemeral-providers).
 
 <Aside type="caution" title="Staging is an upload-to-default feature — and needs a writable durable default">
@@ -973,7 +984,7 @@ function AttachEvidence() {
       label="Attach evidence"
       accept="application/pdf"
       onUploaded={(result: DocumentUploadResult) => {
-        // result: { path, providerId, size, mimeType }
+        // result: { path, providerId, size, mimeType, documentId, staged }
         console.log('stored at', result.path, 'on', result.providerId);
       }}
     />
@@ -981,7 +992,7 @@ function AttachEvidence() {
 }
 ```
 
-It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports the stored file's `{ path, providerId, size, mimeType }` when the upload completes.
+It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports the stored file's `{ path, providerId, size, mimeType, documentId, staged }` when the upload completes. **`documentId`** is the reference the server created for a shared-default, offline-staged or global upload — to link or tag the file, use it directly rather than calling `createDocument` (which `404`s on a provider you don't own; see [the upload contract](#the-upload-contract)). It is `null` for an upload to a provider you own, where `createDocument` with `providerId` + `path` is the way to get a reference.
 
 | Prop | Type | Description |
 |------|------|-------------|
@@ -993,7 +1004,7 @@ It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports t
 | `size` | `string?` | shadcn button size. |
 | `className` | `string?` | Extra classes for the trigger. |
 | `disabled` | `boolean?` | Disable the control. |
-| `onUploaded` | `(result: DocumentUploadResult) => void` | Called with `{ path, providerId, size, mimeType }` after a successful upload. |
+| `onUploaded` | `(result: DocumentUploadResult) => void` | Called with `{ path, providerId, size, mimeType, documentId, staged }` after a successful upload. |
 
 `DocumentUploadProps` and `DocumentUploadResult` are exported from the same barrel.
 
