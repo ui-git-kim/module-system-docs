@@ -1,133 +1,89 @@
 ---
 title: Disciplines & Guardrails
-description: Rules as records, the measures that make them checkable, and the one gate enforced at write time and again on every call
-lastUpdated: 2026-09-28
+description: A discipline is a rule, its guardrail is the measure, and the model checks its own answer against it
+lastUpdated: 2026-09-30
 sidebar:
   order: 9
 ---
 
-import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
+import { Aside } from '@astrojs/starlight/components';
 
 ## The model in plain words
 
-A **discipline** says *what to do* — a rule about how the AI must go about an operation. A **guardrail** says *how the AI knows it has done it*. Both go into **the same prompt**, so the model that writes the answer also checks it: before it finishes, it compares its answer with each "how you know you've done it" line, and if one is not met it changes the answer.
+A **discipline** is a rule: *what to do*. Its **guardrail** is the measure: *how you know you've done it*. Both are prompt text, and both go into **the same prompt**, so the model that writes the answer also checks it. Before it finishes, it compares its answer with each measure, and on a Task operation it says what it found in its [check report](#the-check-report-v1720).
 
-> Disciplines are the same as approaches, but they are **measurable**. The prompt tells the AI: *this is what you have to do, and this is how you know you have done it.*
+> This is what you have to do, and this is how you know you have done it.
 
-- **Code checks are optional.** Where something can be checked for certain — every item appears in the source, a field is present, a transcription is within 2% of a text version — a guardrail can also carry code checks that run after the answer comes back.
-- **A guardrail never calls a second AI.** Asking another model to judge the answer is a *check in a flow*, not a guardrail: run a separate checking operation as a [flow](/modules/ai-core/service-api/#runflow) step. Since v1.64.0 that operation has its own category, **Check**, with a ready-made starting shape (the answer and its source in; `passed`, `score`, `issues` and `cannotJudge` out) — see [Operation categories](/modules/ai-core/configuration/#operation-categories-v1640).
-- **Evals keep their judges.** Offline testing ([`runEval`](/modules/ai-core/service-api/#runeval)'s faithfulness and answer-correctness metrics) still uses judge operations; that is testing, not a guardrail. Since v1.64.0 the Evals tab's **Judge** picker lists Check operations first (see [Checks as eval judges](/modules/ai-core/configuration/#checks-as-eval-judges)).
+That is all a guardrail is. Nothing runs after the answer comes back.
 
-A discipline without a guardrail is only *asked for* — it is an approach. That single invariant is what separates a *discipline* (a **measured** how) from an *approach* (an **unmeasured** how — expertise, persona, reasoning, tone). This page is the deep dive on that pair — how a rule is stored, how its guardrail is stored and rendered, and the one thing that is load-bearing when you get it wrong: **the single gate that re-checks the pairing at write time and again on every call.**
+- **No measure yet? Then it is an approach.** A discipline with no attached guardrail measure is never refused. It is written into the prompt as an [approach](/modules/ai-core/prompt-model/): its rule text only, in the approaches section, not numbered and not in the check report. Attach a guardrail with a measure and it becomes a discipline again.
+- **A guardrail never calls a second AI.** Asking another model to judge the answer is a *check in a flow*: run a separate operation of the **Check** [category](/modules/ai-core/configuration/#operation-categories-v1640) as a [flow](/modules/ai-core/service-api/#runflow) step.
+- **Evals keep their judges.** Offline testing ([`runEval`](/modules/ai-core/service-api/#runeval)) still uses judge operations; that is testing, not a guardrail.
 
-<Aside type="note" title="Current as of v1.72.0">
-The discipline and guardrail machinery is the **Prompt Model v2** shape (v1.22.0): the CRUD service, the write-time integrity rules and the resolution-time re-validation. Since **v1.48.0 a guardrail is standalone and reusable**: it attaches to one or more disciplines through `ai_discipline_guardrail` (the old `ai_guardrail.disciplineId` is nullable and deprecated). Since **v1.59.0** its code checks are a list of rules built in the admin from presets. Since **v1.63.0** a guardrail's heart is its **measure** — written into the prompt — its code checks are optional, and a guardrail no longer asks another AI to judge the answer: the scored rule and the old groundedness check are **retired** (kept as stored, never run, always named). There is no `tier`, no `authority` hierarchy, and no `enabled` flag on these records. Since **v1.72.0** the wording follows importance (a soft lead-in above the disciplines, a strong one above the restated important rules), and a Task operation answers in JSON with a **check report**: for each discipline with a measure, the model says what it found and whether it passed. The app never sees the report; it is kept with the run for the admin (see [The check report](#the-check-report-v1720)).
+<Aside type="note" title="Current as of v1.73.0">
+v1.73.0 made guardrails measure text only. The code-check rule builder and its presets are gone, no code check runs after the answer, and a discipline with no measure is written as an approach instead of being refused. Guardrails saved before v1.73.0 may still hold old code checks: they are left in the database and never run. The check report, the answer format, the fail setting, the tone and the per-framework emphasis from v1.72.0 are unchanged. The [Changelog](/modules/ai-core/changelog/) has the history.
 </Aside>
 
 ---
 
-## The brake is both halves
+## Disciplines
 
-The failure this module exists to prevent is not that **the AI was wrong** — it is that **the AI was wrong and looked right**. A confident answer over partial material is, to the reader, indistinguishable from a confident answer over everything. The discipline names the method that would have prevented that; the guardrail says how the model — and, where it can, the code — tells whether the method was actually followed.
-
-<CardGrid>
-  <Card title="Discipline — what to do" icon="pencil">
-    An authored record. Says how the operation must proceed, and — where it prohibits something — what to do instead. A prohibition with no named alternative gets taken anyway under pressure.
-  </Card>
-  <Card title="Guardrail — how you know you've done it" icon="approve-check">
-    A separate, **reusable** record **attached** to the disciplines it measures (one guardrail can measure several). Its **measure** is written into the prompt under each of them; its optional **code checks** run after the answer. Without at least one attached guardrail, a discipline is merely written down — an approach.
-  </Card>
-</CardGrid>
-
-AI Core refuses the two states that would let the pairing rot:
-
-- **Attachment to a missing record** — attaching a guardrail to a discipline (or a discipline to a guardrail) that does not exist. Refused at write time (`attachGuardrail`). A guardrail itself is reusable and may sit unattached — it simply measures nothing until it is attached.
-- **Unguarded discipline** — a discipline with no attached guardrail. `validateDisciplineSet` reports `discipline-without-guardrail`, so it can never resolve into a run.
-
-Both are enforced by the same gate, described below.
-
----
-
-## A discipline is a record — and it is slim
-
-Disciplines are authored records, never code: written, structured, editable, single-source. AI Core seeds generic ones; apps author their own; both live in the same table with the same shape. There is no `tier`, no `authority`, no `appliesTo`, no `checkId` pointer. (It does keep an optional `description` — an admin note, never rendered into the prompt.) **Membership in a segment's disciplines list is the on/off switch**, so there is nothing to "enable".
-
-| Field | Stored as | Purpose |
-|---|---|---|
-| **id** | `id` | Kebab-case, module-namespaced, e.g. `ai-core/no-silent-truncation`. The join key and the identity — **not updatable.** Giving a rule a new id is not an edit, it is a different rule. |
-| **name** | `name` | Human title, e.g. *"No silent truncation"*. |
-| **description** | `description` | Optional admin note — what the rule is for and when it applies. **Never rendered into the prompt** (`promptText` is the substance), and editing it alone does not bump the `version`. |
-| **promptText** | `promptText` | The rule — *what to do* — and, where it prohibits, what to do instead. Emitted into the prompt at assembly time. |
-| **flavour** | `flavour` | *Deprecated (v1.36.0).* Never reached the prompt and is no longer offered in the admin — retained only so existing values and config round-trips survive; ignore it in new work. Disciplines are ordered within a segment by their membership `sortOrder` on `ai_segment_discipline`. |
-| **userId** | `userId` | `null` = app/module. A future per-user builder sets it. |
-| **version** | `version` | Bumps only on a substantive edit (name, prompt or flavour), so the ledger can tell an edited rule from the one that ran yesterday. |
-| **seeded** | `seeded` | `true` for AI Core's built-ins — round-trips through config export/import and marks a row the `replace` importer never deletes. |
-
-<Aside type="tip" title="Prompts are prompt content">
-A discipline's `promptText` and a guardrail's measure are emitted into the prompt at assembly time, so the service treats them as prompt content: its logs carry ids, kinds and versions only — **never the prose.** For how the disciplines section is laid out — the measure lines, the two lead-ins, the Mandatory line, the discipline numbers and the *Must remember* restatement — see [Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section).
-</Aside>
-
-### The seeded set
-
-AI Core seeds its disciplines through install migrations (`ON CONFLICT DO NOTHING`, so an admin edit is never clobbered). Every seeded discipline carries a guardrail — that is the invariant:
-
-| id | Guardrail | The rule it names |
-|---|---|---|
-| `ai-core/no-silent-truncation` | `guardrail-coverage-reported` (runs on every call) | Never shorten, sample or skip input without reporting exactly what was left out. |
-| `ai-core/report-coverage` | `guardrail-feedback-present` (runs on every call) | Every operation reports what it processed and what it did not, or says no independent count exists. |
-| `ai-core/verify-extraction-against-source` | `guardrail-source-verification` (code) | For an extraction, verify each returned item against the source and report coverage. |
-| `ai-core/ground-claims` | `guardrail-groundedness` (**retired** since v1.63.0) | Score how well the output is grounded and abstain when support falls below the threshold. |
-
-The seeded `guardrail-groundedness` is the old groundedness check, which asked a judge operation to score the answer. v1.63.0 does **not** rewrite seeded data, so it is still there — but it no longer runs: every run that reaches it names `guardrail-rule-retired:guardrail-groundedness/classic-1:scored` in `feedback.missing`, and it holds nothing back. The last two disciplines are opt-in per operation (an operation reaches them only by composing the extraction / grounding disciplines segment).
-
-A discipline may own **one or many** guardrails — the `>= 1` count is the invariant, not exactly one.
-
-<Aside type="note" title="The behavioural defaults are approaches">
-The behavioural rules — `no-sycophancy`, `refusal-boundary`, `ask-dont-guess`, `say-when-unsure`, `abstain-over-invent` — carry no guardrail, so they are seeded as **approaches** (unmeasured hows), not disciplines. They live in the standard approaches segment — see [Prompt Model](/modules/ai-core/prompt-model/).
-</Aside>
-
----
-
-## Guardrails are their own records
-
-A guardrail is a separate, **reusable** record — the table `ai_guardrail`. It is **attached** to the disciplines it measures through `ai_discipline_guardrail` (many-to-many):
+A discipline is an authored record, never code. AI Core seeds a few; apps write their own; both live in `ai_discipline` with the same shape:
 
 | Field | Purpose |
 |---|---|
-| `id` | Kebab-case guardrail id (optionally namespaced `owner/name`). |
-| `promptText` | The guardrail's **measure** — shown in the editor as **How you know you've done it**. Written into the prompt under every discipline the guardrail is attached to; the model checks its own answer against it before it finishes. The field name is unchanged; the admin and these docs call it the measure. |
-| `config` | Optional **code checks** that run after the answer — a list of rules (`builtin: 'rules'`, see below). Older configs (`source-verification`, `assertion-rules`) are still read, exactly as before. |
-| `kind` | **Derived, never picked.** `deterministic` for every guardrail a write accepts; `model-scored` now only labels a guardrail that still stores a **retired** scored rule (or the old groundedness check). |
-| `disciplineId` | **Deprecated (v1.48.0), nullable.** Attachments live in `ai_discipline_guardrail`; kept only for the pre-join seeds, never read for resolution. |
-| `version` | Bumps when the guardrail's own substance (kind, config or measure) moves — a re-save of an unchanged guardrail never moves it. |
+| `id` | Kebab-case, namespaced, e.g. `ai-core/no-silent-truncation`. The identity — **not updatable**. |
+| `name` | Human title. |
+| `description` | Optional admin note. **Never rendered into the prompt**, and editing it alone does not bump the `version`. |
+| `promptText` | The rule — what to do, and where it prohibits something, what to do instead. |
+| `flavour` | *Deprecated (v1.36.0).* Kept only so old values round-trip; ignore it. |
+| `userId` | `null` = app/module. |
+| `version` | Bumps only on a real edit (name, rule or flavour), so the ledger can tell an edited rule from yesterday's. |
+| `seeded` | `true` for AI Core's built-ins; the `replace` importer never deletes one. |
+
+**Membership in a segment's disciplines list is the on/off switch.** There is no `enabled` flag, no tier and no authority hierarchy. Disciplines are ordered by their membership `sortOrder`, and `important` is set per membership (see [Prompt Assembly → key rules](/modules/ai-core/prompt-assembly/#the-disciplines-section)).
+
+### Discipline or approach?
+
+What a discipline counts as depends only on its guardrails:
+
+| It has… | It counts as | In the prompt |
+|---|---|---|
+| At least one attached guardrail with a measure | **Discipline** | In the disciplines section with its measure lines, numbered `D1`, `D2`, … and in the check report. Important → restated in key rules under the strong lead-in. |
+| No attached guardrail, or none with a measure | **Approach (no measure yet)** | Its rule text only, in the approaches section after the operation's own approaches (or where the disciplines were, when it has no approaches). Not numbered, not in the check report. Important → restated in key rules like an approach. |
+
+The admin says which is which. The Disciplines list has a **Counts as** column and filter (*Discipline* or *Approach (no measure yet)*), the discipline editor shows the same badge with a note, and the operation editor's Disciplines block marks each one that is currently an approach. The operation **preview** adds a note naming any discipline written as an approach. The ledger still lists it in `disciplineVersions`, because it shaped the prompt.
+
+<Aside type="caution" title="The seeded disciplines are approaches for now">
+AI Core's four seeded guardrails (`guardrail-coverage-reported`, `guardrail-feedback-present`, `guardrail-source-verification`, `guardrail-groundedness`) were code checks with no measure. So since v1.73.0 each seeded discipline they measure is written as an approach, and those guardrails list as **No measure**. AI Core does not rewrite seeded records: write a measure on a guardrail (or attach one that has a measure) to make the discipline count again.
+</Aside>
+
+The two checks AI Core runs itself on every call — output cut by the length limit is always reported, and every run returns a complete feedback object — do not depend on any guardrail, so they carry on whatever the guardrails say.
+
+---
+
+## Guardrails
+
+A guardrail is its own **reusable** record in `ai_guardrail`, **attached** to the disciplines it measures through `ai_discipline_guardrail` (many-to-many; one guardrail can measure several disciplines):
+
+| Field | Purpose |
+|---|---|
+| `id` | Kebab-case guardrail id, `owner/name`. |
+| `promptText` | The **measure** — shown in the editor as **How you know you've done it**. Written into the prompt under every discipline it is attached to. **Required:** a guardrail without a measure cannot be saved. |
+| `version` | Bumps only when the measure's text changes. |
 | `seeded` | `true` for built-ins. |
 
-A guardrail must carry **a measure, at least one code check, or both**. With a measure and no code checks it is complete. With neither it measures nothing: a write refuses it, and a stored one is named `guardrail-empty:<id>` on every run.
+The table still has `kind`, `config` and a deprecated `disciplineId` column, so nothing stored is lost. None of them is read any more: a stored `config` with old code checks is kept as it is and never run.
 
-Attachments live in **`ai_discipline_guardrail`** (`disciplineId`, `guardrailId`, `position`). Deleting a discipline removes its attachments (the reusable guardrails survive); deleting a guardrail detaches it everywhere first; the resolver runs the **deduped** set an operation's disciplines attach.
+**The editor is the id and the measure.** Nothing else. **Save** is blocked until the measure has text. A guardrail that still holds code checks from before v1.73.0 shows one note: *Its old code checks are no longer run* — only the measure counts. The Guardrails list has a **Measure** badge and filter (*Has a measure* or *No measure*).
 
-Rules and guardrails **version independently** — that is exactly why the guardrail is a separate record. The ledger records the version of every discipline that shaped a run; it does not yet record guardrail ids or versions (that is on the [Roadmap](/modules/ai-core/roadmap/)).
+**Attachments.** `attachGuardrail` refuses a discipline or guardrail that does not exist. Detaching, or deleting a guardrail, is never refused; when it leaves a discipline with no measured guardrail, the admin says the discipline will be written as an approach, and the service logs it. Deleting a discipline removes its attachments (the guardrails survive), and is refused while a segment still lists it.
 
-### The measure — how you know you've done it
-
-The measure is the heart of a guardrail. Write what a finished answer looks like when the discipline has been followed — something the model can check its own answer against:
-
-> *Back every claim with an exact quote from the source, and make sure each quote appears word for word in the source.*
-
-At assembly the measure renders on its own line under each discipline it is attached to, prefixed **How you know you've done it:** — or, when the discipline is marked *important* in that list, the important label: **Mandatory — how you know you've done it:** unless the model's framework words it another way (see [Emphasis](/modules/ai-core/prompt-frameworks/#emphasis-v1720)). An important discipline is repeated, with its measure, in the restated block at the end (*Must remember*, or whatever the framework calls it).
-
-**Tone follows importance (v1.72.0).** A lead-in tells the model to check its answer against the measures before it finishes, and its tone now depends on how much the rules matter:
-
-- The disciplines section always opens with the **soft** lead-in (*check your answer against those before you finish, and adjust it where it falls short*).
-- The restated important block at the end opens with the **strong** lead-in (*if one is not met, change your answer until it is*) whenever it restates an important discipline with a measure.
-
-Soft wording alone was sometimes missed on Claude 4.6 and 4.8, so the firm wording is kept for the rules that matter most, stated last, closest to the answer. The per-operation **Strong / Soft** choice (v1.63.0) is gone: the editor no longer shows it and a run no longer reads it. The lead-in texts are still records you edit on the Approaches tab, and AI Core never rewrites them. The exact layout and the three records are on [Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section).
-
-A measure is a **self-check, not a certificate**: the model grading its own work against a stated standard is far better than an unstated standard, but it is still the model. Where something can be checked for certain, add a code check as well.
+**Old callers.** The admin API, `upsertGuardrail`, `ensureGuardrail`, `ensureDiscipline` and config import still accept the old `kind` and `config` fields and ignore them. A write without a measure is refused as `guardrail-measure-missing`.
 
 ### Write a measure as a test
 
-Since v1.72.0 the model answers each measure in its check report, so write the measure as a test it can answer. Read it as a question that starts *Have you…?* The model has to be able to answer that question from its own answer and the material it was given, say what it found, and give a pass or a fail.
+The model answers each measure in its check report, so write the measure as a test it can answer. Read it as a question that starts *Have you…?* The model must be able to answer it from its own answer and the material it was given, say what it found, and give a pass or a fail.
 
 | Instead of | Write |
 |---|---|
@@ -137,15 +93,17 @@ Since v1.72.0 the model answers each measure in its check report, so write the m
 
 A good measure:
 
-- **describes the finished answer**, not the effort (*every conclusion is preceded by…*, not *try hard to quote*);
+- **describes the finished answer**, not the effort;
 - **can be checked by reading** the answer and the material, with nothing the model can't see;
-- **has one clear pass or fail.** A discipline gets one entry in the report however many measures it has, so a discipline with two measures fails when either is not met. If you need to know which one failed, make them two disciplines.
+- **has one clear pass or fail.** A discipline gets one entry in the report however many measures it has, so it fails when any of them is not met. If you need to know which one failed, make them two disciplines.
 
-What the model should *do* after a fail (fix the answer, or say what it could not do) belongs in the lead-in texts, not in each measure.
+What the model should *do* after a fail belongs in the lead-in records, not in each measure. A measure is a **self-check, not a certificate**: the model grading its work against a stated standard beats an unstated one, but it is still the model. Where you need an independent check, run a Check operation in a flow.
 
-### The check report (v1.72.0)
+---
 
-A **Task** operation now answers in **JSON sections** that AI Core builds from the prompt: the answer, and — when at least one of its disciplines has a measure — a **check report**. The report has one entry for each discipline with a measure:
+## The check report (v1.72.0)
+
+A **Task** operation answers in **JSON sections** that AI Core builds from the prompt: the answer and — when at least one of its disciplines has a measure — a **check report**, with one entry per measured discipline:
 
 | Field | What the model writes |
 |---|---|
@@ -153,278 +111,76 @@ A **Task** operation now answers in **JSON sections** that AI Core builds from t
 | `found` | What it found when it checked its answer against the measure |
 | `result` | `pass` or `fail` |
 
-To make this work, every discipline in the prompt is numbered **D1, D2, …** in the order it appears, and an important one keeps the same number where it is restated at the end. The format section lists the sections in a short, fixed field list — mechanical text, like an output schema's field list — so no instruction about what to do on a fail is added there. That stays in the lead-in records you edit. A Check or Router operation gets the check report the same way when one of its disciplines has a measure; one with no measured discipline answers in its own fields exactly as before. A System prompt never answers on its own, so it has none. What the prompt looks like is on [Prompt Assembly](/modules/ai-core/prompt-assembly/#json-answer-sections-v1720).
+Every discipline with a measure is numbered in the order it appears, and an important one keeps its number where it is restated. A discipline written as an approach is not numbered. A Check or Router operation gets the report the same way when one of its disciplines has a measure; a System prompt never answers on its own, so it has none. The prompt itself is on [Prompt Assembly](/modules/ai-core/prompt-assembly/#json-answer-sections-v1720).
 
-**The app never sees the report.** AI Core takes it off before the answer is returned, so `result.text` and `result.structured` have exactly the shape they had before v1.72.0. The report is kept with the run in the usage ledger's `checkReport` column and shown to the admin: in the **Test run** result, and on the **Usage** tab, where each ledger row has a **Self-check** badge and expands to show its report. Each `found` text is kept to 2,000 characters. On a run handled as **sensitive**, the `found` text is not kept at all — only the numbers and the passes and fails — so the ledger holds no model-written text for sensitive work. The report is the one stated exception to the ledger's *no content* rule, and it is removed with the rest of the ledger by account erasure and the retention prune.
+**The app never sees the report.** AI Core takes it off before the answer is returned, so `result.text` and `result.structured` keep their shape. The report is kept with the run in the ledger's `checkReport` column and shown to the admin in the **Test run** result and on the **Usage** tab (the **Self-check** badge). Each `found` is kept to 2,000 characters; on a run handled as **sensitive** it is not kept at all — only the numbers and results. The report is removed with the rest of the ledger by account erasure and the retention prune.
 
-**When the report holds a fail, the admin decides what happens.** Each operation has a setting, **When the check report has a fail**:
+**When the report holds a fail, the admin decides.** Each operation has **When the check report has a fail**:
 
-- **Tell the app** (the default) — the run's feedback names the disciplines that failed, for example `self-check-failed:D2` or `self-check-failed:D2,D4`, and sets `feedback.reason` to `self-check-failed` when no earlier reason is set (an earlier one, such as `output-truncated-by-length-limit`, is kept), so the run reaches the review queue either way. To spot a fail, look for the `self-check-failed:` prefix in `feedback.missing` rather than testing the reason. AI Core never lets anyone believe more was done than was.
-- **Record only** — the fail is kept with the run for the admin, and the app is not told.
+- **Tell the app** (the default) — the run's feedback names the failed disciplines (`self-check-failed:D2`, `self-check-failed:D2,D4`) and sets `feedback.reason` to `self-check-failed` when no earlier reason is set, so the run reaches the review queue. Look for the `self-check-failed:` prefix in `feedback.missing` rather than testing the reason.
+- **Record only** — the fail is kept for the admin, and the app is not told.
 
-Either way, what the model found never goes to the app.
-
-**A bad report is always named, never quietly accepted**, whatever the fail setting — and it never costs the app a good answer, which is still returned:
+**A bad report is always named**, whatever the fail setting, and the answer is still returned:
 
 | Feedback | Meaning |
 |---|---|
 | `self-check-report-missing` | No check report came back, although the prompt asked for one. |
-| `self-check-report-malformed:<n>` | `n` entries could not be read. An entry with a known number and a pass or fail but no `found` text counts here too; it is still kept, and a fail in it still counts. |
-| `self-check-report-duplicate:<numbers>` | A discipline was reported more than once, e.g. `self-check-report-duplicate:D1`. The first entry is kept; a fail in any of them counts. |
-| `self-check-not-reported:<numbers>` | Disciplines with a measure that the report left out, e.g. `self-check-not-reported:D3`. |
+| `self-check-report-malformed:<n>` | `n` entries could not be read (an entry with no `found` text counts here; it is still kept, and a fail in it still counts). |
+| `self-check-report-duplicate:<numbers>` | A discipline was reported more than once. The first entry is kept; a fail in any counts. |
+| `self-check-not-reported:<numbers>` | Measured disciplines the report left out. |
 
-Any of these sets `feedback.reason` to `self-check-report-incomplete`, unless an earlier reason is already set or a fail is being told to the app (that comes first).
+Any of these sets `feedback.reason` to `self-check-report-incomplete`, unless an earlier reason is set or a fail is being told to the app.
 
-**Plain text instead.** An operation's **Answer format** can be set to **Plain text**: the answer comes back as it did before v1.72.0 (free text, or the operation's own output fields), with no check report and no numbers. Use it for long free-form writing, where the check report would share the output limit with the answer. A call cut off at its output limit (or its tool-step limit) is read as far as it got: a complete answer is kept even when the check report after it was cut, and the report's missing entries are named. A text answer that was cut comes back cut short and named, as before v1.72.0 (`output-truncated-by-length-limit` or `output-truncated-by-caller-cap`, with `complete-output` and the coverage; `answer-cut-short:<finish reason>` for any other early stop). An answer with output fields that was cut fails (and is costed), as a structured answer always did. A call whose model can't give a JSON answer — its facts say it has no structured output, or it is a Google model before Gemini 3 and the operation has tools — also runs as Plain text, and the run says why (`answer-sections-unavailable:structured-output` or `answer-sections-unavailable:tools`). See [Configuration → Answer format and the check report](/modules/ai-core/configuration/#answer-format-and-the-check-report-v1720).
-
-### Code checks (optional) — a list of rules
-
-A guardrail's code checks are a list of **rules**. Each reads as a sentence — **check this, against that, it passes when…, only when…, and if it fails…** — and runs **in code**, after the answer comes back, with no model call:
-
-| Part | Choices |
-|---|---|
-| **Check** | *The whole answer* — its structured output when the operation has an output schema, otherwise its **plain text** (so a free-text answer such as a transcription is checkable) · *one field of the answer* · *each item in a list* (the whole item, one field of it, or its main text worked out). A field or list needs an output schema; without one the rule says it could not be checked. |
-| **Against** | *Nothing* (the answer on its own) · *all the source material* (every context item and marked input) · *the text sent to an input*. Code never reads a file, so *the file sent to an input* is refused on write. |
-| **Passes when** | Code checks — all of them, or any of them. |
-| **Only when** | Optional: the rule applies to an item (or the answer) only when a condition holds — an *if X then Y*. |
-| **If it fails** | *Just report it* (named in `feedback.missing`) · *flag it for review* (sets `feedback.reason` — the review queue, and pauses a flow waiting on feedback) · *hold the answer back* (see below). |
-| **If it can't be checked** | *Just report it* · *flag it for review* — for when the source is missing, the text is too large, a pattern ran out of time, and so on. |
-
-The **code checks** are `exists` · `absent` · `non-empty` · `empty` · `equals` · `not-equals` · `one-of` · `matches` / `not-matches` (a regular expression, optionally ignoring case) · `gte` · `lte` · `between` · `length-between` · `unique` · `is-type` · `appears-in-source` — plus two that compare with the source character by character:
-
-- **`matches-source-exactly`** — the checked text equals the source (spacing collapsed, case kept, by default).
-- **`close-to-source`** — at most a given share of characters are wrong (the character error rate), and the measured accuracy is reported in `feedback.ruleScores`. This is the only rule that produces a score.
-
-Both accept **placeholders**: a token such as `[UNCLEAR]` in the answer stands for one or more illegible source characters (1 by default, up to a set number each), and together placeholders may cover at most a set share of the source (5% by default) — so an answer made of placeholders can never pass. When a rule fails *because* its placeholders cover too much, it says so, rather than reporting a difference.
-
-Here is a transcription guardrail: the measure asks the model to compare character by character, and a code rule flags any illegibility marker other than `[UNCLEAR]`:
-
-```json
-{
-  "id": "my-app/transcription-matches-document",
-  "promptText": "Before you finish, compare your transcription with the document character by character. Every character must match what is visible, in the same order, and anything genuinely illegible must be [UNCLEAR]. Correct any difference before you answer.",
-  "config": {
-    "builtin": "rules",
-    "rules": [
-      {
-        "id": "no-other-markers",
-        "check": { "what": "result" },
-        "against": { "what": "nothing" },
-        "test": {
-          "type": "code",
-          "combine": "all",
-          "conditions": [{ "condition": "not-matches", "value": "\\[(?:illegible|unreadable|\\?+)\\]", "flags": "i" }]
-        },
-        "onFail": "flag"
-      }
-    ]
-  }
-}
-```
-
-When the app also sends the document's **text** (a DOCX, or a PDF with a text layer), a code rule can check it character by character — *close to the source, at most 2% wrong, `[UNCLEAR]` allowed*.
-
-<Aside type="caution" title="Hold does not withhold">
-*Hold the answer back* marks the run **abstained** with the reason `abstained-guardrail-rule-failed` and flags it for review — but the answer is **still returned**. The app decides what to show. Check for the `abstained-` prefix (the barrel exports `isHeldBack(feedback)`) rather than one exact reason.
-</Aside>
-
-### No second AI inside a guardrail — retired rules
-
-Until v1.63.0 a rule could be **scored** (a scorer operation rated the answer) and the old **groundedness** check asked a judge operation to score it. Both are **retired**: a guardrail no longer asks another AI to judge the answer.
-
-- **New writes refuse them** — the admin, `upsertGuardrail`, `ensureGuardrail` and `ensureDiscipline` (for a guardrail it creates) — with: *"Guardrails no longer ask another AI to judge the answer. Write the measure into 'How you know you've done it', add a code check, or run a separate checking operation in a flow."* A legacy config with `builtin: 'groundedness'`, or any older-format config sent with `kind: 'model-scored'`, is refused the same way.
-- **Config import keeps them** so an exported file re-imports losslessly: the guardrail is written as-is and the import report adds a note naming each retired rule. The file never fails over it.
-- **Stored ones never run.** Every run that reaches one names `guardrail-rule-retired:<guardrailId>/<ruleId>:scored` in `feedback.missing` (an old groundedness guardrail uses the rule id `classic-1`). It is named, never silent — but it sets no `reason` and holds nothing back, because nothing was measured. A missing scorer no longer blocks runs.
-- **The editor shows a retired rule read-only**, with that explanation and a **Delete** button. **Save is blocked** while one remains — for a stored groundedness guardrail that means no edit at all, not even to its measure, until the retired rule is deleted.
-
-A check that genuinely needs another model's judgement belongs in a **flow**: run a separate checking operation — since v1.64.0 an operation of the **Check** [category](/modules/ai-core/configuration/#operation-categories-v1640) — as the next step, and route on its answer. A dedicated flow Check step, where you choose what a failed check does, is [planned](/modules/ai-core/roadmap/#ai-judged-checks-as-flow-steps). Evals keep their judge metrics for offline testing.
-
-### The guardrail editor
-
-The editor opens with the measure, **How you know you've done it**, at the top, then **Code checks (optional)** below it. A new guardrail starts from a preset — templates in the editor, never seeds. Each preset is a card with a plain title and description and a short **Use** button:
-
-| Preset | What it sets up |
-|---|---|
-| Every item it returns is in the source | Code: each item's main text appears in the source material; says how many passed; flags. |
-| Rules about the answer | Code: a check on the whole answer, starting with *the answer is not empty*; flags. Build on it (a field is present, is one of a set, matches a pattern…). |
-| Every quote is in the source | A measure (*back every claim with an exact quote, word for word from the source*) plus a code rule that each item in a list you pick appears in the source. |
-| A transcription matches its document | A measure (*compare with the document character by character… `[UNCLEAR]` for anything illegible*) plus a code rule that flags other illegibility markers. |
-| A transcription is close to a text version | Code: *close to the source* against an input's text, at most 2% wrong, `[UNCLEAR]` allowed. |
-| Start blank | One empty rule to build yourself. |
-
-A preset's measure is only a starting point to edit. It fills the measure field only when that field is empty — or still holds an earlier preset's measure you have not touched, when you pick a different starting preset. Text you wrote is never replaced. Instead of a preset you can also pick one of the two checks that already run on every call, or write only a measure and save.
-
-The list of guardrails shows a badge for each: **Measure only**, **Measure + code checks**, **Code checks**, **Runs on every call**, **Holds a retired rule** or **Can't run** (the last two as warnings). Besides a rule with problems marked on it, two things block **Save**: a retired rule still in the list, and a guardrail with neither a measure nor a code check.
-
-### Every shortfall is named
-
-A rule that cannot do what it says names why; nothing passes silently. A rule is named in feedback as `<guardrailId>/<ruleId>`:
-
-| Feedback | Meaning |
-|---|---|
-| `guardrail-rule-failed:<rule>[:item-<i>][:<detail>]` | The rule failed — e.g. `:error-rate-0.031-of-0.02`, `:placeholders-0.12-of-0.05`, `:differs-from-source`, `:incomplete-3-of-5`. At most 50 item lines per rule, then `:and-<n>-more`. |
-| `guardrail-rule-unavailable:<rule>[:item-<i>]:<why>` | It could not be checked: `no-source`, `no-structured-output`, `items-not-found`, `ambiguous-field`, `too-large`, `over-budget`, `cancelled`, `pattern-timeout` (a pattern ran past its time limit — see below). |
-| `guardrail-rule-misconfigured:<rule>:<what>` | The stored rule is broken (the editor and the write path refuse these; this catches a hand-edited or imported one). |
-| `guardrail-rule-no-items:<rule>` | The list was empty, or no item met *only when*. An empty list still has its completeness checked — `[]` where the source holds three is reported as `incomplete-0-of-3`. |
-| `guardrail-rule-file-not-read:<rule>` | A code check compared against all source material and an uploaded file was among it — code never reads a file. |
-| `guardrail-rule-inferred-field:<rule>:<field>` | *Its main text* was worked out (and which field was used). |
-| `guardrail-rule-retired:<rule>:scored` | A stored rule that asked another AI to judge the answer. Never run; `missing` only, never `reason`. |
-| `guardrail-empty:<guardrail>` | The guardrail has neither a measure nor a code check, so it measures nothing. (Replaces `guardrail-rules-empty`.) |
-| `guardrail-config-mixed:<guardrail>` | A rules config with leftover old settings. |
-| `guardrail-source-port-*:<key>` · `guardrail-source-keys-malformed` | The input-scoping gaps below. |
-
-Reasons: `guardrail-rule-failed` (a *flag* rule failed), `guardrail-rule-unavailable` (a *flag* rule could not be checked), `abstained-guardrail-rule-failed` (a *hold* rule failed). To catch every failed rule, look for the `guardrail-rule-failed:` prefix in `missing` rather than one exact `reason`. A missing lead-in record is named separately — `discipline-check-lead-in-unavailable:<key>` (see [Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section)) — and so are a fail and a bad report in the model's own [check report](#the-check-report-v1720) (`self-check-failed:<numbers>`, `self-check-report-…`, `self-check-not-reported:<numbers>`).
-
-#### Checking against a specific input
-
-*The text sent to an input* names input keys. A guardrail is shared across operations, so it names a key, not one operation's input. An input counts only when the run **binds it by `inputKey`** — positional binding cannot say which segment is which input once a document rides as context, so a rule never guesses:
-
-| Feedback | Meaning |
-|---|---|
-| `guardrail-source-port-undeclared:<key>` | The operation reaching this guardrail declares no input with that key. |
-| `guardrail-source-port-not-keyed:<key>` | The run bound its inputs by position. Send `inputKey` on the segment. |
-| `guardrail-source-port-not-supplied:<key>` | The operation declares it, but this run did not send it (or sent it empty). |
-| `guardrail-source-port-file-unread:<key>` | That input carried a file. A code check never reads a file, and an upload's text is only its caption, so the input is **left out**. Send the document's text in a text input. |
-| `guardrail-source-keys-malformed` | The keys are not a list of strings. The rule compares against **nothing** rather than quietly widening to all sources. |
-
-#### Patterns run under a time limit
-
-Every admin-authored pattern — in a rule, a classic assertion or a completeness count — runs under a **time limit**, because a pattern that backtracks without end (such as `^(a+)+$` on a steerable answer) would otherwise freeze the whole process. A pattern is tested against a whole list in one timed call of at most 200 ms; a run has one second of pattern time in all; and a pattern that runs out of time is not run again in that run — so the worst case is bounded by the allowance, not by the length of the list. What a timeout means:
-
-- a modern rule's pattern check reports `pattern-timeout` (could not be checked);
-- in a classic assertion, a timed-out check counts as *not holding* (so `matches` and `not-matches` both fail, as for a pattern that will not compile), a timed-out *only when* never skips the rule (it still applies), and the rule names `assertion-rule-pattern-timeout:<label>`;
-- a completeness count that runs out of time is reported as `completeness-unverified`.
-
-### Guardrails that run on every call
-
-Two built-ins run on **every language call** — cheap, universal, and not configurable. A guardrail can still declare them (`builtin: 'coverage-reported'` or `'feedback-present'`) to record that a discipline depends on them; that does not switch them on:
-
-<CardGrid>
-  <Card title="coverage-reported" icon="warning">
-    When output was cut by the length limit, coverage must be stated. It records `covered` output tokens against `total: null` — because no independent count of the full output exists, and inventing one is exactly what this module forbids. Backs `ai-core/no-silent-truncation`.
-  </Card>
-  <Card title="feedback-present" icon="approve-check">
-    Belt-and-braces: a run may never return or ledger a partially formed feedback object. A failure here is a defect in AI Core itself, and it throws loudly (`feedback_invariant_violated`). Backs `ai-core/report-coverage`.
-  </Card>
-</CardGrid>
-
-### Classic rules — the check types before v1.59.0
-
-Guardrails written before v1.59.0 name one fixed check type in `config.builtin`. The two code types are **still read, forever**, and run **exactly** the code they always did, emitting exactly the feedback names apps may already match. In the editor each shows as one or more **classic** rules with a note saying so. Saving an untouched one stores it unchanged; editing one stores it in the rules format with its classic rules intact; *Update to current behaviour* converts a classic rule into a modern one after listing what changes.
-
-- **`source-verification`** — each returned item (at `itemsPath` in the structured output, reading `valueKey` or its one obvious text field) must appear in the source; states coverage (`verified-items`) and, when a count exists outside the model (`denominator`), completeness. Names `unverified-item:<i>`, `unverifiable-item:<i>`, `source-verification-failed`, `completeness-unverified`, `incomplete-extraction:<n>-of-<d>`. Backs `ai-core/verify-extraction-against-source`.
-- **`assertion-rules`** — admin-authored rules over the structured output (`forEach`, `when`, `clause` / `anyOf` / `allOf`). Names `assertion-failed:<label>[:item-<i>]`, `assertion-rule-misconfigured:<label>`, `assertion-rules-failed`.
-- Their `sourceKeys` (v1.58.2) names the input keys to check against, with the same scoping gaps as above.
-- **`groundedness`** is **retired** (v1.63.0): read as one retired rule, `classic-1`, that never runs and is named `guardrail-rule-retired:<id>/classic-1:scored`. Its old feedback names (`groundedness-below-threshold`, `unsupported-claims`, `groundedness-unavailable`, `groundedness-no-source`, `abstained-below-groundedness`) are no longer produced.
-
-**Classic checks are bounded (v1.61.0).** Each source is prepared once per run, every match is charged against the run's scan budget (and gives other work a turn), and a rule checks at most **2,000 items**. What each check does when it hits a limit — it fails closed, never passes by default:
-
-| Name | Meaning |
-|---|---|
-| `source-verification-unavailable:<over-budget\|cancelled>` | The scan budget ran out (or the run was cancelled) part-way; the items left stay unverified, so the check cannot pass. |
-| `source-verification-items-capped:<n>-of-<m>` | Only the first `n` of `m` items were checked; the rest count as uncovered. |
-| `assertion-rule-over-budget:<label>` / `assertion-rule-cancelled:<label>` | Source matching could not finish for that rule; the rule fails, like a pattern that ran out of time. |
-| `assertion-rule-items-capped:<label>:<n>-of-<m>` | Only the first `n` of `m` items were checked for that rule. |
-
-A config naming an unknown builtin, or one stored under the wrong kind, is reported as `guardrail-check-unimplemented:<id>` and measures nothing; it is never run silently. A config with no builtin at all is a measure-only guardrail when it has a measure, and `guardrail-empty:<id>` when it does not.
+**Plain text instead.** An operation's **Answer format** can be **Plain text**: the answer comes back as free text (or the operation's own fields), with no check report and no numbers — useful for long writing, where the report would share the output limit. A model that can't give a JSON answer runs as Plain text and the run says why (`answer-sections-unavailable:structured-output` or `answer-sections-unavailable:tools`). See [Configuration → Answer format and the check report](/modules/ai-core/configuration/#answer-format-and-the-check-report-v1720).
 
 ---
 
 ## The one gate: `validateDisciplineSet`
 
-This is the load-bearing part. There is exactly **one** function that decides whether a set of disciplines is coherent — `validateDisciplineSet(ids)` — and it is called at **two** moments so the two enforcement points cannot drift apart.
+One function decides whether a set of disciplines can be used, `validateDisciplineSet(ids)`, and it runs at two moments so they cannot drift apart:
 
-> **The July 2026 finding held:** an ESM code registry cannot host a sound enforcement point, because registration is a file-ordered side-effect and a rule can register before the rule it conflicts with. **A database table can** — every rule and every guardrail already exists in one table at the moment of a write, so there is no ordering problem to lose to. The gate checks the one thing that matters — that each named discipline exists and is actually a brake.
+- **At write time** — when a disciplines segment's members change (`records.upsertSegment`) or an operation's own disciplines slot changes (`records.upsertOperation`).
+- **At run time** — on every `aiCore.run`, over the disciplines the operation reaches (system prompt fold included).
 
-`validateDisciplineSet` returns machine-readable kebab violations so either caller can name the exact problem:
-
-| Violation | Meaning |
-|---|---|
-| `unknown-discipline:<id>` | The set references a discipline that does not exist. |
-| `discipline-without-guardrail:<id>` | A referenced discipline owns no guardrail — a rule that was never turned into a brake. |
-
-A guardrail no longer depends on any operation, so the old `guardrail-scorer-missing` violation (and the `scorerGaps` detail) is gone. A guardrail that measures nothing or holds a retired rule is named at run time, not refused here.
-
-### At write time — the disciplines list is validated on change
-
-The gate fires when a **disciplines segment's membership changes** (`records.upsertSegment`, on the disciplines slot), and when an operation's **own** disciplines slot changes (`records.upsertOperation`) — same function, same refusal. The related CRUD refusals guard the surrounding records:
-
-- **A guardrail is standalone; attaching requires both ends to exist.** `upsertGuardrail` creates a reusable guardrail that names no discipline; `attachGuardrail` refuses a discipline or a guardrail that does not exist.
-- **A guardrail that measures nothing, or a broken or retired rule, is refused.** `upsertGuardrail` (and consumer seeding) refuses, as `guardrail-config-invalid: guardrail "<id>" — …` followed by each problem in plain words: *add a measure ("How you know you've done it") or at least one code check. A guardrail with neither measures nothing*; the retired-rule message above; *the rules must be a list*; *the file sent to an input can't be read by a code check — compare against the text of an input*; *it needs code checks*. Config import refuses the same, except that it keeps a retired rule (see above). A classic code config is stored as given, as it always was.
-- **Seeding only validates what it writes.** `ensureDiscipline` validates the guardrails it will *create*, before the discipline is written; an entry naming a guardrail that already exists is only attached, so it may give just the id and nothing else in it is checked.
-- **A referenced discipline cannot be deleted.** `deleteDiscipline` is refused while any segment still carries it via `ai_segment_discipline`, naming every referring segment and the enabled operations that compose them. Once unreferenced, its guardrail **attachments** are removed (the reusable guardrails themselves survive).
-- **Removing the last guardrail is allowed but loud.** `detachGuardrail` (and deleting a guardrail) is never refused, but if it strips a discipline's *last* guardrail it logs an audited warning: that discipline now has no brake and will fail `validateDisciplineSet` until it gains another.
-
-Authoring a new discipline and its guardrail is therefore a short, ordered sequence — attaching requires the discipline to already exist:
-
-<Steps>
-
-1. **Create the discipline** — what to do.
-
-   ```ts
-   import { disciplinesService } from './disciplines.service.js';
-
-   await disciplinesService.createDiscipline({
-     id: 'my-app/cite-policy-clause',
-     name: 'Cite the policy clause',
-     promptText:
-       'Quote the clause before stating a conclusion about it. If no clause supports the conclusion, say so instead of concluding.',
-   });
-   ```
-
-2. **Create a guardrail (reusable) and attach it** — how you know you've done it. The measure alone is enough; the code check is optional and here confirms each quoted clause really is in the source.
-
-   ```ts
-   await disciplinesService.upsertGuardrail({
-     id: 'guardrail-cite-policy-clause',
-     // The measure: written into the prompt under the discipline.
-     promptText:
-       'Every conclusion is preceded by the exact clause it rests on, quoted word for word.',
-     // Optional code checks (kind is derived: 'deterministic').
-     config: {
-       builtin: 'rules',
-       rules: [
-         {
-           id: 'clauses-are-quoted',
-           check: { what: 'each', path: 'clauses', infer: true },
-           against: { what: 'sources' },
-           test: { type: 'code', combine: 'all', conditions: [{ condition: 'appears-in-source' }] },
-           coverage: true,
-           onFail: 'flag',
-         },
-       ],
-     },
-   });
-   await disciplinesService.attachGuardrail({
-     disciplineId: 'my-app/cite-policy-clause',
-     guardrailId: 'guardrail-cite-policy-clause',
-   });
-   ```
-
-3. **List it in a disciplines segment.** Membership is the switch — adding it to a segment's disciplines list is what turns it on, and that write runs `validateDisciplineSet` over the resulting set. See [Prompt Model](/modules/ai-core/prompt-model/) for the segment API.
-
-</Steps>
-
-### At resolution time — every call re-validates
-
-Write-time checks guard the admin surface, but records change between writes, so the pairing has to hold again at the moment of use. `aiCore.run` resolves the disciplines reached through the operation's segments (including any system prompt's segments folded in) and calls the **same** `validateDisciplineSet` on **every call**. A violation refuses loudly — a `discipline-integrity-violation` — rather than running in a degraded shape nobody asked for.
-
-Because both moments call one function, a raced admin write cannot cause a silent bad run: the resolver re-checks the resolved set before it assembles a prompt, and refuses at the exact moment the bad set would be used — not at the next restart.
+It has one rule: **every discipline named must exist.** A missing one is `unknown-discipline:<id>`; at run time that refuses the call as `discipline-integrity-violation`. A discipline with no measure is **not** a violation anywhere — resolver, run, preview, test run, flows or evals — it is written as an approach.
 
 ---
 
-## The seam is managed, not closed
+## Authoring a discipline and its guardrail
 
-Nobody closes the seam between the authored rule and its enforcement, so AI Core does not claim to prevent every gap — it makes each one loud at the moment it would matter. The strong cases *are* refused: an unguarded discipline can never resolve into a run (`discipline-without-guardrail`), attaching a guardrail to a missing discipline is refused at write, a guardrail that measures nothing is refused at write and named at run time, and a referenced discipline cannot be deleted. The one deliberately-permitted gap — detaching (or deleting) a discipline's last guardrail — is allowed but logged loudly, and caught at the next resolution.
+```ts
+import { disciplinesService } from './disciplines.service.js';
 
-A few `config-io` **replace-mode** edge cases remain — an eval case orphaned by a self-inconsistent hand-authored replace, and create-path provenance under a transient database failure. They are narrow, low-severity, and the resolver still refuses at run time in every one; they are tracked on the [Roadmap](/modules/ai-core/roadmap/).
+// 1. The rule — what to do.
+await disciplinesService.createDiscipline({
+  id: 'my-app/cite-policy-clause',
+  name: 'Cite the policy clause',
+  promptText:
+    'Quote the clause before stating a conclusion about it. If no clause supports the conclusion, say so instead of concluding.',
+});
+
+// 2. The measure — how you know you've done it. Reusable.
+await disciplinesService.upsertGuardrail({
+  id: 'my-app/clause-quoted',
+  promptText: 'Every conclusion is preceded by the exact clause it rests on, quoted word for word.',
+});
+await disciplinesService.attachGuardrail({
+  disciplineId: 'my-app/cite-policy-clause',
+  guardrailId: 'my-app/clause-quoted',
+});
+```
+
+3. **List it in a disciplines segment.** Membership is the switch — see [Prompt Model](/modules/ai-core/prompt-model/). An app that seeds its own uses `ensureDiscipline` with its guardrails in one call — see [Registering & Seeding](/modules/ai-core/registering-and-seeding/).
+
+<Aside type="tip" title="Prompts are prompt content">
+A discipline's rule and a guardrail's measure are emitted into the prompt, so the service's logs carry ids and versions only — **never the prose.**
+</Aside>
 
 ---
 
 ## Related
 
-- **[Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section)** — how the disciplines section renders: measure lines, the soft and strong lead-ins, the Mandatory line, the discipline numbers and *Must remember*.
-- **[Prompt Model](/modules/ai-core/prompt-model/)** — where the discipline and guardrail pairing sits in the segment model.
-- **[Registering & Seeding](/modules/ai-core/registering-and-seeding/)** — the mechanics of an app authoring its own disciplines and guardrails.
-- **[Data Model](/modules/ai-core/data-model/)** — the full `ai_discipline` and `ai_guardrail` table shapes.
+- **[Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section)** — how the disciplines section renders: measure lines, the lead-ins, the Mandatory line, the numbers and *Must remember*.
+- **[Prompt Model](/modules/ai-core/prompt-model/)** — approaches and disciplines in the segment model.
+- **[Data Model](/modules/ai-core/data-model/)** — the `ai_discipline` and `ai_guardrail` tables.
 - **[Service API](/modules/ai-core/service-api/)** — the feedback object every run returns.
