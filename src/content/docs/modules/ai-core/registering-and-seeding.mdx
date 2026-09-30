@@ -1,7 +1,7 @@
 ---
 title: Registering & Seeding
 description: How a consumer module plugs into AI Core — registering code that runs versus seeding records that persist
-lastUpdated: 2026-09-28
+lastUpdated: 2026-09-30
 sidebar:
   order: 5
 ---
@@ -10,8 +10,8 @@ import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
 A consumer module plugs into AI Core two ways, and they are not the same thing. One **registers** code that runs on every boot. The other **seeds** a record that persists in the database and can then be edited by an admin. This page is about that line — where it falls, why it falls where it does, and the exact calls on each side. For the contract you code against, see [Integration](/modules/ai-core/integration/); for the full method surface, see [Service API](/modules/ai-core/service-api/); for the events you can subscribe to, see [Hooks & Events](/modules/ai-core/hooks-and-events/).
 
-<Aside type="note" title="Last checked against v1.45.0">
-This page describes AI Core as checked against module v1.45.0 (August 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers.
+<Aside type="note" title="Last checked against v1.78.0">
+This page describes AI Core as checked against module v1.78.0 (September 2026). The module installs into a real app, type-checks clean there, its admin page serves these records, and its consumer surface has been exercised end-to-end against live providers.
 </Aside>
 
 ---
@@ -120,9 +120,10 @@ For an **embedding** operation, bind the `'embedding'` purpose and pass the vect
 | `sensitivity` | `'normal' \| 'sensitive'` (optional) | Gates the operation against provider terms; defaults to `normal`. |
 | `inputItems` | `OperationInputItemWrite[]` (optional) | The declared **input contract** — the ordered items the caller supplies (each `label` + `kind` + optional `marker` + optional `injectionRisk`). Omit for the default single-Message contract. `OperationInputItemWrite` is an `OperationInputItem` that may still carry the old flag name `untrusted` (the name before v1.62.0): it is accepted, turned into `injectionRisk` when `injectionRisk` is absent, and never stored. |
 | `toolIds` | `string[]` (optional) | Provider-hosted tool ids the operation may call (e.g. `web-search`), gated by the egress/sensitivity rule at resolution. |
+| `variableBindings` | `Array<{ name; required? }>` (optional) | The operation's declared **prompt variables** (v1.58.0) — which `{token}`s from the variable catalogue it uses, each optionally marked `required` (advisory: shown, not enforced). They are what [`getOperationInfo().variables`](/modules/ai-core/service-api/#getoperationinfo) returns; substitution itself does not depend on them. Seed a variable the catalogue does not hold yet with `ensurePromptVariable` (below). |
 | `objective` | `Array<{ kind; text }>` (optional) | The operation's own inline **objective** — a goal/objective/task list, stored as three private per-op segments (objective, goals, tasks — v1.50.0), each rendered in its own slot; goals and tasks as numbered lists. |
 | `approaches` | `Array<{ key; important? }>` (optional) | The operation's own inline **approaches** slot (approach keys, ordered). |
-| `disciplines` | `Array<{ id; important? }>` (optional) | The operation's own inline **disciplines** slot (discipline ids, ordered) — each must own a guardrail. |
+| `disciplines` | `Array<{ id; important? }>` (optional) | The operation's own inline **disciplines** slot (discipline ids, ordered) — each must exist. One with no measured guardrail is written into the prompt as an approach (v1.73.0). |
 | `answerFormat` | `'json-sections' \| 'plain-text'` (optional) | Create-time (v1.72.0): how the answer comes back. Omitted = `json-sections` — the answer plus, when a discipline has a measure, the model's check report, which your app never sees. Use `plain-text` for an operation that writes long free-form text: the check report shares the output limit with the answer. Either way `run` returns the same `result` shape. See [Answer format and the check report](/modules/ai-core/configuration/#answer-format-and-the-check-report-v1720). |
 | `selfCheckFailure` | `'tell-app' \| 'record-only'` (optional) | Create-time (v1.72.0): what a check report with a fail does. Omitted = `tell-app` (feedback names the failed discipline numbers, e.g. `self-check-failed:D2`); `record-only` keeps it for the admin only. |
 | `disciplineCheck` | `'strong' \| 'soft'` (optional) | **Ignored since v1.72.0.** It set the tone of the one lead-in above the disciplines (v1.63.0); the tone now follows importance — see [Prompt Assembly](/modules/ai-core/prompt-assembly/#the-disciplines-section). Still accepted, so older seeding code keeps working. |
@@ -163,9 +164,65 @@ Most consumers just bind a built-in purpose — the seeded roles exist on every 
 | `contentSource` | `'static' \| 'context'` (optional) | Whether the content is static prompt text or drawn from runtime context. |
 | `injectionRisk` | `boolean` (optional) | Flags the content as an injection risk (it may contain instructions), so AI Core sanitises and fences it as material. |
 | `marker` | `string \| null` (optional) | The marker that wraps this segment's content items. |
-| `userId` | `string \| null` (optional) | Scopes the segment to a single user, when set. |
+| `userId` | `string \| null` (optional) | An authorship pointer for a future per-user builder; nothing reads it yet. |
 | `approaches` | `Array<{ key; important? }>` (optional) | Ordered approach members for an `approaches` slot, each with per-membership `important`. |
 | `disciplines` | `Array<{ id; important? }>` (optional) | Ordered discipline members for a `disciplines` slot, each with per-membership `important`. |
+
+### `ensureApproach` — `EnsureApproachSpec`
+
+An **approach** is an unmeasured "how" — expertise, persona, reasoning style or tone. Create-if-absent by `key`; an existing approach is never touched. Returns `{ created, approach }`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `key` | `string` | Kebab-case, namespaced with the consumer module id. The approach is matched by key. |
+| `name` | `string` | Admin-facing label. |
+| `promptText` | `string` | The text written into the prompt. |
+| `contentSource` | `'static' \| 'context'` (optional) | Default `static`. |
+| `flavour` | `string \| null` (optional) | **Deprecated (v1.36.0)** — stored, never read. |
+| `userId` | `string \| null` (optional) | An authorship pointer for a future per-user builder; nothing reads it yet. |
+
+List it in an `approaches` segment, or in an operation's own `approaches`, to use it. Since v1.75.0 an admin can turn an approach into a discipline; an app that seeds the approach again on start-up creates it again as an approach (see [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/#one-list-approaches--disciplines-v1750)).
+
+### `ensureDiscipline` — `EnsureDisciplineSpec`
+
+A **discipline** is a measured "how": a rule plus at least one guardrail with a measure. Create-if-absent by `id`: a new discipline and the guardrails it creates are written in **one transaction**, so it never lands without its measure. An existing discipline is never touched. Returns `{ created, discipline }`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `string` | Kebab-case, namespaced with the consumer module id. A discipline's id **is** its key. |
+| `name` | `string` | Admin-facing label. |
+| `description` | `string \| null` (optional) | An admin note, never written into the prompt. |
+| `promptText` | `string` | The **rule** — what to do, and where it prohibits something, what to do instead. |
+| `why` | `string \| null` (optional) | v1.74.0. Why the rule matters, written straight after the rule as "Why: …". Blank is stored as `null`. |
+| `target` | `string \| null` (optional) | v1.74.0. The measurable value the rule aims for; it fills the `{target}` gap in an attached guardrail's measure. A full stop at its end is dropped. |
+| `guardrails` | `Array<{ id; promptText? }>` | The discipline's guardrails, in order. One that does not exist yet is created with its measure (`promptText`), and one with no measure is refused before anything is written (`guardrail-measure-missing`). One that already exists is only attached, so its `id` is enough. Old `kind` and `config` fields are accepted and ignored (v1.73.0). With no guardrail that has a measure, the discipline is written into the prompt as an approach. |
+| `userId` | `string \| null` (optional) | An authorship pointer for a future per-user builder; nothing reads it yet. |
+
+### `ensureGuardrail` — `EnsureGuardrailSpec`
+
+A **guardrail** is a reusable measure — *how you know you've done it*. Create-if-absent by `id`, optionally attached to disciplines that already exist; an existing guardrail and its attachments are never touched. Returns `{ created, guardrail }`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `string` | Kebab-case, namespaced with the consumer module id. |
+| `promptText` | `string \| null` | The **measure**. Required for a new guardrail: without one the call is refused (`guardrail-measure-missing`, an `IntegrityError`). It may leave a `{target}` gap that each discipline fills with its own target. |
+| `disciplineIds` | `string[]` (optional) | Disciplines to attach it to. Each must exist, or the whole call is refused and nothing is written. |
+| `kind` / `config` | (optional) | Accepted and ignored since v1.73.0. |
+
+### `ensurePromptVariable` — a `{token}` the prompt can use
+
+Declares a [prompt variable](/modules/ai-core/integration/#prompt-variables-v1490) in the catalogue, create-if-absent by `name`; an existing variable is never touched. The **value** still arrives at run time, in `RunOptions.variables`. Returns `{ created, variable }`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | `string` | The token, as written between braces in a segment. Don't use `target`: it is reserved for the `{target}` gap in guardrail measures, and the admin and config import refuse it (this function does not yet). |
+| `description` | `string \| null` (optional) | What the variable holds. |
+| `injectionRisk` | `boolean` (optional) | Default `false`. When `true` the value is sanitised and fenced as material. |
+| `onMissing` | `'skip' \| 'fallback'` (optional) | Default `skip`: what happens when no value arrives. |
+| `fallback` | `string \| null` (optional) | The text used when `onMissing` is `fallback`. |
+| `source` | `string` (optional) | Who fills the value. Default `caller` (your app passes it); only a `caller` variable takes a value over HTTP. |
+| `sourceRef` | `object \| null` (optional) | What a field-bound variable stands for; AI Core never resolves it. |
+| `changes` | `'fixed' \| 'per-user' \| 'daily' \| 'per-call'` (optional) | How often the value changes (v1.67.0), which prompt caching uses. Default `per-call`. Any other value is refused (`BadRequestError`). |
 
 Flows are the exception on the seed side: there is no consumer `ensureFlow`. A flow is composed in the admin from operations the way an operation is composed from libraries — see [Usage](/modules/ai-core/usage/#flows). The consumer's job for flows is on the register side, below.
 
