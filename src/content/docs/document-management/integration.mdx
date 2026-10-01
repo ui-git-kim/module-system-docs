@@ -223,11 +223,11 @@ export interface ProvenanceResult {
 |--------|---------|-------------|
 | `getDocumentsForNode(nodeId, userId)` | `Promise<DocumentReference[]>` | All document references linked to a Structure node, ownership-checked against `userId`. |
 | `getDocument(documentId, userId)` | `Promise<DocumentReference \| null>` | A single reference, or `null` if it does not exist or is not owned by `userId`. |
-| `getDownloadStream(documentId, userId)` | `Promise<Readable>` | A Node `Readable` of the underlying file, streamed live from the provider. |
-| `getDownloadStreamByPath(providerId, userId, path)` | `Promise<{ stream: Readable; fileName: string }>` | A `Readable` (plus the derived `fileName`) for a provider path with no `doc_document` reference — how a job-worker consumer pulls the bytes for an uploaded file off the request path. |
+| `getDownloadStream(documentId, userId)` | `Promise<Readable>` | A Node `Readable` of the underlying file, streamed live from the provider. The promise **rejects** when the file cannot be opened (see [Download errors](#download-errors-reject-up-front)). |
+| `getDownloadStreamByPath(providerId, userId, path)` | `Promise<{ stream: Readable; fileName: string }>` | A `Readable` (plus the derived `fileName`) for a provider path with no `doc_document` reference — how a job-worker consumer pulls the bytes for an uploaded file off the request path. Rejects up front like `getDownloadStream`. |
 | `getFileInfo(documentId, userId)` | `Promise<FileInfo>` | Live metadata (name, size, MIME type, timestamps) fetched from the provider. |
 | `getDocumentCount(nodeId, userId)` | `Promise<number>` | The number of references linked to a node — cheaper than fetching them all. |
-| `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cognitive-pipeline routes ingested files into an `Ingested/` folder. |
+| `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId; documentId; staged? }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cognitive-pipeline routes ingested files into an `Ingested/` folder. |
 | `putParsedArtefact(userId, input)` | `Promise<ParsedArtefact>` | **Store** the output an external parser produced for a source (this module never parses). Bytes default to a derived writable area (`DOC_ARTEFACT_PREFIX`) unless `input.target` overrides; deduped by source `contentHash`. Never written to a read-only or **ephemeral (Local Connect)** provider — derived data is always redirected to a persistent store so it survives the source machine going offline. |
 | `getParsedArtefact(userId, source, opts?)` | `Promise<ParsedArtefact \| null>` | Fetch the latest (or a given `format`/`version`) stored artefact for a source — so a consumer can re-ingest without re-parsing. |
 | `listParsedArtefacts(userId, source)` | `Promise<ParsedArtefact[]>` | Every stored artefact for a source. |
@@ -252,7 +252,7 @@ export interface DocumentReference {
   remotePath: string;
   fileName: string;
   mimeType: string | null;
-  fileSize: number | null;
+  fileSize: number | null;         // bytes; null when unknown or 2 GiB or larger (Int column)
   contentHash: string | null;      // SHA-256, computed server-side at creation
   isFavourite: boolean;
   status: 'active' | 'archived';
@@ -498,6 +498,8 @@ When Structure is installed, Document Management contributes a full set of UI ex
 
 <Aside type="caution" title="Commented out by default — you must enable them">
 The Structure registrations import from `@/features/structure`, which does not exist in a standalone install — so the side-effect imports are **commented out** in the generated `index.ts`. After installing Structure, uncomment them to activate the integration. The backend action subscriptions above need no such gating; they are inert without Structure but always compile.
+
+The six registration files are still generated in a standalone install, so a project-wide type-check that includes them (`tsc -b`) reports `TS2307` (cannot find `@/features/structure`) for each one. Since v1.18.0 that is the only error they raise: the node parameters are typed explicitly, so there is no implicit-`any` error on top.
 </Aside>
 
 This is the block you uncomment in `frontend/src/features/document-management/index.ts`:
@@ -617,7 +619,7 @@ nodeCardExtensionRegistry.register({
 
 ### nodeActionRegistry — "Upload File" and "Link Document"
 
-Two header actions. Rather than owning React state, each handler dispatches a window `CustomEvent` that `NodeDocumentsTab` listens for and opens the relevant UI.
+Two header actions. Rather than owning React state, each handler dispatches a window `CustomEvent` that `NodeDocumentsTab` listens for and opens the relevant UI. **Upload File** opens the file picker; the files upload to the user's default provider and are linked to the node, within the admin's **Max files per upload** cap. **Link Document** opens the tab's "Link a document" sheet, a provider picker over a `FileBrowser`, which creates a reference and links it with `linkType: 'attachment'`. Set `'reference'` or `'primary'`, or link notes, through `useLinkDocument()` or the API. The older standalone `DocumentLinkDialog` component was never wired to these actions and was removed in v1.18.0.
 
 | Property | "Upload File" | "Link Document" |
 |----------|---------------|-----------------|
@@ -751,7 +753,7 @@ Outside of Structure, Document Management registers itself with the standard sta
 | `navigationRegistry.registerMain` | `id: document-management`, `title: Documents`, `url: /documents`, `icon: FileText`, `order: 25` |
 | `navigationRegistry.registerMain` | `id: document-management-included`, `title: Included folders`, `url: /documents/included`, `icon: FolderTree`, `order: 26` — the auto-ingest folder picker |
 | `dashboardRegistry.register` | `id: document-management-recent`, `title: Recent Documents`, `component: RecentDocumentsWidget`, `size: 2x1`, `order: 35`, `category: documents` |
-| `preferencesRegistry.register` | `id: document-management`, `title: Documents`, `component: DocumentPreferences`, `order: 60` |
+| `preferencesRegistry.register` | `id: document-management`, `title: Documents`, `component: DocumentPreferences`, `order: 60` — values (default view, sort, items per page) are persisted in the user's starter preferences under the `documentManagement` key, not in a module table |
 | `settingsPagesRegistry.register` | `id: document-storage` (→ `/settings/document-storage`), `title: Document Storage`, `icon: HardDrive`, `component: DocumentStorageSettingsPage`, `order: 60` — the user provider-CRUD page |
 | `adminPagesRegistry.register` | `id: documents` (→ `/admin/documents`), `title: Document Storage`, `icon: FolderCog`, `component: DocumentEnginesAdminPage`, `order: 40` — the admin engine-policy page |
 | `routeRegistry.register` (backend) | `path: /document-management`, `versions: ['v1']`, `requiresAuth: true` |
@@ -819,7 +821,7 @@ When `opts.folder` is omitted, the destination is the provider's configured `upl
 cognitive-pipeline routes its uploads into a dedicated folder (e.g. `Ingested/`) so it can recognise and **skip** them on a catch-all auto-ingest source — the folder is the marker that a file is already in flight, which is what makes the double-ingest guard reliable. That only holds if the folder is honoured wherever the file lands, including when the user has no provider of their own and falls through to the shared default. It is, on both the isolated and communal shared default.
 </Aside>
 
-**Side effects (both entry points).** A successful write records a `doc_recent_access` `upload` row and emits the awaited async `documents.document.uploaded` event (a storage *reference*, never bytes). `uploadToDefault` on the **shared** default additionally upserts an **owned** `doc_document` reference (idempotent on `(userId, providerId, remotePath)`) so the user can find and download their file — they cannot `createDocument` against a provider they don't own, so this trusted server-side write is the only path to a browsable reference there.
+**Side effects (both entry points).** A successful write records a `doc_recent_access` `upload` row and emits the awaited async `documents.document.uploaded` event (a storage *reference*, never bytes). `uploadToDefault` on the **shared** default additionally upserts an **owned** `doc_document` reference (idempotent on `(userId, providerId, remotePath)`) so the user can find and download their file — they cannot `createDocument` against a provider they don't own, so trusted server-side writes are the only path to a reference there. The other such write is `requestIngest` (`POST /ingest`), which ensures a reference for a path the caller was already allowed to read.
 
 **The returned `documentId`.** `uploadToDefault` / `uploadGlobal` (and `POST /upload` / `POST /upload-global`) return that server-created reference's id as `documentId` — for a **shared-default**, **global** or **offline-staged** upload. A caller that needs a reference (to link the file to a node, tag it, request ingest) must use it **directly**: calling `createDocument` with the returned `providerId` would `404`, because that provider is the shared/staging store the caller does not own, and `createDocument`'s ownership check is deliberate (`resolveFileProvider`'s owned-reference read carve-out relies on a user never being able to forge a reference to a provider they don't own). `documentId` is `null` only for an upload to the caller's **own** provider, where no reference is created — that is the one case to call `createDocument` yourself:
 
@@ -831,8 +833,12 @@ const documentId =
 ```
 
 <Aside type="caution" title="Document visibility is per-user in V1 — even on a communal shared default">
-The isolation toggle governs where **bytes** land, not who can **see** them. Every `doc_document` reference is `userId`-scoped and browsing the shared provider is never granted to non-owners, so a file one user uploads to the shared default is not visible to other users — even in communal (isolation-off) mode. An admin-managed area that is *readable by everyone* is a distinct, not-yet-built capability (cross-user shared visibility); see the [roadmap](/document-management/roadmap/#planned-improvements). For per-user private folders on a shared NAS, keep isolation **on** — each user (admins included) gets their own `u/<userId>/` root automatically.
+The isolation toggle governs where **bytes** land, not who can **see** them. Every `doc_document` reference is `userId`-scoped and browsing the shared provider is never granted to non-owners, so a file one user uploads to the shared default is not visible to other users — even in communal (isolation-off) mode. An admin-managed area that is *readable by everyone* is a distinct, not-yet-built capability (cross-user shared visibility); see the [roadmap](/document-management/roadmap/#planned-improvements). For per-user private folders on a shared NAS, keep isolation **on** — each user gets their own `u/<userId>/` root automatically. The one exception is the admin who **owns** the shared default: when it is also their own default, their web session uploads to it as its owner, without a namespace. Their linked devices are still confined to `u/<adminId>/` (see [Security → Linked devices and the shared store](/document-management/security/#linked-devices-and-the-shared-store)).
 </Aside>
+
+**Isolation and owned references.** While isolation is on, an owned reference to a store the caller does not own is honoured only inside the caller's own `u/<userId>/` or the global prefix. A reference created in communal mode outside that namespace stops resolving once an admin turns isolation on, so `getDownloadStream`, `getDownloadStreamByPath` and `getFileInfo` reject for it, even though the bytes are still on the store and the reference row still exists. A consumer that recorded such a `documentId` should treat the resulting `ForbiddenError` (403) or `NotFoundError` (404) as "no longer accessible", not as a transient error.
+
+**`u/<userId>/` is reserved for that user, and erased with them.** On a shared store, everything under a user's namespace is deleted when their account is erased, whatever the isolation setting was when the files were written. Communal-mode files outside the namespace, and global uploads, are kept. All of that user's references are deleted either way, so a `documentId` a consumer recorded for them stops resolving. See [Security → Account Erasure](/document-management/security/#account-erasure-and-data-categories).
 
 ```typescript
 // A consumer routing an upload into a chosen folder, wherever the file lands:
@@ -966,6 +972,8 @@ const { path, providerId } = await dm.uploadGlobal(userId, fileName, bytes, {
 
 <Aside type="caution" title="Storage, not (yet) global visibility">
 This is the storage half. Reads are **reference-gated**: the uploading **admin** owns the `doc_document` reference, so they — and a process pulling as them, e.g. cognitive-pipeline via `getDownloadStreamByPath` — can read the global file back, but a regular user (who holds no reference to it) cannot yet browse or download the global space. Full cross-user visibility (global-scoped references so *everyone* sees them) is a planned follow-up; see the [roadmap](/document-management/roadmap/#planned-improvements).
+
+Because the reference belongs to the uploading admin, erasing that admin's account deletes it. The global **file** is kept (it is organisation content, outside every user namespace), but a `documentId` a consumer recorded for it stops resolving. Global-scoped references would fix this too.
 </Aside>
 
 ---
@@ -992,7 +1000,7 @@ function AttachEvidence() {
 }
 ```
 
-It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports the stored file's `{ path, providerId, size, mimeType, documentId, staged }` when the upload completes. **`documentId`** is the reference the server created for a shared-default, offline-staged or global upload — to link or tag the file, use it directly rather than calling `createDocument` (which `404`s on a provider you don't own; see [the upload contract](#the-upload-contract)). It is `null` for an upload to a provider you own, where `createDocument` with `providerId` + `path` is the way to get a reference.
+It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports the stored file's `{ path, providerId, size, mimeType, documentId, staged }` when the upload completes. **`documentId`** is the reference the server created for a shared-default, offline-staged or global upload — to link or tag the file, use it directly rather than calling `createDocument` (which `404`s on a provider you don't own; see [the upload contract](#the-upload-contract)). It is `null` for an upload to a provider you own, where `createDocument` with `providerId` + `path` is the way to get a reference. A failed upload is shown inline with the server's own reason (for example "File exceeds the maximum upload size"), read through the starter's `getApiErrorMessage` — see [Error handling in the frontend](#error-handling-in-the-frontend).
 
 | Prop | Type | Description |
 |------|------|-------------|
@@ -1020,6 +1028,169 @@ export const moduleDefinition: ModuleDefinition = {
   // ...
 };
 ```
+</Aside>
+
+---
+
+## Browsing Folders
+
+A provider folder is listed over HTTP with `GET /browse/:providerId` (the root) or `GET /browse/:providerId/*` (a folder by remote path), under `/api/v1/document-management`. Browsing is **owner-only**: it works on providers the caller owns, never on the shared default for a non-owner, and never on the app-wide default for a linked device. Since v1.18.0 the server lists the **whole** folder, sorts it, and returns one page, so paging and sorting behave the same on S3/R2, WebDAV and Local.
+
+### Query parameters
+
+| Parameter | Values | Default | Notes |
+|-----------|--------|---------|-------|
+| `limit` | `1` to `500` | `50` | Entries per page. A value outside the range is a `400`. |
+| `offset` | `0` or more | `0` | Entries to skip in the sorted listing. For the next page, send `offset + items.length`. |
+| `sortBy` | `name`, `date`, `size`, `type` | `name` | The sort key within each group (folders, then files). |
+| `sortOrder` | `asc`, `desc` | `asc` for every `sortBy` | Send `desc` for newest first (`date`) or largest first (`size`). |
+| `foldersOnly` | `true`, `false` | `false` | Only subfolders, as the Included folders tree uses. Must be the literal string; anything else is a `400`. |
+
+### Response
+
+```json
+{
+  "path": "matters/2026",
+  "items": [
+    { "name": "Correspondence", "path": "matters/2026/Correspondence", "isFolder": true },
+    {
+      "name": "brief.pdf",
+      "path": "matters/2026/brief.pdf",
+      "isFolder": false,
+      "mimeType": "application/pdf",
+      "size": 482113,
+      "lastModified": "2026-09-14T03:12:44.000Z"
+    }
+  ],
+  "totalCount": 137,
+  "hasMore": true,
+  "truncated": false
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `items` | This page, folders first. |
+| `totalCount` | Entries in the whole listing (after `foldersOnly`), before paging. At most 5,000. |
+| `hasMore` | Another page exists: request `offset + items.length`. |
+| `truncated` | The provider listing stopped at the 5,000-entry cap, so entries beyond it cannot be browsed and `totalCount` is the capped count. |
+
+### Sort order
+
+- **Folders always come first**, whatever the sort.
+- **The sort spans the whole folder**, not just the entries already loaded, so pages never overlap or reorder.
+- `name` is case-insensitive and number-aware (`file2` before `file10`). `date` is the last-modified time, and an entry with no date sorts as the oldest. `size` is in bytes, and no size counts as `0`. `type` is the lower-cased file extension, falling back to the MIME type.
+- **`sortOrder` applies to the chosen key only.** Ties fall back to name, then path, always A to Z. So under newest-first or largest-first, folders (which have no date or size on S3) and equal files stay in A to Z order.
+
+### The 5,000-entry listing cap
+
+Each request gathers the folder from the provider up to `MAX_FOLDER_LISTING` (5,000 entries; S3 follows its continuation token to get there), then sorts and pages it. A larger folder is cut at the cap and reported with `truncated: true`. An S3-compatible store that keeps returning the same or an empty continuation page is also cut short and flagged `truncated`, rather than looped on. Every page request re-lists the folder, so each "Load more" on a very large folder costs a full provider listing; a listing cache is a roadmap item. The limits are code constants (see [Configuration → Browse listing limits](/document-management/configuration/#browse-listing-limits)).
+
+### From React: `useFolderPages`
+
+`useFolderPages` is exported from the feature barrel. It loads a folder page by page for a **Load more** control, and its `FolderPagesOptions` and `FolderPagesData` types come from the same barrel:
+
+```tsx
+import { useFolderPages } from '@/features/document-management';
+
+function MatterFiles({ providerId }: { providerId: string }) {
+  const { data, hasNextPage, fetchNextPage, isFetchingNextPage } = useFolderPages(
+    providerId,
+    'matters/2026',
+    { pageSize: 50, sortBy: 'date', sortOrder: 'desc' }
+  );
+  if (!data) return null;
+  return (
+    <>
+      <p>Showing {data.items.length} of {data.totalCount}</p>
+      <ul>
+        {data.items.map((item) => (
+          <li key={item.path}>{item.name}</li>
+        ))}
+      </ul>
+      {data.truncated ? <p>Only the first 5,000 entries of this folder can be browsed.</p> : null}
+      {hasNextPage ? (
+        <button onClick={() => fetchNextPage()} disabled={isFetchingNextPage}>
+          Load more
+        </button>
+      ) : null}
+    </>
+  );
+}
+```
+
+| Option | Default | Notes |
+|--------|---------|-------|
+| `pageSize` | `50` | Clamped to 1–500 before the request is sent, so it never causes a `400`. |
+| `sortBy` / `sortOrder` | server defaults | Passed through as above. |
+| `foldersOnly` | `false` | Only subfolders. |
+
+`data` is `{ items, totalCount, truncated }`: every loaded page merged and de-duplicated by path, because an entry added between requests can shift the offsets. Drive the control with `hasNextPage`, `fetchNextPage` and `isFetchingNextPage`. The query keys sit under the module's `folder` key, so the module's upload hooks refresh every loaded page after an upload. `useFolder(providerId, path, options)` is still exported and returns **one** page (`FolderContents`); check its `hasMore`.
+
+The module's own `FileBrowser` uses `useFolderPages`. When no sort is passed it follows the user's **Sort files by** preference with a natural direction: name and type A to Z, date newest first, size largest first.
+
+---
+
+## App Settings and the Default Provider
+
+`GET /settings` is readable by any signed-in user (`useAppSettings()` in the frontend). It returns the same object as the service's `getAppSettings()`: the engine policy, upload limits, artefact retention, the app-wide default (`defaultProviderId`, `defaultIsolateUsers`) and the Local Connect download URL. The route adds two per-request fields:
+
+| Field | Who gets it | Meaning |
+|-------|-------------|---------|
+| `defaultProvider` | Admins in a web session; `null` for everyone else, linked devices included | The current app-wide default provider, credentials redacted, whoever owns it: another admin, or the organisation after its creator's account was erased (`orgOwned: true`). `GET /providers` only lists the caller's own providers, so this is how an admin page names a default that is not in the admin's list. |
+| `viewerIsAdmin` | Everyone | `true` for an admin web session. A UI hint only, never a security gate. |
+
+An in-process call to `getAppSettings()` from another module returns neither field.
+
+### Renaming the app-wide default
+
+`PUT /settings` is admin-only (`requireAdmin`). Two fields rename the **current** app-wide default, whoever owns it:
+
+| Field | Meaning |
+|-------|---------|
+| `defaultProviderName` | The new display name (1–120 characters, trimmed). Only the name changes, never the config, owner or flags. |
+| `defaultProviderNameFor` | The id of the provider you mean to rename, usually the one your editor is showing. Optional, but send it. |
+
+When `defaultProviderNameFor` is sent and that provider will not be the default once the request applies (another admin changed it, or the page is stale), the server answers `409` and writes **nothing** from the request:
+
+```json
+{ "error": "The default storage location changed. Reload the page and try again.", "code": "conflict" }
+```
+
+The check runs before any other field in the request is saved, and again at rename time. A request that sets `defaultProviderId` and renames in one go renames the new default, so send that id as `defaultProviderNameFor`. Without `defaultProviderNameFor`, the server renames whatever is the default now (the behaviour older clients rely on), or answers `400` when no default is set. Each rename is audit-logged with the admin's `actorId`.
+
+The module's admin page (`/admin/documents`) is built on this contract. A default owned by someone else appears in its picker as "Name (another admin)" or "Name (organisation)", keeps its adapter locked on, and is renamed inline. After a `409` or a failed save, the page refetches the settings and resets the picker to the server's default.
+
+---
+
+## Error Handling in the Frontend
+
+Every Document Management route answers an error with the same JSON envelope:
+
+```json
+{ "error": "This storage address is not allowed. Storage on a private or internal network can only be added by an administrator.", "code": "endpoint_not_allowed" }
+```
+
+Since v1.18.0 the module's own UI shows the server's reason everywhere through the starter's `getApiErrorMessage(err, fallback)` from `@/lib/api`, instead of a generic failure or a raw "Request failed with status code 400". Use the same helper when you build UI on the module's hooks or its HTTP API:
+
+```tsx
+import { getApiErrorMessage } from '@/lib/api';
+import { useUploadToDefault } from '@/features/document-management';
+
+function UploadStatus() {
+  const upload = useUploadToDefault();
+  return upload.isError ? (
+    <p className="text-destructive">{getApiErrorMessage(upload.error, 'Upload failed.')}</p>
+  ) : null;
+}
+```
+
+- `getApiErrorMessage` returns the envelope's `error` (with any field-level `details` appended), else the error's own message, else your fallback.
+- File downloads and the bulk zip use `responseType: 'blob'`, so their error body arrives as a `Blob`. The module's download calls parse a JSON error body back onto the error first, so the helper still shows the server's reason. Those two calls also opt out of the shared API client's 30-second request timeout, because large bodies can take longer.
+- Stable `code` values worth handling: `endpoint_not_allowed` (400), `conflict` (409), `forbidden` (403, including the linked-device refusal on the shared store), `read_only` (403), `not_found` (404), `too_large` (413) and `provider_unavailable` (503).
+
+<Aside type="caution" title="Host requirement — starter v2.13.0 or later">
+The generated frontend imports `getApiErrorMessage` from `@/lib/api`, which the starter exports from v2.13.0. On an older starter, `tsc` or `vite build` fails with "has no exported member getApiErrorMessage". The generated backend routes also import `attachRole` from the starter's auth middleware (`middleware/auth.middleware.js`), which current starters provide.
 </Aside>
 
 ---
@@ -1324,6 +1495,45 @@ Note the schema uses plain string fields (`nodeId`, `documentId`) with `@@index`
 
 ---
 
+## Consumer Impact in v1.18.0
+
+v1.18.0 needs no schema change (`npx document-management update --skip-schema`). The cross-module service interface (`DocumentManagementServiceInterface`), the `documents.*` action hooks and their payloads are **unchanged**. What a consuming module may notice:
+
+### Download errors reject up front
+
+`getDownloadStream` and `getDownloadStreamByPath` now reject **before** returning a stream when the file cannot be opened. On WebDAV and Local, a missing file is a `NotFoundError` (404), and a refused or unreachable WebDAV server is a `ProviderUnavailableError` (503) with a [client-safe message](/document-management/security/#client-safe-connection-errors). S3/R2 already rejected when the object could not be fetched. Put the call inside your `try`/`catch`:
+
+```typescript
+let stream: Readable;
+try {
+  stream = await docs.getDownloadStream(documentId, userId);
+} catch (err) {
+  // NotFoundError, ProviderUnavailableError, ForbiddenError ... — the file could not be opened
+  return markSourceUnavailable(documentId, err);
+}
+// A failure part-way through the body still arrives as a stream 'error' event:
+// attach the listener straight away, before awaiting anything else.
+stream.on('error', (err) => abortJob(documentId, err));
+```
+
+The `doc_recent_access` row is written before the file is opened, so a pull that then fails is still recorded as a download.
+
+### Other changes to plan for
+
+| Change | What to do |
+|--------|------------|
+| **Isolation re-check on owned references.** With isolation on, a communal-era reference outside the user's `u/<userId>/` (or the global prefix) no longer resolves. | Treat a `ForbiddenError` or `NotFoundError` on a recorded `documentId` as "no longer accessible". See [the upload contract](#the-upload-contract). |
+| **Account erasure.** All of an erased user's references are deleted, and their files under `u/<userId>/` on shared storage are purged. Global files are kept, but the uploading admin's reference to them goes with that admin's account. | Expect a recorded `documentId` for an erased user to stop resolving, and erase what your own module stores about that user through its own deletion handler. |
+| **`fileSize` is `null` for files of 2 GiB or more** (`doc_document.fileSize`, `ParsedArtefact.sizeBytes`). | Read the size from the `documents.document.uploaded` event, which keeps the real value, or from `getFileInfo`. |
+| **In-process calls are trusted.** Service calls carry no caller principal and are treated like a web session, so the [linked-device restriction](/document-management/security/#linked-devices-and-the-shared-store) does not apply to them. | If your module serves requests made with device tokens, apply your own checks before calling in. |
+| **Browse is paged.** `GET /browse` returns 50 entries by default; before, WebDAV and Local returned the whole folder and S3 up to 100. | Page with `offset` (or `useFolderPages`) until `hasMore` is `false`, and watch for `truncated`. See [Browsing Folders](#browsing-folders). |
+| **Custom adapters.** The adapter `ListOptions` is now just `{ maxItems }` (`limit`, `offset`, `sortBy`, `sortOrder` and `fileTypes` were removed), so an adapter that reads `options.limit` fails type-check. | Return the whole folder up to `maxItems`, with `hasMore: false` and `truncated: true` when capped, and do not sort or page: the service does both. Network adapters must also dial through the endpoint guard (see [Developer Workflow](/document-management/developer-workflow/)). |
+| **`GET /settings` gains `defaultProvider` and `viewerIsAdmin`.** | Optional. See [App Settings and the Default Provider](#app-settings-and-the-default-provider). |
+| **`DocumentLinkDialog` was removed.** It was never exported from the barrel or wired to the node actions. | Nothing, unless you imported the generated file by path. `update` lists the orphaned `components/DocumentLinkDialog.tsx` and offers to remove it (moved to a backup). |
+| **Host floor.** The frontend needs `getApiErrorMessage` from `@/lib/api` (starter v2.13.0 or later) and the backend uses `attachRole` from the starter's auth middleware. | Update the host starter first if it is older. |
+
+---
+
 ## Integration Checklist
 
 Use this when building a module that integrates with Document Management:
@@ -1334,12 +1544,15 @@ Use this when building a module that integrates with Document Management:
 - [ ] **Event subscriptions** — `addActionAsync` on the `documents.*` hooks you care about, with priority 30+ (the module's own subscriptions run at 20).
 - [ ] **Provenance** — pass `computeHash: true` when creating references for evidence/audit use, and persist the returned `contentHash`.
 - [ ] **Graceful degradation** — never assume Document Management (or Structure) is present; check `isAvailable()` and handle absence.
+- [ ] **Download errors handled** — `getDownloadStream` / `getDownloadStreamByPath` inside `try`/`catch`, with a stream `'error'` listener attached straight away.
+- [ ] **Browse paged** — follow `hasMore` with `offset` (or use `useFolderPages`), and handle `truncated`.
+- [ ] **Errors shown with `getApiErrorMessage`** — user-visible failures show the server's reason, not a generic message.
 - [ ] **Self-contained schema** — reference `documentId` / `nodeId` with plain string fields and `@@index`, never `@relation`.
 
 ---
 
 ## Next Steps
 
-- [Configuration](/document-management/configuration/) — database schema, API endpoints, and environment variables
-- [Usage](/document-management/usage/) — pages, components, and hooks
-- [Security](/document-management/security/) — the provider-delegated security model and credential encryption
+- [Configuration](/document-management/configuration/) — environment variables, private-network storage endpoints, and provider config shapes
+- [Usage](/document-management/usage/) — pages, components, hooks, and the full API reference
+- [Security](/document-management/security/) — the provider-delegated security model, the endpoint guard, the caller trust model, and account erasure

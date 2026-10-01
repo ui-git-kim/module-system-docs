@@ -1,6 +1,6 @@
 ---
 title: Configuration
-description: Environment variables, storage adapter configuration, credential encryption, install prompts, and read-only mode for the Document Management module
+description: Environment variables, private-network storage endpoints, storage adapter configuration, credential encryption, install prompts, and read-only mode for the Document Management module
 sidebar:
   order: 2
 ---
@@ -17,17 +17,18 @@ Only **one** secret belongs in your environment: `DOC_ENCRYPTION_KEY`. Per-provi
 
 ## Environment Variables
 
-The backend reads fifteen environment variables. Only `DOC_ENCRYPTION_KEY` is required — the rest have sensible defaults and two are only relevant when the matching adapter is enabled.
+The backend reads seventeen environment variables. Only `DOC_ENCRYPTION_KEY` is required — the rest have sensible defaults and two are only relevant when the matching adapter is enabled.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DOC_ENCRYPTION_KEY` | ✅ Yes | — (secret) | 32+ character key used to derive the AES-256-GCM key that encrypts storage-provider credentials at rest. Generate with `openssl rand -hex 32`. Lives only in the backend environment, never in the database. |
-| `DOC_MAX_UPLOAD_SIZE` | No | `52428800` | **Default** maximum upload size in **bytes** (50 MB). Enforced on the byte stream, not the spoofable `Content-Length` header. An admin can override it on `/admin/documents` (**Upload limits**); this env value is the fallback. |
+| `DOC_ALLOW_PRIVATE_ENDPOINTS` | No | `false` | Set to `true` to let **any** user's provider connect to storage on loopback or private-network addresses (a development MinIO, a LAN NAS). Off, only providers an admin saved from a web session may. Cloud-metadata and link-local addresses are always refused. Read at startup. See [Private-network storage endpoints](#private-network-storage-endpoints). |
+| `DOC_MAX_UPLOAD_SIZE` | No | `52428800` | **Default** maximum upload size in **bytes** (50 MB). Enforced on the byte stream, not the spoofable `Content-Length` header. An admin can override it on `/admin/documents` (**Upload limits**), up to 2,147,483,647 bytes (just under 2 GiB, the limit of the `Int` column). This env value is the fallback and may be higher. A missing, non-numeric or non-positive value falls back to 50 MB. |
 | `DOC_MAX_FILE_COUNT` | No | `20` | **Default** maximum number of files per multi-file upload — a **client-side** batch cap (DM uploads one file per call, so the server sees N separate requests and can't count a batch). Admin-overridable. |
 | `DOC_ACCEPTED_MIME_TYPES` | No | — (empty = all) | **Default** comma-separated allowed MIME types for the file-picker (e.g. `application/pdf,image/*`). A **UI filter, not a server gate** — the declared type is client-spoofable. Admin-overridable. |
 | `DOC_THUMBNAIL_CACHE_DIR` | No | `./data/doc-thumbnails` | Directory where generated image thumbnails are cached (keyed by a hash of provider + path + size). |
 | `DOC_ARTEFACT_PREFIX` | No | `.derived-artefacts` | Folder prefix (a **derived, writable area**) where parsed-artefact bytes are stored when a producer gives no explicit `target` — kept separate from the original source, which may sit on a read-only/evidence provider that rejects writes. On the shared app-default provider, artefacts are namespaced under `u/<userId>/`. |
-| `DOC_GLOBAL_PREFIX` | No | `global` | Folder prefix on the shared default provider for **admin global uploads** (shared, non-user content — e.g. a global knowledge base), **outside** every `u/<userId>/` namespace. See [Integration → Global uploads](/document-management/integration/). |
+| `DOC_GLOBAL_PREFIX` | No | `global` | Folder prefix on the shared default provider for **admin global uploads** (shared, non-user content — e.g. a global knowledge base), **outside** every `u/<userId>/` namespace. Global files are kept when their uploader's account is erased. Keep it clear of `u/`: a prefix that overlaps the per-user namespace makes account erasure skip its namespace sweep. See [Integration → Global uploads](/document-management/integration/#global-uploads-admin). |
 | `DOC_STAGING_PREFIX` | No | `.staging` | Folder prefix **within a user's namespace** (`u/<userId>/`) on the shared default provider where **Local Connect offline uploads** are staged until the local machine reconnects and they are organised into the local folder. See [Security → Local Connect](/document-management/security/#local-connect-ephemeral-providers). |
 | `DOC_LOCAL_CONNECT_DOWNLOAD_URL` | No | — (empty = hidden) | Public URL of the **Local Connect companion installer**. Surfaced read-only to the browser through `GET /settings` and shown as the **Download companion app** button on the Document Storage page's Local Connect card. Leave empty and the card shows a "not configured yet" note instead of a button. Not a secret. See [Local Connect companion download](#local-connect-companion-download). |
 | `DOC_CF_API_TOKEN` | No (managed tunnels only) | — (secret) | Cloudflare API token used to provision a tunnel per Local Connect computer. Needs **Account → Cloudflare Tunnel → Edit** and **Zone → DNS → Edit** on the zone below. Sent only as an `Authorization` header to Cloudflare; never stored in the database and never returned by the API. Leave unset and Local Connect tunnel provisioning is simply off. |
@@ -36,7 +37,7 @@ The backend reads fifteen environment variables. Only `DOC_ENCRYPTION_KEY` is re
 | `DOC_LOCAL_CONNECT_DOMAIN` | No (managed tunnels only) | — | Domain the per-computer hostnames hang off, e.g. `lc.example.com` gives hostnames like `lc9f2c….lc.example.com`. Must sit inside `DOC_CF_ZONE_ID`. |
 | `DOC_LOCAL_CONNECT_MAX_TUNNELS` | No | `10` | Maximum tunnels one user may hold. A safety net against a companion looping on provisioning; raise it if a user genuinely links more computers. |
 | `DOC_S3_DEFAULT_REGION` | No (S3 only) | `ap-southeast-2` | Default AWS/R2 region applied when an S3 provider config omits `region`. Layers **over** the `defaultRegion` install prompt: the S3 adapter resolves the region as the provider config's own `region` → `DOC_S3_DEFAULT_REGION` → the baked `{{defaultRegion}}` value (default `ap-southeast-2`). Only emitted when `storageAdapters` is `s3` or `all`. |
-| `DOC_LOCAL_BASE_PATH` | No (local only) | `./data/doc-local` | Base directory the local filesystem adapter is restricted to. Only emitted when `storageAdapters` is `local` or `all`. |
+| `DOC_LOCAL_BASE_PATH` | No (local only) | `./data/doc-local` | Base directory the local filesystem adapter is restricted to. Each user's Local provider is pinned to `u/<userId>` under it, and account erasure deletes that folder. Only emitted when `storageAdapters` is `local` or `all`. |
 
 ### Example `.env`
 
@@ -53,6 +54,7 @@ DOC_ARTEFACT_PREFIX=.derived-artefacts  # where parsed-artefact bytes land by de
 DOC_GLOBAL_PREFIX=global                # admin global uploads, outside any user namespace
 DOC_STAGING_PREFIX=.staging             # Local Connect offline uploads, staged per user
 DOC_LOCAL_CONNECT_DOWNLOAD_URL=         # companion installer URL; blank hides the download button
+# DOC_ALLOW_PRIVATE_ENDPOINTS=true      # let every user reach loopback/LAN storage (development only)
 
 # Only when the S3 adapter is enabled
 DOC_S3_DEFAULT_REGION=ap-southeast-2
@@ -65,12 +67,23 @@ DOC_LOCAL_BASE_PATH=./data/doc-local
 The key is used for both encryption and decryption. If you change `DOC_ENCRYPTION_KEY` after providers have been saved, every existing `doc_storage_provider.config` blob becomes **undecryptable** and the adapter will throw on connect. Treat the key as permanent for the life of the data, or re-enter every provider's credentials after a deliberate rotation.
 </Aside>
 
+<Aside type="note" title="Settings that affect account erasure">
+When a user's account is deleted, Document Management deletes their files under `u/<userId>/` on shared storage and their server-local folder `DOC_LOCAL_BASE_PATH/u/<userId>`. Two settings shape that:
+
+- **`DOC_LOCAL_BASE_PATH`** is the root the purge works from. Keep it stable: a user's Local files live under it, and changing it later leaves the old folders behind. The purge skips a user's folder when it is part of a shared store, such as a Local provider that is the app-wide default.
+- **`DOC_GLOBAL_PREFIX`** must not overlap `u/`. Global uploads are organisation content and survive their uploader's erasure; if the prefix overlapped the per-user namespace, the sweep could not tell them apart, so it refuses to run.
+
+Files uploaded in communal mode (isolation off) sit outside `u/<userId>/` and are kept. See [Security → Account Erasure](/document-management/security/#account-erasure-and-data-categories).
+</Aside>
+
 <Aside type="tip" title="How the defaults are read in code">
-`DOC_MAX_UPLOAD_SIZE`, `DOC_MAX_FILE_COUNT`, `DOC_ACCEPTED_MIME_TYPES`, `DOC_THUMBNAIL_CACHE_DIR`, `DOC_ARTEFACT_PREFIX`, `DOC_GLOBAL_PREFIX`, `DOC_STAGING_PREFIX`, and `DOC_LOCAL_CONNECT_DOWNLOAD_URL` are resolved in `document-management.config.ts`; `DOC_S3_DEFAULT_REGION` in `adapters/s3.adapter.ts`; `DOC_LOCAL_BASE_PATH` in `adapters/local.adapter.ts`. Each falls back to the default above when unset, so the module boots even with only `DOC_ENCRYPTION_KEY` provided. The three upload limits (`DOC_MAX_UPLOAD_SIZE` / `DOC_MAX_FILE_COUNT` / `DOC_ACCEPTED_MIME_TYPES`) are **defaults only** — an admin can override each on `/admin/documents`, and `getUploadLimits()` resolves the effective value (the `doc_app_settings` override if set, else the env default).
+`DOC_MAX_UPLOAD_SIZE`, `DOC_MAX_FILE_COUNT`, `DOC_ACCEPTED_MIME_TYPES`, `DOC_THUMBNAIL_CACHE_DIR`, `DOC_ARTEFACT_PREFIX`, `DOC_STAGING_PREFIX`, `DOC_LOCAL_CONNECT_DOWNLOAD_URL` and the Local Connect tunnel variables are resolved in `document-management.config.ts`; `DOC_GLOBAL_PREFIX` in `document-management.service.ts` (`globalPrefix()`); `DOC_ALLOW_PRIVATE_ENDPOINTS` in `adapters/endpoint-guard.ts`; `DOC_S3_DEFAULT_REGION` in `adapters/s3.adapter.ts`; `DOC_LOCAL_BASE_PATH` in `adapters/local.adapter.ts` and in the service, which derives each user's Local root and the account-erasure purge from it. Each falls back to the default above when unset, so the module boots even with only `DOC_ENCRYPTION_KEY` provided. The three upload limits (`DOC_MAX_UPLOAD_SIZE` / `DOC_MAX_FILE_COUNT` / `DOC_ACCEPTED_MIME_TYPES`) are **defaults only** — an admin can override each on `/admin/documents`, and `getUploadLimits()` resolves the effective value (the `doc_app_settings` override if set, else the env default).
 
 ```typescript
-// document-management.config.ts
-export const MAX_UPLOAD_SIZE = Number(process.env.DOC_MAX_UPLOAD_SIZE ?? 50 * 1024 * 1024);
+// document-management.config.ts — a missing or invalid number falls back to the default
+const rawMaxUpload = Number(process.env.DOC_MAX_UPLOAD_SIZE ?? 50 * 1024 * 1024);
+export const MAX_UPLOAD_SIZE =
+  Number.isFinite(rawMaxUpload) && rawMaxUpload > 0 ? Math.floor(rawMaxUpload) : 50 * 1024 * 1024;
 export const THUMBNAIL_CACHE_DIR = process.env.DOC_THUMBNAIL_CACHE_DIR || './data/doc-thumbnails';
 export const ARTEFACT_PREFIX = process.env.DOC_ARTEFACT_PREFIX || '.derived-artefacts';
 
@@ -81,7 +94,7 @@ const DEFAULT_REGION = process.env.DOC_S3_DEFAULT_REGION || '{{defaultRegion|ap-
 </Aside>
 
 <Aside type="note" title="Artefact retention is admin-set, not an env var">
-`DOC_ARTEFACT_PREFIX` only decides **where** parsed-artefact bytes land. **How long they are kept** is a runtime **admin policy**, not an environment variable: `artefactKeepVersions` (keep the N newest versions per source + format) and `artefactMaxAgeDays` (delete artefacts older than N days) live on `doc_app_settings` and are set via the admin-only `PUT /settings` (alongside `allowedAdapters` / `defaultProviderId`), with the admin-only `POST /artefacts/prune` applying the policy on demand. Both default to `null` — every artefact version is kept forever until an admin opts in. `GET /settings` returns `artefactRetention: { keepVersions, maxAgeDays }`. Document Management does **not** surface a retention card of its own (it never creates artefacts — they are produced by another feature such as cognitive-pipeline, which owns any retention UI); this API stays available for such a producer to drive. Removed from the DM admin page in 1.15.2. See [Database](/document-management/database/#doc_app_settings) and [Integration](/document-management/integration/#parsed-artefacts--provenance).
+`DOC_ARTEFACT_PREFIX` only decides **where** parsed-artefact bytes land. **How long they are kept** is a runtime **admin policy**, not an environment variable: `artefactKeepVersions` (keep the N newest versions per source + format) and `artefactMaxAgeDays` (delete artefacts older than N days; at most 36,500, and a larger value is a `400`) live on `doc_app_settings` and are set via the admin-only `PUT /settings` (alongside `allowedAdapters` / `defaultProviderId`), with the admin-only `POST /artefacts/prune` applying the policy on demand. Both default to `null` — every artefact version is kept forever until an admin opts in. `GET /settings` returns `artefactRetention: { keepVersions, maxAgeDays }`. Document Management does **not** surface a retention card of its own (it never creates artefacts — they are produced by another feature such as cognitive-pipeline, which owns any retention UI); this API stays available for such a producer to drive. Removed from the DM admin page in 1.15.2. See [Database](/document-management/database/#doc_app_settings) and [Integration](/document-management/integration/#parsed-artefacts--provenance).
 </Aside>
 
 ## Local Connect managed tunnels
@@ -136,6 +149,36 @@ DOC_LOCAL_CONNECT_DOWNLOAD_URL=https://downloads.example.com/local-connect/lates
 ```
 
 See [Usage → Local Connect card](/document-management/usage/#local-connect-link-this-computer) for the user-facing flow, and the [Local Connect companion setup](/document-management/local-connect/setup/) for the whole link-and-share journey.
+
+## Private-network storage endpoints
+
+Since v1.18.0 the server checks every storage endpoint it connects to (an S3 `endpoint` or a WebDAV `baseUrl`) against an address policy, so a provider cannot be used to reach services on the server's own network. There are three tiers:
+
+| Tier | Examples | Allowed for |
+|------|----------|-------------|
+| Public | AWS S3, Cloudflare R2, Wasabi, a hosted Nextcloud, Local Connect tunnel hostnames | Everyone |
+| Private | `localhost`, a Docker-network MinIO, a NAS on the office LAN, a Tailscale address | Providers an admin saves from a web session, or **every** provider when `DOC_ALLOW_PRIVATE_ENDPOINTS=true` |
+| Always refused | Cloud-metadata and link-local addresses, and other reserved ranges | Nobody |
+
+**When to set `DOC_ALLOW_PRIVATE_ENDPOINTS=true`:** your users (not just admins) need to connect storage that only exists on a private network, for example in local development, or in a single-team deployment whose MinIO or NAS lives on the LAN. Leave it at the default `false` on a multi-user or internet-facing deployment, and have an admin add private-network storage instead. The variable is read when the backend starts, so restart after changing it.
+
+A refused endpoint is a `400` with code `endpoint_not_allowed`, at save time and from the bucket-discovery calls. See [Security → Storage Endpoint Guard](/document-management/security/#storage-endpoint-guard-ssrf) for how the check works.
+
+<Aside type="caution" title="Upgrade note: existing private-network providers">
+After updating to v1.18.0 (no schema change: `npx document-management update --skip-schema`), existing providers whose endpoint is a loopback or private-network address are **refused at connect time**, because they were saved before the server recorded admin approval. Check the app-wide default first: if it is one of them, every user's uploads and downloads on it fail until it is restored. Either set `DOC_ALLOW_PRIVATE_ENDPOINTS=true` and restart, or have an admin re-add the provider (or re-save its full connection settings) from a web session. An admin can only re-save a provider they own, so a user's own private-network provider needs the environment variable. Cloud-metadata and link-local addresses stay refused either way.
+</Aside>
+
+## Browse listing limits
+
+Folder browsing has three code-level limits in `document-management.config.ts`. They are constants, not environment variables:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `DEFAULT_PAGE_SIZE` | `50` | Entries per browse page when the request names no `limit` |
+| `MAX_PAGE_SIZE` | `500` | Largest `limit` a browse request may ask for |
+| `MAX_FOLDER_LISTING` | `5000` | Most entries gathered from a provider for one folder. A larger folder is cut here and reported with `truncated: true` |
+
+Each browse request lists the whole folder (up to `MAX_FOLDER_LISTING`) and then sorts and pages it on the server. See [Integration → Browsing folders](/document-management/integration/#browsing-folders) for the API.
 
 ---
 
@@ -195,6 +238,7 @@ export interface S3ProviderConfig {
   accessKeyId: string;
   secretAccessKey: string;
   forcePathStyle?: boolean; // Required for MinIO and some S3-compatibles
+  allowPrivateNetwork?: boolean; // SERVER-SET ONLY: an admin approved a private-network endpoint
 }
 ```
 
@@ -204,8 +248,13 @@ export interface S3ProviderConfig {
 | `accessKeyId` | ✅ | Access key ID (encrypted at rest). |
 | `secretAccessKey` | ✅ | Secret access key (encrypted at rest). |
 | `region` | — | AWS/R2 region. Falls back to `DOC_S3_DEFAULT_REGION` when omitted. |
-| `endpoint` | — | Custom endpoint URL. Set this for R2, MinIO, or Wasabi; leave unset for AWS S3. |
+| `endpoint` | — | Custom endpoint URL (`http://` or `https://`). Set this for R2, MinIO, or Wasabi; leave unset for AWS S3. |
 | `forcePathStyle` | — | Path-style addressing. Defaults to `true` whenever an `endpoint` is set, which is what MinIO and most S3-compatibles need. |
+| `allowPrivateNetwork` | — | **Never sent by a client.** The server stamps it into the encrypted config when an admin saves a private-network endpoint, and recomputes it on every config write; a client-supplied value is stripped. |
+
+<Aside type="note" title="MinIO on localhost or the LAN">
+An `endpoint` on `localhost`, a Docker network or the office LAN is a private-network address. Only an admin, signed in to the web app, can save it, unless the operator sets `DOC_ALLOW_PRIVATE_ENDPOINTS=true`. See [Private-network storage endpoints](#private-network-storage-endpoints).
+</Aside>
 
 <Aside type="note" title="Path-style is inferred from the endpoint">
 You rarely need to set `forcePathStyle` by hand. The adapter computes `forcePathStyle: c.forcePathStyle ?? Boolean(c.endpoint)` — so providing a custom endpoint (R2/MinIO/Wasabi) turns it on automatically, while plain AWS S3 stays on virtual-hosted-style. Presigned preview URLs are minted with a 300-second TTL.
@@ -266,15 +315,21 @@ export interface WebDAVProviderConfig {
   username?: string;
   password?: string;
   token?: string;           // Bearer token alternative to username/password
+  allowPrivateNetwork?: boolean; // SERVER-SET ONLY: an admin approved a private-network endpoint
 }
 ```
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `baseUrl` | ✅ | WebDAV root URL. For Nextcloud/ownCloud this is typically `https://host/remote.php/dav/files/<user>`. |
+| `baseUrl` | ✅ | WebDAV root URL (`http://` or `https://`). For Nextcloud/ownCloud this is typically `https://host/remote.php/dav/files/<user>`. |
 | `username` | — | Basic-auth username. Pair with `password`. |
 | `password` | — | Basic-auth password (encrypted at rest). |
 | `token` | — | Bearer token, used instead of username/password. Sent as `Authorization: Bearer <token>`. |
+| `allowPrivateNetwork` | — | **Never sent by a client.** Server-set when an admin saves a private-network `baseUrl`, as for S3. |
+
+<Aside type="note" title="A NAS on the LAN">
+A `baseUrl` that resolves to a LAN address (a Synology or QNAP NAS, a self-hosted Nextcloud on the office network) is a private-network endpoint. Only an admin, signed in to the web app, can save it, unless the operator sets `DOC_ALLOW_PRIVATE_ENDPOINTS=true`. A Local Connect folder is not affected: its `baseUrl` is a tunnel hostname on Cloudflare's public edge.
+</Aside>
 
 <Tabs>
   <TabItem label="Basic auth">
@@ -317,7 +372,7 @@ export interface LocalProviderConfig {
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `basePath` | ✅ | Root directory the adapter is locked to. Falls back to `DOC_LOCAL_BASE_PATH`, then `./data/doc-local`, when empty. |
+| `basePath` | ✅ | Root directory the adapter is locked to. For a provider created through the API, the server **overrides** it with the user's own root, `DOC_LOCAL_BASE_PATH/u/<userId>`, on create and whenever the config is updated, so one user's Local files can never overlap another's. (The adapter itself falls back to `DOC_LOCAL_BASE_PATH`, then `./data/doc-local`, when it is empty.) |
 
 ```typescript
 const localConfig: LocalProviderConfig = {
@@ -331,7 +386,7 @@ The local adapter logs an informational message (`log.info`, not a warning) when
 
 ### The Adapter Factory
 
-Regardless of which provider type you save, the service decrypts the config, augments it with `type`, and asks the factory for a connected adapter. The `readOnly` flag is injected here, before any I/O — that is the single enforcement point for read-only mode (see below).
+Regardless of which provider type you save, the service decrypts the config, augments it with `type`, and asks the factory for a connected adapter. The `readOnly` flag is injected here, before any I/O — that is the single enforcement point for read-only mode (see below). The S3 and WebDAV adapters' `connect()` also re-checks that the endpoint is an `http(s)` URL, and their clients dial through the endpoint guard's HTTP and HTTPS agents, which check the address of every connection and redirect (see [Private-network storage endpoints](#private-network-storage-endpoints)).
 
 ```typescript
 export async function createAdapter(
@@ -341,7 +396,7 @@ export async function createAdapter(
 ): Promise<StorageAdapter> {
   const AdapterClass = getAdapterClass(type); // s3|r2 → S3Adapter, webdav → WebDAVAdapter, local → LocalAdapter
   const adapter = new AdapterClass();
-  (adapter as { readOnly: boolean }).readOnly = options.readOnly ?? false;
+  (adapter as unknown as { readOnly: boolean }).readOnly = options.readOnly ?? false;
   await adapter.connect({ ...(config as object), type } as ProviderConfig);
   return adapter;
 }
@@ -427,8 +482,9 @@ The `defaultRegion` prompt is **only shown** when `storageAdapters` is `s3` or `
 ```typescript
 export type AdapterId = 's3' | 'webdav' | 'local';
 
-// Selected at init: 's3' | 'webdav' | 'local' | 'all'
-const SELECTED = '{{storageAdapters|s3}}';
+// Selected at init: 's3' | 'webdav' | 'local' | 'all'. Typed as string so the
+// 'all' comparison still type-checks when init bakes in a single adapter.
+const SELECTED: string = '{{storageAdapters|s3}}';
 
 export const ENABLED_ADAPTERS: AdapterId[] =
   SELECTED === 'all' ? ['s3', 'webdav', 'local'] : [SELECTED as AdapterId];
@@ -515,6 +571,7 @@ Use this when standing up the module in a target app:
 - [ ] **Local base path scoped** — `DOC_LOCAL_BASE_PATH` points at an intended directory (development only)
 - [ ] **Adapters selected** — `storageAdapters` chosen at init; `ENABLED_ADAPTERS` reflects what the UI should offer
 - [ ] **Custom endpoints for non-AWS** — R2/MinIO/Wasabi providers set `endpoint` (path-style is then inferred)
+- [ ] **Private-network storage decided** — `DOC_ALLOW_PRIVATE_ENDPOINTS` left `false` (admins add LAN/localhost storage) or set `true` deliberately; after upgrading to v1.18.0, existing LAN/localhost providers re-added or covered by the variable
 - [ ] **Read-only on evidence** — providers holding evidence/legal files created with `isReadOnly: true`
 
 ---

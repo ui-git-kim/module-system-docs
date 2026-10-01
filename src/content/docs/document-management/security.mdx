@@ -1,6 +1,6 @@
 ---
 title: Security
-description: The provider-delegated security model — credential encryption, Cloudflare Zero Trust, file proxying, content hashing, and legal/evidence considerations
+description: The provider-delegated security model — credential encryption, the outbound storage-endpoint guard, the caller trust model, Cloudflare Zero Trust, file proxying, content hashing, account erasure, and legal/evidence considerations
 sidebar:
   order: 7
 ---
@@ -19,7 +19,7 @@ The database stores **references, metadata, and your organisation** (favourites,
 
 ## Provider-Delegated Security
 
-The module does **not** implement its own authentication infrastructure, tunnel management, or TLS termination. Each layer of the security chain is handled by a dedicated provider that specialises in it. The app's only direct responsibility is encrypting storage credentials at the application layer.
+The module does **not** implement its own authentication infrastructure, tunnel management, or TLS termination. Each layer of the security chain is handled by a dedicated provider that specialises in it. The app's direct responsibilities are the controls only it can apply: encrypting storage credentials at the application layer, and deciding which storage addresses the server may connect to (see [Storage Endpoint Guard](#storage-endpoint-guard-ssrf)).
 
 <CardGrid>
   <Card title="Cloudflare Zero Trust Access" icon="approve-check">
@@ -124,15 +124,17 @@ export function decryptConfig<T = Record<string, unknown>>(payload: string): T {
 
 <Steps>
 
-1. **You submit provider credentials** through the admin Storage Providers page (`POST /providers`).
+1. **You submit provider credentials** through the Document Storage settings page or the admin Document Storage page (`POST /providers`).
 
-2. **The service encrypts the config** with `encryptConfig()` before the database write. The plaintext never touches the database.
+2. **The service vets the endpoint.** An S3 `endpoint` or WebDAV `baseUrl` must be an `http(s)` URL on a network the server is allowed to reach (see [Storage Endpoint Guard](#storage-endpoint-guard-ssrf)). The server, never the client, records whether an admin approved a private-network address.
 
-3. **Neon stores the ciphertext** in `doc_storage_provider.config`, itself encrypted at rest by Neon.
+3. **The service encrypts the config** with `encryptConfig()` before the database write. The plaintext never touches the database.
 
-4. **On use, the service decrypts** with `decryptConfig()` in memory, only when it needs to instantiate an adapter for a browse/download/upload.
+4. **Neon stores the ciphertext** in `doc_storage_provider.config`, itself encrypted at rest by Neon.
 
-5. **API responses redact the config entirely** — see below.
+5. **On use, the service decrypts** with `decryptConfig()` in memory, only when it needs to instantiate an adapter for a browse/download/upload.
+
+6. **API responses redact the config entirely** — see below.
 
 </Steps>
 
@@ -150,6 +152,9 @@ function toProviderResponse(p: StorageProvider): StorageProviderResponse {
     providerType: p.providerType,
     isDefault: p.isDefault,
     isReadOnly: p.isReadOnly,
+    isEphemeral: p.isEphemeral,
+    deviceId: p.deviceId ?? null,
+    deviceLabel: p.deviceLabel ?? null,
     status: p.status,
     statusMessage: p.statusMessage,
     lastCheckedAt: p.lastCheckedAt ? p.lastCheckedAt.toISOString() : null,
@@ -169,6 +174,8 @@ function toProviderResponse(p: StorageProvider): StorageProviderResponse {
 | Redact in responses | `toProviderResponse()` omits `config`; the client never sees credentials |
 | Never logged | Credentials are not logged, even at debug level |
 | Tamper-evident | GCM auth tag causes `decrypt()` to throw on any modified ciphertext |
+| Server-owned approval | The private-network approval flag (`allowPrivateNetwork`) lives inside the encrypted config and is only ever set by the server; a client-supplied value is discarded |
+| Client-safe errors | A stored `statusMessage` or connection-test result never echoes a raw network error (see [Client-safe connection errors](#client-safe-connection-errors)) |
 
 <Aside type="danger" title="Protect DOC_ENCRYPTION_KEY">
 `DOC_ENCRYPTION_KEY` is the single secret that protects every stored credential. Generate it with `openssl rand -hex 32`, store it only as a secret environment variable, and never commit it. If it is lost, stored credentials cannot be decrypted and providers must be re-connected. If it leaks, rotate it and re-encrypt all provider configs.
@@ -215,6 +222,98 @@ The companion registers the provider through the API itself — you do not add i
 # One row per shared folder, registered by the companion
 https://kim-laptop.example.com/s/3f9a1c2b7d4e/
 ```
+
+The tunnel hostname is also why Local Connect passes the [Storage Endpoint Guard](#storage-endpoint-guard-ssrf): it resolves to Cloudflare's public edge, not to the user's machine. A provider pointed straight at the companion's loopback port, with no tunnel, is a private-network endpoint. Only an admin can save one, or every user can once the operator sets `DOC_ALLOW_PRIVATE_ENDPOINTS=true`, which is meant for development only.
+
+---
+
+## Storage Endpoint Guard (SSRF)
+
+A storage provider's endpoint (an S3 `endpoint` or a WebDAV `baseUrl`) is supplied by whoever adds the provider. The server then connects to it and streams the answer back through browse, download and the connection test. Without a guard, a signed-in user could aim a provider at a service only the server can reach, such as a cloud-metadata endpoint, an admin console on the loopback interface or a host on the internal network, and read it through the app. This is server-side request forgery (SSRF). Since v1.18.0 every outbound storage connection is checked against an address policy.
+
+### Two layers, one classifier
+
+<CardGrid>
+  <Card title="Save time — a clear 400" icon="approve-check">
+    `POST /providers`, `PUT /providers/:id` (when the config changes), and the credential-first bucket routes `POST /providers/buckets` and `POST /providers/buckets/create`. The endpoint must be an `http://` or `https://` URL, and its IP address, or every address the hostname resolves to right now, must be allowed. A refusal is a `400` with code `endpoint_not_allowed`, returned before anything is saved or dialled.
+  </Card>
+  <Card title="Connect time — the enforcement point" icon="seti:lock">
+    The S3 and WebDAV clients dial through guarded HTTP and HTTPS agents that check the resolved address of **every** connection. A DNS answer that changes after the provider was saved, every redirect hop and IP-address hosts are all covered. So are providers saved before this release, because the check runs on each connection, not only at save time.
+  </Card>
+</CardGrid>
+
+A hostname that does not resolve yet, such as a brand-new tunnel, is accepted at save time. The connect-time layer still applies once it resolves. A host with several addresses is allowed only when **all** of them are, and IPv6 forms that carry an IPv4 address are judged as that IPv4 address.
+
+### Address tiers
+
+| Tier | Covers | Who may connect |
+|------|--------|-----------------|
+| **Always refused** | Cloud-metadata endpoints, link-local, unspecified, multicast and broadcast addresses, documentation (TEST-NET) and other reserved ranges, and anything that is not a valid IP address | Nobody: not admins, and not with `DOC_ALLOW_PRIVATE_ENDPOINTS` |
+| **Private** | Loopback, the RFC 1918 private ranges, carrier-grade NAT (also used by Tailscale), the benchmarking range, and IPv6 unique-local and site-local | Providers an admin saved from a web session, or every provider when `DOC_ALLOW_PRIVATE_ENDPOINTS=true` |
+| **Public** | Everything else, including Cloudflare's edge (Local Connect tunnels, R2) | Everyone |
+
+### Admin-saved private-network providers
+
+When an admin, signed in to the web app, saves a provider whose endpoint resolves into a private range (a development MinIO, a NAS on the office network), the server stamps an approval flag, `allowPrivateNetwork`, into that provider's **encrypted** config. The connect-time guard reads it and lets that one provider reach the private network. Anyone else who submits a private-network endpoint gets the `400`.
+
+The flag is server-owned. The validation schema strips any client-supplied value, the service discards it as a backstop, and it is recomputed on every config write. "Admin" comes from the session's role (see [Caller Trust Model](#caller-trust-model)); a linked device's token is never treated as admin, even when it belongs to an admin.
+
+### The operator opt-in
+
+`DOC_ALLOW_PRIVATE_ENDPOINTS=true` lets **every** provider, whoever saved it, reach loopback and private-network addresses. It suits a single-team or development deployment whose storage lives on a private network. It defaults to `false`, is read when the backend starts (restart after changing it), and never unlocks the always-refused tier. See [Configuration](/document-management/configuration/#private-network-storage-endpoints).
+
+### Client-safe connection errors
+
+Connection errors are rewritten before they reach a user, so no route can be used to scan hosts or ports:
+
+- **Refusals** use fixed text that never names the resolved address: "This storage address is not allowed. Storage on a private or internal network can only be added by an administrator." An endpoint that is not a valid `http(s)` URL gets an equally fixed message.
+- **Network-level failures** (refused, reset or timed-out connections, DNS and TLS failures, failed redirects) collapse to one sentence: "Could not reach the storage server. Check the address and that the server is online."
+- **The storage server's own answer** (a bad key, a missing bucket, access denied) is kept, capped at 200 characters, because the user needs it to fix their settings.
+
+This applies to the connection test and the stored `statusMessage`, bucket discovery, browse and download errors, and the `lastError` of an offline-staged upload awaiting reconcile.
+
+<Aside type="caution" title="Upgrading to v1.18.0: private-network providers">
+Providers saved before v1.18.0 carry no approval flag. After the update (no schema change: `npx document-management update --skip-schema`), any existing provider whose endpoint is a loopback or private-network address, such as a Docker-network MinIO or a LAN NAS, is **refused at connect time**. If that provider is the app-wide default, every user's uploads to it and downloads from it fail until it is restored. To restore it, either:
+
+- set `DOC_ALLOW_PRIVATE_ENDPOINTS=true` and restart the backend, or
+- have an admin, signed in to the web app, re-add the provider, or re-save its full connection settings. An admin can only re-save a provider they own, so a user's own private-network provider, or an organisation-owned one, needs the environment variable.
+
+Providers on cloud-metadata or link-local addresses stay refused either way.
+</Aside>
+
+---
+
+## Caller Trust Model
+
+Every trust decision beyond "which user is this" is derived from the **authenticated request**, never from the request body. The controller builds one small principal from `req.user`:
+
+| Field | Meaning | Source |
+|-------|---------|--------|
+| `device` | The request used a **device token** (for example the Local Connect companion), a lower-trust credential that lives on a computer | `req.user.authMethod === 'device'` |
+| `admin` | An admin **web session** | `req.user.role === 'admin'`, which the starter's `attachRole` / `requireAdmin` middleware populates. It is never true for a device token |
+
+The routes whose handlers need admin-ness run the starter's `attachRole` middleware: `GET /settings`, `POST /providers`, `POST /providers/buckets`, `POST /providers/buckets/create`, `PUT /providers/:id` and `POST /providers/:id/test`. They deliberately stay open to non-admins, because the companion calls create, update and test on its own rows with a device token. Admin-only routes, such as `PUT /settings`, use `requireAdmin`.
+
+What admin-ness unlocks on those routes:
+
+- **Provisioning storage past the user policy.** Admins bypass the user self-service storage policy, including the `disabled` (app-managed) setting, because they provision the app-wide shared provider.
+- **Saving a private-network endpoint**, as described above.
+- **The admin view of the settings.** `GET /settings` adds the admin-only `defaultProvider` descriptor and sets `viewerIsAdmin`. `viewerIsAdmin` only tells the UI what to show; it is not a security gate.
+
+Before v1.18.0 these routes never populated the role, so the admin bypass silently did not apply. Cross-module and server-internal callers pass no principal and are trusted like a web session: they act for a user id the calling module has already authorised.
+
+### Linked devices and the shared store
+
+The app-wide shared default is an ordinary provider row owned by the admin who provisioned it, so owner rights over it span every user's `u/<userId>/` namespace and the global prefix. A device token never gets those owner rights, even when it belongs to that admin:
+
+| Operation on the current app-wide default, with a device token | Result |
+|------------------------------------------------------------------|--------|
+| Browse, file info, upload to a named path, bulk download, manual references (`POST /documents`), update (`PUT /providers/:id`) and test | `403`: "The app-wide shared storage can only be browsed or managed from a web session, not from a linked device." |
+| Live search | That provider is skipped; only database-reference results are returned |
+| Download, preview, ingest, include a folder | Resolved as for any other user: confined to the device owner's own `u/<userId>/` namespace, plus references they hold that isolation honours |
+| `POST /upload` (upload to default) | Treated as a shared upload: namespaced under `u/<userId>/` when isolation is on, the file name reduced to a basename, and the owned reference returned as `documentId` |
+
+The admin's web session is unchanged. The restriction covers the **current** app-wide default only; a store that was the default earlier is not covered yet, and that follow-up is on the [roadmap](/document-management/roadmap/).
 
 ---
 
@@ -267,6 +366,21 @@ function contentDisposition(fileName: string): string {
   return 'attachment; filename="' + (ascii || 'download') + '"; filename*=UTF-8' + "''" + encoded;
 }
 ```
+
+### Download streams fail cleanly
+
+Every download route (`/download`, the bulk zip and the parsed-artefact download) streams through one helper, so the failure rules are the same everywhere:
+
+- **Opening the file fails.** The adapter rejects before any byte is sent, rather than reporting the failure later as a stream error that nothing may be listening for yet. On WebDAV and the local adapter a missing file is a `404`, and a refused or unreachable WebDAV server is a `503` with the [client-safe message](#client-safe-connection-errors).
+- **The body fails before the first byte.** The response is the typed JSON error, without the attachment header.
+- **The body fails part-way.** The response is cut, so a truncated file never looks complete.
+- **The client goes away.** The upstream stream is destroyed and its storage connection is released, instead of sitting paused in the pool.
+
+A bulk zip adds its files one at a time over a single storage connection. A file that cannot be opened is left out; a file that fails part-way stops the download rather than producing a zip that holds a truncated file.
+
+### PDF preview runs same-origin
+
+The PDF.js worker used by `FilePreview` is bundled from the installed `pdfjs-dist` and served from the app's own origin. No third-party CDN code runs in the app origin or sees previewed PDFs, and preview works under a `script-src 'self'` Content Security Policy.
 
 ---
 
@@ -401,6 +515,24 @@ Because each row records **who** (`userId`), **what** (`providerId` + `remotePat
 The recent-access log is capped per user (`RECENT_ACCESS_CAP`, default 100 rows) with older rows pruned. For long-term legal retention, export or replicate the audit rows to durable storage rather than relying solely on the in-app capped log.
 </Aside>
 
+A single-file download is recorded **before** the file is opened, so one that then fails still appears as a `download` attempt. A bulk zip records each file once its entry has been written.
+
+### Audit-tagged log lines
+
+`doc_recent_access` tracks file access. Security and policy changes go to the backend log instead, each line tagged `audit: true`, so filtering the log on that field gives the security trail. The lines carry ids, field names and counts. They never carry credentials, config values, Local Connect run tokens or file paths.
+
+| Event | What the line records |
+|-------|-----------------------|
+| Provider connected | `userId`, `providerId`, type, the default / read-only / ephemeral flags, and whether the admin policy bypass applied (never the config) |
+| Provider updated | `userId`, `providerId`, `changedFields` and `credentialsChanged`: field names only, never values |
+| Provider disconnected | `userId`, `providerId` |
+| Storage endpoint refused (save time) | `userId` and the refused host (see [Storage Endpoint Guard](#storage-endpoint-guard-ssrf)) |
+| Local Connect tunnel provisioned, re-issued or deleted | `userId`, `machineKey`, tunnel id and hostname. Re-issues include the branch where two requests race; the run token is never logged |
+| Admin policy change | `actorId` (the admin) plus the new values, for: allowed engines; the app-wide default and isolation (with `changedFields`); the default-provider rename; the user self-service policy; upload limits; artefact retention; node-type upload locations set or removed; and an artefact prune that deleted rows |
+| Account erasure | `userId`, the cascade `trigger`, row counts, `sharedProvidersRetained` and `sharedProviderIds`, the namespace-sweep results and the retained-file counts (see [Account Erasure](#account-erasure-and-data-categories)) |
+
+Refusals at connect time (a provider dialling a disallowed address) are logged as warnings without the audit tag.
+
 ---
 
 ## Path-Traversal Prevention (Local Adapter)
@@ -440,7 +572,7 @@ The `LocalAdapter` is intended for development and logs an informational message
 
 ## Upload Size Enforced on the Stream
 
-Upload size is enforced on the **byte stream**, not just the spoofable `Content-Length` header. A counting transform aborts the upload the moment the running total exceeds `DOC_MAX_UPLOAD_SIZE` (default `52428800`, i.e. 50MB).
+Upload size is enforced on the **byte stream**, not just the spoofable `Content-Length` header. A counting transform aborts the upload the moment the running total exceeds the effective cap: the admin's **Upload limits** override when one is set (at most 2,147,483,647 bytes, just under 2 GiB), otherwise `DOC_MAX_UPLOAD_SIZE` (default `52428800`, i.e. 50MB).
 
 ```typescript
 /** Passthrough stream that aborts once maxBytes have flowed through it. */
@@ -461,15 +593,17 @@ function createSizeLimiter(maxBytes: number): Transform {
 }
 ```
 
-The controller checks the declared `Content-Length` as a fast-fail and then pipes the request body through the limiter so an under-reported length can't sneak past:
+Every upload route (`POST /upload`, `POST /upload/:providerId` and `POST /upload-global`) runs through one helper, `runSizeLimitedUpload`, so the routes cannot drift apart. It reads the effective cap per request (an admin change applies without a restart), checks the declared `Content-Length` as a fast-fail, then pipes the request body through the limiter so an under-reported length can't sneak past:
 
 ```typescript
-if (contentLength > MAX_UPLOAD_SIZE) {
-  res.status(413).json({ error: 'File exceeds the maximum upload size', code: 'too_large' });
+const { maxUploadSize } = await documentManagementService.getUploadLimits();
+const contentLength = Number(req.headers['content-length'] ?? 0);
+if (contentLength > maxUploadSize) {
+  sendTooLarge(res); // 413 { error: 'File exceeds the maximum upload size', code: 'too_large' }
   return;
 }
-const limited = req.pipe(createSizeLimiter(MAX_UPLOAD_SIZE));
-// ... if the stream limiter aborts, respond 413 'too_large'
+const limited = req.pipe(createSizeLimiter(maxUploadSize));
+// ... if the stream limiter aborts (UPLOAD_TOO_LARGE), respond with the same 413
 ```
 
 <Aside type="tip" title="Raw body uploads">
@@ -478,8 +612,10 @@ Uploads use the raw request body with a `?path=` query parameter (which names th
 
 | Control | Where | Limit |
 |---------|-------|-------|
-| `Content-Length` fast-fail | Controller, before streaming | `DOC_MAX_UPLOAD_SIZE` (default 50MB) → HTTP 413 `too_large` |
-| Stream byte count | `createSizeLimiter` transform | `DOC_MAX_UPLOAD_SIZE` → abort with `UPLOAD_TOO_LARGE` → HTTP 413 |
+| `Content-Length` fast-fail | `runSizeLimitedUpload`, before streaming | Effective cap (admin override, else `DOC_MAX_UPLOAD_SIZE`, default 50MB) → HTTP 413 `too_large` |
+| Stream byte count | `createSizeLimiter` transform | Effective cap → abort with `UPLOAD_TOO_LARGE` → HTTP 413 |
+
+Files of 2 GiB or more upload normally when the cap allows them, but the `Int` size columns cannot hold their size, so the reference stores `fileSize: null` (size unknown). The `documents.document.uploaded` event still carries the real size.
 
 ---
 
@@ -521,7 +657,7 @@ model doc_document {
   remotePath     String                 // pointer into the provider — not content
   fileName       String
   mimeType       String?
-  fileSize       Int?
+  fileSize       Int?                   // bytes; null when unknown or 2 GiB or larger
   contentHash    String?                // SHA-256 for integrity verification
   isFavourite    Boolean  @default(false)
   status         String   @default("active")   // active | archived
@@ -561,33 +697,67 @@ The strongest form of data sovereignty is a source whose raw files **never leave
 The raw original stays on the user's machine; only the **derived** knowledge base (extracted text + embeddings) lives in the app. That is a deliberate choice — the searchable index leaves the machine, the evidence does not — and it is what lets a legal source be both *ingestible* and *never uploaded*.
 </Aside>
 
-<Aside type="caution" title="Communal mode: repointing the default is not a revocation control">
-`resolveFileProvider` honours any reference the caller owns, regardless of which provider is the *current* app-wide default (so offline-staged bytes stay readable after an admin repoints it). With per-user isolation **on** (the default), a user can only ever hold a reference to their own `u/<userId>/` namespace, so this never crosses tenants. With isolation **off** (`defaultIsolateUsers=false`, communal mode), a user can hold a reference to a deliberately-shared file — and repointing/unsetting the app-wide default no longer severs it. To revoke access to a specific communal file, delete the reference (or the underlying bytes/provider), not the default pointer.
+<Aside type="caution" title="Owned references, isolation, and revocation">
+`resolveFileProvider` honours a reference the caller owns by the provider it names, whichever provider is the *current* app-wide default. That keeps offline-staged bytes readable after an admin repoints the default, and lets an admin read back their global uploads. A reference to a store the caller does not own is only ever a server write: `uploadToDefault`, `uploadGlobal` and offline staging create one for the caller's own content, and `ensureReference` (behind `POST /ingest`) creates one for a path the resolver already let the caller reach.
+
+**Isolation on (the default).** Since v1.18.0 such a reference is honoured only inside the caller's own `u/<userId>/` namespace or the global prefix. That includes references created while isolation was off, so switching isolation on revokes a user's communal-era references outside their namespace. The bytes stay on the store, and an admin can move them from a web session.
+
+**Isolation off** (`defaultIsolateUsers=false`, communal mode). A reference to a deliberately-shared file keeps working, and repointing or unsetting the app-wide default does not sever it. To revoke access to a specific communal file, delete the reference (or the underlying bytes or provider), not the default pointer.
 </Aside>
 
 ---
 
 ## Account Erasure and Data Categories
 
-The module declares a **security manifest** (`security.registration.ts`) so the host can erase a user's data when their account is deleted. The account-deletion handler removes **every per-user table** in a single transaction — providers, documents, node links, folder bookmarks, the recent-access log, included folders, parsed artefacts, and pending reconciles.
+The module declares a **security manifest** (`security.registration.ts`) so the host can erase a user's data when their account is deleted. Since v1.18.0 the deletion handler tells the user's **personal data** apart from **shared infrastructure** they happened to create, and it reaches the user's files on operator-controlled storage, not only their database rows.
 
-Two categories have **bytes on a storage provider**, not just metadata rows, and get an extra step before the row deletion: **parsed artefacts** (`purgeUserArtefactBlobs`) and **offline-staged uploads** awaiting reconcile (`purgeUserStagedBytes`). Both best-effort delete the bytes from storage, **confined to the user's `u/<userId>/` namespace** on shared providers so they can never touch another tenant's data, and **never throw** — a provider being unreachable does not block the account deletion. The `doc_parsed_artefact` and `doc_pending_reconcile` metadata rows are then removed inside the same transaction as the other per-user tables.
+<Steps>
+
+1. **Classify the user's providers.** A provider the user owns is **shared infrastructure** when it is the app-wide default, or when any other user's reference, offline-staged upload (any status) or parsed artefact points at it. A database failure here fails the handler before anything is erased, so the account-deletion cascade retries it.
+
+2. **Purge the bytes the user's rows point at:** parsed artefacts (`purgeUserArtefactBlobs`) and offline-staged uploads (`purgeUserStagedBytes`), by exact path, best effort.
+
+3. **Sweep the user's namespace on operator storage.** Everything under `u/<userId>/` is deleted, recursively, on every shared store the user has bytes on: the current app-wide default, former defaults and staging stores (found from the user's own rows), and the user's own providers classified as shared infrastructure. The prefix is reserved for that user whatever the current isolation setting. Local Connect (ephemeral) stores are never swept, because they are a user's own machine.
+
+4. **Purge the server-local folder** `DOC_LOCAL_BASE_PATH/u/<userId>`, where a user's Local provider keeps its files, and which is left behind even after the provider is removed. The purge is skipped when that folder is part of a shared store: the user's Local provider is shared infrastructure, or a Local provider someone else owns (typically the organisation) is based on, above or inside it. If an overlap cannot be ruled out, the folder is kept and reported.
+
+5. **Tear down Local Connect managed tunnels** at Cloudflare.
+
+6. **One transaction for the rows.** The per-user rows are deleted, and shared-infrastructure providers are **kept and re-owned** to the organisation (`org:document-management`), with the user's default flag and the Local Connect device fields cleared. The user's other providers are deleted. The current app-wide default is re-read just before the transaction, so `defaultProviderId` never points at a deleted row.
+
+</Steps>
+
+Re-owning instead of deleting matters because every other user's references, staged uploads and artefacts are pinned to the provider's id, and the row holds the only copy of the operator's encrypted credentials. Deleting it would cut those users off for good; a re-added bucket gets a new id that none of their rows point at. The config is operator credentials, not the erased person's data. No signed-in principal ever has the organisation's owner id, so nobody gets owner access to an organisation-owned store: every file operation on it goes through the namespace-guarded paths. An admin sees an organisation-owned default on `/admin/documents`, labelled "(organisation)", and can rename it there. Its connection settings cannot be edited, tested or removed yet; organisation-owned provider management is on the [roadmap](/document-management/roadmap/).
+
+**Kept by design:**
+
+- **The user's own storage**, such as their bucket, NAS or Local Connect machine. It is their storage, not the operator's, so the module never deletes from it.
+- **Files outside `u/<userId>/` on shared stores**: communal-mode uploads (isolation off), global uploads under `DOC_GLOBAL_PREFIX`, and files the user added as the owner of a store that is now organisation infrastructure. These are shared or organisation content. They are **counted, never listed**, in the cascade report and the audit line.
+- **Anything on a read-only store.** Read-only providers are never written to, so their namespace is not swept. Each one shows up as a failed store in the report.
+
+The handler's `detail` in the cascade report summarises what was kept or could not be reached, in counts only: shared providers re-owned to the organisation, stores where the namespace purge failed, a failed server-local purge, and files retained outside the namespace. A `DOC_GLOBAL_PREFIX` configured to overlap `u/` makes the namespace sweep refuse to run (it is logged), rather than guess which files are whose.
+
+<Aside type="tip" title="Keep isolation on when per-user erasure matters">
+With isolation **on**, everything a user uploads to the shared default lands under their own `u/<userId>/` and is erased with their account. In communal mode (isolation **off**) their shared-default uploads sit outside that namespace, so erasure deletes the user's references to them but keeps the files.
+</Aside>
 
 The category names below are exactly those declared in the manifest's `dataCategories`:
 
 | Data category | Classification | What is erased |
 |---------------|----------------|----------------|
-| `storage_providers` | `owned` | `doc_storage_provider` rows (including encrypted `config`) |
+| `storage_providers` | `owned` | `doc_storage_provider` rows (including encrypted `config`). Shared infrastructure is re-owned to the organisation instead of deleted |
 | `document_references` | `owned` | `doc_document` references |
 | `node_links` | `owned` | `doc_node_link` rows |
 | `folder_bookmarks` | `owned` | `doc_folder_bookmark` rows |
 | `included_folders` | `owned` | `doc_included_folder` rows |
 | `recent_access_log` | `owned` | `doc_recent_access` audit rows |
-| `parsed_artefacts` | `owned` | `doc_parsed_artefact` rows **and** the artefact bytes under the user's namespace |
-| `pending_reconcile` | `owned` | `doc_pending_reconcile` rows **and** the offline-staged upload bytes under the user's namespace |
+| `parsed_artefacts` | `owned` | `doc_parsed_artefact` rows **and** the artefact bytes |
+| `pending_reconcile` | `owned` | `doc_pending_reconcile` rows **and** the offline-staged upload bytes |
+
+On top of the categories, the handler deletes the user's files under `u/<userId>/` on shared storage and their server-local folder (steps 3 and 4), and their Local Connect tunnel rows.
 
 <Aside type="note" title="Best-effort byte purge, guaranteed row deletion">
-The byte purge is best-effort and namespace-confined; the metadata-row deletion is transactional and guaranteed. This ordering means a transient storage outage can leave orphaned bytes (within the user's own namespace) but never leaves a dangling reference row — and never reaches outside the deleted user's data.
+Deleting bytes is best effort per store: an unreachable or read-only store is logged (ids, counts and the error class, never file paths), reported, and skipped, and the row erasure still runs. Reading the rows that **locate** those bytes is not best effort. If they cannot be read, the handler fails and the cascade retries before any row is deleted, rather than reporting success and orphaning the files for good. The byte passes are idempotent, so a retried erasure is safe, including for the creator of an organisation-owned Local default. Every delete is confined to the erased user's namespace, their server-local folder, or the exact files their own rows point at.
 </Aside>
 
 ---
@@ -605,24 +775,34 @@ A consolidated lookup of every control described on this page.
 | Credential storage | Encrypted ciphertext in `doc_storage_provider.config` (`@db.Text`) | Database |
 | Credential redaction | `toProviderResponse()` omits `config` | `document-management.service.ts` |
 | Tamper detection | GCM auth tag throws on modified ciphertext | `utils/encryption.ts` |
+| Outbound endpoint guard (SSRF) | Address classifier + guarded HTTP/HTTPS agents (every connection, redirect and DNS answer) + save-time `400 endpoint_not_allowed`; private networks only for admin-saved providers or `DOC_ALLOW_PRIVATE_ENDPOINTS` | `adapters/endpoint-guard.ts` |
+| Client-safe connection errors | Fixed refusal text; network failures collapsed to one sentence; provider answers capped | `safeConnectionMessage()` in `adapters/endpoint-guard.ts` |
+| Caller principal | `device` / `admin` derived from the session only (`attachRole` / `requireAdmin`), never the body | `principalOf()` in the controller |
+| Device tokens on the shared store | No owner rights over the current app-wide default; namespace-confined like any other user | `findOwnedProviderRow`, `getProviderRow` |
+| Owned-reference isolation | With isolation on, owned references honoured only inside `u/<userId>/` or the global prefix | `resolveFileProvider` |
 | File proxying | Backend streams bytes; frontend never holds long-lived credentials | `download` / `preview` controller |
+| Download stream hygiene | Open failures reject up front; mid-body failure cuts the response; client abort releases the storage connection | `sendStream` (controller), adapters' `download()` |
 | Short-lived presigned URLs | Preview-only, provider-issued (S3/R2) | `preview` endpoint (`{ kind: 'url' }`) |
+| PDF preview worker | PDF.js worker bundled from the installed `pdfjs-dist` and served same-origin; no third-party CDN code runs in the app origin or sees previewed PDFs | `FilePreview.tsx` |
 | Read-only enforcement | `assertWritable()` → `ReadOnlyError` (403) at the adapter | Adapters |
 | Ephemeral (Local Connect) sovereignty | Raw bytes never persisted; derived artefacts redirected off the machine; `contentHash` by default; offline ⇒ `unavailable` | `isEphemeral`, `resolveArtefactTarget`, `createDocument` |
 | Content integrity | SHA-256 `contentHash` + Verify Integrity re-hash | `utils/encryption.ts`, `doc_document` |
 | Access audit trail | `doc_recent_access` (who / what / action / when) | Database |
+| Security audit log | Log lines tagged `audit: true` for provider, tunnel, admin-policy and erasure events, with the admin `actorId` on policy changes | Backend log |
 | Path-traversal prevention | `safeResolve()` → `PathTraversalError` (403) | `LocalAdapter` |
-| Upload size enforcement | Counting transform aborts at `DOC_MAX_UPLOAD_SIZE` | `createSizeLimiter` |
+| Upload size enforcement | Counting transform aborts at the effective cap (admin override, else `DOC_MAX_UPLOAD_SIZE`) | `runSizeLimitedUpload`, `createSizeLimiter` |
 | Parsed-artefact integrity | SHA-256 `artefactHash` per stored artefact + `sourceContentHash` link | `doc_parsed_artefact` |
-| Account erasure | Per-user tables deleted in one transaction; artefact bytes purged within the user's namespace | `security.registration.ts` |
+| Account erasure | Per-user rows deleted in one transaction; shared-infrastructure providers re-owned to the organisation; `u/<userId>/` swept on every shared store and the server-local folder purged; the user's own storage untouched; communal and global files retained and counted | `security.registration.ts`, `purgeUserNamespaceBytes` |
 
 ### Security-relevant environment variables
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
 | `DOC_ENCRYPTION_KEY` | Yes (secret) | — | 32+ char key for AES-256-GCM credential encryption. Generate with `openssl rand -hex 32` |
-| `DOC_MAX_UPLOAD_SIZE` | No | `52428800` (50MB) | Maximum upload size, enforced on the byte stream |
-| `DOC_LOCAL_BASE_PATH` | No | `./data/doc-local` | Base directory the `LocalAdapter` is restricted to |
+| `DOC_ALLOW_PRIVATE_ENDPOINTS` | No | `false` | `true` lets every provider reach loopback and private-network storage endpoints. Off, only admin-saved providers may. Never unlocks cloud-metadata or link-local addresses. See [Storage Endpoint Guard](#storage-endpoint-guard-ssrf) |
+| `DOC_MAX_UPLOAD_SIZE` | No | `52428800` (50MB) | Default maximum upload size, enforced on the byte stream; an admin override takes precedence |
+| `DOC_LOCAL_BASE_PATH` | No | `./data/doc-local` | Base directory the `LocalAdapter` is restricted to. Each user's Local provider is pinned to `u/<userId>` under it, and account erasure purges that folder |
+| `DOC_GLOBAL_PREFIX` | No | `global` | Folder for admin global uploads on the shared default. Must not overlap `u/`, or the erasure namespace sweep refuses to run |
 | `DOC_THUMBNAIL_CACHE_DIR` | No | `./data/doc-thumbnails` | On-disk thumbnail cache directory |
 
 <Aside type="note" title="Per-provider credentials are not env vars">

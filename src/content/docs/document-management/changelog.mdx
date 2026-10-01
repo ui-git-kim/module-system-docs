@@ -13,7 +13,7 @@ This page documents notable changes to the **Document Management** module. The m
 - **Minor** (1.0.0 → 1.1.0): New features, backwards compatible
 - **Patch** (1.0.0 → 1.0.1): Bug fixes, documentation updates
 
-Each entry groups changes under **Added**, **Changed**, and **Security** so you can scan for what affects your installation.
+Each entry groups changes under headings such as **Security**, **Added**, **Changed**, **Fixed** and **Removed** so you can scan for what affects your installation.
 
 <Aside type="tip" title="Connector, not storage">
 Document Management V1 is a **renderer and connector**. It connects to external storage, browses, previews, and downloads files, and keeps lightweight document references that link to Structure nodes. The database stores references, metadata, and your organisation (favourites, tags, node links) — never file content. In-app file creation (Plate), versioning, workflow states, export, and the companion desktop app are planned for V2.
@@ -21,7 +21,115 @@ Document Management V1 is a **renderer and connector**. It connects to external 
 
 ---
 
-## v1.17.2 <Badge text="Current" variant="success" /> <Badge text="30 September 2026" variant="note" />
+## v1.18.0 <Badge text="Current" variant="success" /> <Badge text="1 October 2026" variant="note" />
+
+**Cleanup & security audit: every finding fixed.** This release resolves all 19 findings of the 2026-09-30 cleanup and security audit (1 critical, 5 moderate, 13 minor). It also fixes the 10 issues an adversarial review of those fixes found, and the 3 a second, focused review found, all before release. The headline is an outbound **storage endpoint guard**: a storage provider can no longer point the server at its own internal network. Large folders now page with **Load more**. Bookmarks, document preferences and bulk download, which were only half built, now work. Erasing an account no longer breaks shared storage, and it now removes the user's files from operator storage.
+
+<Aside type="caution" title="Updating">
+No schema change. `npx document-management update --skip-schema`.
+
+- **Storage on a private network is refused until you allow it.** After the update, an existing provider whose endpoint is a loopback or private-network address stops connecting. Examples are a development MinIO on `localhost` or a Docker network, or a NAS on the office LAN. Two fixes:
+  - set `DOC_ALLOW_PRIVATE_ENDPOINTS=true` in the backend `.env`, which lets any user connect private-network storage; or
+  - have an admin save the provider's connection settings again from a web session (`PUT /providers/:id` with its `config`, as its owner). An admin save stamps the provider as allowed and keeps its id, so existing references keep working. Re-adding it as a new provider also works, but the new provider gets a new id that existing references do not follow.
+
+  Cloud-metadata and link-local addresses are always refused, whatever the setting. Public endpoints (AWS S3, Cloudflare R2, Wasabi, a hosted Nextcloud) and Local Connect tunnels are unaffected.
+- **Communal-era references.** If the shared default ever ran with per-user isolation **off** and isolation is now on, a user's references to files outside their own `u/<userId>/` folder stop resolving (see Security).
+- **`DocumentLinkDialog` is gone.** The update offers to delete the orphaned `components/DocumentLinkDialog.tsx` (see Removed).
+</Aside>
+
+<Aside type="note" title="Host requirement: starter v2.13.0 or later">
+The generated frontend imports `getApiErrorMessage` from `@/lib/api`, and the generated backend routes import `attachRole` from the starter's auth middleware. Both ship in current starters. On a starter older than v2.13.0, `tsc` or `vite build` fails with "has no exported member `getApiErrorMessage`".
+</Aside>
+
+### Security
+
+- **Outbound storage endpoint guard (audit finding 1, critical).** The user supplies a provider's endpoint (an S3 `endpoint` or a WebDAV `baseUrl`), and the module streams back whatever that endpoint returns. An unchecked endpoint therefore let any signed-in user make the server fetch from its own internal network. Endpoints are now checked in two places:
+  - **When a provider is saved.** `POST /providers`, `PUT /providers/:id`, `POST /providers/buckets` and `POST /providers/buckets/create` answer `400` with code `endpoint_not_allowed`.
+  - **On every connection.** The S3 and WebDAV clients dial through guarded HTTP agents. These check each resolved address, every redirect hop and IP literals, so changing DNS after the save does not get past them.
+
+  Only `http` and `https` are accepted. Addresses fall into three tiers:
+  - cloud-metadata, link-local, unspecified, multicast and reserved ranges are **always refused**;
+  - loopback and private-network ranges are **allowed only for an admin, or for everyone when `DOC_ALLOW_PRIVATE_ENDPOINTS=true`**;
+  - all other addresses are public and allowed.
+
+  When an admin saves a private endpoint from a web session, the server stamps an `allowPrivateNetwork` flag into the encrypted config. A client can never set that flag, and a linked device never gets it. Local Connect is unaffected, because its tunnel hostnames resolve to Cloudflare's public edge. See [Security](/document-management/security/).
+- **Connection errors no longer echo network detail.** A connection test's stored `statusMessage` and the bucket-discovery `400` used to carry the raw network error, which could reveal internal hosts and ports. They now carry fixed, client-safe text: "This storage address is not allowed. Storage on a private or internal network can only be added by an administrator." for a refusal, and "Could not reach the storage server. Check the address and that the server is online." for a network failure.
+- **The admin policy bypass now works (finding 2).** Admins are meant to bypass the **User storage connections** policy, because they provision the shared default. Those routes never attached the caller's role, though, so the bypass never applied. Under **app-managed** (`disabled`), an admin's **Add provider** and bucket discovery returned `403`, and `viewerIsAdmin` was always `false`. `attachRole` is now on six routes: `GET /settings`, `POST /providers`, `POST /providers/buckets`, `POST /providers/buckets/create`, `PUT /providers/:id` and `POST /providers/:id/test`. Admins can now add providers under app-managed storage. Admin rights come only from the session role, and a device token is never admin.
+- **Isolation is re-checked on owned references (finding 7).** While per-user isolation is on, a reference to a provider the user does not own is honoured only inside their own `u/<userId>/` folder or the global prefix. That includes references created earlier in communal mode, so turning isolation on now revokes those. Before, such a reference was honoured wherever it pointed, and `ensureReference` (`POST /ingest`) could create one. This corrects the [v1.9.0](#v190) note, which assumed a user could only ever hold references inside their own namespace.
+- **Linked devices lose owner rights over the shared default (finding 8).** The app-wide shared default is a provider owned by the admin who added it, and owner rights span every user's folder and the global prefix. A device token belonging to that admin, such as their Local Connect companion, now gets a `403` on that store for browse, file info, upload by path, bulk download, manual references, update and test. Its download, preview, ingest and include are confined to what any other user could reach: its own `u/<userId>/` folder, plus references honoured under isolation. Its uploads land in that folder. The admin's web session is unchanged.
+- **Account erasure keeps shared storage and removes the user's files (audit findings 3 and 4, numbered #4 and #3 in the fix commit).** There were two problems. Erasing the account that created the app-wide default deleted that provider, which cut every other user off and left the default pointing at nothing. And the erased user's uploads stayed on operator storage. Now:
+  - Providers that are **shared infrastructure** are kept and **re-owned to the organisation** (`org:document-management`), so the default never dangles. Shared infrastructure means the app-wide default, or a store that another user's documents, staged uploads or parsed artefacts point at.
+  - The user's `u/<userId>/` folder is swept on every shared store: the current and former defaults, and the staging stores.
+  - The user's server-local folder (`DOC_LOCAL_BASE_PATH/u/<userId>`) is purged, unless it backs a shared store. Retrying an erasure is safe.
+  - The user's own bucket, NAS or Local Connect computer is never touched.
+  - Communal-mode, global and store-root files are kept by design. They are counted, never listed, in the deletion report.
+  - If the user's rows cannot be read, the handler fails, so the cascade retries before anything is erased.
+
+  Keep isolation on wherever per-user erasure matters.
+- **The PDF preview worker is bundled (finding 11).** The PDF.js worker used to load at run time from unpkg, so third-party code ran in the app's origin and received every previewed PDF. It is now bundled from the installed `pdfjs-dist` and served from the app's own origin. No CDN code runs in the app, and preview works under a `script-src 'self'` CSP.
+- **Audit-tagged security logs (finding 10).** These events now log with `{ audit: true }`:
+  - provider connected, updated (field names and whether credentials changed, never values) and disconnected;
+  - Local Connect tunnel provisioned, re-issued and deleted (never the run token);
+  - refused storage endpoints;
+  - every admin policy change, with the acting admin's `actorId`: allowed engines, the app-wide default and isolation, the default-provider rename, the user storage policy, upload limits, artefact retention, node-type upload folders and artefact prune;
+  - account erasure, with its trigger and any shared providers it kept.
+
+  Filtering on `audit: true` gives the security trail.
+
+### Added
+
+- **Paged, sorted folder browsing.** `GET /browse/:providerId/*` takes these query parameters:
+  - `limit` (default 50, max 500) and `offset`;
+  - `sortBy` (`name` | `date` | `size` | `type`) and `sortOrder` (`asc` | `desc`);
+  - `foldersOnly`.
+
+  Folders always list first, and the sort spans the whole folder, not just one page. Responses carry `totalCount`, `hasMore` and `truncated`. A folder lists at most 5,000 entries, and `truncated` says when that cap cut it short. An S3-compatible store that returns repeated or empty continuation pages is also cut short and flagged. See [Usage](/document-management/usage/).
+- **`useFolderPages(providerId, path, { pageSize, sortBy, sortOrder, foldersOnly })`** is an infinite query whose data is `{ items, totalCount, truncated }`. `useFolder` still returns one page; check `hasMore`. `FileBrowser` gains `sortBy`, `sortOrder` and `pageSize` props, pages with **Load more**, shows "Showing N of M", and notes when a folder is over the cap. The **Included folders** tree gets **Load more folders**.
+- **Multi-select zip download.** In list view, tick files and choose **Download .zip** (at most 200 files, one folder at a time; folders cannot be zipped). The zip is named after the folder. `useBulkDownload()` resolves to the zip `Blob`. The zip streams at once and adds files one at a time. A file that cannot be opened is left out, and a file that fails part-way cuts the download rather than producing a truncated zip.
+- **`useDocumentPreferences()`** returns `{ prefs, isLoading, save }`. The hooks file also exports `DEFAULT_FOLDER_PAGE_SIZE`, `DOCUMENT_PAGE_SIZES` and `DEFAULT_DOCUMENT_PREFERENCES`. Of the new hooks, only `useFolderPages` is in the feature barrel (`@/features/document-management`).
+- **Admins can rename the app-wide default, whoever owns it.** For an admin, `GET /settings` returns a `defaultProvider` summary (with `orgOwned`). `PUT /settings` accepts `defaultProviderName`, plus `defaultProviderNameFor` (the provider id the editor shows). If the default has changed since the page loaded, the server answers `409` (code `conflict`, "The default storage location changed. Reload the page and try again.") and writes nothing. `useRenameAppDefaultProvider()` takes `{ name, providerId }`. On the admin page, a default created by another admin or owned by the organisation shows as "(another admin)" or "(organisation)", keeps its adapter locked on, and can be renamed inline.
+- **`DOC_ALLOW_PRIVATE_ENDPOINTS`** (default `false`) is the operator opt-in for private-network storage. See [Configuration](/document-management/configuration/).
+
+### Changed
+
+- **The default browse page is 50 entries.** Before, WebDAV and Local returned the whole folder and S3 returned 100. Sorting happens on the server. "Newest first" and "Largest first" keep folders and ties in A-to-Z order.
+- **Errors show the server's reason.** `DocumentUpload`, the **Add provider** dialog (Connect, Create bucket and Add provider), Local Connect pairing, the "provider unavailable" card, bulk `.zip` download and the admin Document Storage page now show the message through the starter's `getApiErrorMessage`. They no longer show a generic or raw axios message. Upload failures on the Documents page, which used to fail silently, now read "Uploaded X of N files. Could not upload `name`: `reason`".
+- **"Max files per upload" applies everywhere (finding 12):** both Upload buttons on the Documents page, the Structure node Upload and its **Upload File** action, as well as `DocumentUpload`. It is still a client-side limit, because each file is a separate request.
+- **Downloads fail cleanly.** A missing file on a WebDAV or Local provider now returns `404` before any bytes are sent. A refused or unreachable WebDAV host returns `503` with the client-safe message. A failure before the first byte returns the JSON error without download headers. An aborted download releases its storage connection. File and zip downloads lift the host API client's 30-second timeout, so large files finish.
+- **A download is recorded in `doc_recent_access` before the file is opened**, so a download that then fails is still logged as an attempt.
+- **One upload size-limit helper.** The three upload routes share a single helper for the size limit. Behaviour is unchanged.
+
+### Fixed
+
+- **S3/R2 folders over 100 entries were silently cut short (finding 5).** `offset` was ignored, so the rest of the folder could not be reached, and `sortBy`/`sortOrder` were accepted but ignored. Both are now honoured on every provider.
+- **The Documents preferences panel saves and applies (finding 14).** **Settings → Preferences → Documents** (Default view, Sort files by, Items per page) was never saved or read. The values now persist in the user's starter preferences (the `documentManagement` key). **FileBrowser** applies them; the toolbar view toggle overrides the default for that visit.
+- **Folder bookmarks work (finding 15).** A **Bookmark folder** button sits beside the breadcrumb; click **Bookmarked** to remove it. Sidebar bookmarks now open their folder (`ProviderSidebar` gains `onSelectBookmark`), and `useBookmarks` takes `(providerId?, { enabled? })`.
+- **Out-of-range numbers return a clear `400` instead of a `500` (finding 9).** An upload cap of 2 GiB or more could never be saved. The admin override is now capped at 2,147,483,647 bytes, and `artefactMaxAgeDays` at 36,500. Bookmark and node-link `order` and artefact `version` must fit a 32-bit integer. A file of 2 GiB or more uploads and links normally. Its reference stores `fileSize` as `null` instead of failing the request and leaving the bytes orphaned.
+- **Host type error TS2367** in apps initialised with a single storage adapter (`s3`, `webdav` or `local`).
+
+### Removed
+
+- **`DocumentLinkDialog` (finding 16).** Nothing rendered it. With Structure installed, a node's **Documents** tab links files through its **Link document** sheet or **Upload**, with link type `attachment`. Set `reference` or `primary`, or add link notes, through `useLinkDocument()` or the API.
+- **Paging and sort options from the adapter contract.** `ListOptions` loses `limit`, `offset`, `sortBy`, `sortOrder` and `fileTypes`. It is now `{ maxItems }`: `listFolder` returns the whole folder up to that cap and sets `truncated`; the service sorts and pages. A hand-written custom adapter that reads `options.limit` no longer type-checks.
+- **Dead config:** the unused `getInstalledProviderTypes()`. The thumbnail util now reads `THUMBNAIL_CACHE_DIR` from the config, so the setting has one source.
+- **The hand-rolled `apiErrorMessage` reader** in **Add provider**, replaced by `getApiErrorMessage`.
+
+### Tooling
+
+None of these change the generated output or the schema.
+
+- **GitHub Actions CI (finding 6)** runs three jobs:
+  - **Module gates:** `npm ci`, type-check, build, `check:templates`, `check:template-syntax`, `parity:check`, conformance and a version-match check.
+  - **Dependency audit:** fails on moderate-or-higher advisories in the runtime dependencies, and high-or-higher across the whole tree. It also runs weekly.
+  - **Host type-check:** opt-in and parked. It installs the module into a bare starter and runs the host's `tsc` and `vite build`.
+
+  Conformance runs through a baseline wrapper that allows only the six by-design Structure C2 results. CI is advisory: it reports failures but cannot block a push. See [Developer Workflow](/document-management/developer-workflow/).
+- **`npm run check:template-syntax`** parses the code inside every template string with esbuild. This is the check that was previously a session-only script.
+- **esbuild advisory GHSA-g7r4-m6w7-qqqr cleared (finding 19).** The advisory sat in the esbuild nested under tsup, which is dev and build tooling only. It was not exploitable here. The fix is an `overrides.tsup.esbuild: "$esbuild"` pin and a runtime esbuild floor of `^0.28.1`.
+
+---
+
+## v1.17.2 <Badge text="30 September 2026" variant="note" />
 
 **Fixes uploads from a node's Documents tab not being linked for users without their own default storage.** When a user has no default of their own (their upload lands on the admin-set app-wide shared default) or their Local Connect default is offline (the upload is staged), the file was stored but never linked to the node, and the tab failed silently. Admins who own the shared default did not see it.
 
@@ -422,7 +530,7 @@ This is a frontend-and-config release. There is no database change, so a downstr
 ### Changed
 
 - **The route is the source of truth.** A consumer holding a stable `documentId` (e.g. cognitive-pipeline) reads a document wherever it currently lives — staging while offline, the local folder after reconnect — with nothing to change on its side. `getDefaultProviderRow` returns a user's ephemeral default; derived artefacts still never land on it (`resolveArtefactTarget` keeps them on durable storage).
-- **`resolveFileProvider` honours any owned reference.** A file the caller owns a reference to stays readable even after an admin repoints the app-wide default away from the provider it was staged on. This does not weaken tenant isolation: with per-user isolation on (the default), the only reference a user can hold to a provider they don't own is a server-created one confined to their own `u/<userId>/` namespace.
+- **`resolveFileProvider` honours any owned reference.** A file the caller owns a reference to stays readable even after an admin repoints the app-wide default away from the provider it was staged on. This does not weaken tenant isolation: with per-user isolation on (the default), the only reference a user can hold to a provider they don't own is a server-created one confined to their own `u/<userId>/` namespace. *(Corrected in [v1.18.0](#v1180): this did not hold for references created while isolation was off, including by `ensureReference`. Since v1.18.0, an owned reference is honoured under isolation only inside the user's own `u/<userId>/` folder or the global prefix.)*
 
 ### Security
 
@@ -430,6 +538,8 @@ This is a frontend-and-config release. There is no database change, so a downstr
 
 <Aside type="caution" title="Communal mode: repointing the default is not a revocation control">
 With **per-user isolation off** (`defaultIsolateUsers=false`, communal mode — non-default), a user can hold a reference to a shared-default file that was deliberately shared. Because references are now honoured regardless of the current default, repointing or unsetting the app-wide default no longer severs access to such a reference. To revoke access to a specific file in communal mode, delete the reference (or the underlying bytes/provider). With isolation **on** (the default), this does not arise — a user can only reference their own namespace.
+
+*Corrected in v1.18.0: references created in communal mode used to survive a later switch to isolation. Since [v1.18.0](#v1180), turning isolation on revokes them, except inside the user's own `u/<userId>/` folder or the global prefix.*
 </Aside>
 
 <Aside type="caution" title="Updating from 1.8.x">

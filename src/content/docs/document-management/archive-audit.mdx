@@ -38,6 +38,150 @@ At the end of a session you want to archive, run the archive-readiness prompt (b
 
 ---
 
+## 2026-09-30 – 2026-10-01 — Cleanup & security audit: all 19 findings fixed, adversarially reviewed (v1.18.0)
+
+**Verdict:** ✅ Safe to archive **once pushed**. The release bump (`npm run version:minor` → 1.18.0), the release commit and the docs pointer are the final orchestrator steps. No schema change. veradai: `npx document-management update --skip-schema`, after checking that no provider sits on a private address (see Open items).
+
+**Shipped this session:** v1.18.0 (**minor**). It adds a new env var, new browse parameters and response fields, and new settings fields. It removes a component and narrows the adapter `ListOptions` contract. There is no schema change.
+
+Module commits:
+- `cf53a6f` chore: the `check:template-syntax` gate
+- `ab82b52` fix(deps): esbuild GHSA-g7r4-m6w7-qqqr
+- `407a002` ci: finding #6
+- `5d15acf` fix: findings #1–#5 and #7–#18
+- `ee09fff` fix: review findings R1–R10
+- `039f483` fix: second-review findings (reconcile, erasure overlap + realpath, preview abort)
+- `bb4fe68` chore(release): v1.18.0
+- `08d68d9` chore: lock sync to 1.18.0
+- the docs pointer follows (see the final SHA at push)
+
+All module gates are green: build, type-check, `check:templates`, `check:template-syntax`, parity and conformance (the 6 by-design C2 results, now baselined in CI).
+
+**Verified in the host:** an **isolated copy of veradai** (starter 2.13.0) was updated to this build with `update --skip-schema --force`. `node_modules` was linked read-through by junctions; the live veradai tree was never written. Host `tsc` (backend + frontend) reported **0 errors**, both after the audit fixes and again after the review fixes. A production `vite build` bundles `pdf.worker` as a hashed asset with **no CDN reference**.
+
+**Why:** kim asked for the read-only **cleanup & security audit** on 2026-09-30, then approved fixing every finding. The 19 findings were 1 critical, 5 moderate and 13 minor:
+- #1 SSRF through a provider's S3 `endpoint` or WebDAV `baseUrl` (critical).
+- #2 the documented admin bypass of the storage policy never fired, because no route attached the role.
+- #3 erasing the account that created the app-wide default deleted it for everyone.
+- #4 erasure left the user's files on operator storage.
+- #5 browse paging and sort were declared but unused, so S3 folders were silently cut at 100 entries.
+- #6 no CI.
+- #7 owned references were not re-checked across a communal → isolated switch.
+- #8 the owning admin's **device token** had owner rights over the whole shared store.
+- #9 int4 overflow gave a `500`.
+- #10 security actions were not tagged `audit: true`.
+- #11 the PDF.js worker loaded from unpkg.
+- #12 `maxFileCount` was applied only in `DocumentUpload`.
+- #13 hand-rolled error readers.
+- #14 the preferences panel did nothing.
+- #15 bookmarks were half-wired.
+- #16 the orphaned `DocumentLinkDialog`, and bulk download had no UI.
+- #17 a triplicated upload size-limit block.
+- #18 dead config.
+- #19 the esbuild advisory.
+
+Note the numbering: the audit JSON's keys 3 and 4 are **swapped** relative to the fix commit (#3 there is the files purge, #4 the re-own). The changelog cites both.
+
+**Design (scratchpad `specs/`):** eight spec batches:
+- A: SSRF
+- BF: authorisation and isolation
+- C: erasure
+- D: browse paging
+- E: CI and dependencies
+- G: backend tidy
+- H: frontend
+- I: finish or remove
+
+`INTEGRATION.md` set conflict rules R1–R9, which won over the specs:
+- R1: sorting is server-side, never client-side.
+- R3: admin rights come only from `principalOf(req).admin`, and those six routes use `attachRole`.
+- R5: the `org:document-management` owner sentinel.
+- R6: clamp sizes to `null` instead of a BigInt migration.
+- R7: `getApiErrorMessage` for every user-visible error.
+- R8: the six Structure marker lines stay untouched.
+- R9: no new dependencies.
+
+**Implementation:** one workflow, with **disjoint file ownership** in the same tree:
+- a sequential **backend chain**, B1 → B2 → B3 (`src/templates/backend/*`);
+- a sequential **frontend chain**, F1 → F2 (`src/templates/frontend/*`);
+- a parallel **CI role** (`.github/*`).
+
+Agents made no git writes and ran no build, install or version scripts. They reported `module.ts` changes and docs wording rather than editing those files. The orchestrator then removed the `DocumentLinkDialog` mapping from `module.ts` and added the `adapters/endpoint-guard.ts` mapping and the `DOC_ALLOW_PRIVATE_ENDPOINTS` env var. Each role self-checked with `check:template-syntax` and `check:templates`, plus runtime tests and an in-memory host type-check harness (veradai typings, read-only).
+
+**Review:** a 6-area adversarial review of `8f764bd..HEAD` covered the SSRF guard, authorisation and isolation, erasure, browse paging, frontend features, and tidy, regressions and CI. Each finding went to a skeptic verifier; the two SSRF findings each had two independent skeptics. **10 were confirmed and 2 refuted.** Both refuted findings were about `check:template-syntax` false-pass shapes. All 10 were fixed in `ee09fff`, each with a before/after runtime repro against veradai's real libraries (webdav 5.10, the AWS SDK, archiver, axios, React and TanStack Query):
+1. **High.** A refused WebDAV download emitted `error` before any listener was attached, and that **crashed the process**. `WebDAVAdapter.download` now awaits the GET and rejects up front, and `LocalAdapter` opens the file handle first.
+2. **High.** A **retried** erasure deleted an org-owned Local shared default rooted at `DOC_LOCAL_BASE_PATH/u/<creator>`. The server-local purge is now skipped when any other provider's base overlaps that root.
+3. **Medium.** The shared WebDAV pool (`maxSockets` 50) could be exhausted by aborted downloads. The pool is now uncapped, and the new `sendStream` destroys the upstream on abort.
+4. **Medium.** A bulk zip of more than 50 S3 files deadlocked the socket pool. The zip now streams at once and opens one file at a time.
+5. **Low.** Erasure row-read failures were swallowed. They now propagate, so the cascade retries, and a separate `localRootFailed` flag is reported.
+6. **Low.** The S3 continuation loop was unbounded. It now has a page cap, stops on a repeated or empty token, and de-duplicates.
+7. **Low.** The admin rename hit the current default rather than the one the editor showed. `defaultProviderNameFor` now names the target, the server returns a `409` if it changed, and the page re-seeds after a failed save.
+8. **Low.** "Newest/largest first" reversed the tie-breaks.
+9. **Low.** Blob downloads hit the host's 30-second axios timeout. They now pass `timeout: 0`.
+10. **Low.** The Structure registration callbacks raised TS7006 on a standalone host. The callbacks are now typed.
+
+**Second review:** because the R1–R10 fixes changed stream-lifecycle and erasure code, a focused 3-area re-review of `5d15acf..ee09fff` ran next. It confirmed **3 lows**, all regressions introduced and fixed inside this unreleased version, and refuted 2. All were fixed in `039f483` and proven with the reviewers' repros against the working tree:
+1. **Reconcile.** R1's up-front download rejection escaped the hash `.catch(() => null)`, so a staged file landing on an existing folder of the same name failed every pass. The open and the hash now both sit inside the fallback, and the file de-dupes as before.
+2. **Erasure overlap.** R2's guard also skipped the purge when another store merely *contained* the subject's root (a legacy store rooted at the local root), which silently kept the subject's reserved `u/<id>/` files. It now skips only when a base equals or sits inside that root.
+3. **Preview.** R9's `timeout: 0` meant a closed preview still downloaded the whole file and pinned an unrevoked blob URL. The preview now aborts the request on close and never creates a URL after cleanup.
+
+One refuted finding was still hardened: re-pointing `DOC_LOCAL_BASE_PATH` from a symlink/junction alias to its target between an erasure and its retry could slip past the R2 guard and delete the org-owned store. The reproduction is contrived but the outcome catastrophic, so paths are now compared after following links (`realpathSync.native`).
+
+**Unfinished / WIP:** none. The release (`bb4fe68`), lock sync (`08d68d9`) and this docs pass were pushed together.
+
+**Loose ends & follow-ups:** everything open is recorded on the [roadmap → Audit follow-ups (v1.18.0)](/document-management/roadmap/#audit-follow-ups-v1180):
+- the older screens that still fail silently;
+- admin management of org-owned providers;
+- the standalone TS2307 from the six Structure registrations;
+- activating the parked CI host type-check;
+- a folder-listing cache, since every **Load more** re-lists the folder;
+- S3 `NoSuchKey` returning `500` instead of `404`;
+- zip entry name collisions (entries use base names only);
+- no cancel for a bulk download;
+- device vs web on audit lines;
+- `syncIncludedFolders` not disconnecting its adapters;
+- communal-mode files kept on erasure (by design);
+- smaller UI items.
+
+The standing backlog item **"`DocumentUpload` error surfacing" is closed**: it shows the server reason through `getApiErrorMessage` since v1.18.0. Do not re-pitch it.
+
+**Decisions & ideas:**
+- **Private-network storage is allowed for an admin or by operator opt-in, not refused outright.** A development MinIO and a LAN NAS are legitimate. An admin web-session save stamps `allowPrivateNetwork` into the encrypted config; a client can never send it, and a device token never gets it. Local Connect needs none of this, because tunnel hostnames are public.
+- **`attachRole`, not `requireAdmin`,** on the six provider and settings routes, because the Local Connect companion calls create, update and test with a device token.
+- **Erasure re-owns shared infrastructure to an organisation sentinel.** The audit's suggested fix was to refuse erasure. Re-owning was chosen so one user's erasure never blocks and never cuts anyone off. Communal, global and store-root files are kept by design and counted.
+- **Adapters list the whole folder (capped at 5,000) and the service sorts and pages it,** so every provider behaves the same. The accepted cost is a re-list per page, so a listing cache is on the roadmap.
+- **Preferences live in the starter's user preferences** (the `documentManagement` key), with no DM table.
+- **Finish or remove:** bookmarks, preferences and bulk download were finished. `DocumentLinkDialog` was removed; link type and notes stay API-only.
+- **int4: clamp to `null` instead of a BigInt migration,** to keep this a no-schema release.
+- **CI is advisory** (GitHub Free private repos cannot require checks). The host type-check is parked behind a token, and it costs roughly 10–15 minutes of Actions time per run.
+- **Review-fix trade-offs:**
+  - bulk zip concurrency is exactly 1;
+  - only the shared WebDAV pool is uncapped; the per-client S3 pool stays at 50;
+  - a download is recorded in `doc_recent_access` **before** the stream opens, so a failed attempt is still audited.
+
+**Process lessons:**
+- **Check `ListAgents` before blaming a workflow.** During the read-only audit, uncommitted edits appeared in `services.ts`, `types.ts`, the frontend templates and the docs. They were briefly taken for unapproved edits by audit agents and saved aside as patches. In fact they were a **concurrent peer session's** v1.17.2 work (the node-upload `documentId` fix, committed as `54d96f1` / `e23745a` / `8f764bd`). Listing the other sessions on this folder first would have shown it at once.
+- **The scratchpad syntax checker was lost between sessions again,** after v1.17.1 had recreated it. It is now a repo script, `npm run check:template-syntax` (`cf53a6f`), and a CI gate, so it cannot be lost again.
+- **A session usage limit interrupted the implementation workflow** after B1, F1 and the CI role had finished. It resumed cleanly from B2 and F2 the next day. Disjoint file ownership and the no-git-writes rule made it easy to confirm that nothing was half-applied.
+- **Host-verify junctions write through.** The isolated veradai copy links `node_modules` by Windows junctions. The only writes that reached veradai's real `node_modules` were Vite and jiti temp folders from the build, which is harmless, but junctions are not read-only. Unlink them **before** deleting the copy (`host-verify.sh cleanup`); never `rm -rf` the copy while they exist.
+
+**Recorded where:**
+- changelog v1.18.0, with an Updating aside for the private-endpoint break and a host-floor aside (starter v2.13.0+);
+- correction notes on the v1.9.0 isolation claims;
+- the roadmap: a Completed entry, **Audit follow-ups (v1.18.0)** and the updated Short-term #1 listing-cache sample;
+- this entry.
+
+The feature pages (security, usage, configuration, developer-workflow and the others the implementers' docs notes name) are updated in the same docs pass. Session scratchpad: `audit-findings.json`, `specs/`, `docs-notes.md` and the runtime repros under `fix-tmp/` and `review-tmp/`.
+
+**Open items for next session:**
+1. **veradai → 1.18.0.** Before updating, check every provider endpoint. kim's Wasabi default and the Local Connect tunnels are public, so they are unaffected. Any loopback or LAN provider needs `DOC_ALLOW_PRIVATE_ENDPOINTS=true` or an admin re-save. Then run `npx document-management update --skip-schema`, accept deleting the orphaned `components/DocumentLinkDialog.tsx`, and hard-refresh the browser. Confirm in the real build that `dist/assets` contains a hashed `pdf.worker.min-*.mjs` and that no `unpkg` reference is left.
+2. ~~Delete the isolated veradai copy~~ — **done**: `veradai-verify` was removed with `host-verify.sh cleanup` (junctions unlinked first; veradai's `node_modules` verified intact). It also held a copy of veradai's backend `.env`, so it should not linger.
+3. **CI's first runs.** Watch the first push run. Consider running `actionlint` over `ci.yml`. Enable the host type-check (`STARTER_REPO_TOKEN`, optionally `STARTER_REF`, one manual run, then `HOST_TYPECHECK=true`).
+4. **Upstream asks** for [Module Starter → Upstream Issues](/module-starter/upstream-issues/): the C2 deferred-marker scan misses template barrels, ship the tsup → esbuild override in the scaffold, and optionally a CI template. Retire the conformance baseline wrapper once the scaffold fix arrives.
+5. **The standing backlog:** global visibility, true single-provider-many-folders, safe-upload / content verification, and the new medium-priority audit follow-ups.
+
+---
+
 ## 2026-09-20 — Fix two host-app type errors in generated backend (v1.17.1)
 
 **Verdict:** ✅ Safe to archive / ship. No schema change. veradai: `--skip-schema`.

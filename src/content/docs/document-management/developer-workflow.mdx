@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside, Tabs, TabItem, Card, CardGrid, Steps } from '@astrojs/starlight/components';
 
-This page is for developers who **maintain the Document Management module itself** — not for app builders consuming it. It covers the local development loop, version management, scaffold updates, the common change scenarios you will hit, debugging, and the documentation push sequence.
+This page is for developers who **maintain the Document Management module itself** — not for app builders consuming it. It covers the local development loop, continuous integration, version management, scaffold updates, the common change scenarios you will hit, debugging, and the documentation push sequence.
 
 The mental model to keep front of mind: **this repository is a code generator, not the running app.** You edit *templates* — backtick-delimited TypeScript strings that hold the source of generated files — then build the module to an npm package, then run `npx document-management init` inside a starter-template app to generate real files from those templates. Nothing in `src/templates/` runs in this repo; it runs in the *target app* after generation.
 
@@ -63,10 +63,12 @@ You change a template, rebuild the module, then regenerate (or update) the modul
     npm run dev        # tsup --watch — rebuilds on every save
     ```
 
-3. **Type-check** (catches template-string and module-definition type errors before you generate anything):
+3. **Type-check and run the template gates** (catch module-definition type errors, escaping mistakes and syntax errors inside the templates before you generate anything):
 
     ```bash
-    npm run type-check     # tsc --noEmit
+    npm run type-check             # tsc --noEmit
+    npm run check:templates        # an unescaped ${ inside a template
+    npm run check:template-syntax  # a syntax error in the code inside a template
     ```
 
 4. **Test inside a starter-template app.** In a separate checkout of an app built from the starter template:
@@ -121,6 +123,87 @@ When testing an `update`, run `npx document-management update --dry-run` first. 
 <Aside type="note" title="`info` is your build sanity check">
 After `npm run build`, run `npx document-management info` and confirm the version and feature list match what you just edited in `src/module.ts`. If `info` shows a stale version, your `dist/` is out of date or `npm link` is pointing at a different build.
 </Aside>
+
+---
+
+## Continuous Integration
+
+Every push to `main`, every pull request, a weekly run (Sunday 21:17 UTC — Monday morning in Australia) and any manual run execute `.github/workflows/ci.yml`. Push and pull-request runs are skipped when a commit changes only Markdown files or the `docs` submodule pointer. The workflow has read-only repository permissions.
+
+### The three jobs
+
+| Job | What it runs | When |
+|-----|--------------|------|
+| **Module gates** | `npm ci`, then `type-check`, `build`, `check:templates`, `check:template-syntax`, `parity:check`, conformance (through the baseline wrapper below), and a check that `package.json` and `src/module.ts` carry the same version. Once `npm ci` succeeds, every gate runs even when an earlier one failed, so a single run lists every problem. | Every run |
+| **Dependency audit** | `npm audit --omit=dev --audit-level=moderate` — the runtime dependencies (`commander`, `esbuild`, `postgres`) ship with the CLI onto host machines, so they fail at **moderate** or higher. Then `npm audit --audit-level=high` over the whole tree, build tooling included. | Every run, including the weekly one — advisories arrive without commits |
+| **Host type-check** | Installs this module into a fresh checkout of the starter and runs the host's own type-check and build. See [Enabling the host type-check](#enabling-the-host-type-check). | Opt-in (parked by default) |
+
+The version check exists because hosts detect updates from `module.version` while npm reads `package.json`. `npm run version:*` moves both; a hand edit may not. (It does not compare the root version inside `package-lock.json`, which the bump helper leaves alone.)
+
+To run the same gates locally, from the repo root:
+
+```bash
+npm run type-check && npm run build && npm run check:templates && npm run check:template-syntax && npm run parity:check && node .github/scripts/check-conformance-baseline.cjs
+```
+
+<Aside type="note" title="CI is advisory on a GitHub Free private repository">
+Required status checks and branch protection are not available on a GitHub Free private repository, so CI cannot block a push to `main`. It reports — a failure email and a red mark on the commit — and it is up to you to act on it.
+</Aside>
+
+### The template syntax gate (`check:template-syntax`)
+
+Templates are backtick strings, so `tsc` and `tsup` see the code inside them only as opaque text: a stray token, broken JSX or a bad cast inside a template passes this repo's own build and type-check and fails only when a host app compiles the generated file. `npm run check:template-syntax` (`scripts/check-template-syntax.cjs`) closes that gap for **syntax**:
+
+- It loads every `src/templates/backend/*.ts` and `src/templates/frontend/*.ts` module (skipping the `index.ts` re-export barrels) and parses each exported string that looks like code with esbuild — as TSX for frontend templates, TS for backend ones.
+- Scaffold placeholders are substituted first, so templates that use them are checked too: the `{{#if var}}` / `{{/if}}` markers are dropped and `{{var}}` / `{{var|default}}` become a literal `0`. Only identifier-shaped placeholders are touched, so JSX double braces such as `style={{ color: 'red' }}` are left alone.
+- It prints each failure with the file, the template's export name and the line, and exits `1` if any string fails. Pass file names to check only those: `npm run check:template-syntax -- backend/services.ts`.
+
+What it **cannot** catch: type errors, imports that will not resolve in the host (including a missing `.js` extension in a backend import), JSX identifiers that do not exist, or anything about runtime behaviour. Those still need the generated code compiled in a real host — locally, or through the opt-in host type-check job. It also does not replace `check:templates`: an unescaped `${...}` is evaluated when the template module loads, so this gate only ever sees the already-interpolated string (or, when the name is undefined, reports that the module failed to load).
+
+### The conformance baseline
+
+`npm run conformance:check` (the scaffold's `scripts/check-conformance.cjs`) currently reports six **C2** violations — one for each Structure registration (`structure-tabs`, `-widgets`, `-cards`, `-actions`, `-sidebar` and `-fields`). They are by design: their imports in the frontend barrel (`INDEX_TEMPLATE` in `src/templates/frontend/routes.ts`) are commented out on purpose, because a Vite build cannot import a module that may not be installed. The scaffold is meant to accept a commented-out frontend import as a "deferred" marker, but its scan strips comments before it looks, so it never sees the marker inside a template (logged on the [module-starter upstream issues](/module-starter/upstream-issues/) page).
+
+CI therefore runs the real check through `.github/scripts/check-conformance-baseline.cjs` (under `.github/`, because `scripts/` belongs to the scaffold). The wrapper runs the checker unchanged and passes only when:
+
+- every violation is one of those six named C2 lines (each at most once), **and**
+- each of those registrations still has its commented-out import inside `INDEX_TEMPLATE`.
+
+Anything else fails CI: any other violation, a deleted marker line (that is the real forgotten-registration bug C2 exists to catch), a crashed checker, or checker output the wrapper cannot parse. Fewer baselined hits is fine — for example, one import uncommented.
+
+<Aside type="caution" title="Keep the baseline in step with module.ts">
+If you add, remove or rename a Structure registration in `src/module.ts`, update the `DEFERRED` list in `.github/scripts/check-conformance-baseline.cjs` in the **same commit**. Once the scaffold fix arrives through `scaffold:update`, `conformance:check` exits 0 and the wrapper prints that the baseline is no longer needed — then delete the wrapper and call `npm run conformance:check` from `ci.yml` instead.
+</Aside>
+
+### Enabling the host type-check
+
+The **Host type-check** job installs this module into a fresh checkout of the (private) starter with `init --no-interactive --force`, then runs the host's backend type-check (after `prisma generate`), its frontend `tsc` and a `vite build`. It is the only automated check that sees **type errors inside generated code** — the class of bug fixed in v1.17.1. It is parked by default because it needs a token and a fair amount of Actions time (it has a 30-minute timeout). To enable it:
+
+<Steps>
+
+1. **Create a read token.** Create a fine-grained personal access token with **Contents: read-only** on `ui-git-kim/unique-react-fullstack-starter`, and add it to this repository as the secret `STARTER_REPO_TOKEN`.
+
+2. **Pin the starter (optional).** Set the repository variable `STARTER_REF` to a starter tag or commit SHA, so changes on the starter's `main` cannot turn this job red. Without it the job uses `main`.
+
+3. **Run it once by hand.** Actions → **CI** → **Run workflow**, and confirm the job is green. A manual run always includes this job.
+
+4. **Run it everywhere (optional).** Set the repository variable `HOST_TYPECHECK` to `true` to run it on every push, pull request and the weekly schedule.
+
+</Steps>
+
+Without the Structure module installed, the six generated `structure-*` registrations cannot resolve `@/features/structure` (`TS2307`). The job tolerates exactly those errors, with a warning, and fails on any other — including a static Structure import in any other generated file, so keep those imports inside the six registration files.
+
+### Dependency audit and the esbuild override
+
+`tsup` (the build tool) pins its own esbuild to `^0.27`, which carried advisory GHSA-g7r4-m6w7-qqqr (low severity; it was not exploitable here, because `tsup` never starts esbuild's serve mode). The patched release is esbuild 0.28.1, and `npm audit fix` cannot reach a nested pin, so `package.json` forces it:
+
+```jsonc
+// package.json (excerpt)
+"dependencies": { "esbuild": "^0.28.1" },
+"overrides": { "tsup": { "esbuild": "$esbuild" } }
+```
+
+`$esbuild` makes `tsup` use the same esbuild as the module's own runtime dependency, so the tree holds a single, patched copy. **Remove the override once a `tsup` release accepts esbuild `^0.28`** (the same problem is logged upstream for the module starter's toolchain).
 
 ---
 
@@ -228,19 +311,29 @@ All adapter SDKs are always installed and all three adapters are always generate
 
 1. **Add the adapter template** in `src/templates/backend/adapters.ts`, implementing the `StorageAdapter` interface (`connect`, `disconnect`, `testConnection`, `listFolder`, `getFileInfo`, `exists`, `download`, `upload`, `delete`, `move`, `copy`, `createFolder`, `deleteFolder`, plus optional `getPreviewUrl`, `getThumbnailUrl`, `search`).
 
-2. **Add the type to the `getAdapterClass` switch** in the adapters factory (`adapters/index.ts`), so `createAdapter(type, config, { readOnly })` instantiates it (also `export` the class from that barrel). Honour `readOnly` by throwing `ReadOnlyError` from write operations at the adapter level.
+    **`listFolder(path, { maxItems })` returns the whole folder.** Gather every entry up to `maxItems` (default `MAX_FOLDER_LISTING`, 5,000), in any order, with `hasMore: false` — and set `truncated: true` when the cap cut the listing short. Do **not** sort or page: the service (`pageFolderContents`) sorts the whole listing (folders first), applies `foldersOnly` and slices the requested page, so browse behaves the same on every provider. `ListOptions` no longer carries `limit`, `offset`, `sortBy`, `sortOrder` or `fileTypes`, so a custom adapter that still reads `options.limit` fails to type-check.
 
-3. **Register the file** in `src/module.ts` under `backend.templates`:
+2. **If the adapter talks to a network endpoint, route it through the SSRF guard** (`adapters/endpoint-guard.ts`). A storage address is user-supplied and the server streams what it fetches back through `/download`, so:
+    - call `parseHttpEndpoint` on the address in `connect()` (http and https only — this also covers rows saved before the guard existed);
+    - dial **only** through `createGuardedAgents(...)` or `sharedGuardedAgents(...)`, passing `allowsPrivateNetwork(config)`, and hand the client **both** the http and https agents **as instances** — the S3 SDK builds an unguarded agent of its own when given agent *options*, and the WebDAV client falls back to a plain agent for whichever one is missing (a redirect can switch protocol);
+    - pass any connection error you surface (a test result, a status message, a thrown provider error) through `safeConnectionMessage`, so a refusal or an unreachable host never echoes the resolved address back to the caller;
+    - add any new URL-bearing config field to `vetProviderEndpoint` in the service, which checks every provider config write.
+
+    See [Security](/document-management/security/) for the address tiers and the `DOC_ALLOW_PRIVATE_ENDPOINTS` opt-in.
+
+3. **Add the type to the `getAdapterClass` switch** in the adapters factory (`adapters/index.ts`), so `createAdapter(type, config, { readOnly })` instantiates it (also `export` the class from that barrel). Honour `readOnly` by throwing `ReadOnlyError` from write operations at the adapter level.
+
+4. **Register the file** in `src/module.ts` under `backend.templates`:
 
     ```typescript
     'adapters/ftp.adapter.ts': backend.FTP_ADAPTER_TEMPLATE,
     ```
 
-4. **Add its SDK** to `backend.dependencies` so it's always installed.
+5. **Add its SDK** to `backend.dependencies` so it's always installed.
 
-5. **Extend `ENABLED_ADAPTERS` / `getSelectableProviderTypes()`** logic in the config template and add the new value to the `storageAdapters` prompt options in `src/module.ts`.
+6. **Extend `ENABLED_ADAPTERS` / `getSelectableProviderTypes()`** logic in the config template and add the new value to the `storageAdapters` prompt options in `src/module.ts`.
 
-6. **Bump, build, and test** with `npx document-management init` selecting the new adapter.
+7. **Bump, build, and test** with `npx document-management init` selecting the new adapter.
 
 </Steps>
 
@@ -298,6 +391,9 @@ All adapter SDKs are always installed and all three adapters are always generate
       'doc_app_settings',
       'doc_included_folder',
       'doc_parsed_artefact',
+      'doc_node_type_upload_location',
+      'doc_pending_reconcile',
+      'doc_local_connect_tunnel',
       'doc_my_new_table',   // ← add here
     ],
     ```
@@ -323,7 +419,7 @@ All adapter SDKs are always installed and all three adapters are always generate
     export { documentManagementRoutes } from './routes.config';
     ```
 
-3. **Structure registrations stay commented out** in the generated barrel by default — the consuming app uncomments them once the Structure module is present.
+3. **Structure registrations stay commented out** in the generated barrel by default — the consuming app uncomments them once the Structure module is present. Adding, removing or renaming one means updating `DEFERRED` in the CI [conformance baseline](#the-conformance-baseline) in the same commit, and keeping every static `@/features/structure` import inside those registration files (the opt-in host type-check tolerates that import nowhere else).
 
 </Steps>
 
@@ -462,16 +558,18 @@ Run it before every bump; write a literal `${...}` in generated code as `\${...}
 | Conditional block always (or never) renders | `{{#if}}` only does truthiness and single-literal string equality — it has no array-membership test |
 | Build fails with "Unterminated template literal" | An unescaped backtick inside a template string (see escaping rule above) |
 | Generated file has a wrong/empty value where a `${...}` should be | An unescaped `${...}` interpolated at build time instead of being emitted verbatim. The **build does not catch this** — run `npm run check:templates`, and write it `\${...}` |
+| The host app reports a syntax error (unexpected token, unclosed JSX tag) in a generated file | Broken code inside a template string — this repo's build cannot see it. Run `npm run check:template-syntax`, which names the template export and line |
 
 ### Build errors
 
 ```bash
-npm run type-check       # tsc --noEmit — catches type errors in module.ts and template typings
-npm run check:templates  # scripts/check-templates.cjs — flags an unescaped ${ in any template
-npm run build            # tsup — fails on an unterminated backtick, NOT on an unescaped ${
+npm run type-check             # tsc --noEmit — catches type errors in module.ts and template typings
+npm run check:templates        # scripts/check-templates.cjs — flags an unescaped ${ in any template
+npm run check:template-syntax  # scripts/check-template-syntax.cjs — parses the code inside every template
+npm run build                  # tsup — fails on an unterminated backtick, NOT on an unescaped ${
 ```
 
-Because templates are strings, the TypeScript compiler **cannot** check the code *inside* them — `type-check` only validates `module.ts` and the template *exports'* types. The only way to type-check generated code is to generate it into a target app and run that app's `tsc`. A `tsup` build failure is almost always an unescaped **backtick** inside a template literal. An unescaped **`${...}`** does *not* fail the build — it interpolates silently at build time — so run `npm run check:templates` to catch it before you bump.
+Because templates are strings, the TypeScript compiler **cannot** check the code *inside* them — `type-check` only validates `module.ts` and the template *exports'* types. `check:template-syntax` catches **syntax** errors inside them, but not type errors. The only way to type-check generated code is to generate it into a target app and run that app's `tsc`; CI automates this with the opt-in [Host type-check](#enabling-the-host-type-check) job, which generates the module into a bare starter and runs the host's type-check and `vite build`. A `tsup` build failure is almost always an unescaped **backtick** inside a template literal. An unescaped **`${...}`** does *not* fail the build — it interpolates silently at build time — so run `npm run check:templates` to catch it before you bump.
 
 ### Verifying `.js` extensions in backend imports
 
@@ -551,7 +649,7 @@ If you push the parent repo's submodule-pointer commit before pushing the `docs`
     `npm run version:patch` (or minor/major) for ANY change to `src/templates/**` or `src/module.ts`. Not for docs/README.
   </Card>
   <Card title="Built?" icon="rocket">
-    `npm run build` and `npm run type-check` pass; `npx document-management info` shows the new version.
+    `npm run build`, `npm run type-check`, `npm run check:templates` and `npm run check:template-syntax` pass; `npx document-management info` shows the new version. After pushing, the CI run is green.
   </Card>
   <Card title="Generated cleanly?" icon="document">
     `npx document-management update --dry-run` in a target app shows the expected files; backend imports end in `.js`.
@@ -567,6 +665,9 @@ If you push the parent repo's submodule-pointer commit before pushing the `docs`
 - [ ] **`.js` extensions** on all backend-template relative imports
 - [ ] **Placeholders** (`my-feature`, `MyFeature`, `myFeature`, `my_feature`) used instead of hardcoded names
 - [ ] **Backticks and `${...}` escaped** inside template literals (`npm run check:templates` passes — the build alone won't catch an unescaped `${`)
+- [ ] **Code inside templates parses** (`npm run check:template-syntax` passes)
 - [ ] **Registries used** — generated code extends via registries, never edits core starter files
 - [ ] **`npm run build` passes** with no errors
+- [ ] **Conformance baseline in step** — if a Structure registration was added, removed or renamed, `DEFERRED` in `.github/scripts/check-conformance-baseline.cjs` matches
+- [ ] **CI green** after the push (it is advisory, so check it — a failure does not block the push)
 - [ ] **Docs submodule pushed** (if `docs/**` changed), then parent pointer committed
