@@ -1,6 +1,6 @@
 ---
 title: Integration & Delivery
-description: How an app wires cognitive-db in via initConfig() (an AiAdapter onto AI Core, a StructureAdapter onto Structure), the sourceId/sourceType no-content-duplication contract, storage modes, and how the engine is delivered — vendored into Cognitive Pipeline or installed standalone from Git.
+description: How an app wires cognitive-db in via initConfig() (an AiAdapter onto AI Core, a StructureAdapter onto Structure), the sourceId/sourceType source-identity contract, storage modes, and how the engine is delivered — vendored into Cognitive Pipeline or installed standalone from Git.
 sidebar:
   order: 3
   label: "Integration & Delivery"
@@ -8,7 +8,7 @@ sidebar:
 
 import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
 
-cognitive-db is a library, not a service. It runs **inside your app's process**, uses **your app's database and API keys**, and never phones home. This page covers the two things you need to know to adopt it: how an application **integrates** the engine (the `initConfig()` contract and the no-content-duplication pattern), and how the engine is **delivered** to that application (vendored into Cognitive Pipeline, or installed standalone from Git).
+cognitive-db is a library, not a service. It runs **inside your app's process**, uses **your app's database and API keys**, and never phones home. This page covers the two things you need to know to adopt it: how an application **integrates** the engine (the `initConfig()` contract and the `sourceId` / `sourceType` source-identity contract), and how the engine is **delivered** to that application (vendored into Cognitive Pipeline, or installed standalone from Git).
 
 <Aside type="tip">
 Most developers never touch this directly. The [Cognitive Pipeline module](/modules/cognitive-pipeline/) bundles the engine and runs every step below for you at install time — a single `npx cognitive-pipeline init`. Read this page if you are integrating the engine by hand, or want to understand what Cognitive Pipeline does under the covers.
@@ -68,6 +68,25 @@ The engine never sees a provider name, a model id or an API key. It runs named o
 
 If you call an engine function before `initConfig()`, you get a clear `CognitiveDB: Not initialized` error. A storage adapter can also be injected later with `updateConfig({ storage: { structure } })`. When no explicit `mode` is set, the engine uses Structure whenever an adapter is present.
 
+### Processing levels
+
+Each `ingest()` call takes a `processingLevel` that sets how much the model is asked to extract. The default is `standard`, and the level table is exported as `PERCEPTION_LEVELS`.
+
+| Level | Model calls | Extracts | Output cap per call |
+|---|---|---|---|
+| `minimal` | None for extraction (see the summary note below) | Nothing. The content record is stored, and embedded when embeddings are on. There are no entities, no relationships and no connection discovery; a `followed_by` thread edge can still be added when `sequentialAdjacency` is on. | — |
+| `standard` | `extract-entities` (`extract-entities-with-proposals` when ontology growth is on) | Entities, relationships, emotions | 2,000 tokens |
+| `deep` | + `extract-concepts` | + decisions, intentions, memories, questions | 4,000 tokens |
+| `full` | + `infer-implicit`, run only when the earlier calls found entities or relationships | + implied entities and relationships | 8,000 tokens |
+
+- **Summary.** With the `understanding` switch on, a `summarise` call (capped at 500 tokens) follows whenever entities were found or the content is over 8,000 characters. This applies at `minimal` too: long content is still summarised, so its vector is never built from truncated text. Separately, when `retrieveToConnect` is on (Structure storage, above `minimal`, with a scope supplied and embeddings on), a short `summarise` call (capped at 300 tokens) and a query embedding run before extraction to find existing entities to link to; the `understanding` switch does not gate it.
+- **Each call builds on the last.** `extract-concepts` gets the entity list, `infer-implicit` gets the entities and relationships, and `summarise` gets the entity names.
+- **Stated versus implied.** The seeded `extract-entities` operation asks only for what the content states (its `explicit-only` approach, editable in AI Core), so implied items come only from `infer-implicit`, at `full`. Under Structure storage they are written with evidence tier `inferred`; the retiring v1 store merges them in with the stated items.
+- **Caps are per call.** The cap limits each call's output. It is not a token budget for the whole ingest, and ingest checks no budget before it runs. The `resources/` budget helpers and the `degradation/` auto-level selection are separate helpers that `ingest()` does not call.
+- **A second, disagreeing table.** The `degradation/` helpers keep their own level table, which does not match this one (see the [Roadmap](/cognitive-db/roadmap/)). It adds a fifth level, `skip`, which `ingest()` rejects.
+
+Cognitive Pipeline sources offer `minimal`, `standard` and `deep`. To use `full`, call `ingest()` directly.
+
 ### Feature switches
 
 The optional `features` block turns parts of the engine **off**. A switch never makes the engine do more than the processing level would.
@@ -92,9 +111,9 @@ These default to **off**:
 
 Each switch is a field on `FeaturesConfig`. An unset switch reads as its default.
 
-### The no-content-duplication contract: `sourceId` + `sourceType`
+### The source-identity contract: `sourceId` + `sourceType`
 
-This is the most important integration rule. The engine stores its *understanding* of your content: entities, connections, emotions, concepts, questions and embeddings. It keys that understanding back to your own records with two fields:
+This is the most important integration rule. Ingest keeps the text as a content record in your database (`data.content` on a Structure record) and writes its *understanding* around it: entities, connections, emotions, concepts, questions and embeddings. The content record is keyed back to your own item with two fields:
 
 - `sourceId` — the stable id of the item in **your** system
 - `sourceType` — what kind of item it is (it also picks the Structure node type for the content record)

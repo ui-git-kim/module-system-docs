@@ -53,7 +53,7 @@ These are confirmed present in v1.0.0 by the audit:
 - **Embeddings + semantic search** over pgvector, including *filtered* semantic search (marketed as "hybrid" — see §5).
 - **Connections as first-class, versioned nodes** with atomic `previousVersion` / `supersededBy` chains.
 - **Ontology-as-data** — `concept` and `relationship_type` nodes, a base ontology, and `superClass` / `domain` / `range` constraints.
-- **Perception** — graded LLM extraction of entities, relationships, emotions, concepts, and questions, with graceful degradation when the LLM is unavailable.
+- **Perception** — graded LLM extraction of entities, relationships, emotions, concepts, and questions. A malformed model response degrades to an empty extraction; a failed extraction call fails the ingest (see §5, Reprocessing queue).
 - **Tier-1 immediate connection discovery**, confidence propagation (learning), and working-memory event tracking with consolidation.
 - **Condensation** — duplicate merging, version compression, archival, and summarisation (v1 `cog_node` path; being reframed as host-triggered **data minimisation** and dormant under Structure-native storage — see §3).
 - **Pattern detection** (preference / behavioural / temporal), **proactive gap and question detection**, and some contradiction detection.
@@ -78,6 +78,10 @@ An early security assessment (concept doc §9) proposed enforced multi-tenant is
 `userId` being **nullable** is intentional, not a gap: system-level and ontology nodes are shared, not user-owned, so they carry a null `userId`. Audit items that asked to thread a *separate* tenant identity through validation (e.g. `ONT-01`) were deliberately **not** implemented — the fix, where relevant, is to scope by `userId` ownership, which the account-erasure pathway already respects.
 
 The lawful **deletion / erasure pathway is implemented** — the consuming module's account-erasure deletion handler cascades through the module's per-user data. "Never decay" governs *relevance ranking over time*; it never meant "cannot delete on lawful request".
+
+### Federated graphs — won't do
+
+The original design's post-launch wishlist included **federated graphs** (connecting several users' graphs). That conflicts with `tenantId === userId`: each user's graph is isolated by `userId` ownership, and there is no layer above the user to join graphs through. It is not planned.
 
 ---
 
@@ -137,12 +141,24 @@ A multi-agent cleanup and security audit found 162 confirmed findings. The engin
   - the three `estimateTokens` variants;
   - the per-level tables duplicated between perception and degradation;
   - the hand-written LLM response types kept beside their Zod schemas.
-- **Config flags that are read nowhere:** wire up or drop the `DetectionConfig` and `ProactiveOptions` flags.
+- **Config flags that are read nowhere:** wire up or drop the `DetectionConfig` flags (`maxTokensPerRun`, `analyseEntities`, `analyseStructural`, `analyseSequential`, `analyseCommunicative`, `enabledPatternTypes`, `patternGrowth`, `patternGrowthThreshold`) and the `ProactiveOptions` flags (`minBudget`, `expensiveBudget`).
 - **`consolidateHelpfulness`** re-applies the same feedback each run (bounded at 0.99; not called by the host).
 - **Closeness centrality** is still one synchronous search per node: about 6.5 s at the 5000-node cap.
 - **The scheduler:** `cancel` and `pause` are identical, and its id-only functions are not user-scoped. The host does not use the scheduler.
 - **Two marker meanings** (`ontology`, `entity-types`) still describe content-derived type names as "trusted".
 - **v1-only duplicates and owner checks** (`mapToNode` copies, `node.repository` count / createMany, ontology and proactive id-only reads) are removed with v1 in B4, not patched first.
+
+**More planned improvements (minor)**, found when the original build specs were checked against the code before they were deleted:
+
+- **Pattern evidence edges.** A pattern points at the observations behind it with `supported_by` edges, and at disconfirming ones with `contradicted_by` edges, both running from the pattern to the evidence.
+  - Neither type is in `COGNITIVE_DB_CONNECTION_TYPES`, so the host never seeds them and Structure stores those edges with no type definition. Add them before the pattern lane is wired.
+  - The direction matters. `propagateChange` reads both directions, so it handles these edges. `confidence.service.calculateConfidence` reads only a node's incoming edges, so its two default pattern rules (`pattern-evidence-support`, `pattern-evidence-contradiction`) never fire. Read a pattern's outgoing evidence edges there, or drop the two rules, since propagation already covers evidence → pattern effects.
+- **Propagation has no producer.** The intent is that a confidence or status change ripples to connected nodes. As built, a ripple happens only when a caller runs `propagateChange` directly, or enqueues the change with `queuePropagation` for `runTier3Processing` to drain. No engine write enqueues anything: pattern confirm and contradict, recheck reactivate and archive, `confidence.service` updates and working-memory helpfulness adjustments all change confidence or status without a ripple. Running the Tier-3 batch alone therefore propagates nothing, and each drained item reaches one hop only (`recursive` defaults to `false`). Wiring the lane means deciding who enqueues: the engine on each confidence write, or the host.
+- **Proactive scoring is lexical.** Question resolution scores keyword overlap, and surprise detection scores Jaccard word overlap; neither uses the node vectors. The question threshold (0.7) equals the keyword weight, so a candidate that neither matches nor mentions the question's subject must contain *every* question keyword. The batch answer search (`findPotentialAnswers`) also scores only a small page of content and entity records (three times the result limit), filtered in memory to those created after the question, so an answer outside that page is never considered.
+
+  The original design used embeddings: a semantic search over content created after the question, and cosine distance between a surprise seed and the nodes it reaches (a code comment in `surprise.detector.ts` still points to this). Question nodes are already embedded under Structure, so it is feasible. If it adds embedding calls, gate them on cost: the engine token budget the unused `minBudget` / `expensiveBudget` options were for, or AI Core's spending limits, depending on the §5 token-budget decision.
+- **Decision and intention checks read only incoming edges.** `incomplete_decision` (gap detection) and `aged_intention` (temporal reminders) look only for *incoming* `explained_by` / `caused_by` / `motivated_by` / `because` and `completed_by` / `resolved_by` / `done` edges. The base ontology defines `explained_by` and `caused_by` with the explained item as the source, so a correctly linked decision is still flagged. Check both directions, or the direction each type defines.
+- **Emotion-trend significance** divides the slope by the signed weekly mean, so a net-negative tone never reports a trend and a near-neutral one over-reports. Weeks with no emotions also count as neutral. Scale valence by its fixed −1 to 1 range instead, and skip empty weeks.
 
 ### AI Core operations catalogue — host seeding
 
@@ -163,6 +179,21 @@ Four decisions from the security profile still need a product answer before the 
 
 Related: **third-party AI processor disclosure** — content leaving to US-based LLM and embedding providers is a data-flow disclosure consideration under Australian privacy law (and potentially others depending on where an app's users sit).
 
+### Open decision — evidence-driven weakening vs never-decay
+
+**Status:** Needs a decision. No stored data is affected yet, because nothing calls the pattern lane.
+
+The pattern and learning code lowers confidence when new evidence arrives:
+
+- `contradictPattern` takes 0.1 off a pattern's confidence.
+- `propagateChange` lowers a pattern when its `supported_by` evidence weakens, and lowers neighbouring nodes across `contradicts` / `contradicted_by`, `causes` / `explains` and `related_to` / `about` edges.
+- `confidence.service`'s default rules are written the same way: one lowers a pattern on a `contradicted_by` edge (it never fires today; see "Pattern evidence edges" above), and one lowers an effect whose cause is weak.
+- In the other direction, the Tier-3 recheck counts only `supported_by` evidence and ignores `contradicted_by`, so it can reactivate a pattern that contradictions questioned (see [Architecture](/cognitive-db/architecture/#lifecycle)).
+
+The v1.9.0 contradiction-caveat work took the opposite line. It emits only a non-destructive `qualifies` edge, because down-weighting a claim would break never-decay, which the code there calls "strengthen-only". [Foundations](/cognitive-db/foundations/) defines never-decay as no weakening by age or disuse, and the original design (`COGNITIVE_DB_PHILOSOPHY_V2.md`) expected conflicting information to lower confidence.
+
+Decide which reading holds. Then either state in Foundations that new evidence may lower confidence (time never may), or move these lanes to strengthen-only plus `qualifies` caveats. Settle this before wiring ingest-time pattern confirmation (§5).
+
 ### Append-only access-audit trail
 
 **Status:** Planned
@@ -182,9 +213,10 @@ Distinct from §7's "Phase B — Deep Perception: **Built**" row — Phase B bui
 - **The seven extraction levels** — explicit, implicit, inferred, emotional, cognitive, meta-connections, questions. Levels 3/4/6/7 are where the value is and are the ones a prompt silently skips.
 - **Density benchmark** — "I love purple, it reminds me of my grandmother's garden" (nine words) must yield ≥6 entities, ≥8 connections, ≥2 meta-connections and ≥2 questions (~19 nodes). 3–5 nodes from a comparable sentence means extraction is too shallow.
 - **Provenance on every inferred edge** — `sourceType`, `confidence`, and a plain-English `changeReason`; an inferred connection without one is a bug.
+- **Source provenance on every edge** _(planned; never built)_ — each relationship edge the ingest writes should record which content produced it. Records already do: entity, emotion, concept and question writes are logged in `cog_intelligence_log` with their `sourceNodeId`, and engine-discovered edges keep it in `cog_intelligence_discovery`. A stated or inferred **relationship edge**, though, carries only `strength`, `confidence`, `evidence` (the first observation's quote), `bidirectional`, `evidenceTier` and `origin`, and a re-observation adds only a `lastStrengthened` time and reason. Re-observing it from another document raises its strength without naming that document, so the graph cannot answer "which documents assert A → B". To close it, record the content id on each observation: a `data.sourceContentIds` list, or a `cog_intelligence_log` row on each edge create / strengthen. Evidence-grade apps need every derived fact to trace back to its source.
 - **Build at ingest, never at retrieval; no decay, ever** — connection strength never weakens by age or disuse.
 
-Rides on the v2 Structure-native storage ([RFC](/cognitive-db/v2-rfc/) Phase 3): Structure already stores the full depth — connections are nodes, and meta-connections (connections about connections) are storable today via a connection type whose `fromTypes`/`toTypes` include `connection`. Superseding decision recorded on the v2 track: the base ontology is **app-supplied** — the engine ships no base types (this supersedes the older "package ships base types; apps extend" note in the engine's internal `PHASE_B_DEEP_PERCEPTION.md`).
+Rides on the v2 Structure-native storage ([RFC](/cognitive-db/v2-rfc/) Phase 3): Structure already stores the full depth — connections are nodes, and meta-connections (connections about connections) are storable today via a connection type whose `fromTypes`/`toTypes` include `connection`. Decision recorded on the v2 track: under Structure the base ontology is **app-supplied** — the engine ships no base *node* types. The app supplies them, and an unknown type the model proposes goes to the `proposeNodeType` review queue. The engine does still ship a catalogue of the fixed connection types it writes itself (`COGNITIVE_DB_CONNECTION_TYPES`; the pattern lane's two evidence types are still missing — see "Pattern evidence edges" above), which the host seeds into Structure, and it still exports `BASE_ONTOLOGY` / `MINIMAL_ONTOLOGY` for the retiring v1 `cog_node` path.
 
 ### Summary-based node vector + chunk-aware embedding (cognitive-pipeline Stage-1 seam)
 
@@ -211,27 +243,28 @@ A constraint on the §6 connection-strength formula: relevance may read recency 
 
 The engine now has a flag-guarded Structure-native ingest path ([v2 RFC](/cognitive-db/v2-rfc/) §6/§9.2), landed incrementally on top of v1 (which stays the degrade-safe fallback). Storage resolves to Structure whenever an adapter is injected (cognitive-pipeline's `buildStructureAdapter`, v1.21.0); v1 `cog_node` is the fallback.
 
-**Landed:** records + ontology reads + entity dedup (exact + **normalised-name** + semantic over `structure_node`) + summary-based embeddings; typed emotion / concept / question nodes (embedded for search); unknown node types **always** filed to the `proposeNodeType` review queue (regardless of growth mode); entity re-observation logged to `cog_intelligence_log`; engine-discovered connections written pending and auto-promoted above a configurable confidence threshold (default 0.9), with `promoteConnection`'s typed failures handled and the discovery buffer resolved to `promoted` only after promotion actually succeeds; and a **change-gate** (v1.3.0) — re-ingesting an identical doc (keyed by `sourceId`, else content hash) skips perception + embedding entirely, while a changed doc updates its content node in place and re-perceives; and **graph-aware extraction** (retrieve-to-connect, v1.12.5, flag-gated `features.retrieveToConnect`, default off) — before `extract-entities`, a scope-confined semantic search over existing entity instances is fed to the op as a `related-entities` context item so the model **links** a new mention to the existing node instead of duplicating (additive — dedup remains the backstop; degrade-safe when off / unscoped). The same pass threads active-scope confinement (`scopeRootId`) and read-permission exclusion (`unreadableTypes`, host-resolved and pushed via `IngestInput`) into the engine's node searches — closing the previously-unscoped dedup / discovery searches — and organically-grown relationship types now carry a coarse `relationClass` so a growing vocabulary stays anchored to the fixed four-value backbone. Storage-aware **surprise detection** (v1.12.7) gathers each seed's neighbourhood via the adapter's `expandGraph` primitive (batch N-hop, space-confined) instead of the empty v1 graph — degrade-safe and dormant until cognitive-pipeline wires `expandGraph` on the adapter.
+**Landed:** records + ontology reads + entity dedup (exact + **normalised-name** + semantic over `structure_node`) + summary-based embeddings; typed emotion / concept / question nodes (embedded for search); unknown node types **always** filed to the `proposeNodeType` review queue (regardless of growth mode); entity re-observation logged to `cog_intelligence_log`; engine-discovered connections written pending and auto-promoted above a configurable confidence threshold (default 0.9), with `promoteConnection`'s typed failures handled and the discovery buffer resolved to `promoted` only after promotion actually succeeds; and a **change-gate** (v1.3.0) — re-ingesting an identical doc (keyed by `sourceId`, else content hash) skips perception + embedding entirely, while a changed doc updates its content node in place and re-perceives; and **graph-aware extraction** (retrieve-to-connect, v1.12.5, flag-gated `features.retrieveToConnect`, default off) — before `extract-entities`, a scope-confined semantic search over existing entity instances is fed to the op as a `related-entities` context item so the model **links** a new mention to the existing node instead of duplicating (additive — dedup remains the backstop; degrade-safe when off / unscoped). The same pass threads active-scope confinement (`scopeRootId`) and read-permission exclusion (`unreadableTypes`, host-resolved and pushed via `IngestInput`) into the engine's node searches — closing the previously-unscoped dedup / discovery searches — and organically-grown relationship types now carry a coarse `relationClass` so a growing vocabulary stays anchored to the fixed four-value backbone. Storage-aware **surprise detection** (v1.12.7) gathers each seed's neighbourhood via the adapter's `expandGraph` primitive (batch N-hop, space-confined) instead of the empty v1 graph — degrade-safe, and active once the host forwards `expandGraph` (cognitive-pipeline v1.21.25).
 
 **Read-lane flip (in progress, toward `cog_node` retirement):** the ingest write-lane and the proactive/intelligence lanes are storage-aware; the remaining read/intelligence services (graph algorithms, pattern detection, confidence, degradation, metrics, and the whole search surface) hard-bound v1 `cog_node`, so under Structure they read the empty parallel store. A read-only audit mapped the real remaining set (scoped to what the host actually invokes — every such service is currently *dormant public API*, not host-wired, so this is anticipatory not a live outage), and successive batches made them storage-aware behind the storage flag, v1 path byte-identical: **batch 1 (v1.12.9)** eight graph/algorithm/detection/confidence/degradation/metrics/search services; **similarity + adapter lifecycle mirror (v1.12.10)**; the **graph lane** — `connection.service` + `traversal.service` (v1.12.13); the **pattern lane** — `pattern.service` + `confirmation.service` (v1.12.14) and `learning/propagation.service` (v1.12.15); and the **ontology** — `ontology.service` + the class-scoped cones (`classScopedCone` / `classScopedShortestPath`, reading `superClasses` / `relationClass` / `superProperty` off Structure's type registry) (v1.12.16). **The read-lane flip is now COMPLETE** — every read/intelligence service branches on the storage flag with a byte-identical v1 path. Retirement is **greenfield, no backfill** (decided): the remaining step is **B4 — retire `cog_node` and cut engine v2.0.0**, a deliberate epoch coordinated with the cognitive-pipeline major (not an incremental engine step).
 
 **Parked:**
 
 - **Working-memory consolidation** — the engine would react to `cognitive-pipeline.working-memory.updated` (branch on `change.type`) and contribute a token-aware trimmer to the `working-memory.context` filter. The `budgetAssemble` primitive (v1.3.0) is the ready-made trimmer; deferred until the chat / context-assembly surface needs it.
-- **Cross-item batch dedup** — concurrent `ingestBatch` items sharing a brand-new entity can still race (dedup checks committed `structure_node` rows). **Blocked in Structure mode**: merging the duplicate needs a node-archival capability the adapter's `updateNode` seam lacks; the engine-side alternative is serialised entity creation. Deferred to a host-tested follow-up.
+- **Cross-item batch dedup** — concurrent `ingestBatch` items sharing a brand-new entity can still race (dedup checks committed `structure_node` rows). **Blocked in Structure mode**: merging the duplicate needs the adapter's optional `mergeNode` / `archiveNode`, which the engine does not call yet and the host leaves unwired (see §4); the engine-side alternative is serialised entity creation. Deferred to a host-tested follow-up.
 - **Bulk create** — records are created one call at a time; `bulkCreateNodes` (and `embedBatch`) batching is a performance refinement. Deferred to a host-tested follow-up.
 - **Condensation → data minimisation (parked; host-triggered).** The v1 condensation pass (`summariseOldContent` and friends) reads `cog_nodes` and nothing triggers it, so under Structure-native storage it is **dormant — it never runs** in the default mode. Not broken; asleep in the new store. It is being **reframed** rather than storage-flipped as-is, pending a host-side design process:
   - **Goal = data minimisation, not "archiving":** reclaim space by shedding the bulky, *regenerable* data (raw text, chunk text, vectors) while **never touching the entity / relationship graph** — that graph is tiny but the most expensive thing to recreate, and losing it loses the connections.
   - **The staleness-based "archive unused" job is dropped.** Recency ≠ importance, and hiding nodes by how recently they were accessed violates never-decay.
   - **Safe levers kept:** *summarise-with-restorable-original* (a storage tier, not decay — the original is recoverable from `cog_content_archive`) and *duplicate collapsing*. The host side is ready — `cog_content_archive` is provisioned and the `cognitive-db/summarise` op is seeded.
+  - **Summary quality for the restorable-original lever.** Once raw text is archived, the summary is all the record holds until it is restored, so the original design required it to keep the key facts and named entities. Today `generateLLMSummary` reuses `cognitive-db/summarise`, whose catalogue objective is a 1–3 sentence summary for semantic-search embedding, and passes no extracted entities. Before the host wires data minimisation, decide whether that is enough. If not, add a summary objective to the catalogue that keeps facts and entities, or pass the extracted entities as context.
   - **Ownership:** cognitive-pipeline orchestrates and owns the **trigger**; the engine only lends its summarise primitive. Condensation is a **host-triggered capability**, not an engine-owned automatic pass.
-  - **Still blocked:** the merge / re-parent levers need a Structure node archive / merge / re-parent API (`updateNode` drops `status` / `parentId` — see §4). No engine code change; parked pending the host-side design.
+  - **Still blocked:** the merge / re-parent levers need the adapter's optional `archiveNode` / `moveNode` / `mergeNode`. Structure provides them, but no engine code calls them yet and the host leaves them unwired while this work is parked (see §4). Parked pending the host-side design.
 
 ---
 
 ## 4. Structure integration gaps
 
-These are the concrete integration gaps between the engine and the Structure module. All are **planned**, none are built.
+These are the concrete integration gaps between the engine and the Structure module. The open ones are **planned**, not built; done items stay struck through for the record.
 
 <Steps>
 
@@ -249,9 +282,9 @@ These are the concrete integration gaps between the engine and the Structure mod
 
 6. **Active-scope + read-permission push for graph-aware extraction** — retrieve-to-connect (v1.12.5), and the engine's now scope-aware dedup / discovery searches, confine to the user's active space and drop unreadable node types only when cognitive-pipeline resolves and passes `scopeRootId` + `unreadableTypes` on the `ingest()` call and forwards `scopeRootId` / `excludeNodeTypes` through `buildStructureAdapter`'s `semanticSearchNodes` / `findSimilarNodes` (Structure's runtime already honours both). Until then, retrieve-to-connect stays dark by design. Also on re-vendor: seed the `cognitive-db/related-entities` marker, and persist a proposed relationship type's `relationClass` onto the Structure connection type. The exact-name dedup stage remains cross-scope until `StructureNodeQuery` gains a scope/parent filter.
 
-7. **Node archive / merge / re-parent API** — Structure's `updateNode` allowlist drops `status` and `parentId`, so the engine cannot archive, merge, or re-parent a `structure_node`. This blocks cross-item batch dedup (§3), the merge / re-parent levers of condensation → data minimisation (§3), and gap re-parenting. A Structure-side capability is needed before those slices can run.
+7. **Node archive / merge / re-parent API** — Structure's `updateNode` allowlist drops `status` and `parentId`, so the engine cannot archive, merge, or re-parent a `structure_node` through it. Structure now has `archiveNode` / `moveNode` / `mergeNode`, and the engine declares them as optional adapter methods (v1.12.10), but no engine code calls them yet and the host deliberately leaves them unwired while data minimisation is parked. This blocks cross-item batch dedup (§3), the merge / re-parent levers of condensation → data minimisation (§3), and gap re-parenting.
 
-8. **`expandGraph` wiring + `getConnectionsForNodes` batch edge read** — two optional adapter methods the engine now calls. (a) The **surprise detector** (v1.12.7) calls `StructureAdapter.expandGraph`; Structure exposes the primitive but cognitive-pipeline must forward it in `buildStructureAdapter`. (b) **Structural-gap** detection (v1.12.8) calls `StructureAdapter.getConnectionsForNodes(nodeIds, userId, { status? })` — a thin `fromNodeId|toNodeId in (...)` connection read Structure must add, then cognitive-pipeline forwards it. Until each is wired, that feature stays dark under Structure (degrade-safe). The **intelligence lane** is otherwise complete: temporal reminders + trend detection are storage-aware as of v1.12.8 (they work once the adapter is injected).
+8. ~~**`expandGraph` wiring + `getConnectionsForNodes` batch edge read**~~ — **done.** Structure exposes both, and cognitive-pipeline forwards them in `buildStructureAdapter` (v1.21.25), so the surprise detector (v1.12.7) and structural-gap detection (v1.12.8) work under Structure. The **intelligence lane** is otherwise complete: temporal reminders + trend detection are storage-aware as of v1.12.8 (they work once the adapter is injected).
 
 </Steps>
 
@@ -263,7 +296,7 @@ Structure's explicit, user-created connections and the engine's semantically dis
 
 ## 5. Feature completions
 
-These are the deferred stubs the 2026-07-14 audit documented rather than implemented speculatively. Each was left as an honest stub; each needs a product decision before building.
+These started as the deferred stubs the 2026-07-14 audit documented rather than implemented speculatively. Later reviews added features that are built but not wired, and design ideas never built. Each open item needs a product decision before it is built or wired; shipped and done items stay listed for the record.
 
 ### Discovery Tier 2 / Tier 3
 
@@ -271,11 +304,38 @@ These are the deferred stubs the 2026-07-14 audit documented rather than impleme
 
 `discovery.service` returns **Tier 1** results only. The semantic **entity-matching** and **potential-contradiction** tiers are empty stubs (`entityMatches` / `potentialContradictions` always empty). Building them means defining how aggressively the engine cross-references entities and flags conflicts.
 
-### Budget persistence
+### Ingest-time pattern confirmation
 
-**Priority:** Medium · **Status:** In-process stub
+**Priority:** Medium · **Status:** Built, not wired
 
-Token / budget tracking (`resources/budget.service`) is computed **in-process only** — per-user budgets and alert thresholds are never persisted or invalidated. This needs a storage model and a policy for what happens when a budget is exceeded.
+`checkPatterns` confirms or contradicts a user's active patterns against a newly ingested item. It is a public export, but neither ingest path calls it, and `IngestResult` reports no pattern outcome. Cognitive Pipeline calls no pattern, propagation or batch API either, so in practice patterns never learn from new documents. The design intent stands: confirmation is cheap and runs per item at ingest, while detection is slow and periodic (Tier 3). Wiring it in after extraction needs a `patterns` switch gate, which `checkPatterns` lacks today, and should wait for the evidence-weakening decision in §3.
+
+### Token budgets vs AI Core spending limits
+
+**Priority:** Medium · **Status:** Built, not wired; spending limits now live in AI Core
+
+`resources/budget.service` holds token budgets per operation, per session and per day (`DEFAULT_BUDGET`). The limits sit in an in-process cache and are never persisted; usage is summed from today's `cog_processing_log` rows. `degradation/` builds on these budgets: `selectLevel` picks a processing level the remaining budget can afford, and `handleBudgetExceeded` steps down a level until one fits, otherwise it returns `queue`. Nothing calls any of it: ingest checks no budget, and `recordUsage` has no caller. The ledger is also incomplete. v1 ingest logs its tokens under the operation `ingest`, which counts toward the daily total but matches no per-operation budget, and Structure ingest writes no `cog_processing_log` row at all.
+
+Cost control has moved to the host. Every engine model and embedding call goes through the host's `AiAdapter` (AI Core, in Cognitive Pipeline) with the user's id, and AI Core keeps the usage ledger. Since AI Core v1.66.0 it refuses a call with `spend-limit-reached` once a per-user daily or monthly limit, or an app-wide monthly limit, is reached. These are US-dollar limits, and each is off until an admin sets it.
+
+**Open decisions:**
+
+- **Retire or keep.** Retire the engine's token budgets in favour of AI Core's limits, or keep them only to pick a cheaper processing level before AI Core refuses. That second option would need AI Core's spend figures rather than a parallel token ledger.
+- **What a per-operation limit means.** The defaults were sized as allowances for a single call (`ingestPerception` 2,000 tokens, for example). But `checkBudget` subtracts everything that operation has logged since server-local midnight, so each one is really a daily cap for that operation. Together the five per-operation defaults allow 10,500 tokens a day, so the 50,000 session and 200,000 daily totals can only be reached by spend logged under other operation names. The session limit applies only when a `sessionId` is passed, and the degradation helpers never pass one. Decide per call or per period before choosing any storage model.
+
+### Reprocessing queue
+
+**Priority:** Low · **Status:** Not built (flagging helpers only)
+
+The design: when the model is unavailable or the budget is spent, store the content, flag it `needsReprocessing`, and re-perceive flagged items later while the budget allows. Only the flagging exists, and only as uncalled helpers:
+
+- `handleLLMUnavailable` sets the flag.
+- `handleProcessingError` counts attempts in `retryCount` and clears the flag on the third failure.
+- `getQueueStats` and `clearQueue` read and clear the flag, and `getRetryDelay` gives exponential backoff.
+
+The two handlers write node metadata on either storage path. Ingest never sets the flag and nothing consumes it (the no-op `processQueue` was removed in 1.12.25).
+
+Today a retry is simply another `ingest` call. Under Structure, an ingest whose extraction call failed wrote no record, so calling it again just runs it again; `force: true` is needed only to re-perceive a document that was already ingested unchanged. Building "store now, perceive later" under Structure would also mean writing the content record before (or when) the extraction call fails, since today it is written only after extraction. **Open decision:** build the queue in the engine, or leave retry to the host's ingest jobs and retire these helpers.
 
 ### Hybrid lexical + semantic search
 
@@ -283,11 +343,11 @@ Token / budget tracking (`resources/budget.service`) is computed **in-process on
 
 Delivered by **`fusedSearch`** — it runs a semantic leg and a `ts_rank` lexical leg (`lexicalSearch`) and fuses them with **Reciprocal Rank Fusion** (`rrfFuse`), combining the two by rank position so their incomparable score scales (cosine distance vs `ts_rank`) never need reconciling. The old, misnamed `hybridSearch` (filtered semantic search — never a lexical blend) was renamed to **`filteredSemanticSearch`** in the same release. The fusion, diversity (`mmrSelect`), de-duplication (`dedupe`) and token-budget (`budgetAssemble`) primitives live in the new pure, storage-free `./retrieval` domain and work over both storage paths.
 
-### `undoMerge` connection replay
+### v1 merge does not move edges
 
-**Priority:** Low · **Status:** Status-only
+**Priority:** Low · **Status:** v1 only; retires in B4
 
-`condensation.undoMerge` restores node **status** but does not reverse the connections redirected during the merge. A full restore needs the merge step to record what it redirected so it can be replayed.
+`condensation.undoMerge` restores the merged node's **status** only, but there are no redirected connections to replay. The v1 merge never moves edges, because `nodeRepository.update` does not write `fromNodeId` / `toNodeId`. It does not write `previousVersion` either, so version compression's relink is a no-op too. A merged node's connections therefore stay on its `merged` tombstone. All of this is v1 `cog_node` code that B4 deletes. Under Structure, a merge would use the adapter's optional `mergeNode`, which the host deliberately leaves unwired while data minimisation is parked.
 
 ### Cross-item batch entity dedup
 
@@ -297,18 +357,18 @@ Entity dedup is correct *within* a single ingest, but concurrent items in `inges
 
 ### In-repo docs consolidation
 
-**Priority:** Low · **Status:** Migration done; cleanup pending
+**Priority:** Low · **Status:** Done (2026-10-01)
 
-The shared docs site is the single source of truth. The engine repo still carries superseded working docs under `docs/` that predate this site. The teaching content has already been migrated here (the worked perception example, the query-reconstruction flow, the compensation table, and the integration reference bits). Remaining cleanup, in the engine repo:
+The shared docs site is the single source of truth. The engine repo's superseded working docs under `docs/` predate this site; their teaching content was migrated here (the worked perception example, the query-reconstruction flow, the compensation table, and the integration reference bits).
 
-- **Delete** the superseded build specs `PHASE_A`–`PHASE_F` (their as-built status lives in [Architecture](/cognitive-db/architecture/) and §7 above). *(The stale `INTEGRATION.md` was deleted in 1.12.24; its current content is the [Integration](/cognitive-db/integration/) page.)*
-- **Keep** as in-repo working history (per the [v2 RFC](/cognitive-db/v2-rfc/) §12): the code audit (`docs/AUDIT-2026-07-14.md`) and the concept / refinements design notes (`COGNITIVE_DB_PHILOSOPHY_V2.md` and the R1–R7 refinements docs).
+- **Deleted** the six superseded build specs `PHASE_A`–`PHASE_F` (2026-10-01; the separate B4 retirement plan, `PHASE_B4_COG_NODE_RETIREMENT.md`, stays). Before deletion, their lasting content (design decisions, thresholds, as-built status and deferred ideas) was checked against the code and folded into [Overview](/cognitive-db/), [Architecture](/cognitive-db/architecture/), [Integration](/cognitive-db/integration/), [Providers](/cognitive-db/providers/), [Foundations](/cognitive-db/foundations/), [Security](/cognitive-db/security/) and this roadmap. *(The stale `INTEGRATION.md` was deleted in 1.12.24; its current content is the [Integration](/cognitive-db/integration/) page.)*
+- **Keep** as in-repo working history (per the [v2 RFC](/cognitive-db/v2-rfc/) §12): the code audits (`docs/AUDIT-2026-07-14.md`, `docs/AUDIT-2026-10-01.md`), the B4 retirement plan and the concept / refinements design notes (`COGNITIVE_DB_PHILOSOPHY_V2.md` and the R1–R7 refinements docs).
 
 ---
 
 ## 6. Research agenda (R1–R7)
 
-A neuroscience-informed refinements plan (24 January 2026) layers seven enhancements onto the node model. **None of this is built.** The whole layer is designed to be **additive and opt-in** (config flags), non-breaking to existing APIs — no phase requires the others to deliver value.
+A neuroscience-informed refinements plan (24 January 2026) layers seven enhancements onto the node model. Apart from R5's sequential pattern detector and the pure cores listed below, **none of this is built.** The whole layer is designed to be **additive and opt-in** (config flags), non-breaking to existing APIs — no phase requires the others to deliver value.
 
 | Phase | Name | Core idea |
 |-------|------|-----------|
@@ -364,23 +424,34 @@ Existing phases (A–F)
 None of R1–R7 blocks app-level work. Because every phase is opt-in behind a config flag and additive at the schema level (new columns, new tables), existing apps keep working unchanged until they enable a refinement.
 </Aside>
 
+### Ideas from the original design (not planned)
+
+The original build plan closed with a post-launch wishlist. None of it is built or scheduled; it is recorded here so the ideas are not lost:
+
+- **MCP server** — expose the engine as a Model Context Protocol server.
+- **Streaming results** — deliver results progressively.
+- **Declarative workflows** — config-driven processing.
+- **Full graph export / import** — serialise a user's whole graph.
+
+The same list also proposed federated graphs, which are out of scope (§2).
+
 ---
 
 ## 7. Implementation phases (A–F)
 
-The V2 "everything is a node" rewrite was scoped in six phases. The original design map could only *infer* their status; the 2026-07-14 audit **verified** it. Reconciled status:
+The V2 "everything is a node" rewrite was scoped in six phases. The original design map could only *infer* their status; the 2026-07-14 audit **verified** it, and the C–F notes were rechecked against the code when the phase build specs were retired (2026-10-01). Reconciled status:
 
-| Phase | Focus | Status | Notes (verified by audit) |
+| Phase | Focus | Status | Notes (verified against the code) |
 |-------|-------|--------|---------------------------|
 | **A — Core Graph** | Unified node model, embeddings, semantic search, basic connections | **Built** | The `cog_node` scaffold, embeddings, and pgvector search are all present. |
 | **B — Deep Perception** | Multi-level perception, ontology typing, Tier-1 discovery | **Built** | Graded perception, ontology-as-data, and immediate discovery all ship. Machinery only — calibrating extraction *depth* to the density benchmark is a separate near-term track (§3). |
-| **C — Patterns & Learning** | Pattern detection, version propagation, confidence updates | **Partial** | Pattern detection, confidence propagation, and version chains exist and were audited; propagation had correctness fixes applied. |
-| **D — Working Memory & Proactive** | Session tracking, consolidation, contradiction / question / surprise detection | **Partial** | Working-memory events, consolidation, and proactive gap / question / contradiction detection exist and were verified. |
-| **E — Resource Optimisation** | Token budgets, condensation, graceful degradation | **Partial** | Graceful degradation ships; condensation ships on the v1 `cog_node` path but is **dormant under Structure-native storage**, reframed as host-triggered data minimisation (§3); **budget persistence is a stub** (§5). |
-| **F — Full Intelligence** | Gap analysis, temporal reminders, advanced graph algorithms | **Mostly not started** | Graph algorithms exist; most advanced-intelligence work (and the R1–R7 layer) is not built. |
+| **C — Patterns & Learning** | Pattern detection, version propagation, confidence updates | **Partial** | Detectors, confirm / contradict, recheck and propagation are built and storage-aware, but dormant: ingest does not call `checkPatterns`, nothing queues propagations, and no host runs the Tier-3 batch (§3, §5). Pattern evolution (split / merge / supersede) and category-level preferences are not built; preference detection groups emotions by exact target. |
+| **D — Working Memory & Proactive** | Session tracking, consolidation, contradiction / question / surprise detection | **Partial** | Built and host-wired: working-memory event tracking and co-retrieval consolidation into `co-activated` edges (`retrieve()` records events; a session-end listener runs `consolidate`), and the proactive checks behind the host's Suggestions inbox (`runFullCheck`). **Not yet met:** `ingest()` runs no proactive checks, and the host's debounced post-ingest `runFullCheck` does no contradiction detection, so contradictions are detected only by `checkProactive`, which nothing calls, and no insights or `needsAttention` come back with an ingest result; the token budget does not gate proactive depth (`minBudget` / `expensiveBudget` are unread; see the §5 token-budget decision); answer matching and surprise scoring use word overlap, not semantic search or embeddings (§3). |
+| **E — Resource Optimisation** | Token budgets, condensation, graceful degradation | **Partial** | Degradation helpers ship, but ingest does not call them; condensation ships on the v1 `cog_node` path but is **dormant under Structure-native storage**, reframed as host-triggered data minimisation (§3); token budgets are built but not wired; spending limits are AI Core's (§5). |
+| **F — Full Intelligence** | Gap analysis, temporal reminders, trends, graph algorithms | **Built (not host-wired)** | Gap detection (including structural dead-ends), temporal reminders, trend detection and the community / centrality / path / similarity algorithms all ship as public API, storage-aware since v1.12.8–v1.12.10. The host calls none of them directly; only structural gaps run, inside `runFullCheck` when `structuralGaps` is on (the gap and reminder checks `runFullCheck` always runs are the proactive layer's own, lighter ones). The planned single "full proactive report" was never built; `runFullCheck` is the orchestrator the host uses. See [Architecture](/cognitive-db/architecture/#the-intelligence-lane). |
 
 <Aside type="tip">
-The earlier design map marked C, D, and E as "status unconfirmed — verify". The audit was that verification: the learning, pattern, working-memory, and proactive subsystems are real. What remains for C–E is completing the stubs in §5, not building from scratch.
+The earlier design map marked C, D, and E as "status unconfirmed — verify". The audit was that verification: the learning, pattern, working-memory, and proactive subsystems are real. What remains for C–F is wiring what is built and completing the gaps named in the notes above, §3 and §5, not building from scratch.
 </Aside>
 
 ---

@@ -10,7 +10,7 @@ import { Aside, Card, CardGrid, Steps } from '@astrojs/starlight/components';
 
 cognitive-db is the intelligence engine that powers the [Cognitive Pipeline module](/modules/cognitive-pipeline/). It gives an application a brain-like knowledge layer: it *understands* content at ingest — extracting entities, discovering connections, detecting patterns — rather than just storing and retrieving it.
 
-Everything below describes the engine as shipped in **v1.0.0** (the first stable release, 2026-07-14, cut after a full code audit). Where a capability is planned or partial rather than built, it is labelled as such.
+Everything below describes the engine as it currently ships (v1.12.x; the first stable release, v1.0.0, was cut on 2026-07-14 after a full code audit). Where a capability is planned or partial rather than built, it is labelled as such.
 
 ## The unified node model
 
@@ -64,7 +64,9 @@ model cog_node {
   embeddingModel  String?
   shouldEmbed     Boolean  @default(true)
 
-  // Context validity (see below)
+  // Context validity — reserved and inert: written and copied across versions,
+  // but never read by search, traversal or ranking. Successor: the planned
+  // `contexts` ingest parameter (Roadmap §4). Removed with cog_node (B4).
   validInContexts   String[] @default([])
   invalidInContexts String[] @default([])
 
@@ -104,7 +106,15 @@ Entity types and relationship types are **not** hardcoded string unions. They ar
   </Card>
 </CardGrid>
 
-The engine ships a **base ontology** (`src/ontology/base-ontology.ts`) and the consuming application supplies its own concept and relationship types through `initConfig()`. Growing the ontology for a new domain is a configuration change, never an engine code change — this is the *generic, not app-specific* principle in force.
+Under Structure storage the ontology *is* the app's own Structure type registry, read on every ingest: concepts are node types (`superClasses` gives the is-a hierarchy) and relationship types are connection types (`fromTypes` / `toTypes` act as domain and range, alongside `relationClass` and `superProperty`) — see the [v2 RFC](/cognitive-db/v2-rfc/) §3 and §5. The app supplies those types; the engine creates none itself:
+
+- It ships `COGNITIVE_DB_CONNECTION_TYPES`, the connection types it writes on its own (such as `related_to`, `about` and `co-activated`), for the host to seed.
+- It still exports the v1-era `BASE_ONTOLOGY` / `MINIMAL_ONTOLOGY` starter sets as reference only. Nothing seeds them; only `loadOntology` on the retiring `cog_node` store can load them, and it throws under Structure.
+- `initConfig()` carries no ontology and no prompts. Prompts are AI Core operations, which the host seeds from the engine's `cognitive-db/operations` catalogue.
+
+When the model returns a type the app has not defined, the engine proposes it instead of creating it. An unknown entity type is queued for admin review (Structure's `proposeNodeType`), except that in `'auto'` growth mode a proposal at or above `ontologyGrowthThreshold` (default 0.85) is handed back for the host to create. Relationship-type proposals (when the growth mode is not `'off'`) are returned to the host (in `'auto'` mode only those at or above the threshold), because Structure has no review queue for connection types. An instance of an unknown type waits until the type exists — it is never filed under a placeholder — and the host can re-ingest the item with `force: true` once the type is approved. Growing the ontology for a new domain is therefore a configuration change, never an engine code change — the *generic, not app-specific* principle in force.
+
+**Who enforces domain and range.** Structure does, at write time: its `createConnection` rejects an edge whose endpoints fall outside the connection type's `fromTypes` / `toTypes`. The lists are subsumption-aware (a listed type admits its subtypes), and an empty list or `'*'` means any type. Ingest records a rejected edge as a warning and carries on. The engine's exported `validateConnection(prisma, fromConcept, toConcept, connectionType, userId)` is advisory only: it resolves the effective domain and range up the `superProperty` chain and returns `{ valid, errors, warnings }`, treating an unknown relationship type as valid with a warning so organic growth is never blocked. No engine write path calls it — it exists for a host that wants a pre-flight check — and the v1 `cog_node` path writes connections with no domain/range check.
 
 The ontology definitions and the concrete instances that point at them via `instanceOf` form one **semantic knowledge graph** — a typed layer sitting above the data it classifies:
 
@@ -139,9 +149,13 @@ The ontology definitions and the concrete instances that point at them via `inst
 
 Because a connection is a node (`nodeType = 'connection'`), it is far more than an edge in a lookup table.
 
-- It carries its own `strength`, `confidence` and full version history — a connection can be strengthened, weakened or superseded over time with a recorded reason, exactly like an entity.
+- It carries its own `strength` (0–1), `confidence` and provenance (`sourceType`, `changeReason`). Strength is edited **in place**, not re-versioned: each change overwrites the edge's `lastStrengthened` / `strengthenReason` (or `lastWeakened` / `weakenReason`) metadata, and under Structure storage the strength itself rides in the connection's `data`. A relationship stated again strengthens the existing edge — by a tenth of the weaker of its current and newly observed strength, capped at 1 — instead of being duplicated. Strength changes only through an explicit call (`strengthenConnection`, `weakenConnection` or `updateConnectionStrength`, which stamps `lastUpdated` / `updateReason`) or a re-observation, never with age or disuse.
 - It can have **its own connections**. A connection between two nodes can be linked to the reasoning that justified it — a *meta-connection*. This is how the engine models **N-way** relationships that a rigid two-node edge table could never express (a gap explicitly called out when the old multi-table schema was retired).
-- It can have its own `embedding` and `metadata`, so connections are themselves discoverable and searchable.
+- It carries its own `metadata`, and it is found by traversal from its endpoints, not by vector search — connections are not embedded by default (see [Embeddings](#embeddings-strategic-not-universal)).
+
+<Aside type="caution" title="Meta-connections: modelled, not yet produced">
+The model allows a connection whose endpoint is another connection, but the engine does not create one yet. No perception level extracts connections about connections, so level 6 in the table below and the meta-connection in the worked example show the target depth (the density benchmark in [Roadmap §3](/cognitive-db/roadmap/)), not what ingest writes today. The only writer is the public `createMetaConnection`. It works on the retiring v1 `cog_node` store and throws under Structure storage: Structure can hold an edge on an edge, but the engine has not been ported to write one.
+</Aside>
 
 ## Deep perception: a worked example
 
@@ -223,7 +237,7 @@ Each of those becomes a row in `cog_node` — the same shape throughout, disting
   data: { question: "Is the grandmother still alive?", priority: low }
 ```
 
-This is what *build at ingest, not retrieval* buys: the inference, the meta-connection and the open question are all discovered and persisted **now**, so a later query traverses them instead of re-deriving them.
+This is what *build at ingest, not retrieval* buys: the inference and the open question are discovered and persisted **now** (the meta-connection is the target depth — see the caution above), so a later query traverses them instead of re-deriving them.
 
 ## Versioning & provenance
 
@@ -239,13 +253,34 @@ Every meaningful change creates a **new version** rather than mutating a row in 
 
 Versioning is **atomic** — `previousVersion`/`supersededBy` form linked chains so history is never lost and the active node is always reachable. This underpins the *never-decay* principle: information is never deleted or degraded by the passage of time. Relevance *ranking* may downscale a node, but the node — and every prior version of it — remains. (The one exception is the lawful erasure pathway; see [Data ownership](#data-ownership--the-userid-boundary).)
 
+Version chains are a v1 `cog_node` mechanism. Under Structure storage records are updated in place, and an engine update made through `updateRecord` logs the prior state as a `previousState` snapshot in `cog_intelligence_log`.
+
 <Aside type="note" title="Two kinds of versioning — don't conflate them">
 `cog_node` versioning tracks how the engine's *understanding* of something evolved. That is distinct from *document* versioning (draft v1 → v2 → v3), which belongs to the application layer, not the engine.
 </Aside>
 
+## Entity resolution (dedup)
+
+Before an extracted entity becomes a new record, ingest tries to resolve it to an existing record of the **same type**, so "Jordan" the person and "Jordan" the organisation stay two records. Under Structure storage the stages run in order and stop at the first hit:
+
+1. **Exact name**, case-insensitive. The oldest matching record wins.
+2. **Normalised name**, for multi-word names only: lower-cased, trimmed, whitespace collapsed. Punctuation is kept, so "St. Mary's" and "St Marys" do not match at this stage (the semantic stage can still match them). The lookup is bounded: it checks up to 500 records that contain the name's longest word.
+3. **Semantic.** The bare name is embedded and searched within its type (top 5); a hit scoring 0.85 or more resolves. This needs host embeddings, and it is confined to the active scope and to readable types when the host passes `scopeRootId` / `unreadableTypes`.
+
+A matched entity is re-observed rather than duplicated (no second record is created and no records are combined): the extraction is assigned to the existing record, its new attributes are merged into that record's data, an entity that was only inferred becomes observed once a document states it, and a `cog_intelligence_log` row records which content mentioned it. A semantic match is accepted as the same entity without review.
+
+Not yet built under Structure:
+
+- The v1 alias stage (`data.aliases`). It needs an alias index in Structure.
+- Scope confinement for the two name stages. It needs a scope filter on `StructureNodeQuery`.
+
+When retrieve-to-connect is on, the model sees existing entities before extraction, and dedup remains the backstop.
+
 ## Embeddings: strategic, not universal
 
-Not every node is embedded. The `shouldEmbed` flag keeps the pgvector index focused on things worth searching semantically — content, entities, patterns and questions are embedded; ontology and purely structural nodes are found by *type*, not by semantics, so they are left out. This avoids diluting the vector index with schema metadata.
+Not every node is embedded; the vector index is kept for things worth searching semantically. Under Structure storage the engine embeds content, entity, emotion, concept and question records. On the retiring v1 `cog_node` store the `shouldEmbed` flag does the same job and patterns are embedded too; under Structure they are not, and `findSimilarPatterns` is a plain name/summary text match. Ontology and purely structural nodes are found by *type*, not by semantics, so they are left out. This avoids diluting the vector index with schema metadata.
+
+**Connections are not embedded by default.** Under Structure storage the engine never embeds a connection (the embeddings adapter only handles nodes): a connection is reached by traversal from its endpoints, and semantic search returns only nodes. On the v1 path a connection gets a vector only when it carries a substantive `changeReason` (over 50 characters), embedded as `connectionType: changeReason`.
 
 Search built on this index is **filtered semantic search** (embeddings scoped by `nodeType`, `userId`, status and similar). It is referred to as "hybrid" search in the codebase, but note it is currently a filtered semantic search only — a lexical/keyword blend is **not yet built**.
 
@@ -298,7 +333,19 @@ async function queryFeelings(userId: string) {
 
 cognitive-db does **not** own or manage the application's LLM context window — the application does. What the engine does is *track* activation, so it can learn from what actually got used and consolidate session activity back into the long-term graph.
 
-That tracking lives in `cog_working_memory_event`: rows recording which nodes were `activated` / `retrieved` / `used` / `deactivated` in a session, which nodes were `usedWith` each other, and optional `wasHelpful` feedback. Co-retrieval signals feed the learning subsystem (confidence propagation); consolidation folds session activity back into the graph. The application still decides what goes into its own prompt.
+That tracking lives in `cog_working_memory_event`, a storage-agnostic table that stays when `cog_node` retires. Four event types can be recorded, but only some of them teach the engine anything today:
+
+| Event | What it feeds |
+|---|---|
+| `retrieved`, `used` | Each carries `usedWith`, the other nodes returned or used alongside it. The two count the same: each unordered pair counts once per event, and consolidation turns repeated pairs into `co-activated` edges. |
+| `wasHelpful` (on `used` events, set by `trackUsage`) | Explicit helpfulness feedback, which drives `consolidateHelpfulness`. |
+| `activated`, `deactivated` | Stored and returned by the session and event reads, but nothing learns from them yet. Using activation as a "relevant now" signal (for example for pre-fetching) is not built. |
+
+**Consolidation.** `consolidate(prisma, userId)` turns a pair co-retrieved at least `threshold` times (default 3) within the retention window (default 7 days) into a `co-activated` edge with `sourceType: 'consolidation'` (plus `origin: 'consolidation'` under Structure). A new edge starts at `frequency / 10`, capped at `maxStrength` (0.8); each later batch of at least `threshold` *new* co-retrievals adds `strengthIncrease` (an absolute 0.05), up to the same cap, and the edge's `data.lastCoRetrievalAt` mark stops the same events counting twice. Consolidation touches only its own `co-activated` edges, never lowers a strength, and links only two live nodes the user owns. `consolidate` (not `consolidateSession`) then deletes events older than the window: the usage log is transient process data, and what it taught the graph persists as edges, so pruning it is not decay. Co-retrieval feeds consolidation, **not** confidence propagation, which gives `co-activated` edges no effect.
+
+**Helpfulness.** `consolidateHelpfulness` adjusts confidence from explicit feedback, never from age. Once a node has at least three `wasHelpful` ratings, a helpful share above 70% raises its confidence by 0.05 and one below 30% lowers it by 0.05, bounded to 0.1–0.99. The change does not ripple to connected nodes.
+
+Cognitive Pipeline records only `retrieved` events (from `retrieve()`) and runs `consolidate` when a working-memory session ends. It has no helpfulness surface yet, so nothing calls `consolidateHelpfulness`. The application still decides what goes into its own prompt.
 
 ## Tiered discovery
 
@@ -306,25 +353,168 @@ Connection discovery is deliberately staged so expensive work never blocks the u
 
 | Tier | Timing | Scope | Status |
 |---|---|---|---|
-| **Immediate** | ~2–3 s, synchronous | Direct, high-confidence connections for the just-ingested node (semantic + `mentions`) | **Built** |
-| **Background** | ~30 s, non-blocking | Wider connection search around the new node | **Built** |
-| **Periodic** | Batch, scheduled | Pattern detection and consolidation-style passes | **Built** |
+| **Immediate** | Synchronous, inside ingest | Nearest neighbours of new entities, buffered then auto-promoted (Structure); semantic + `mentions` (v1 fallback) | **Built** |
+| **Background** | ~30 s, non-blocking | Wider connection search around the new node | **Stub** (`queueTier2Discovery` is a no-op) |
+| **Periodic** | Batch, scheduled | Pattern detection, recheck of questioned patterns and queued propagations (`runTier3Processing`) | **Built, not host-wired** |
 | **On-demand** | Query time | Anything not worth precomputing ahead of time | **Built** |
 
+**The immediate tier under Structure storage.** Discovery runs inside ingest, after the stated relationships are written. It needs host embeddings and the `relationshipDiscovery` switch.
+
+- **Search.** For each entity this ingest created (not one resolved to an existing record), Structure returns up to 5 nearest neighbours scoring at least 0.75. A neighbour can be any embedded record, not only an entity. The search is confined to the active scope and to readable types only when the host passes `scopeRootId` / `unreadableTypes`.
+- **Buffer.** Each pair is first recorded in `cog_intelligence_discovery`.
+- **At or above `storage.autoPromoteThreshold`** (default 0.9): the pair is written as a pending `related_to` connection (origin `discovered`, evidence tier `inferred`), then promoted to active. If Structure refuses the promotion, the edge stays pending and the candidate can still be recovered.
+- **Below the threshold:** no edge is written. The pair stays a buffered candidate, which `listDiscoveries` / `promoteDiscovery` can review.
+
+Strong matches therefore become edges now, and weaker ones are kept for later. Under Structure there is no document-to-document similarity edge and no content → entity `mentions` edge: a new entity records its source document in `data.sourceContentId`, and each later mention is a `cog_intelligence_log` row. The v1 `cog_node` fallback (`discoverTier1`) writes both kinds of edge, and it alone enforces the original design's ~2–3 s time budget. Under Structure the search is bounded instead by the 5-neighbour, 0.75-floor limit per new entity.
+
+**The periodic tier.** `runTier3Processing(prisma, userId, options)` runs four steps, checking a 30-second budget between them (so a single step can overrun it):
+
+1. **Detection** — new patterns are created, and a re-detected pattern gets one more evidence edge with no change to its confidence.
+2. **Recheck** of questioned patterns (see [Patterns and learning](#patterns-and-learning)).
+3. **Draining the pending-propagation queue.**
+4. **Legacy time-based decay** — a no-op under Structure because of never-decay; on the retiring v1 store it still runs by default.
+
+The periodic tier is built but dormant. Neither the engine nor Cognitive Pipeline calls it, and the in-memory scheduler is unused, so a host that wants periodic patterns must trigger it on its own schedule.
+
 <Aside type="caution" title="Tier 2 & Tier 3 discovery are currently stubs">
-Within discovery, the deeper **semantic entity-matching (Tier 2)** and **potential-contradiction (Tier 3)** passes are present as empty stubs in `discovery.service.ts` — the types and call sites exist, but they return no results yet. Tier-1 immediate discovery is fully built. Treat Tier 2/3 semantic entity-matching and contradiction discovery as roadmap, not shipped.
+Within discovery, the deeper **semantic entity-matching (Tier 2)** and **potential-contradiction (Tier 3)** passes are present as empty stubs in `discovery.service.ts` — the types and call sites exist, but they return no results yet. Tier-1 immediate discovery is fully built. Treat Tier 2/3 semantic entity-matching and contradiction discovery as roadmap, not shipped. This is separate from the periodic tier above: the stub is `discoverTier3` in `discovery.service.ts`, while periodic pattern work runs through `runTier3Processing` in `batch/`.
 </Aside>
+
+## Patterns and learning
+
+Patterns are nodes. A pattern is a `pattern` record whose type is stored in `data.patternType`, and connections link it to its evidence. The whole lane below is built but dormant: neither ingest nor Cognitive Pipeline calls `detectPatterns`, `checkPatterns`, `propagateChange` or `runTier3Processing`, so none of it runs until a host wires it.
+
+### Pattern types
+
+`PatternType` has ten values: `preference`, `behavioural`, `temporal`, `relational`, `emotional`, `thematic`, `structural`, `sequential`, `communicative` and `custom`. Only six have a detector: preference, behavioural, temporal, thematic, emotional and sequential (the R5 PrefixSpan strategy). The engine never creates relational, structural, communicative or custom patterns on its own.
+
+### Detection
+
+`detectPatterns` runs deterministic statistics over the user's active emotion, decision and content nodes, up to 1000 of each, newest first. It makes no model call. With the defaults (`DEFAULT_DETECTION_CONFIG`), a detector proposes a pattern only when it has at least `minObservations` (3) observations and a confidence of at least `minConfidence` (0.6); temporal counts observations across all nodes rather than per group. A run stops at `maxPatternsPerRun` (50).
+
+`analyseEmotions` gates the preference and emotional detectors, `analyseTemporal` gates temporal and sequential, and `analyseTopics` gates thematic; behavioural always runs. The Tier-3 batch passes only `maxPatternsPerRun`, so the other thresholds can be changed only by calling `detectPatterns` directly. The host's `patterns` switch turns off detection and the batch recheck. It does not gate `checkPatterns` or propagation.
+
+### Detectors
+
+- **Preference.** Emotions are grouped by their exact target, lower-cased and trimmed. A group of at least `minObservations` becomes "Likes X" when its mean valence is above +0.3, and "Dislikes X" when it is below −0.3 (positive scores +1, negative −1, neutral or mixed 0). Confidence is min(0.5 + n/10 × 0.3 + consistency × 0.2, 0.95), where consistency is 1 minus the standard deviation of valence. Grouping is per target, not per category: loving purple, blue and teal produces three separate candidates, each needing three emotions, and never "prefers cool colours". Generalising to a category through the target's ontology type is a deferred design idea; the `observedValues` and `excludedValues` fields on `PatternNodeData` are declared for it but never written.
+- **Behavioural and thematic** detection is lexical, not semantic. Behavioural clusters decisions by a shared keyword (3+ letters) in their names. Thematic counts tags and 4+-letter keywords, and needs a topic to appear in at least 20% of content items.
+- **Temporal.** Content and decision nodes are bucketed by hour of day and day of week using `createdAt`. An hour is a peak when it holds more than twice the hourly mean; all peak hours collapse into one label (morning / afternoon / evening / night) based on their mean hour, with confidence at most 0.85. A weekday that holds more than 2.5× the daily mean becomes "Active on &lt;day&gt;s", with confidence at most 0.8 and no evidence edges.
+- **Sequential** (R5) orders and groups decision and emotion events by `createdAt` too: by thread, or otherwise by UTC calendar day.
+
+`createdAt` is when the engine stored the record (read in the server's local time zone for temporal), not when the event happened. A back-filled import therefore yields ingest-time rhythms, not real-world habits; event-time patterns would need an occurred-at field on records.
+
+### Evidence
+
+A pattern points at the observations behind it with `supported_by` edges, running pattern → evidence; the edge's strength is how much that observation supports the pattern. Disconfirming observations get `contradicted_by` edges in the same direction. When `checkPatterns` tests new content, the evidence is the content item, not the individual emotion.
+
+The direction is load-bearing. Propagation reads both directions, so it handles these edges correctly, but `confidence.service` reads only a node's incoming edges, so its two default pattern rules (`pattern-evidence-support`, `pattern-evidence-contradiction`) never fire.
+
+### Confirmation and contradiction
+
+`checkPatterns(prisma, contentNode, emotions, entities, userId)` tests a newly ingested item against the user's active patterns (up to 100) and applies each result straight away. Only four types have a checker:
+
+| Type | Confirms when | Contradicts when |
+|---|---|---|
+| Preference | an emotion about the same target has the expected valence | its polarity is opposite |
+| Emotional | the same emotion appears | an opposite from a small hardcoded English table appears (only `happy`, `sad`, `anxious` and `angry` patterns have opposites; for example `calm` contradicts `anxious`) |
+| Thematic | the topic appears in the text or matches a tag | never |
+| Behavioural | the keyword appears in the text | never |
+
+Thematic and behavioural matching is a plain substring test, so a topic like `art` also matches "start". No checker uses the `entities` argument. Temporal, sequential and every other type are never confirmed or contradicted by new content.
+
+Confirming a pattern adds 0.05 to its confidence, capped at 0.99, so a pattern is never certain. It also increments `evidenceCount`, stamps `lastConfirmed`, and adds a `supported_by` edge to the evidence; a repeat edge to the same node strengthens the existing edge instead of adding another.
+
+### Lifecycle
+
+Contradicting a pattern subtracts 0.1 from its confidence, stamps `lastContradicted`, and adds a `contradicted_by` edge. Confidence is floored at 0.1, so contradiction never deletes a pattern or zeroes it; one contradiction cancels two confirmations. When confidence falls below 0.3 the pattern becomes `questioned` (under Structure this is stored in `data.engineStatus`), and it is no longer checked against new content.
+
+The Tier-3 recheck re-examines questioned patterns. It counts the pattern's `supported_by` evidence that is active with a confidence of at least 0.5. With at least 3 such pieces the pattern is reactivated (`data.minObservations` would override the 3, but nothing writes it), and its confidence becomes the higher of its current value and 0.5 + 0.04 × the count, capped at 0.99. Otherwise the pattern is archived (`data.engineStatus: 'archived'` under Structure): it is kept with its evidence, never deleted. So the lifecycle is active → questioned (confidence below 0.3) → reactivated or archived.
+
+<Aside type="caution" title="Recheck can undo a contradiction">
+Recheck ignores `contradicted_by` edges, and a Structure record with no stored confidence reads as 1.0. So a pattern that still has its original supporting observations is typically reactivated at 0.62 or more, which undoes the contradictions that questioned it. This is to be resolved together with the evidence-weakening open decision in [Roadmap §3](/cognitive-db/roadmap/).
+</Aside>
+
+### Confidence propagation
+
+`propagateChange(prisma, node, changeType, options)` re-scores the active neighbours of a node whose confidence or status changed. By default it goes one hop; with `recursive: true` it goes up to `maxDepth` (2). It changes at most 50 nodes, ignores changes smaller than 0.05, and visits each node once, so cycles are safe. It never touches questioned or archived nodes. Under Structure each change updates `data.confidence` in place and logs a before/after row to `cog_intelligence_log`. Propagation reads no clock or node age.
+
+The effect depends on the edge type:
+
+| Edge type | Effect on the neighbour |
+|---|---|
+| `supported_by` (a pattern's evidence changed) | The pattern loses strength × 0.1 when the evidence falls below 0.5, and gains strength × 0.02 (cap 0.99) when the evidence is above 0.8 |
+| `causes` / `explains` | Loses strength × 0.05 when the changed node is below 0.5 |
+| `contradicts` / `contradicted_by` | Loses strength × the changed node's confidence × 0.1 when the changed node is above 0.7, and becomes `questioned` below 0.3 |
+| `related_to` / `about` | Loses strength × 0.02 when the changed node drops below 0.3 |
+| Any other type | Nothing |
+
+Every decrease is floored at 0.1. Apart from `supported_by`, the rules look only at the changed node and ignore edge direction, so a weakened effect also weakens its cause, and a changed pattern can lower the content node it is `contradicted_by`.
+
+**Nothing produces propagations yet.** A ripple happens only when a caller runs `propagateChange` directly, or enqueues the change with `queuePropagation` for the Tier-3 batch to drain, and no engine write enqueues anything. Pattern confirm and contradict, recheck reactivate and archive, `confidence.service` updates and working-memory helpfulness adjustments all change confidence or status without a ripple. Running the Tier-3 batch alone therefore propagates nothing, and each drained item reaches one hop only (`recursive` defaults to `false`).
 
 ## Proactive intelligence
 
-The engine is designed to *volunteer* insight rather than wait to be queried — the *proactive over reactive* principle. In v1.0.0 the built proactive surface includes:
+The engine is designed to *volunteer* insight rather than wait to be queried — the *proactive over reactive* principle.
 
-- **Gap and question detection** — orphaned entities, abandoned threads, unanswered questions (`src/intelligence/gap.detector.ts`, `src/proactive/`).
-- **Some contradiction detection** — surfacing tensions between things already ingested (`src/proactive/contradiction.detector.ts`). Note this is distinct from the stubbed *discovery-tier* contradiction pass above.
-- **Question resolution and surprise detection** — noticing when new content answers an earlier open question, or is unexpectedly novel.
-- **Pattern detection** — preference, behavioural and temporal patterns across everything ingested.
+**Entry points.** The proactive layer has two entry points. Both return an empty result marked `disabled: true` when the `proactive` switch is off. Neither makes a model or embedding call: every detector is a deterministic heuristic, so the layer spends no tokens.
 
-Deeper temporal/sequential pattern mining and the neuroscience-informed refinements (Hebbian weighting, spreading activation, replay-based consolidation, attractor retrieval) are on the **roadmap (R1–R7)** and are not built.
+- `runFullCheck(prisma, userId)` is the graph-wide pass, which Cognitive Pipeline's Suggestions inbox runs, debounced after ingest. It returns:
+  - up to 3 candidate answers (later content and entities) for each of up to 50 open questions;
+  - up to 5 entity gaps: the first named entities, among up to 100, with more than 2 connections but fewer than 2 data fields;
+  - structural dead-ends and orphans, when the `structuralGaps` switch is on;
+  - up to 5 temporal reminders, drawn from up to 100 active entities and patterns: those with confidence of at least 0.7 not updated for 30+ days, as a prompt to review, never a change to the node;
+  - surprising connections around up to 50 entities.
+
+  It does **not** run contradiction detection, so the inbox shows no contradictions today.
+- `checkProactive(prisma, { contentNode, extractedEntities, extractedEmotions, userId })` is the per-content check. It runs contradiction detection, finds open questions the content may answer (writing tentative `may_answer` edges), and looks for surprising connections from the content's matched entities. It sets `needsAttention` / `attentionReasons` when any contradiction is found.
+
+`ingest()` does not call `checkProactive`, and neither does Cognitive Pipeline, so contradiction detection and `may_answer` edges are dormant today. Calling `checkProactive` after `ingest()` would not bring contradictions back under Structure. By then ingest has already merged the new attributes into the matched record (the newest value wins, and the prior values survive only as the `previousState` snapshot in `cog_intelligence_log`), so there is nothing left to diff. For contradictions to work, the check has to run inside ingest, between entity resolution and that merge, or diff against the snapshot.
+
+The detectors behind those entry points:
+
+- **Gap and question detection** — entity gaps and, when switched on, structural gaps in `runFullCheck`; the fuller gap and reminder analytics (including long-open questions) are described in [The intelligence lane](#the-intelligence-lane).
+- **Contradiction detection** (`contradiction.detector.ts`) works on each extracted entity that carries attributes. It finds the stored entity (by matched id, else by exact or normalised name within its type) and diffs the two field by field. A field present in both whose values differ is a conflict; strings are compared case-insensitively and bookkeeping fields are ignored. Severity is a field heuristic: identity or state fields (`status`, `role`, `relationship`, `alive`, …) make a conflict high severity, and contact, location and employer fields make it medium, as do three or more conflicts. Contradictions are surfaced for review and never resolved automatically. With `emitCaveats`, the engine also records a non-destructive `qualifies` edge, never `contradicts`. The detector runs only inside `checkProactive` (see *Entry points*), and it is separate from the stubbed discovery-tier contradiction pass above.
+- **Question resolution** (`question.resolver.ts`) scores relevance lexically. The score is 0.7 × the share of the question's keywords (stopwords removed) found in the candidate's text, plus 0.3 when an extracted entity matches the question's `aboutEntity` (or 0.2 when the text merely mentions it), capped at 1; the threshold is 0.7. A match is only ever *tentative*. `checkProactive` writes a `may_answer` edge (content → question, strength = relevance, `sourceType: 'proactive'`). The batch pass reports matches without writing an edge, and considers only content and entity records created after the question. Only `markAnswered`, the user confirming, writes `answers` (strength 1.0, `sourceType: 'user'`) and closes the question: `status: answered` on v1, or `data.answeredBy` under Structure, whose `updateNode` cannot change status.
+- **Surprise detection** (`surprise.detector.ts`) calls a connection *surprising* when two nodes are structurally close but share little meaning. From a seed entity, the engine expands a capped neighbourhood: v1 traversal, or the adapter's `expandGraph` under Structure, capped at 20 reached nodes. It scores each reached node against the seed by Jaccard word overlap over the name, summary, sub-type and a few descriptive `data` fields, with stopwords removed, and reports a pair with overlap below 0.3 with `surpriseScore = 1 − similarity`. Per content, `checkProactive` seeds from each matched entity at up to three hops and keeps the top three. The batch pass in `runFullCheck` seeds from up to 50 entities at two hops and keeps the ten highest-scoring distinct pairs. The score is lexical, not embedding cosine, and `path` holds only the two endpoints. Under Structure the detector needs the host's `expandGraph`, which Cognitive Pipeline wires from v1.21.25.
+- **Pattern detection** is a separate lane that neither entry point runs; see [Patterns and learning](#patterns-and-learning).
+
+The neuroscience-informed refinements (Hebbian weighting, spreading activation, replay-based consolidation, attractor retrieval) are on the **roadmap (R1–R7)** and are not built; the exception is R5's sequential pattern detector, which ships (see [Patterns and learning](#patterns-and-learning)).
+
+### The intelligence lane
+
+Besides the Suggestions-inbox pass, the engine exports deterministic analytics from `src/intelligence/` and `src/algorithms/`: gap detection, temporal reminders, trend detection and graph algorithms. None of them calls a model, so they cost no tokens and send nothing to an AI processor. They have been storage-aware since v1.12.8–v1.12.10. The host calls none of them directly; only structural gaps run, inside `runFullCheck`, when the `structuralGaps` switch is on (off by default in the engine; Cognitive Pipeline turns it on by default and wires `getConnectionsForNodes`, so structural gaps do reach its Suggestions inbox).
+
+**Gap detection** (`detectGaps`) returns gaps sorted from high to low priority, each with suggested follow-up prompts. Each check reads the user's newest 500 entities.
+
+| Gap | Fires when | Priority |
+|---|---|---|
+| `sparse_topic` | a `topic` / `concept` / `project` / `theme` entity has `data.occurrenceCount` above 3 but fewer than 3 connections. Only the v1 store increments that count, so this check does not fire under Structure-native storage | high above 10 mentions, medium above 5, else low |
+| `incomplete_decision` | a `decision` entity has no incoming `explained_by` / `caused_by` / `motivated_by` / `because` edge | medium |
+| `orphan_entity` | an entity has no active connections | low |
+| `missing_detail` | an entity has fewer than 2 non-empty `data` fields and no summary | low |
+
+`detectStructuralGaps` is separate. It reports a `dead_end` (low) for a node with incoming but no outgoing edges, and an `orphan_entity` for a node with no edges. It runs only when the whole active graph is under 5000 nodes and, under Structure, only once the host has wired `getConnectionsForNodes`.
+
+**Temporal reminders** (`getTemporalReminders`, separate from the simpler `getProactiveReminders` pass inside `runFullCheck`) are prospective memory. They only resurface items and never demote or hide them, so they respect never-decay.
+
+| Reminder | Fires when |
+|---|---|
+| `anniversary` | a `decision` or `event` entity was created a year ago, ± 7 days |
+| `aged_intention` | an `intention` entity is over 30 days old with no incoming `completed_by` / `resolved_by` / `done` edge |
+| `long_open_question` | a question is over 7 days old and is neither answered (`data.answeredBy`) nor flagged outdated |
+| `periodic_review` | an entity or pattern not updated for 90 days that has 5 or more connections or confidence of at least 0.8. It checks `metadata.lastAccessedAt` first, but nothing writes that field |
+
+Known limit: each pass reads the user's newest 500 nodes of its type and filters by date in memory, so on a larger graph year-old anniversaries and old intentions can fall outside that window.
+
+These detectors match fixed names: the subtypes `topic`, `concept`, `project`, `theme`, `decision`, `event` and `intention`, and the edge types named above. Under Structure the node and connection types are app-supplied, and the engine's seeded connection types (`COGNITIVE_DB_CONNECTION_TYPES`) include none of those edge types. A check whose names the host's ontology does not use finds nothing; if the host uses the subtypes but not the edge names, every decision and aged intention is flagged.
+
+**Trend detection** (`detectTrends`, default 90 days) buckets nodes by week and fits a least-squares slope to three series: topic frequency (content nodes linked to a `topic` or `concept` entity), mean emotional valence (positive +1, negative −1, neutral or mixed 0) and new entities per subtype. A series is reported as `increasing`, `decreasing`, `emerging` or `fading` when its slope is large relative to its mean.
+
+**Graph algorithms** load the user's whole graph into memory, up to 5000 nodes, and treat edges as undirected.
+
+- **Centrality** (`analyzeCentrality`) gives degree, betweenness over a sample of at most 100 nodes, closeness (the inverse of the mean hop distance to reachable nodes) and PageRank. `findKeyNodes` blends the four into a top-10 list. Under Structure, results come back unranked until the host wires `getConnectionsForNodes`.
+- **Communities** (`detectCommunities`) use a simplified greedy heuristic, not Louvain or Leiden. Each node joins a neighbour's community when its summed edge strength to that community beats its strength to its own, for at most 50 passes; there is no modularity null model. Single-node communities are dropped. Each community's theme lists up to five member names and is built without a model call.
+- **Paths:** `findShortestPath` (fewest hops), `findStrongestPath` (Dijkstra with edge cost 1 − strength, so stronger links count as shorter) and bounded enumeration (`findAllPaths` / `findAllPathsBetween`: depth ≤ 10, at most 1000 paths).
 
 ## Data ownership — the `userId` boundary
 
@@ -340,36 +530,36 @@ The lawful **deletion / erasure pathway is implemented** — the module's accoun
 
 ## Data ownership contract
 
-cognitive-db never stores an application's original content — the *apps-own-their-data* principle. It stores its *understanding*, referenced back to the application's own table via `sourceId` + `sourceType`. Provider models, API keys, ontology and prompts are all supplied by the application through `initConfig()`; nothing is hardcoded. See the [Cognitive Pipeline module](/modules/cognitive-pipeline/) for how a real consumer wires this up.
+cognitive-db has no datastore of its own — the *apps-own-their-data* principle. Everything it writes, the ingested text included, lives in the app's own database. Under Structure storage the engine writes each item as a Structure content record through the `StructureAdapter`: the text goes in `data.content`, with `sourceId`, `sourceType` and a content hash that keeps re-ingest idempotent ([v2 RFC](/cognitive-db/v2-rfc/) §4 decision 2). The retiring v1 store keeps it in `cog_node.rawContent`. The engine's understanding (entities, connections, derived records, embeddings) is written around that record. Models and keys come from AI Core through the `AiAdapter`, and records and types from Structure through the `StructureAdapter`; the app passes both to `initConfig()`, and nothing is hardcoded. See the [Cognitive Pipeline module](/modules/cognitive-pipeline/) for how a real consumer wires this up.
 
 ## Subsystem map
 
-The engine's `src/` is organised by capability. Each subsystem is a focused service module; the flags below reflect the v1.0.0 audit.
+The engine's `src/` is organised by capability. Each subsystem is a focused service module; the flags below reflect the current code ("not host-wired" means built and exported, but neither ingest nor Cognitive Pipeline calls it yet).
 
 | Subsystem (`src/…`) | Responsibility | Status |
 |---|---|---|
 | `core/` | Node model, repository, mapper, embedding service | Built |
 | `ingest/` | The ingest entry point that orchestrates the pipeline | Built |
-| `perception/` | LLM extraction of entities, relationships, emotions, concepts, questions (graded levels; graceful degradation when the LLM is unavailable) | Built |
-| `ontology/` | Base ontology, concept/relationship-type management, `superClass`/`domain`/`range` | Built |
+| `perception/` | LLM extraction of entities, relationships, emotions, concepts, questions (graded levels; a malformed model response degrades to an empty extraction; a failed extraction call fails the ingest) | Built |
+| `ontology/` | Reference base ontology, the engine's connection-type catalogue, concept/relationship-type management, `superClass`/`domain`/`range` (advisory `validateConnection`) | Built |
 | `graph/` | Connections, filtered semantic ("hybrid") search, traversal | Built |
 | `discovery/` | Tiered connection discovery | Tier 1 built; Tier 2 & 3 stubbed |
 | `versioning/` | Atomic version chains, entity matching & dedup | Built (single-ingest dedup; cross-item batch dedup not built) |
-| `learning/` | Confidence propagation and updates (learning from use) | Built |
+| `learning/` | Confidence propagation and updates (learning from use) | Built, not host-wired (nothing enqueues propagations) |
 | `working-memory/` | Activation tracking + consolidation back into the graph | Built |
-| `patterns/` | Preference / behavioural / temporal pattern detection & confirmation | Built |
-| `proactive/` | Gap/question detection, some contradiction detection, surprise, question resolution | Built |
-| `intelligence/` | Gap detector, temporal service, trend detection | Built |
-| `condensation/` | Merge duplicates, version compression, archival, summarisation | Built for v1 `cog_node` (`undoMerge` replay is status-only); **dormant under Structure-native storage** — being reframed as host-triggered *data minimisation* (staleness-archival retiring), see roadmap §3 |
-| `algorithms/` | Centrality, community detection, pathfinding, similarity | Built |
-| `resources/` | Token/metrics accounting, budgets | Built (budget **persistence** is in-process only) |
-| `degradation/` | Graceful degradation & auto-level selection under limits | Built |
-| `batch/` | Batch processing + scheduler | Built |
+| `patterns/` | Preference / behavioural / temporal / thematic / emotional / sequential pattern detection & confirmation | Built, not host-wired |
+| `proactive/` | Gap/question detection, contradiction detection, surprise, question resolution | Built (`runFullCheck` is host-wired; `checkProactive`, and with it contradiction detection, is not) |
+| `intelligence/` | Gap detector, temporal service, trend detection | Built, not host-wired (structural gaps run inside `runFullCheck`, which Cognitive Pipeline calls with the switch on) |
+| `condensation/` | Merge duplicates, version compression, archival, summarisation | Built for v1 `cog_node` (merge does not move edges); **dormant under Structure-native storage** — being reframed as host-triggered *data minimisation* (staleness-archival retiring), see roadmap §3 |
+| `algorithms/` | Centrality, community detection, pathfinding, similarity | Built, not host-wired |
+| `resources/` | Token/metrics accounting, budgets | Built, not wired (spending limits are AI Core's) |
+| `degradation/` | Graceful degradation & auto-level selection under limits | Built, not called by ingest |
+| `batch/` | Batch processing + scheduler | Built, not host-wired (scheduler unused) |
 | `providers/` | Thin wrappers over the host's `AiAdapter` (`runLanguage`, `embed` / `embedQuery` / `embedBatch`) — no provider SDK | Built |
-| `config/` | `initConfig()` — models, keys, ontology, prompts | Built |
+| `config/` | `initConfig()` — the Prisma client, the `AiAdapter`, the storage adapter and feature switches | Built |
 
-<Aside type="caution" title="Known partials at v1.0.0">
-Beyond the Tier 2/3 discovery stubs: **budget persistence** is in-process only (not durably stored); **`undoMerge`** flips connection status but does not replay the merge; **cross-item batch entity dedup** runs within a single ingest, not across a batch. The **R1–R7** neuroscience refinements, true **standalone DB mode** (the engine still needs Prisma), the `contexts` parameter on ingest with Structure materialised-path propagation, and most advanced "Phase F" intelligence are **planned, not built**.
+<Aside type="caution" title="Known partials">
+Beyond the Tier 2/3 discovery stubs: **token budgets** are built but not wired, and spending limits are AI Core's; the **v1 merge** does not move edges, and **`undoMerge`** restores node status only; **cross-item batch entity dedup** runs within a single ingest, not across a batch. The **R1–R7** neuroscience refinements (apart from R5's sequential detector), true **standalone DB mode** (the engine still needs Prisma), and the `contexts` parameter on ingest with Structure materialised-path propagation are **planned, not built**. The Phase F analytics ship, but only structural gaps (through `runFullCheck`) reach the host.
 </Aside>
 
 ## Where to go next
