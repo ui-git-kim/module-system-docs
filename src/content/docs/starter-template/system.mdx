@@ -33,7 +33,7 @@ The startup security posture, reused — not reimplemented — from the security
 - Tier, environment, edge, and DB adapter
 </TabItem>
 <TabItem label="Console">
-The live **Errors** and **Activity** feeds from the in-memory audit sink (newest first). Manual refresh only — there is no polling, so a left-open admin tab never adds steady API load.
+The live **Errors** and **Activity** feeds from the in-memory audit sink (newest first). Manual refresh only — there is no polling (except while a **Verify integrity** check runs), so a left-open admin tab never adds steady API load.
 </TabItem>
 </Tabs>
 
@@ -112,7 +112,21 @@ The `"AuditLog"` table is created at runtime via `CREATE TABLE IF NOT EXISTS` �
 
 **Retention & erasure.** Activity rows age out after `SECURITY_AUDIT_RETENTION_DAYS`. They are also **owned data**: the [deletion cascade](/starter-template/security-feature/) erases a tenant's activity rows on account deletion (errors from authed requests carry the tenant; unauthenticated errors are operational telemetry that age out via retention). Compliance rows are **preserved** (legal hold) — the cascade never deletes them.
 
-**Tamper-evidence (compliance).** Each compliance row stores the exact canonical serialisation it was hashed over plus `hash = SHA-256(prevHash + payload)`, chained across rows and serialised with a Postgres advisory lock. `GET /api/v1/admin/system/audit/verify` recomputes the chain from the stored payloads and reports the first break; `GET /api/v1/admin/system/audit/export` returns it for offline archival. The **History** tab on the System page surfaces durable rows and a "Verify integrity" action.
+**Tamper-evidence (compliance).** Each compliance row stores the exact canonical serialisation it was hashed over plus `hash = SHA-256(prevHash + payload)`, chained across rows and serialised with a Postgres advisory lock. `GET /api/v1/admin/system/audit/export` returns the rows for offline archival. The **History** tab on the Console page surfaces durable rows and a **Verify integrity** action.
+
+**Verify integrity runs in the background (v2.13.1).** A full check re-reads the whole compliance log (roughly 10–30 seconds per million records), which used to outlast the browser's request timeout. Now:
+
+- `POST /api/v1/admin/system/audit/verify` starts the check and answers **202** at once. If a check is already running, it joins that one instead of starting a second.
+- `GET /api/v1/admin/system/audit/verify` returns the status and never scans: `{ runId, state, startedAt, finishedAt, checked, result }`, where `state` is `idle`, `running` or `done`, and `result` (once done) says whether the chain is intact and where the first break is.
+- The Console page polls the status, more slowly as the run gets longer, shows the number of records checked so far, then **Intact**, **Broken** or **Failed**.
+
+Every run checks the whole chain from the start. The status lives in the memory of the server process that ran it, and the last result is kept until the next run or a restart. With several server instances, a poll can reach one that didn't run the check; the page then says it lost track and asks you to start it again.
+
+**Writes are batched (v2.13.1).** Both SQL sinks buffer rows in the process and write up to 200 at a time in one `INSERT`. The compliance sink takes the advisory lock and reads the previous hash once per batch, not once per row. A passing failure (the database asleep or unreachable, a pool timeout) is retried with a growing delay, from 1 second up to 60. Only an error that can never succeed (no table, no rights) turns database writes off for the process, with one warning. Rows still in the buffer when the server shuts down are lost; flushing at shutdown is on the [roadmap](/starter-template/roadmap/).
+
+`SqlAuditSink` and `ComplianceAuditSink` are exported from the admin barrel. Their constructors take optional `{ batchSize, retryBaseMs, retryMaxMs }`, and `flush()` resolves once every row buffered so far is written or given up on. A subclass that overrode `writeRow(row)` now overrides `writeBatch(rows, isRetry)` instead, and the protected `ready` member is gone (clean break, v2.13.1).
+
+**Row counts can be estimates (v2.13.1).** An `"AuditLog"` table of 10,000 rows or more reports the database's own estimate, shown with **≈** in the storage summary, so opening the page never counts a large log row by row. **Verify integrity** reports the exact number it checked.
 
 ## API
 
@@ -124,11 +138,12 @@ All endpoints are admin-only (reads included — diagnostics reveal where the ap
 | `GET` | `/api/v1/admin/system/errors?limit=` | Newest-first errors (stack redacted outside dev) |
 | `GET` | `/api/v1/admin/system/activity?limit=` | Newest-first activity events |
 | `GET` | `/api/v1/admin/system/history?kind=&limit=` | Durable DB history (P2) — empty when in-memory only |
-| `GET` | `/api/v1/admin/system/audit/verify` | Recompute the compliance hash chain (P3) |
+| `POST` | `/api/v1/admin/system/audit/verify` | Start the compliance hash-chain check in the background, or join the one running (P3). **202** with its status |
+| `GET` | `/api/v1/admin/system/audit/verify` | The current or last check's status (`AuditVerifyStatus`). Never scans. Before v2.13.1 this ran the whole check itself |
 | `GET` | `/api/v1/admin/system/audit/export?limit=` | Export compliance rows for offline archival (P3) |
 
 ## Security
 
 - **Admin-only reads** — the posture and error detail are recon-relevant, so reads are gated like the Security page.
 - **Redaction** — stack traces are stripped outside development; activity summaries mask sensitive keys and reduce nested objects to a shape hint.
-- The rate limiter is unchanged — the console simply makes 429s and unhandled errors **visible** instead of silent.
+- The [rate limits](/starter-template/configuration/#rate-limits) apply as usual — the console simply makes 429s and unhandled errors **visible** instead of silent.

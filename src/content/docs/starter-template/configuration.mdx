@@ -25,7 +25,7 @@ VITE_APP_NAME=My App
 |----------|----------|---------|-------------|
 | `VITE_NEON_AUTH_URL` | **Yes** | None | Neon Auth endpoint URL. Must **exactly match** the backend's `NEON_AUTH_URL` — tokens issued by one are verified against the other via JWKS. |
 | `VITE_API_URL` | No | `http://localhost:3100` | Backend API base URL consumed by the axios client in `@/lib/api.ts`. Override per environment (e.g. `https://api.myapp.com` in production). |
-| `VITE_APP_NAME` | No | `"My App"` | Fallback display name used by `AppSettingsContext` when the server-side `AppSettings.appName` isn't loaded yet. Visible in the navigation brand during the brief initial load window. |
+| `VITE_APP_NAME` | No | `"My App"` | Fallback display name used by `AppSettingsContext` when the server-side `AppSettings.appName` isn't loaded yet. Visible in the navigation brand during the brief initial load window. Since v2.13.1 that only happens on a device's first visit or the first load after signing out: other loads show the name cached on the device. |
 
 <Aside type="caution" title="No build-time validation yet">
 The frontend currently doesn't validate env vars at build time. Missing or malformed `VITE_NEON_AUTH_URL` surfaces as a runtime auth failure, not a build error. Build-time validation (e.g. with Zod) is a planned improvement — see the [roadmap](/starter-template/roadmap/).
@@ -143,6 +143,74 @@ npm run build
 
 Works with any static hosting: traditional web hosting (cPanel), Cloudflare Pages, nginx, or a CDN.
 
+The build also writes `VITE_NEON_AUTH_URL` and `VITE_API_URL` into `index.html` as `preconnect` hints (v2.13.1). The browser then opens both connections while the JavaScript downloads, instead of one after the other once it has run. Rebuild after changing either value.
+
+### Browser caching
+
+Every file the build puts in `dist/assets/` has a content hash in its name (for example `index-B4x9k2.js`). A changed file always gets a new name, so browsers can keep these files for a year and never re-check them. That saves a round trip on every return visit. `index.html` is the opposite: it names the current files, so the browser must re-check it on every load, or a new deploy wouldn't be picked up.
+
+**Cloudflare Pages and Netlify** need no setup. The template ships `frontend/public/_headers` (v2.13.1), which Vite copies into `dist/` unchanged:
+
+```text
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+```
+
+`index.html` is left out on purpose, so it keeps the host's default: re-check on every load.
+
+**Other hosts ignore `_headers`.** Set the same two rules in the server config. In both examples below, `index.html` and the app-route fallback get `no-cache`, and a missing file under `/assets/` gets a plain 404. It must never get `index.html` back with the one-year header, or the browser would keep the wrong file for a year.
+
+<Tabs>
+  <TabItem label="nginx">
+```nginx
+server {
+  root /var/www/myapp/frontend/dist;
+
+  # Hashed files: keep for a year. A missing file is a 404, never index.html.
+  location /assets/ {
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    try_files $uri =404;
+  }
+
+  # index.html and every app route (the single-page-app fallback): re-check on every load.
+  location / {
+    add_header Cache-Control "no-cache";
+    try_files $uri /index.html;
+  }
+}
+```
+
+An `add_header` inside a `location` replaces any `add_header` lines set at `server` level. If you set other headers there (HSTS, for example), repeat them in both blocks.
+  </TabItem>
+  <TabItem label="Apache (.htaccess)">
+```apache
+# Needs mod_headers and mod_rewrite (Apache 2.4+).
+
+# Hashed files: keep for a year. Everything else, index.html included: re-check on every load.
+<If "%{REQUEST_URI} =~ m#^/assets/#">
+  Header set Cache-Control "public, max-age=31536000, immutable"
+</If>
+<Else>
+  Header set Cache-Control "no-cache"
+</Else>
+
+# Single-page-app fallback: unknown app routes get index.html.
+# Never for /assets/, so a missing file there is a plain 404.
+RewriteEngine On
+RewriteCond %{REQUEST_URI} !^/assets/
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.html [L]
+```
+
+Put it in `dist/`, or in `frontend/public/.htaccess` so every build copies it there.
+  </TabItem>
+</Tabs>
+
+<Aside type="caution" title="Rolling back on Cloudflare Pages or Netlify">
+In single-page-app mode, these hosts answer a request for a file that isn't in the current deploy with `index.html`. For a file under `/assets/`, that answer carries the one-year header. This happens when a tab opened before a deploy asks for an old file. It only causes harm if you later roll back to the deploy that had that file: a browser that cached the wrong answer keeps loading `index.html` in its place until its cache is cleared.
+</Aside>
+
 ### Backend (Node.js)
 
 The backend needs Node.js. Options:
@@ -237,12 +305,27 @@ Frontend variables prefixed with `VITE_` are exposed to the browser. Never put s
 | `LOG_LEVEL` | No | Logging level: `fatal`, `error`, `warn`, `info` (default), `debug`, `trace` |
 | `DEBUG_PRISMA` | No | Enable verbose Prisma query logging |
 | `DB_QUERY_TIMEOUT` | No | Query timeout in ms (default: 10000) |
+| `DB_POOL_IDLE_TIMEOUT_MS` | No | How long an idle database connection stays open, in ms (default: 60000 = 60 s; v2.13.1). The next query after a short pause reuses the open connection instead of reconnecting. Keep it well under Neon's 5-minute scale-to-zero window. `0` never closes idle connections (not recommended on Neon) |
 | `SHUTDOWN_TIMEOUT` | No | Graceful shutdown timeout in ms (default: 10000) |
 | `REQUEST_TIMEOUT` | No | HTTP request timeout in ms (default: 30000; `0` disables — mitigates Slowloris) |
 | `TRUST_PROXY_HOPS` | No | Number of trusted reverse-proxy hops for Express `trust proxy` / `req.ip` (default: 1; `0` = direct exposure) |
-| `RATE_LIMIT_WINDOW_MS` | No | Sliding window for the global API rate limiter in ms (default: 900000 = 15 min) |
-| `RATE_LIMIT_MAX` | No | Max requests per window per client IP for the global limiter (default: 300) |
+| `RATE_LIMIT_WINDOW_MS` | No | Window for both API rate limiters, in ms (default: 900000 = 15 min) |
+| `RATE_LIMIT_MAX` | No | Max requests per window from one client IP, checked **before** sign-in (default: 3000). A flood guard: keep it generous, because an office or a mobile carrier can put many users behind one address. The `/api/health/db` probe has its own counter at the same limit |
+| `RATE_LIMIT_USER_MAX` | No | Max requests per window for each **signed-in user**, checked after sign-in (default: 600; v2.13.1). A device token counts against its owner. Raise it for apps with many modules |
 | `SECURITY_PROFILE` | No | Security tier: `standard`, `hardened` (default), `strict` — see below |
+
+### Rate limits
+
+The API has two rate limits, both counted over `RATE_LIMIT_WINDOW_MS` (v2.13.1):
+
+1. **Per address, before sign-in** (`RATE_LIMIT_MAX`, 3000). Every `/api/` request counts, so a flood is turned away before any work is done. Health checks are never limited by it.
+2. **Per signed-in user** (`RATE_LIMIT_USER_MAX`, 600). Checked right after the sign-in check on every route that needs sign-in, so one busy user can't use up anyone else's budget. A request that fails sign-in doesn't count. Public routes (health, branding, theme) never reach it.
+
+An active user makes roughly 40–100 requests in 15 minutes. Over either limit, the API answers **429** `{ error: 'Too many requests' }`. Both limits are kept in the server's memory, so each server instance counts on its own. The admin [Security page](/starter-template/admin-feature/#security) shows both.
+
+<Aside type="caution" title="Set RATE_LIMIT_MAX=300 yourself? It still applies">
+Before v2.13.1 there was one limit, 300 per address, which a busy office, or many mobile users behind one carrier address, could use up. An app whose `backend/.env` sets `RATE_LIMIT_MAX=300` keeps that old value. Raise it, or delete the line to get the new default.
+</Aside>
 
 ---
 

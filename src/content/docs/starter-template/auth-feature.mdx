@@ -1023,6 +1023,8 @@ async getOrCreateProfile(userId: string, email: string) {
   The first user to sign up automatically becomes an admin. All subsequent users get the `user` role.
 </Aside>
 
+The snippet above is simplified. The real code makes the "first user" choice safe when two people sign up at once: it counts and creates inside one Serializable transaction, so only one of them becomes admin. Since v2.13.1 that strict path runs only while the `User` table is empty. Once any user exists, a quick check skips it and the new user is created in a plain transaction, so sign-ups no longer queue behind each other.
+
 Since v2.13.0, `getOrCreateProfile` first checks whether the account has a deletion that didn't finish. If it does, it refuses with **403** `code: 'account_deletion_pending'` rather than re-creating the profile, so a sign-in mid-deletion can't bring the account back. See [When a deletion doesn't finish](/starter-template/security-feature/#when-a-deletion-doesnt-finish).
 
 ---
@@ -1165,10 +1167,13 @@ Every auth page wraps its card in the same shell — decorative `AuthBackground`
 ```tsx
 import { AuthBackground } from '../components/AuthBackground';
 import { useBranding } from '@/features/admin';
+import { resolveApiAssetUrl } from '@/lib/api-url';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 
 export function SignInPage() {
   const branding = useBranding();
+  // The logo is served by the API (a root-relative URL): resolve it to the API host
+  const logoSrc = resolveApiAssetUrl(branding.logoUrl);
   // ...
   return (
     <section className="relative flex min-h-screen items-center justify-center bg-background p-4">
@@ -1176,7 +1181,7 @@ export function SignInPage() {
       <div className="relative z-10 w-full max-w-md">
         <Card>
           <CardHeader className="gap-6 text-center">
-            {/* logo / app name from branding */}
+            {/* logo (logoSrc) or app name from branding */}
             <CardTitle>Welcome back</CardTitle>
             <CardDescription>Sign in to your {branding.appName} account</CardDescription>
           </CardHeader>
@@ -1191,6 +1196,8 @@ export function SignInPage() {
 <Aside type="note" title="Auth pages use useBranding(), not useAppSettingsValue()">
 Auth pages render outside the authenticated shell, so they can't access the full `AppSettingsProvider` (which lives inside `DashboardPage`). Since v1.24.0 the starter ships a separate `BrandingProvider` mounted at the app root (in `App.tsx`) that fetches a public subset of settings — app name, logo, logo display mode, style overrides — from `GET /api/v1/branding` (no auth required). Auth pages call `useBranding()` to consume it. `useBranding()` is also forgiving: if the provider isn't mounted (e.g. Storybook, unit tests) it returns `DEFAULT_BRANDING` rather than throwing, so pages stay renderable.
 </Aside>
+
+**The logo URL (v2.13.1).** An uploaded logo now arrives as a short URL, `/api/v1/branding/logo?v=…`, instead of the image data itself. The browser caches the image for a year and fetches it again only when the logo changes (the `v` value changes with it). The path is relative to the API, which often runs on another host, so the four auth pages pass it through `resolveApiAssetUrl()` from `@/lib/api-url` before using it as an `<img src>`. Do the same in any custom auth page or other page that shows the logo. A logo stored as an `http(s)` URL passes through unchanged.
 
 ### Calling the SDK
 
@@ -1268,13 +1275,13 @@ A module that wants a different look can register CSS through the `styleRegistry
 
 ## Sign Out
 
-Use `signOutAndClear()` — it calls `authClient.signOut()`, then clears the TanStack Query cache in a `finally`. That frees the previous account's cached profile (including a base64 avatar), notifications, and settings immediately, and closes a same-tab privacy gap where the old data would otherwise linger (until `gcTime`) and be briefly readable after a user switch. Since v2.13.0 it also forgets any [step-up](#step-up-the-confirm-its-you-dialog) grant, so it can't carry over to the next account. The starter wires it into `NavUser`, the `DataPrivacyPage` and the `AccountDeletionGate` screen. Callers own any navigation afterwards.
+Use `signOutAndClear()` — it calls `authClient.signOut()`, then clears the TanStack Query cache in a `finally`. That frees the previous account's cached profile (including a base64 avatar), notifications, and settings immediately, and closes a same-tab privacy gap where the old data would otherwise linger (until `gcTime`) and be briefly readable after a user switch. Since v2.13.0 it also forgets any [step-up](#step-up-the-confirm-its-you-dialog) grant, so it can't carry over to the next account. Since v2.13.1 it also clears the shell's [device caches](/starter-template/shell-layout/#no-flash-on-refresh-device-caches) (the cached shell settings and each user's last role). The starter wires it into `NavUser`, the `DataPrivacyPage` and the `AccountDeletionGate` screen. Callers own any navigation afterwards.
 
 ```tsx
 import { signOutAndClear } from '@/features/auth';
 
 async function handleSignOut() {
-  await signOutAndClear();       // signOut() + queryClient.clear() + clearStepUpGrant()
+  await signOutAndClear();       // signOut() + query cache, step-up grant and shell caches cleared
   window.location.href = '/auth/sign-in';
 }
 ```
@@ -1383,11 +1390,18 @@ The backend uses `createRemoteJWKSet` from the `jose` library, which automatical
 - Refreshes keys when they rotate
 - Handles key lookup efficiently
 
-No additional caching configuration is needed.
+Since v2.13.1, `startJwksRefresh()` (called once at boot from `app.ts`) fetches the keys when the server starts and again every 5 minutes in the background, inside the 10-minute cache window. So no signed-in request waits for a key download. If a background refresh fails, the old keys stay in use and the failure is logged. No additional caching configuration is needed.
 
 ### Rate Limiting
 
 **Shipped since v1.27.0** — a global per-IP `express-rate-limit` is applied to `/api` in `app.ts`, env-tunable via `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` (health checks are skipped). No setup required; tune the env vars per traffic profile. Mutation- or auth-heavy routes may warrant a stricter per-route limiter on top, and Cloudflare adds an edge rate-limit at `hardened+`.
+
+Since v2.13.1 there are two layers, both counted per `RATE_LIMIT_WINDOW_MS` (15 minutes by default):
+
+- **Per address, before auth** (`RATE_LIMIT_MAX`, default raised from 300 to **3000**). A flood guard, sized so many people behind one shared address (an office, a mobile network) don't lock each other out.
+- **Per user, after `requireAuth`** (`RATE_LIMIT_USER_MAX`, default **600**). The real budget for signed-in traffic, keyed on the user id (a device token counts against its owner). A request that fails auth doesn't use it up.
+
+An app that set `RATE_LIMIT_MAX=300` itself keeps 300; raise it or remove the line to get the new default. Both limits are kept in each server's memory, so with several instances each counts separately.
 
 ### Security Checklist
 

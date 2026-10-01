@@ -45,6 +45,11 @@ When a user loads the dashboard:
 6. When admin saves changes, `refetch()` updates the context and UI updates immediately
 </Steps>
 
+Two caches make this fast (v2.13.1):
+
+- **On the device.** After each fetch, the browser keeps the part of the settings the shell draws first (app name, logo, navigation and toolbar overrides, hidden widgets). On the next load, the shell draws from that copy until the fetch lands, so a refresh doesn't flash the defaults. Signing out clears it.
+- **On the server.** The backend keeps the settings in memory for up to 30 seconds, and every save clears that copy. With several server instances, the others can serve the old settings for up to 30 seconds after a save.
+
 ### Why Settings GET is Public
 
 The admin API has a unique permission structure:
@@ -68,10 +73,12 @@ frontend/src/features/admin/
 ├── admin-pages.registration.ts     # Registers admin pages
 ├── context/
 │   ├── AppSettingsContext.tsx      # Global settings provider (authenticated)
-│   └── BrandingContext.tsx         # Public branding provider (auth pages)
+│   ├── BrandingContext.tsx         # Public branding provider (auth pages)
+│   └── shell-settings-cache.ts     # Per-device copy of the shell's settings (v2.13.1)
 ├── components/
-│   ├── AdminLayout.tsx             # Admin panel layout
-│   ├── AdminComponents.tsx         # Admin-specific components
+│   ├── AdminLayout.tsx             # Admin panel layout (+ page prefetch)
+│   ├── AdminPanels.tsx             # AdminDetailTabs + AdminSheet (on the barrel)
+│   ├── AdminComponents.tsx         # Sortable list/item (@dnd-kit; import directly, not from the barrel)
 │   ├── RoleProtectedRoute.tsx      # Client-side role guard for admin routes
 │   └── system-blocks.tsx           # Shared severity/audit rows (System + Console)
 ├── pages/
@@ -115,6 +122,8 @@ backend/src/features/admin/
 ├── audit-config.ts                 # Resolve which audit sink to use
 ├── audit-sink.ts                   # Pluggable audit (activity + error) sink
 ├── audit-sql-sink.ts               # Durable + compliance SQL audit sinks
+├── audit-verify.ts                 # Background "Verify integrity" run (v2.13.1)
+├── user-search-index.ts            # Runtime search indexes for the Users list (v2.13.1)
 ├── audit.registration.ts           # Wire audit capture into the sink
 ├── route.registration.ts           # Registers all routers
 └── service.registration.ts         # Service registry
@@ -134,6 +143,10 @@ The **Branding** page (id `settings`, `/admin/settings` — retitled from "App S
 | **Logo** | Custom logo (uploaded as base64 or URL) |
 | **Logo Display Mode** ("Brand Display") | Logo only, logo + name, or name only |
 
+**How an uploaded logo is served (v2.13.1).** The upload is still stored as a base64 data URI, but it is no longer sent inside every settings response. `GET /api/v1/branding/logo` serves it as an image, and the JSON responses give its address instead: `logoUrl: "/api/v1/branding/logo?v=<version>"`. The version changes whenever the logo does, so browsers keep the image for a year and fetch it again only after a new upload. A logo given as an `http(s)` URL is passed through unchanged.
+
+The Branding page sends the logo only when it changed: a new upload, or removing it. Saving the app name alone no longer sends the logo back.
+
 The **Enable Marketing Pages** toggle was removed from this page in v2.13.0, because nothing read it. The `enableMarketingPages` column stays in `AppSettings` for the planned Landing Layout, which will own its setting.
 
 The **Show Dashboard in Nav** toggle moved to the **Navigation** admin page in v1.56.0 (it always persisted via the same `AppSettings` record — only its home changed).
@@ -142,18 +155,23 @@ The **Show Dashboard in Nav** toggle moved to the **Navigation** admin page in v
 
 ```tsx
 import { useAppSettingsValue } from '@/features/admin';
+import { resolveApiAssetUrl } from '@/lib/api-url';
 
 function MyComponent() {
   const settings = useAppSettingsValue();
+  // An uploaded logo's URL is a path on the API host: resolve it first.
+  const logoSrc = resolveApiAssetUrl(settings.logoUrl);
 
   return (
     <header>
-      {settings.logoUrl && <img src={settings.logoUrl} alt={settings.appName} />}
+      {logoSrc && <img src={logoSrc} alt={settings.appName} />}
       <h1>{settings.appName}</h1>
     </header>
   );
 }
 ```
+
+Always pass `logoUrl` through `resolveApiAssetUrl()` before rendering it. In production the API usually runs on another host, so a bare `/api/...` path would ask the frontend's host instead. Any other value (`data:`, `blob:`, `http(s):`) comes back unchanged.
 
 ### Available Hooks
 
@@ -162,7 +180,7 @@ function MyComponent() {
 | `useBranding()` | Public subset: `appName`, `logoUrl`, `logoDisplayMode`, `styleOverrides`. Forgiving — returns `DEFAULT_BRANDING` if provider absent. | `BrandingProvider` (root) |
 | `useBrandingState()` | Full Branding context with loading/error state. | `BrandingProvider` (root) |
 | `useGlobalAppSettings()` | Full authenticated context — `settings`, `isLoading`, `error`, `refetch`, `updateSettings`, `setAppTheme`. Throws if used outside the provider. | `AppSettingsProvider` (shell) |
-| `useAppSettingsValue()` | Just settings with defaults (most common authenticated read). | `AppSettingsProvider` (shell) |
+| `useAppSettingsValue()` | Just settings with defaults (most common authenticated read). Until settings load it returns the shell settings cached on this device (v2.13.1). For display only: anything that edits settings uses `useGlobalAppSettings()`, whose `settings` stays `null` until the server answers. | `AppSettingsProvider` (shell) |
 | `useNavigationLayout()` | The navigation layout, `'side' \| 'top'`. Until settings load it returns the value cached on this device (no layout flash). v2.12.0. | `AppSettingsProvider` (shell) |
 | `useGlobalNavigationOverrides()` | Navigation + section overrides. | `AppSettingsProvider` (shell) |
 | `useGlobalToolbarOverrides()` | Toolbar hidden items. | `AppSettingsProvider` (shell) |
@@ -235,7 +253,7 @@ Admins can hide toolbar items from the header:
 
 The Users page provides:
 
-- **View all users** - A server-side [Data Table](/starter-template/data-table/) of name, email, role, and join date — search by name or email, filter by role, sort any column (v2.11.0: search, filter and sort run on the server via `GET /api/v1/admin/users?search&role&sortBy&sortDir`, so they cover every user, not just the loaded page)
+- **View all users** - A server-side [Data Table](/starter-template/data-table/) of name, email, role, and join date — search by name or email, filter by role, sort any column (v2.11.0: search, filter and sort run on the server via `GET /api/v1/admin/users?search&role&sortBy&sortDir`, so they cover every user, not just the loaded page). Since v2.13.1 a search of 3 or more characters uses indexes the server creates by itself on the first user list it serves (no migration), so it stays fast with many users. If the database doesn't allow it, search still works, just slower
 - **Change roles** - Promote to admin or demote to user (click a row, or its Edit action, to open the user's sheet)
 - **Delete users** - Remove accounts from the row's Delete action or the sheet's danger zone (both confirm first)
 
@@ -276,12 +294,12 @@ It reads the **live resolved posture** — it does not duplicate any logic. The 
 **What it shows (read-only):**
 
 - **Posture checks** — every finding from the startup guardrail with its severity (`ok` / `info` / `warn` / `error`) and remediation.
-- **Resolved configuration** — the active `SecurityConfig` (tier + the resolved knobs).
+- **Resolved configuration** — the active `SecurityConfig` (tier + the resolved knobs), including both API rate limits since v2.13.1: **Rate limit per address** (`RATE_LIMIT_MAX`, checked before sign-in) and **Rate limit per user** (`RATE_LIMIT_USER_MAX`), each per window. See [Rate limits](/starter-template/configuration/#rate-limits).
 - **Key provider** — whether field-encryption key custody is ready (env key present, or KMS wired).
 - **Secrets** — `SECURITY_ENCRYPTION_KEY` and the KMS / AWS credentials — as **set / not-set only**. Values are never read into the response or shown. (`NEON_AUTH_SECRET_KEY` was dropped from this list in v2.13.0: nothing reads it. The deletion cascade removes the auth identity only through a deleter you wire with `setAuthIdentityDeleter`.)
 - **Module manifests** — what each registered module declared to the security registry.
 
-**What it edits:** the **non-secret** knobs only — the tier (`SECURITY_PROFILE`), the per-knob overrides, `SECURITY_EDGE`, `SECURITY_POSTURE_ENFORCE`, trust-proxy / request-timeout / rate-limit. Each edit is written to `backend/.env` via an allow-listed, atomic upsert and is **audit-logged**.
+**What it edits:** the **non-secret** knobs only — the tier (`SECURITY_PROFILE`), the per-knob overrides, `SECURITY_EDGE`, `SECURITY_POSTURE_ENFORCE`, trust-proxy / request-timeout, and the rate limits (`RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, and `RATE_LIMIT_USER_MAX` since v2.13.1). Each edit is written to `backend/.env` via an allow-listed, atomic upsert and is **audit-logged**.
 
 Since v2.13.0, saving an edit asks for an emailed code at the hardened and strict tiers ([step-up](/starter-template/security-feature/#step-up-re-verification-sensitive-actions)). Each edit also reaches the durable audit trail through the `security.envUpdated` hook, which lists the keys changed but never their values. The rewrite keeps the file's permissions, so a `chmod 600` survives, and a new `.env` is created owner-only (`0600`).
 
@@ -290,6 +308,15 @@ Security config is resolved **once at bootstrap** (`securityConfig` is computed 
 </Aside>
 
 The edit endpoint validates against a **strict allow-list** (`.strict()` Zod schema — an arbitrary env key like `DATABASE_URL` is rejected) and the free-text knobs are charset-locked so a value can never inject a second `.env` line.
+
+---
+
+## System and Console
+
+The **System** page shows database health and service status; the **Console** page shows errors, activity and, with a durable audit sink, the audit history. The [System page](/starter-template/system/) doc covers both. Two behaviours changed in v2.13.1:
+
+- **Audit row counts can be estimates.** An audit table of 10,000 rows or more shows the database's own estimate, marked **≈**, instead of counting every row each time the page opens. **Verify integrity** reports the exact number it checked.
+- **Verify integrity runs in the background.** The button starts the check on the server, and the page asks for progress until it finishes: the number of records checked so far, then **Intact**, **Broken** or **Failed**. If the check is already running (started from another tab, say), the new request joins it. See [Durable & compliance storage](/starter-template/system/#durable--compliance-storage-p2p3).
 
 ---
 
@@ -307,9 +334,12 @@ import { lazy } from 'react';
 import { adminPagesRegistry } from '@/config/admin-pages.registry';
 import { Settings } from 'lucide-react';
 
+// The page's loader, shared by lazy() and preload
+const loadMyAdminPage = () => import('./pages/MyAdminPage');
+
 // Named-export → default-export shim required by React.lazy
 const MyAdminPage = lazy(() =>
-  import('./pages/MyAdminPage').then((m) => ({ default: m.MyAdminPage })),
+  loadMyAdminPage().then((m) => ({ default: m.MyAdminPage })),
 );
 
 adminPagesRegistry.register({
@@ -318,10 +348,13 @@ adminPagesRegistry.register({
   description: 'Configure my feature',
   icon: Settings,
   component: MyAdminPage,
+  preload: loadMyAdminPage, // optional (v2.13.1) — lets the panel fetch the page early
   order: 30,              // module pages use 30+ (built-ins reserve 1-29)
   section: 'extensions',  // optional (v1.56.0) — omitted lands here anyway
 });
 ```
+
+`preload` is optional (v2.13.1). With it, the admin panel downloads the page's code before it is opened: for every page once the browser is idle (skipped when it asks to save data or the connection is very slow), when its nav link is hovered, focused or touched, and on a direct visit before the role check finishes. Without it, the page loads on first render as before. The admin feature's own pages all register one.
 
 ### Static import (for frequently-accessed pages or small pages)
 
@@ -479,11 +512,12 @@ See **[Data Table](/starter-template/data-table/)** for filters, bulk actions, s
 | `/api/v1/admin/settings` | GET | Get all app settings (branding + all overrides) |
 | `/api/v1/admin/style-overrides` | GET | Get style registry enable/disable map |
 | `/api/v1/admin/dashboard-overrides` | GET | Get dashboard widget hide-list for all users |
-| `/api/v1/branding` | GET | **Public** (no auth) — public branding subset for auth pages |
+| `/api/v1/branding` | GET | **Public** (no auth) — public branding subset for auth pages. Sent with `Cache-Control: public, no-cache`, so a repeat visit gets a quick "not modified" answer when nothing changed |
+| `/api/v1/branding/logo?v=` | GET | **Public** (no auth, no-Origin allowed) — the uploaded logo as an image (v2.13.1). Cached for a year when `v` matches the current version; **404** when there is no uploaded logo |
 | `/api/v1/theme` | GET | **Public** (no auth, no-Origin allowed) — app theme (`appTheme` + `styleOverrides`) so external/desktop companions can match the app's styling. See [Device Tokens](/starter-template/device-tokens/). |
 
 <Aside type="note">
-The `/settings` endpoint returns **everything** the frontend needs to render the shell: app name, logo, navigation overrides (including section overrides), toolbar overrides, style registry overrides, and (since v1.25.0) the module-owned `appTheme` blob. This is what the `AppSettingsProvider` fetches for all users on mount.
+The `/settings` endpoint returns **everything** the frontend needs to render the shell: app name, logo (an uploaded logo as its `/api/v1/branding/logo?v=…` address since v2.13.1, not the image data), navigation overrides (including section overrides), toolbar overrides, style registry overrides, and (since v1.25.0) the module-owned `appTheme` blob. This is what the `AppSettingsProvider` fetches for all users on mount.
 
 `/style-overrides` exists as a dedicated read because the frontend `styleRegistry` bootstrap may want to fetch and apply overrides before the full settings payload arrives — useful for preventing a brief unstyled flash on first paint.
 </Aside>
@@ -492,7 +526,7 @@ The `/settings` endpoint returns **everything** the frontend needs to render the
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/v1/admin/settings` | PATCH | Update app branding settings |
+| `/api/v1/admin/settings` | PATCH | Update app branding settings. For `logoUrl`: a data URI is a new logo, `null` removes it, and leaving it out (or sending back the served logo URL) keeps it |
 | `/api/v1/admin/navigation` | PATCH | Update navigation + section overrides |
 | `/api/v1/admin/toolbar` | PATCH | Update toolbar overrides |
 | `/api/v1/admin/style-overrides` | **PUT** | Replace the full style registry overrides map |
@@ -696,6 +730,7 @@ Instead: one well-known `appTheme` slot, reserved for whichever style module the
 1. Ensure you clicked "Save Changes" after uploading
 2. Check browser console for errors
 3. Verify the `AppSettingsProvider` wraps your dashboard layout
+4. If your own component renders `logoUrl`, pass it through `resolveApiAssetUrl()` first (v2.13.1). An uploaded logo's URL is a path on the API host, so a bare `<img src={logoUrl}>` asks the frontend's host and gets nothing
 
 ### Navigation Overrides Not Applied
 

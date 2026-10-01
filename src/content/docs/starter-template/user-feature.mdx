@@ -67,6 +67,10 @@ frontend/src/features/user/
 ├── settings-pages.registration.ts  # Registers settings pages
 ├── hooks/
 │   └── useUserProfile.tsx          # Profile context and hook
+├── lib/
+│   ├── debounced-save.ts           # Save once the user pauses (avatar colour)
+│   ├── preferences-mutation.ts     # Profile query key + ordered preference saves
+│   └── timezones.ts                # Time-zone list, built once per session
 ├── services/
 │   └── user.service.ts             # API client
 ├── pages/
@@ -203,6 +207,8 @@ import { AVATAR_COLOUR_OPTIONS } from '@/features/user/components/settings/avata
 
 `AVATAR_COLOUR_OPTIONS` provides 10 preset colours; `allowCustom` adds a native colour-input chip for arbitrary hex. `avatar-colors.ts` also exports `getDefaultAvatarColor` (a stable colour from a user id) and `getContrastColor` (readable text colour), used by `UserAvatar`.
 
+**Saving waits for a pause (v2.13.1).** While the user drags in the custom picker, `onChange` fires for every move. On **Settings → Personal information** the avatar previews the colour at once, but the save waits until the user stops for about 400 ms. It skips a colour that is already saved (or already being saved), and a pick made just before leaving the page is still saved. So one pick sends one request, not dozens, and dragging can no longer trip the rate limit. If you build your own control that saves on every change, do the same: `createDebouncedSaver()` in `features/user/lib/debounced-save.ts` is the helper the page uses.
+
 ---
 
 ## User Preferences
@@ -241,6 +247,8 @@ await updatePreferences({
   Preferences use shallow merge - only the fields you specify are updated.
 </Aside>
 
+**Saves run in order (v2.13.1).** Every preference save shares one TanStack Query mutation scope (`scope: { id: 'user-preferences' }`), so saves run one at a time in the order they were made. A colour change followed by a time-zone change can't land the wrong way round. The server answers with `{ preferences }` only (the merged preferences, not the whole profile), and the hook merges that into the cached profile. `updatePreferences()` still resolves to the full, updated `UserProfile`, so callers don't change.
+
 **Size limits (v2.13.0).** Module preferences can use any key name, so the server caps them. It rejects an update with a **400** when:
 
 - a module value is more than 4 KB once saved as JSON, or a key name is longer than 100 characters;
@@ -278,9 +286,14 @@ Features can register custom settings pages:
 
 ```tsx
 // features/my-feature/settings-pages.registration.ts
+import { lazy } from 'react';
 import { settingsPagesRegistry } from '@/config/settings-pages.registry';
-import { MySettingsContent } from './pages/MySettingsPage';
 import { MyIcon } from 'lucide-react';
+
+// Lazy-loaded: the page downloads only when someone opens it.
+const MySettingsContent = lazy(() =>
+  import('./pages/MySettingsPage').then((m) => ({ default: m.MySettingsContent })),
+);
 
 settingsPagesRegistry.register({
   id: 'my-settings',           // URL: /settings/my-settings
@@ -291,6 +304,8 @@ settingsPagesRegistry.register({
   order: 60,
 });
 ```
+
+Register settings pages with `React.lazy`, as above. `DynamicSettingsPage` shows one page at a time inside a `<Suspense>` boundary, so a lazy page costs nothing until it opens. Don't re-export the page from your feature's or module's `index.ts` either: a static re-export pulls it back into the first download. Since v2.13.1 the user feature's own barrel no longer re-exports its settings pages (`PersonalInfoContent`, `SecurityContent` and the rest); to reuse one, lazy-import it from `@/features/user/pages/<Page>`.
 
 ### Settings Blocks (Component Library)
 
@@ -602,9 +617,11 @@ If the deletion doesn't fully finish, the account is locked as "pending deletion
 |----------|--------|---------|
 | `/api/v1/user` | GET | Get current user profile |
 | `/api/v1/user` | PATCH | Update profile (name, bio, avatarUrl) |
-| `/api/v1/user/preferences` | PATCH | Update preferences |
+| `/api/v1/user/preferences` | PATCH | Update preferences; answers `{ preferences }` (the merged preferences only) |
 | `/api/v1/user/export` | POST | Request data export (web session only) |
 | `/api/v1/user` | DELETE | Delete account (web session + step-up code) |
+
+Since v2.13.1, `PATCH /preferences` answers `{ preferences }` instead of the whole profile, so a preference save no longer sends the avatar image back each time. Backend code calling `userService.updatePreferences(userId, prefs)` gets `{ preferences }` too. This is a clean break: anything that read the profile from this response should read `preferences`, or use `useUserProfile().updatePreferences()`, which still resolves to the merged profile.
 
 The `DELETE` handler responds with `{ success, message, auditId }` and runs the provider-delegated deletion cascade (see `features/security`), passing the request IP and User-Agent for audit logging. The frontend `deleteAccount()` ignores the body and returns `void`. If the cascade doesn't complete, it answers **503** `code: 'account_deletion_incomplete'` instead, and the account stays locked until a retry finishes it.
 

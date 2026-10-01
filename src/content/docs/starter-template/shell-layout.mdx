@@ -142,6 +142,19 @@ Inside the shell, `<ShellInit />` (added in v2.7.0) mounts every component regis
 
 If a page throws while rendering, the route's `errorElement` (`RouteErrorFallback`, set on the top-level routes) shows a friendly "Something went wrong" page with a Reload button. The error detail appears in development only, never in production. Each route error is reported once, to Sentry when it is configured.
 
+### No flash on refresh (device caches)
+
+The shell draws before the app settings and the user's profile arrive. Without help, every refresh would first show the defaults (the plain app name, the default logo, nav and toolbar items the admin hid, widgets the admin switched off) and then rearrange. Since v2.13.1 the shell remembers what it drew last time on this device:
+
+| Cache | `localStorage` key | What it holds | Used for |
+|-------|--------------------|---------------|----------|
+| Shell settings | `shell-settings-cache` | App name, logo display mode, logo URL, **Show Dashboard in main nav**, navigation and toolbar overrides, hidden dashboard widgets | `useAppSettingsValue()` returns these (over the defaults) until the settings load. `main.tsx` hides the cached hidden widgets before the first render |
+| Last role | `shell-role-cache:<userId>` | This user's role the last time their profile loaded | Nav visibility only (for example, the Admin link) while the profile loads |
+
+Both are display-only. `useGlobalAppSettings().settings` stays `null` until the server answers, so admin pages never start editing from a cached copy. The cached role grants nothing: the admin routes still wait for the real role (`RoleProtectedRoute`), and the server checks every request. When the real values arrive they replace the cached ones. Signing out (`signOutAndClear()`) clears both caches. If the browser blocks storage, the shell simply behaves as if nothing was cached.
+
+The code is `features/admin/context/shell-settings-cache.ts` and `features/dashboard/lib/shell-role-cache.ts`.
+
 ---
 
 ## Side layout (sidebar)
@@ -286,7 +299,7 @@ Main navigation items come from the `navigationRegistry`. They appear in the sid
 
 1. Hidden items and order overrides (Admin → Navigation), including **user-menu** items.
 2. The **Show Dashboard in main nav** toggle.
-3. `requiredRole`. Admins see everything.
+3. `requiredRole`. Admins see everything. While the profile is still loading, the role this user had last time on this device is used, so the Admin link doesn't pop in late (see [No flash on refresh](#no-flash-on-refresh-device-caches)).
 4. Section overrides: label, `showLabel` and order.
 5. Hidden sections, whose items fold into `main`. `main` itself can't be hidden, and items whose section was never registered go to `main` too.
 
@@ -550,7 +563,7 @@ This is automatically connected to `SidebarProvider` context.
 
 Breadcrumbs can be generated two ways:
 1. **Static (route-based)** - Defined via route `handle` properties
-2. **Dynamic** - Set programmatically via `useBreadcrumbs()` hook
+2. **Dynamic** - Set programmatically via the `useSetBreadcrumbs()` hook
 
 Dynamic breadcrumbs take precedence when set, otherwise route-based breadcrumbs are used.
 
@@ -590,15 +603,15 @@ const crumbs = matches
 
 ### Dynamic Breadcrumbs
 
-For pages that load data asynchronously (like detail pages showing entity names), use the `useBreadcrumbs()` hook to set breadcrumbs dynamically:
+For pages that load data asynchronously (like detail pages showing entity names), use the `useSetBreadcrumbs()` hook to set breadcrumbs dynamically:
 
 ```tsx
-import { useBreadcrumbs } from '@/components/layout';
+import { useSetBreadcrumbs } from '@/components/layout';
 
 function ProjectDetailPage() {
   const { projectId } = useParams();
   const { data: project } = useProject(projectId);
-  const { setBreadcrumbs } = useBreadcrumbs();
+  const setBreadcrumbs = useSetBreadcrumbs();
 
   useEffect(() => {
     if (project) {
@@ -607,11 +620,14 @@ function ProjectDetailPage() {
         { label: project.name }  // No path = current page (not a link)
       ]);
     }
+    return () => setBreadcrumbs(null);  // Clear on unmount
   }, [project, setBreadcrumbs]);
 
   return <div>...</div>;
 }
 ```
+
+Since v2.13.1, pages should use `useSetBreadcrumbs()`. It returns only the setter, which never changes, so setting the crumbs doesn't render the page a second time. Outside a `BreadcrumbProvider` it does nothing, so a page can call it unconditionally. `useBreadcrumbs()` still works, but it also reads the trail, so the page re-renders every time the trail changes, including straight after it sets it. The built-in admin and settings pages switched to `useSetBreadcrumbs()` and no longer render twice.
 
 #### BreadcrumbItem Interface
 
@@ -628,8 +644,10 @@ interface BreadcrumbItem {
 
 | Hook | Description |
 |------|-------------|
-| `useBreadcrumbs()` | Returns `{ dynamicBreadcrumbs, setBreadcrumbs }`. Throws if not in provider. |
-| `useBreadcrumbsOptional()` | Same but returns `undefined` if not in provider. Safe for shared components. |
+| `useSetBreadcrumbs()` | v2.13.1 — **use this in pages.** Returns the setter (type `SetBreadcrumbs`), stable for the provider's lifetime. Doesn't re-render when the trail changes; a no-op outside a provider. |
+| `useDynamicBreadcrumbs()` | v2.13.1 — returns the trail a page has set, or `null`. For the component that draws the breadcrumb bar (`ShellBreadcrumbs`); re-renders when the trail changes. |
+| `useBreadcrumbs()` | Returns `{ dynamicBreadcrumbs, setBreadcrumbs }`. Throws if not in provider. Re-renders with the trail. |
+| `useBreadcrumbsOptional()` | Same but returns `undefined` if not in provider. Re-renders with the trail. |
 
 #### Clearing on Navigation
 
@@ -876,6 +894,8 @@ import { BreadcrumbProvider } from '@/components/layout';
 | Export | Description |
 |--------|-------------|
 | `BreadcrumbProvider` | Context provider - wraps app layout |
+| `useSetBreadcrumbs()` | v2.13.1 — stable setter for pages (no re-render on trail change; no-op outside the provider) |
+| `useDynamicBreadcrumbs()` | v2.13.1 — read the dynamic trail (for the breadcrumb bar) |
 | `useBreadcrumbs()` | Hook to get/set breadcrumbs (throws if not in provider) |
 | `useBreadcrumbsOptional()` | Safe hook that returns undefined if not in provider |
 | `BreadcrumbItem` | TypeScript interface for breadcrumb items |
@@ -1021,6 +1041,7 @@ frontend/src/features/dashboard/
 │   └── useResolvedNavigation.ts  # Registry + overrides + roles → nav
 └── lib/
     ├── resolve-navigation.ts     # Pure resolver (+ __tests__)
+    ├── shell-role-cache.ts       # Last role per user, for nav while the profile loads
     └── close-on-link-click.ts    # Closes mobile nav sheets on navigation
 
 frontend/src/components/layout/
@@ -1048,6 +1069,14 @@ Modify the CSS variables in `AppShell.tsx`:
 
 1. **Via Admin Panel**: Admin → Branding → Upload logo
 2. **Default Logo**: Modify the `DefaultLogo` component in `components/shell/AppBrand.tsx`. It's shared by the sidebar header, the top bar and the mobile sheet
+
+Since v2.13.1, an uploaded logo comes back from the settings API as a short URL (`/api/v1/branding/logo?v=…`), not as image data. That path is relative to the API, which often runs on a different host. If you draw the logo yourself (in a customised sidebar, for example), pass it through `resolveApiAssetUrl()` from `@/lib/api-url`, as `AppBrand` does:
+
+```tsx
+import { resolveApiAssetUrl } from '@/lib/api-url';
+
+const logoSrc = resolveApiAssetUrl(settings.logoUrl); // null when there is no logo
+```
 
 ### Custom Breadcrumb Logic
 

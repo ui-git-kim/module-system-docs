@@ -129,7 +129,7 @@ interface UpdateProfileInput {
 
 ### UpdatePreferencesInput
 
-Used by `PATCH /api/v1/user/preferences`. Partial update — merges with existing preferences.
+Used by `PATCH /api/v1/user/preferences`. Partial update — merges with existing preferences. Since v2.13.1 the response is `{ preferences: UserPreferences }` (the merged preferences only, not the whole profile).
 
 ```typescript
 interface UpdatePreferencesInput {
@@ -259,6 +259,8 @@ interface RouteConfig {
   versions?: ApiVersion[];
   middleware?: RequestHandler[];
   requiresAuth?: boolean;
+  allowNoOrigin?: boolean;      // admit no-Origin (server-to-server) requests
+  bodyLimit?: string | number;  // v2.13.1: this route's own JSON body limit, e.g. '32mb'
   feature: string;
   description?: string;
   deprecated?: boolean;
@@ -266,9 +268,11 @@ interface RouteConfig {
 }
 ```
 
+`bodyLimit` (v2.13.1) is for a route that needs a different JSON limit from the default. Without it, a route that requires auth reads bodies up to 10 MB right after `requireAuth`, and a public route reads up to 1.5 MB before auth. With it, the body is read after `requireAuth` **and** the route's `middleware`, so that middleware sees no `req.body`. See [Request bodies](/starter-template/registries/#request-bodies).
+
 ### PublicRouteConfig
 
-Configuration for routes that bypass authentication.
+Configuration for routes that bypass authentication. Their JSON bodies are read before auth, up to 1.5 MB, with the raw body kept for webhook signature checks (v2.13.1).
 
 ```typescript
 interface PublicRouteConfig {
@@ -276,8 +280,81 @@ interface PublicRouteConfig {
   method: 'get' | 'post' | 'put' | 'patch' | 'delete';
   handler: RequestHandler;
   description?: string;
+  allowNoOrigin?: boolean;
 }
 ```
+
+---
+
+## Admin Types
+
+### AdminPage
+
+An admin panel page, registered with `adminPagesRegistry` (frontend, `@/config/admin-pages.registry`). See [Admin Pages Registry](/starter-template/registries/#admin-pages-registry).
+
+```typescript
+interface AdminPage extends RegistryItem {
+  id: string;                         // URL: /admin/{id}
+  title: string;
+  description?: string;
+  icon: LucideIcon;
+  component: ComponentType;           // usually a React.lazy component
+  preload?: () => Promise<unknown>;   // v2.13.1: the same import() the lazy component calls
+  order?: number;                     // built-in pages 1–29, module pages 30+
+  badge?: string | number;
+  section?: string;                   // 'overview' | 'users' | 'appearance' | 'platform' | 'extensions'
+}
+```
+
+With `preload` set, the admin panel downloads the page's code before it's opened: at idle, on link hover or focus, and on a direct visit before the role check finishes.
+
+### SystemAuditInfo
+
+The audit section of the System page (`GET /api/v1/admin/system/overview`).
+
+```typescript
+interface SystemAuditInfo {
+  sink: 'memory' | 'database' | 'compliance';
+  durable: boolean;
+  immutable: boolean;
+  retentionDays?: number;
+  persisted?: AuditRowCounts | null;  // null when there's no durable table
+}
+
+// v2.13.1: a large table reports an estimate instead of an exact count
+interface AuditRowCounts {
+  total: number;          // exact, or the planner's estimate when approximate (shown as "≈")
+  approximate: boolean;
+  activity?: number;      // exact per-mode split; only when approximate is false
+  compliance?: number;
+}
+```
+
+Before v2.13.1, `persisted` was `{ total, activity, compliance }`, always exact.
+
+### AuditVerifyStatus
+
+The compliance-chain check (v2.13.1). `POST /api/v1/admin/system/audit/verify` starts the check in the background (or joins the one already running) and answers **202**. `GET` on the same path returns its status. The status lives in the memory of the server process that ran it, so with several instances a poll that reaches another one won't know about the run.
+
+```typescript
+interface AuditVerifyStatus {
+  runId: string | null;               // changes per run; null when none has run
+  state: 'idle' | 'running' | 'done';
+  startedAt: string | null;
+  finishedAt: string | null;
+  checked: number;                    // records checked so far, or in total once done
+  result: ChainVerifyResult | null;   // set once done
+}
+
+interface ChainVerifyResult {
+  ok: boolean;
+  checked: number;
+  brokenAtSeq?: number;
+  message: string;
+}
+```
+
+On the frontend, `systemAdminService.startChainVerification()` and `getChainVerification({ signal })` call these endpoints, and `useVerifyChain(enabled)` returns `{ view, start, busy }`.
 
 ---
 
@@ -467,6 +544,7 @@ const envSchema = z.object({
   DATABASE_ADAPTER: z.enum(['neon', 'pg']).default('neon'),
   DEBUG_PRISMA: z.string().default('false').transform((val) => val === 'true'),  // -> boolean
   DB_QUERY_TIMEOUT: z.coerce.number().default(10000),
+  DB_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().min(0).default(60_000),  // idle connection kept open (v2.13.1)
 
   // Auth
   NEON_AUTH_URL: z.string().url(),
@@ -479,9 +557,10 @@ const envSchema = z.object({
   REQUEST_TIMEOUT: z.coerce.number().default(30000),  // per-request timeout (Slowloris guard); 0 disables
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(1),  // Express `trust proxy` hop count
 
-  // Rate limiting (global API limiter)
-  RATE_LIMIT_WINDOW_MS: z.coerce.number().default(15 * 60 * 1000),  // 900000 = 15 min
-  RATE_LIMIT_MAX: z.coerce.number().default(300),
+  // Rate limiting (v2.13.1: per-IP flood guard before auth + per-user limit after it)
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().default(15 * 60 * 1000),  // 900000 = 15 min, both limiters
+  RATE_LIMIT_MAX: z.coerce.number().default(3000),                   // per IP (was 300)
+  RATE_LIMIT_USER_MAX: z.coerce.number().int().min(1).default(600), // per signed-in user
 
   // Security tier + per-knob overrides (see features/security/security.config.ts)
   SECURITY_PROFILE: z.enum(['standard', 'hardened', 'strict']).default('hardened'),

@@ -163,14 +163,22 @@ declare global {
   var prisma: PrismaClient | undefined;
 }
 
+// Pool options shared by both adapters (v2.13.1)
+export function databasePoolConfig() {
+  return {
+    connectionString: env.DATABASE_URL,
+    idleTimeoutMillis: env.DB_POOL_IDLE_TIMEOUT_MS, // default 60 s
+  };
+}
+
 // Select the adapter based on the DATABASE_ADAPTER env var
 function createAdapter() {
   if (env.DATABASE_ADAPTER === 'neon') {
     // Configure WebSockets for Node.js (not needed in edge runtimes)
     neonConfig.webSocketConstructor = ws;
-    return new PrismaNeon({ connectionString: env.DATABASE_URL });
+    return new PrismaNeon(databasePoolConfig());
   }
-  return new PrismaPg({ connectionString: env.DATABASE_URL });
+  return new PrismaPg(databasePoolConfig());
 }
 
 // Log level derived from NODE_ENV / DEBUG_PRISMA
@@ -190,6 +198,8 @@ if (env.NODE_ENV !== 'production') {
 ```
 
 The client is a **global singleton**: `globalThis.prisma ?? new PrismaClient(...)` reuses a cached instance in non-production so repeated dev hot reloads don't each open a new client and exhaust the connection pool. It is constructed with a `log` config derived from `DEBUG_PRISMA` / `NODE_ENV`, and adapter selection lives in a `createAdapter()` helper reading `env.DATABASE_ADAPTER`.
+
+Since v2.13.1, an idle database connection stays open for 60 seconds (pg-pool's own default is 10), so the first query after a short pause reuses a warm connection instead of reconnecting. Change it with the optional `DB_POOL_IDLE_TIMEOUT_MS`. The pool keeps no minimum, so it still empties when the app is idle and Neon can scale the compute to zero.
 
 ### Using Prisma in Features
 
@@ -293,7 +303,7 @@ model Space {
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
-  @@index([deletionState])
+  // No secondary index: every Space read is by id (v2.13.1)
 }
 ```
 
@@ -312,13 +322,34 @@ model AuthDeviceRetiredToken {
   tenantId  String                    // isolation key (== userId in solo mode)
   rotatedAt DateTime @default(now())  // when it was rotated out
 
-  @@index([deviceId])
   @@index([tenantId])
   @@index([rotatedAt])
 }
 ```
 
 Rows are pruned once the token could no longer have been valid (the refresh-token lifetime after rotation). Like the other device tables, it has no foreign key to `User` and stores only token hashes. `template:update` adds the model and commits the migration for you.
+
+### Indexes removed in v2.13.1
+
+Every index adds a write to each insert and update. The 2026-09-30 performance audit found five that no query used, so they were dropped from `schema.prisma` (and from the embedded copies the scripts use):
+
+| Model | Dropped index | Why it wasn't needed |
+|-------|---------------|----------------------|
+| `Notification` | `@@index([tenantId])` | The `[tenantId, readAt]` and `[tenantId, createdAt, id]` indexes start with `tenantId`, so they already serve it |
+| `AuthDeviceRetiredToken` | `@@index([deviceId])` | Lookups use `tokenHash` (the primary key). This table gains a row on every device refresh |
+| `AuthDevice` | `@@index([userId])` | Every query filters on `tenantId` |
+| `AuthDeviceEnrolment` | `@@index([userId])` | Every query filters on `tenantId` |
+| `Space` | `@@index([deletionState])` | Every read is by `id` |
+
+Apps with a single `schema.prisma` drop them through `template:update`'s migration. Apps that split their schema into several files keep them (the field sync only ever adds), which is harmless.
+
+### Users search indexes (created at runtime)
+
+The admin Users search matches anywhere in an email or name (`ILIKE '%term%'`). A normal index can't help with that, so since v2.13.1 two **pg_trgm** (trigram) GIN indexes back it: `User_email_trgm_idx` and `User_name_trgm_idx`. On a 200,000-user test table, a search went from 148 ms to 1.9 ms.
+
+They are **not** in `schema.prisma`. The first time the Users list loads in each server process, `backend/src/features/admin/user-search-index.ts` runs `CREATE EXTENSION IF NOT EXISTS pg_trgm` and builds both indexes with `CREATE INDEX CONCURRENTLY`, so sign-ups and saves never wait. If the host doesn't offer pg_trgm, or the database role isn't allowed to create it, the search keeps working as a full scan and the failure is logged. Search terms of one or two characters still scan.
+
+The indexes are partial (`WHERE email IS NOT NULL`, `WHERE name IS NOT NULL`). Prisma 7.10 ignores partial indexes, so neither `npm run db:migrate` nor `prisma migrate dev` sees them as drift. A future Prisma that reads partial indexes could, so check this after a Prisma upgrade.
 
 ## Module Database Guidelines
 

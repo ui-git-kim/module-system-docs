@@ -17,6 +17,83 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v2.13.1
+
+**Performance audit fixes: a smaller first load, no flash on refresh, no lockout from the colour picker**
+
+This release fixes the [2026-09-30 performance audit](/starter-template/roadmap/#known-issues--2026-09-30-performance-audit): 3 findings you'd feel, 12 moderate and 18 hygiene items. The first load drops from **375 KB to 273 KB gzipped** (−27%), and the main chunk from 254 KB to about 169 KB. What is still open is listed under [Performance follow-ups (v2.13.1)](/starter-template/roadmap/#performance-follow-ups-v2131).
+
+<Aside type="caution" title="Before you update">
+- **An explicit `RATE_LIMIT_MAX=300` keeps 300.** The per-address default is now 3,000, and a new per-user limit applies after sign-in. If your `.env` sets `RATE_LIMIT_MAX=300`, raise it or delete the line.
+- **`logoUrl` is now a URL, not the image itself.** For an uploaded logo, `/branding` and `/admin/settings` return `/api/v1/branding/logo?v=…`, a path on the API. The template's own components handle it. A customised component that renders `logoUrl`, such as a customised `AppSidebar`, must pass it through `resolveApiAssetUrl()` from `@/lib/api-url`. Otherwise the logo breaks when the API runs on another host.
+- **Clean breaks (pre-launch):**
+  - `PATCH /api/v1/user/preferences` returns `{ preferences }` only. `useUserProfile().updatePreferences()` still resolves to the full profile.
+  - `GET /api/v1/admin/system/audit/verify` now returns the check's status, and `POST` starts it. `systemAdminService.verifyChain` is gone: use `startChainVerification()` and `getChainVerification()`, or `useVerifyChain(enabled)`.
+  - Subclasses of `SqlAuditSink` / `ComplianceAuditSink`: `writeRow` is replaced by `writeBatch(rows, isRetry)`, and the protected `ready` is gone.
+  - `AdminSortableList` and `AdminSortableItem` are no longer exported from `@/features/admin` (their prop types still are). Import them from `@/features/admin/components/AdminComponents` in a lazily loaded page.
+  - The `user`, `support` and `notifications` barrels no longer re-export their lazily routed pages (the `*Content` settings pages, `SupportPage` and `NotificationsPage`).
+  - The JSON body limit before sign-in is now 1.5 MB (it was 10 MB). Routes that require auth keep 10 MB, read after `requireAuth`, so ai-core's attachments still work.
+- **Multi-file schema apps keep the five dropped indexes.** The schema field sync only adds, never removes. That's harmless.
+</Aside>
+
+### You'd notice
+
+- **The avatar colour picker no longer locks you out.** Dragging the custom colour used to send a save for every movement and could hit the rate limit within seconds. Now Settings → Personal information previews the colour at once and saves once you pause (about 400 ms). Repeats are skipped, and a pending save is sent when you leave the page. Preference saves run in order. See [Avatar colour picker](/starter-template/user-feature/#avatar-colour-picker).
+- **No flash on refresh.** The shell remembers its settings on the device (`localStorage` key `shell-settings-cache`): app name, logo, navigation and toolbar overrides, `showDashboardInNav` and hidden dashboard widgets. The last role is remembered per user, only to decide which role-gated menu links (such as Admin) to show (the server and `RoleProtectedRoute` still check it). So the brand, menu and dashboard no longer show defaults and then rearrange. `useGlobalAppSettings().settings` stays `null` while loading, so admin edit pages are unaffected. Signing out clears both caches.
+- A dashboard widget the admin hides now disappears straight away. It could stay visible until the next page change.
+- **Faster first connection.** `index.html` asks the browser to connect to Neon Auth and the API while the JavaScript downloads (`preconnect`).
+- **Notifications respond instantly.** Mark read, mark all read and delete update the list and the unread count at once, and roll back if the request fails. Afterwards only the unread count is fetched again, plus a background refetch of a list whose paging the change affected. See [Notifications](/starter-template/notifications-feature/).
+- **Admin pages load sooner.** The admin layout fetches every admin page's code when the browser is idle (not on Save-Data or 2G), and on link hover, focus or touch. The requested page starts downloading before the role check. Switching to a page that hasn't loaded shows the loading state at once. Admin pages can register a `preload` function, and `adminPagesRegistry` gains `preload(id)` and `preloadAll()`.
+
+### First load
+
+- **The Neon Auth SDK no longer ships all of zod (−54 KB gzipped).** A build-only Vite plugin (`frontend/src/lib/neon-auth-zod.plugin.ts`) points the SDK's `import z from "zod"` at a small `zod/mini` shim. It only does this when the SDK file uses nothing else. Otherwise it leaves full zod in place with one build warning, so an SDK update can't break the build.
+- **The barrels stop pulling lazy code into the first load.** The admin barrel no longer brings in `@dnd-kit` (−18 KB), and the `user`, `support` and `notifications` barrels no longer bring in their lazy pages (−26 KB). The seven `INEFFECTIVE_DYNAMIC_IMPORT` build warnings are gone. `AdminDetailTabs` and `AdminSheet` stay on the admin barrel. See [Lazy settings pages are bundled eagerly](/starter-template/roadmap/#lazy-settings-pages-are-bundled-eagerly).
+- **One class-merge library.** `frontend/src/lib/utils.ts` is now `export { cn } from 'cn'`. `cn` is added to `frontend/package.json`, `install:all` and `sync-deps`, so existing apps get it on `template:update`. `clsx` and `tailwind-merge` stay, because modules import them directly.
+- **Returning visitors skip a round trip.** `frontend/public/_headers` gives `/assets/*` a one-year `immutable` cache on Cloudflare Pages and Netlify. `index.html` keeps revalidating. For nginx and Apache, see [Configuration](/starter-template/configuration/).
+
+### Server
+
+- **CORS preflights are cached for 2 hours** (`maxAge: 7200`), so signed-in calls stop paying an extra round trip. The CORS options moved into `middleware/origin.middleware.ts`. The allow-list still decides.
+- **The logo is served as a cached image.** The public `GET /api/v1/branding/logo` returns the stored logo with a one-year cache when the `?v=` version matches. JSON responses carry that URL instead of the base64 data. An http(s) logo is returned unchanged. On `PATCH /api/v1/admin/settings`, a data URI sets a new logo, `null` removes it, and leaving it out (or sending the served URL back) keeps it. App Settings now sends the logo only when it changed. `/branding` answers repeat visits with a 304. `adminService.getAppSettings()` and the `admin.settingsUpdated` hook still carry the stored value.
+- **Profile reads are faster.** The Space and the user are read in parallel, and a preference save takes 2 database trips instead of 4.
+- **Body limits by route.** Before sign-in, the JSON parser handles only public routes and unknown paths, at 1.5 MB. Routes that require auth are parsed right after `requireAuth`, at 10 MB. Webhooks (`registerPublic`) get their own 1.5 MB parser before auth, with the raw body kept. A route can set its own limit with the new `bodyLimit` option. An oversized body gets a direct **413** `Request body too large`. See [Route Registry](/starter-template/registries/#route-registry).
+- **Rate limits per person, not just per address.** The per-address flood guard before auth now defaults to 3,000 (`RATE_LIMIT_MAX`). A new per-user limit after `requireAuth` defaults to 600 per 15 minutes (`RATE_LIMIT_USER_MAX`), counted once per request. The admin Security page shows both. Both are still in memory, one count per server. See [Admin Security page](/starter-template/security-feature/#admin-security-page).
+- **Sign-up rushes no longer fail.** First sign-in checks cheaply whether any user exists. Only an empty table takes the strict count-then-create path, which is retried on a conflict. The first user still becomes admin.
+- **App settings are cached for 30 seconds** in each server process. Concurrent callers share one read, every save clears the cache, and a failed read isn't cached. `/branding` and `/theme` read only the columns they need. With several servers, the others may serve settings up to 30 seconds old after a save.
+- **Sign-in keys are fetched ahead of time.** Neon Auth's key set is loaded at boot and refreshed every 5 minutes off the request path.
+- **Device tokens** resolve the device and its owner's email in one query.
+- **Idle database connections stay open for 60 seconds** (was 10), so the next click after a pause doesn't reconnect. Tune it with `DB_POOL_IDLE_TIMEOUT_MS`.
+- New optional env keys `RATE_LIMIT_USER_MAX` and `DB_POOL_IDLE_TIMEOUT_MS`. create-app and `sync-env` write commented placeholders.
+
+### Database & audit log
+
+- **Users search uses indexes.** Trigram (`pg_trgm`) indexes on email and name are built at runtime, the first time the Users list loads after a server start. If the host doesn't allow it, search still works, just unindexed. There's no migration. Searches of one or two characters still scan. The page and the count run in parallel, and `adminService.listUsers(params, { signal })` cancels an abandoned search in the browser. On 200,000 users a search went from 148 ms to 1.9 ms.
+- **Five unused indexes dropped:** `Notification @@index([tenantId])`, `AuthDeviceRetiredToken @@index([deviceId])`, `AuthDevice @@index([userId])`, `AuthDeviceEnrolment @@index([userId])` and `Space @@index([deletionState])`. This makes the busiest inserts cheaper.
+- **The compliance audit trail writes in batches.** One transaction takes the lock once and writes up to about 200 chained rows in one insert. Temporary failures are retried with backoff instead of turning the sink off. `SqlAuditSink` uses multi-row inserts too. New optional constructor options `{ batchSize, retryBaseMs, retryMaxMs }` and a `flush()` method.
+- **Admin → System opens fast on a large audit log.** Audit totals come from the database's statistics and are shown with "≈". They load with the page's other queries.
+- **"Verify integrity" runs in the background.** `POST /api/v1/admin/system/audit/verify` starts one check (or joins the running one) and answers **202**. The page polls `GET` for progress and shows errors. It still checks the whole chain every time. See [System](/starter-template/system/).
+
+### Modules
+
+- **Module pages download only when opened.** The module starter ([scaffold 1.31.20](/module-starter/changelog/#scaffold-v13120)) generates admin and settings pages with `React.lazy()`, and the generated barrel no longer re-exports pages. Dashboard widgets, header toolbar items, preferences sections, integration cards and personal-info fields stay static, because the host has no loading boundary around them yet.
+- **Migrated:** billing 2.3.5, style 1.14.14, pickers 1.2.4 and ai-chat 0.1.2 (barrel only). document-management, structure, colour, builder and cog are still to migrate. See [Performance follow-ups (v2.13.1)](/starter-template/roadmap/#performance-follow-ups-v2131).
+- **`user.created` handlers must return quickly.** Hand slow work, such as a welcome email, to `enqueueJob`. See [Hooks](/starter-template/hooks/#user-service-hooks) and [Jobs](/starter-template/jobs-feature/).
+- A module route that needs a bigger body declares `bodyLimit`. ai-core keeps its 10 MB after auth, as before.
+
+### Smaller fixes
+
+- **Sidebar items stop redrawing on every page change.** `NavMain` reads the path once, so only the items gaining or losing the highlight redraw. The top bar re-measures only when its entries change.
+- **Pages that set breadcrumbs render once, not twice.** New `useSetBreadcrumbs()` (setter only, stable) and `useDynamicBreadcrumbs()` (read), plus the `SetBreadcrumbs` type, from `@/components/layout`. Pages should prefer `useSetBreadcrumbs()`. `useBreadcrumbs()` is unchanged. See [Breadcrumbs](/starter-template/breadcrumbs/#available-hooks).
+- `useAdminToolbarActions` re-registers only when something it renders changes, so typing in App Settings no longer re-adds the Save button on every keystroke.
+- The time-zone list on Personal information is built once per session.
+- Stale entries in the docs were corrected.
+- Tests: backend 225 → 361, frontend 57 → 188.
+
+**Propagation:** frontend + backend `src`, the scripts (`cn` in `install-all` and `sync-deps`, the new env placeholders) and the Prisma schema. `template:update` generates one migration, which drops the five unused indexes. The Users search indexes are built at runtime, so they need no migration → **patch**.
+
+---
+
 ## v2.13.0
 
 **Security audit fixes, plus a "confirm it's you" code for sensitive actions**

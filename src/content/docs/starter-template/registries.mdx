@@ -275,9 +275,14 @@ dashboardRegistry.register({
 Register pages in the settings section.
 
 ```typescript
+import { lazy } from 'react';
 import { settingsPagesRegistry } from '@/config/settings-pages.registry';
-import { TeamSettingsPage } from './pages/TeamSettingsPage';
 import { Users, CreditCard } from 'lucide-react';
+
+// Lazy-loaded, so the page downloads only when it's opened
+const TeamSettingsPage = lazy(() =>
+  import('./pages/TeamSettingsPage').then((m) => ({ default: m.TeamSettingsPage })),
+);
 
 // Add a new settings page
 settingsPagesRegistry.register({
@@ -306,6 +311,8 @@ settingsPagesRegistry.register({
 
 **Non-Extensible Pages:** `security`, `data` (for security/compliance reasons)
 </Aside>
+
+**Register pages with `React.lazy`.** Settings pages render inside a `<Suspense>` boundary, so a lazy page costs nothing until someone opens it. Don't re-export the page from your feature's or module's `index.ts`: a static re-export puts it back in the first download. The module starter generates settings and admin pages this way (scaffold 1.31.20).
 
 **Hooks:**
 | Hook | Returns |
@@ -406,9 +413,15 @@ For toggles that need different icons for active/inactive states (like theme tog
 Register pages in the admin panel (admin-only access).
 
 ```typescript
+import { lazy } from 'react';
 import { adminPagesRegistry } from '@/config/admin-pages.registry';
-import { AIAdminPage } from './pages/AIAdminPage';
 import { Bot } from 'lucide-react';
+
+// One loader feeds both the lazy component and `preload`
+const loadAIAdminPage = () => import('./pages/AIAdminPage');
+const AIAdminPage = lazy(() =>
+  loadAIAdminPage().then((m) => ({ default: m.AIAdminPage })),
+);
 
 adminPagesRegistry.register({
   id: 'ai-settings',        // URL: /admin/ai-settings
@@ -416,6 +429,7 @@ adminPagesRegistry.register({
   description: 'Configure AI models',
   icon: Bot,
   component: AIAdminPage,
+  preload: loadAIAdminPage, // v2.13.1 — optional prefetch (see below)
   order: 50,
   badge: 'New',            // Optional badge
   section: 'extensions',   // v1.56.0 — see sections below (optional)
@@ -426,11 +440,15 @@ adminPagesRegistry.register({
 
 **Order bands:** built-in template pages reserve `order` 1–29; module pages should use **30+** (order sorts *within* a section). This replaces the older mixed guidance of 30 vs 50 in earlier docs.
 
+**Lazy pages and prefetch (v2.13.1):** register admin pages with `React.lazy`, as above, and don't re-export them from your barrel. The optional `preload` field is the same `import()` the lazy component calls. When it's set, the admin panel fetches the page's code ahead of time: every page once the browser is idle (skipped when the browser asks to save data or the connection is 2G), and a page as soon as its link is hovered, focused or touched. On a direct visit to `/admin/<id>`, the page starts downloading before the admin role check finishes. Without `preload`, the page still works; it just downloads on first open. Switching to a page that hasn't loaded yet shows the loading fallback straight away.
+
 **Hooks / methods:**
 | Hook / method | Returns |
 |------|---------|
 | `useAdminPages()` | All admin pages |
 | `adminPagesRegistry.getNavSections()` | v1.56.0 — pages grouped into ordered sections (empty sections omitted) |
+| `adminPagesRegistry.preload(id)` | v2.13.1 — start downloading one page's code (its `preload`); does nothing if it has none. Errors are ignored here; the page reports them when it renders |
+| `adminPagesRegistry.preloadAll()` | v2.13.1 — start downloading every page that has a `preload` |
 
 ---
 
@@ -920,6 +938,10 @@ interface RouteConfig {
                              // by other means (webhook HMAC — see the security
                              // feature) or safe probes. Default: false.
                              // Also available on PublicRouteConfig.
+  bodyLimit?: string | number; // v2.13.1 — this route's own JSON body limit
+                             // (bytes, or a string like '32mb'). Parsed after
+                             // auth AND `middleware`. Default: unset (see
+                             // "Request bodies" below).
 }
 ```
 
@@ -932,9 +954,10 @@ interface RouteConfig {
 | `getByFeature(feature)` | Get routes by feature name |
 | `getByVersion(version)` | Get routes by API version |
 | `allowsNoOrigin(path)` | v1.54.0 — whether a request path opted into no-Origin access (consulted by the production origin gate) |
-| `generateDocs()` | Generate route documentation |
+| `usesOwnBodyParser(path)` | v2.13.1 — whether a request path's body is parsed by its route after auth (so the global pre-auth parser skips it) |
+| `generateDocs()` | Generate route documentation (includes `bodyLimit`) |
 
-`requiresAuth` (the default) already applies `requireAuth` when the routes are mounted, so don't list it again in `middleware` — it would run twice.
+`requiresAuth` (the default) already applies `requireAuth` when the routes are mounted, so don't list it again in `middleware` — it would run twice. Since v2.13.1, `requireAuth` is followed by a per-user rate limit (`RATE_LIMIT_USER_MAX`, default 600 per window); see [Configuration → Rate limits](/starter-template/configuration/#rate-limits).
 
 **Guarding sensitive routes** (v2.13.0): add these per route, inside your router, after the auth or admin check.
 
@@ -944,6 +967,33 @@ interface RouteConfig {
 ```typescript
 router.delete('/archive', requireWebSession, requireStepUp, handler);
 ```
+
+#### Request bodies
+
+Reading a JSON body costs the server work, so since v2.13.1 a large body is never read for a caller who hasn't signed in. The rules:
+
+| Route | When its JSON body is read | Limit |
+|-------|----------------------------|-------|
+| Public routes (`register({ requiresAuth: false })`) and unregistered paths | By the global parser, before auth | 1.5 MB (`DEFAULT_JSON_BODY_LIMIT`) |
+| Routes that require auth (the default) | Right after `requireAuth`, before the route's own `middleware` | 10 MB (`AUTHENTICATED_JSON_BODY_LIMIT`) |
+| `registerPublic` routes (webhooks) | By their own parser, before auth, even under an authed prefix such as `/api/v1/billing/webhook`. The raw body is kept for signature checks | 1.5 MB |
+| Routes that set `bodyLimit` | After `requireAuth` (when the route requires it) **and** the route's `middleware` (put `requireAdmin` there to read bodies for admins only) | The route's `bodyLimit` |
+
+A route reads only the bodies of requests it is the **most specific** mount for. So a nested route with its own `bodyLimit` (`/ai/attachments`) always gets its limit, even under an outer route (`/ai`). A body over the limit gets a plain **413** `{ error: 'Request body too large' }`, with no error log or audit row. The limits live in `backend/src/middleware/body-parser.middleware.ts`.
+
+```typescript
+// A route that accepts larger bodies than the 10 MB default
+routeRegistry.register({
+  path: '/ai/attachments',
+  router: attachmentRoutes,
+  feature: 'ai',
+  bodyLimit: '32mb',
+});
+```
+
+<Aside type="caution">
+With `bodyLimit` set, the route's `middleware` runs **before** the body is read, so it sees no `req.body`. Without `bodyLimit`, an authed route's middleware sees the body as before.
+</Aside>
 
 ---
 
