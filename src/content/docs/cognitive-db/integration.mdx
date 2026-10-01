@@ -1,6 +1,6 @@
 ---
 title: Integration & Delivery
-description: How an app wires cognitive-db in via initConfig(), the sourceId/sourceType no-content-duplication contract, hybrid database mode, and how the engine is delivered — vendored into Cognitive Pipeline or installed standalone from Git.
+description: How an app wires cognitive-db in via initConfig() (an AiAdapter onto AI Core, a StructureAdapter onto Structure), the sourceId/sourceType no-content-duplication contract, storage modes, and how the engine is delivered — vendored into Cognitive Pipeline or installed standalone from Git.
 sidebar:
   order: 3
   label: "Integration & Delivery"
@@ -20,212 +20,148 @@ Most developers never touch this directly. The [Cognitive Pipeline module](/modu
 
 ### The core principle: your app owns the infrastructure
 
-cognitive-db is deliberately **generic, not app-specific**. It hardcodes no database connection, no LLM provider, no API keys, and no domain ontology. Everything it needs is supplied by the consuming app at startup through a single `initConfig()` call. The engine just orchestrates the knowledge-graph operations on top of what you give it.
+cognitive-db is deliberately **generic, not app-specific**. It hardcodes no database connection, no model provider, no API keys and no domain ontology. Everything it needs is supplied by the host at startup through a single `initConfig()` call. The engine orchestrates the knowledge-graph work on top of what you give it.
 
 <CardGrid>
   <Card title="You provide" icon="laptop">
-    Prisma client, an LLM model, embedding functions, your ontology, and prompt overrides.
+    A Prisma client, an `AiAdapter` onto your AI Core (models and keys), a `StructureAdapter` onto your Structure module (records), and optional feature switches.
   </Card>
   <Card title="The engine provides" icon="puzzle">
-    Perception, entity extraction, connection discovery, versioning, search, and pattern detection.
+    Perception, entity resolution, connection discovery, search, traversal, pattern detection, consolidation and proactive insights.
   </Card>
 </CardGrid>
 
 ### `initConfig()` — the single wiring point
 
-Call `initConfig()` once at app startup, before any engine service is used. It validates the config (via Zod) and stores it process-wide.
+Call `initConfig()` once at startup, before any engine function is used. It validates the config (via Zod) and stores it process-wide. The root entry and every subpath share that one config.
 
 ```typescript
-import { initConfig } from 'cognitive-db';
-import { PrismaClient } from '@prisma/client';
-import { createAnthropic } from '@ai-sdk/anthropic';
-import { embed, embedBatch, embedQuery } from './lib/cognitive-db/embedding';
-
-const prisma = new PrismaClient();
-const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+import { initConfig, type AiAdapter } from 'cognitive-db';
 
 initConfig({
-  // 1. Database — your Prisma client, your Postgres
-  database: {
-    mode: 'integrated',      // recommended (see Hybrid database mode below)
-    prisma,                  // the app's own PrismaClient instance
-    tablePrefix: 'cog_',     // default; all engine tables are cog_-prefixed
+  // 1. Database — your Prisma client; the engine uses it only for its own cog_* tables
+  database: { mode: 'integrated', prisma },
+
+  // 2. Models — an AiAdapter onto your AI Core (see Providers & Infrastructure)
+  ai: {
+    dimensions: 1024,
+    embeddingModel: 'voyage-3.5',
+    runLanguage: (opId, input, ctx) => aiCore.run(opId, input, ctx),
+    embed: (opId, values, ctx) => aiCore.embed(opId, values, ctx),
+  } satisfies AiAdapter,
+
+  // 3. Records — a StructureAdapter onto your Structure module
+  storage: {
+    mode: 'structure',
+    structure: structureAdapter,
+    autoPromoteThreshold: 0.9,   // optional: auto-activate discovered connections at or above this
   },
 
-  // 2. LLM — a pre-built Vercel AI SDK LanguageModel
-  llm: {
-    model: anthropic('claude-sonnet-4-20250514'),
-    temperature: 0.3,        // optional (default 0.3)
-  },
-
-  // 3. Embeddings — functions the app supplies (model name is for tracking only)
-  embedding: {
-    model: 'voyage-3.5',     // recorded on each node for provenance
-    dimensions: 1024,        // MUST match your vector column width
-    embed,                   // (text) => Promise<EmbeddingResult>   — required
-    embedBatch,              // optional batch variant
-    embedQuery,              // optional query-side variant
-  },
-
-  // 4. Ontology — your entity + relationship-type definitions (loaded as nodes)
-  ontology: {
-    definition: myOntology,  // OntologyDefinition; layered over the base ontology
-    autoLoad: true,          // seed concept / relationship_type nodes on init
-  },
-
-  // 5. Prompts — override any extraction prompt without touching engine code
-  prompts: {
-    contentDescription: 'Court filings, case notes, and evidence records',
-    systemContext: 'You are extracting entities for a family-law matter.',
-    customPrompts: {
-      entityExtraction: '…',       // fully overridable, per function
-      relationshipExtraction: '…',
-    },
-  },
+  // 4. Feature switches — optional; see below
+  features: { emotionDetection: false },
 });
 ```
 
-<Aside type="note" title="Provider config lives in your app, not the engine">
-Note that `llm.model` is a **pre-configured `LanguageModel`** — you build the provider client (`createAnthropic`, `createOpenAI`, …) and pass the model object in. Likewise `embedding.embed` is a **function you write**. The engine never sees a provider name or an API key; those stay in your app's environment. This is why the concept doc's older `{ provider, model, apiKey }` shape has been superseded — the built API takes the constructed model/functions directly, which keeps the engine provider-agnostic.
+<Aside type="note" title="Model config lives in AI Core, not the engine">
+The engine never sees a provider name, a model id or an API key. It runs named operations (`cognitive-db/extract-entities`, …) through `runLanguage`, and AI Core decides which model answers and how the prompt is built. The operations and their context markers ship as `COGNITIVE_DB_OPERATIONS` (from `cognitive-db/operations`) for the host to seed into AI Core.
 </Aside>
 
-The keys the engine hands back through helpers (`getConfig`, `isFeatureEnabled`, `getEmbeddingDimensions`, `getPrismaClient`) are all read from this one config object. If you call a service before `initConfig()`, you get a clear `CognitiveDB: Not initialized` error.
+If you call an engine function before `initConfig()`, you get a clear `CognitiveDB: Not initialized` error. A storage adapter can also be injected later with `updateConfig({ storage: { structure } })`. When no explicit `mode` is set, the engine uses Structure whenever an adapter is present.
 
-<Aside type="caution" title="Dimensions must match">
-`embedding.dimensions` must equal the width of your `vector(N)` column and your model's actual output. A mismatch fails at query time, not at config time. `voyage-3.5` is 1024; `text-embedding-3-small` is 1536; `text-embedding-3-large` is 3072.
-</Aside>
+### Feature switches
 
-### Feature flags
+The optional `features` block turns parts of the engine **off**. A switch never makes the engine do more than the processing level would.
 
-Perception is modular. The optional `features` block on `initConfig()` toggles which extraction passes run — omit it to accept the defaults, or switch individual passes off to trade depth for cost.
+These seven default to **on**:
 
-```typescript
-features: {
-  entityExtraction: true,       // extract entities from content
-  relationshipDiscovery: true,  // discover relationships between entities
-  patterns: true,               // detect behavioural patterns
-  proactive: true,              // proactive insights (contradictions, gaps, …)
-  understanding: false,         // deeper whole-content understanding
-},
-```
+- `entityExtraction` — entities, and so the relationships between them.
+- `relationshipDiscovery` — extracted, inferred and similarity-discovered connections.
+- `emotionDetection` — emotions.
+- `questionDetection` — questions, including "expected but missing" questions.
+- `understanding` — the ingest summary and concept extraction.
+- `patterns` — every pattern-detection entry point.
+- `proactive` — `checkProactive` and `runFullCheck`. When off, they return an empty result marked `disabled: true`.
 
-Each flag maps to a field on `FeaturesConfig`; all are optional booleans.
+These default to **off**:
+
+- `sequentialAdjacency`
+- `structuralGaps`
+- `expectationPass`
+- `retrieveToConnect`
+- `analogicalProxy`
+
+Each switch is a field on `FeaturesConfig`. An unset switch reads as its default.
 
 ### The no-content-duplication contract: `sourceId` + `sourceType`
 
-This is the most important integration rule. **cognitive-db never stores a copy of your original content.** It stores its *understanding* of that content — embeddings, extracted entities, discovered connections, questions — and references the original back to your own table via two fields:
+This is the most important integration rule. The engine stores its *understanding* of your content: entities, connections, emotions, concepts, questions and embeddings. It keys that understanding back to your own records with two fields:
 
-- `sourceId` — the primary key of the row in **your** table
-- `sourceType` — which table/kind it came from
+- `sourceId` — the stable id of the item in **your** system
+- `sourceType` — what kind of item it is (it also picks the Structure node type for the content record)
 
 ```typescript
-import { IngestService } from 'cognitive-db';
+import { ingest } from 'cognitive-db';
 
-const ingest = new IngestService(prisma);
-
-const result = await ingest.ingest({
-  sourceId: 'note-123',        // the id in YOUR notes table
-  sourceType: 'note',          // which of YOUR tables it came from
-  content: note.body,          // text to understand — processed, not persisted verbatim
-  userId: note.userId,         // ownership boundary (see below)
+const result = await ingest(prisma, {
+  userId,                      // ownership boundary (see below) — required, never empty
+  sourceId: 'note-123',        // the id in YOUR system
+  sourceType: 'note',
+  content: note.body,
+  processingLevel: 'standard', // 'minimal' | 'standard' | 'deep' | 'full'
 });
 
-result.contentNode;   // the cog_node that represents this item's understanding
-result.entities;      // extracted entity nodes
-result.connections;   // connections discovered at ingest (Tier-1, immediate)
+result.changeStatus;     // 'new' | 'unchanged' | 'changed'
+result.contentNode;      // the content record
+result.entityNodes;      // resolved or created entities (deduplicated against the graph)
+result.connectionNodes;  // relationships written or re-observed
+result.warnings;         // user-safe, non-fatal notes
 ```
 
-Your app remains the **single source of truth** for the actual content. If a note changes or is deleted, you re-ingest or purge by `sourceId` — the engine holds a derived layer keyed to your data, never a second copy of it. Every downstream consumer of the engine (Cognitive Pipeline, and the planned Documents module) keys off `sourceId`/`sourceType` the same way.
+The `sourceId` is how re-ingest stays idempotent:
+
+- **Identical content** is skipped, at zero tokens.
+- **Changed content** updates the same content record in place. Its emotion, concept and question records are updated too, not copied.
+- **A relationship stated again** strengthens the existing connection instead of adding another.
 
 <Aside type="note" title="userId is the ownership boundary">
-`userId` on each node is how rows are isolated. The engine follows a **`tenantId === userId`** model — a solo-business design where one user *is* the tenant. There is no separate multi-tenant layer and no `tenantId` column: isolation is by **ownership** of the `userId` field. The consuming module's security layer declares `ownedModels: []` and relies on the starter's `userId`-ownership isolation, and it wires up the account-erasure deletion handler for lawful data removal. `userId` is intentionally **nullable** — system and ontology nodes are shared, not user-owned — so a null there is by design, not a gap.
+The engine follows a **`tenantId === userId`** model: in a solo-business design, one user *is* the tenant. There is no separate multi-tenant layer and no `tenantId` column. Isolation is by **ownership**: every read and write is scoped to the `userId` you pass, and every entry point rejects an empty one.
 </Aside>
 
-### Hybrid database mode
-
-The engine supports two database modes. In practice, one is the path everyone uses today.
+### Storage modes
 
 | Mode | Status | How it works |
 |------|--------|--------------|
-| **`integrated`** | ✅ Primary / recommended | You pass in your app's `PrismaClient`. The `cog_*` tables live in your app's own Postgres database, alongside your own tables. One database, one migration story. |
-| **`standalone`** | ⏳ Deferred | Exists in the config schema, but still requires a Prisma client today. A true standalone mode (raw `pg`, no Prisma dependency on the consuming side) was scoped and deliberately deprioritised until a real consumer needs it. |
+| **`structure`** | ✅ Primary | Records live in Structure, through the `StructureAdapter`. The engine keeps only its own `cog_intelligence_*` provenance and discovery tables and the working-memory events. |
+| **`cog_node`** (v1) | ⏳ Retiring | The original single-table graph. It is used only when no Structure adapter is configured, and is scheduled for removal. |
 
-For every real deployment, use `integrated`. The engine reads and writes through the Prisma client you supply, so it participates in your transactions and your connection pooling rather than opening its own.
+The `database.mode` is `integrated`: you pass your app's own `PrismaClient`, and the engine's tables live in your database. A Prisma-free `standalone` mode is planned but not built.
 
-```typescript
-database: {
-  mode: 'integrated',
-  prisma,               // required for integrated mode
-}
-```
+All engine-owned tables are prefixed **`cog_`**, so they never collide with your own. New engine options go into existing JSON columns (`data` / `metadata`) wherever possible, so new capabilities rarely need a schema migration.
 
-<Aside type="caution">
-Setting `mode: 'standalone'` requires a `connectionString`, but the standalone code path still depends on Prisma. Treat standalone as **not yet available** for Prisma-free use — it is on the roadmap, not shipping.
-</Aside>
+### Running the engine's AI operations directly
 
-### Table prefixing and avoiding migrations
-
-All engine tables are prefixed **`cog_`** (`cog_node`, `cog_working_memory_event`, `cog_processing_log`) so they never collide with your app's tables when they share a database. The prefix is configurable via `database.tablePrefix` but defaults to — and is expected to stay — `cog_`.
-
-A related design habit worth adopting: **new configuration goes into existing JSON columns wherever possible, to avoid schema migrations.** The engine's per-node `data` and `metadata` JSON fields, and the consuming module's `config` JSON on its source records, are where new options land — so shipping a new capability rarely means an `ALTER TABLE`. See the [Cognitive Pipeline configuration page](/modules/cognitive-pipeline/configuration/) for how the module leans on this.
-
-### Direct LLM and embedding access
-
-Most apps only touch `IngestService` and `SearchService`, but the engine also re-exports the low-level primitives it uses internally, so you can reach the same configured LLM and embedding functions directly.
+Most hosts only call `ingest`, the search functions and the analysis functions. The engine also exports the thin wrappers it uses over your `AiAdapter`:
 
 ```typescript
-import { generate, extract, llm } from 'cognitive-db';
-import { z } from 'zod';
+import { runLanguage, embedQuery, AI_OPS } from 'cognitive-db';
 
-// Free-form generation against your configured model
-const summary = await generate('Summarise this: …', {
-  system: 'You are a helpful assistant',
-  temperature: 0.5,
-});
-
-// Structured extraction with a Zod schema — output is coerced to the schema
-const data = await extract(
-  z.object({
-    people: z.array(z.string()),
-    places: z.array(z.string()),
-    sentiment: z.enum(['positive', 'negative', 'neutral']),
-  }),
-  'Kim visited Melbourne with Sarah. It was a great trip!',
-  { system: 'Extract entities and sentiment' },
-);
-
-// The same two calls are also available under the `llm` namespace
-const text = await llm.generate('Hello');
+const { embedding } = await embedQuery('search text', { userId });
+const result = await runLanguage(AI_OPS.summarise, { context: [/* … */] }, { userId });
 ```
-
-Embeddings are exposed the same way, wrapping the functions you supplied in `initConfig()`:
-
-```typescript
-import { embed, embedBatch, embedQuery } from 'cognitive-db';
-
-const one   = await embed('Some text to embed');       // EmbeddingResult
-const many  = await embedBatch(['Text 1', 'Text 2']);  // BatchEmbeddingResult
-const query = await embedQuery('search query');        // query-side variant
-```
-
-<Aside type="note" title="Chunking is not the engine's job">
-Long content is summarised before the node-level embedding — the engine never embeds truncated raw text. Per-chunk vectors for full-document retrieval are produced upstream by the ingesting module (Cognitive Pipeline's splitter → Structure chunk store), not by the engine.
-</Aside>
 
 ### Type exports
 
-Every public type is exported from the package root for `import type` use:
+Every public type is exported from the package root for `import type` use. Among them:
 
 ```typescript
 import type {
-  // Config
-  CognitiveDBConfig, LLMConfig, EmbeddingConfig, DatabaseConfig, FeaturesConfig,
-  // Nodes
-  Node, ContentNode, EntityNode, ConnectionNode, PatternNode,
-  // Results
-  EmbeddingResult, BatchEmbeddingResult, SearchResult, IngestResult,
-  // Options
-  GenerateOptions, ExtractOptions, SearchOptions,
+  // Config + adapters
+  CognitiveDBConfig, DatabaseConfig, StorageConfig, FeaturesConfig,
+  AiAdapter, StructureAdapter,
+  // Ingest
+  IngestInput, IngestResult,
+  // Graph
+  Node, ContentNode, SearchResult,
 } from 'cognitive-db';
 ```
 
@@ -271,7 +207,7 @@ To use the engine on its own, install it straight from GitHub. It is not on npm,
 npm install github:ui-git-kim/cognitive-db
 ```
 
-Then add the `cog_node` schema to your Prisma (copy it from the engine's `prisma/schema.prisma`), enable the pgvector extension, run your migration, and call `initConfig()` as shown in Part 1.
+Then copy the engine's `cog_*` models from its `prisma/schema.prisma` into your own schema. Enable the pgvector extension, run your migration, and call `initConfig()` as shown in Part 1.
 
 ```prisma
 generator client {
@@ -279,19 +215,14 @@ generator client {
   previewFeatures = ["postgresqlExtensions"]
 }
 
+// Prisma 7: the connection URL lives in prisma.config.ts, not here.
 datasource db {
   provider   = "postgresql"
-  url        = env("DATABASE_URL")
   extensions = [vector]
 }
 
-// Copy the full cog_node model (and the other cog_* models) from
-// cognitive-db/prisma/schema.prisma into your own schema.
-model cog_node {
-  id       String @id @default(uuid())
-  nodeType String
-  // …rest of the unified node model
-}
+// Copy the cog_* models (cog_intelligence_log, cog_intelligence_discovery,
+// cog_working_memory_events, …) from cognitive-db/prisma/schema.prisma.
 ```
 
 ### Delivery C — `npm link` for engine development
@@ -312,13 +243,13 @@ As noted above, the Cognitive Pipeline lifecycle hook detects this symlink and s
 
 ## Troubleshooting
 
-Three errors account for almost every failed integration.
+**`CognitiveDB: Not initialized`** — an engine function ran before `initConfig()`. Call `initConfig()` once at startup. The root entry and every subpath share that config.
 
-**`CognitiveDB: Not initialized`** — a service was constructed or called before `initConfig()` ran. Call `initConfig()` once at app startup, before any `IngestService` / `SearchService` / repository is used.
+**`userId cannot be empty`** — every entry point (`ingest`, `trackEvent`, `consolidate`, `runFullCheck`, …) requires the caller's `userId`. Some v1 reads would otherwise treat an empty id as "no user filter".
 
-**`embedding.model is required`** — the `embedding.model` field is mandatory (it is recorded on every node for provenance). Add it alongside `dimensions` and your `embed` function.
+**`no Structure node type for content`** — ingest maps `sourceType` to a Structure node type, falling back to `content`, `document`, `note` or `source`. Seed one of these in Structure. This is checked before any model call, so no tokens are spent.
 
-**Type errors on `llm.model`** — `llm.model` must be a Vercel AI SDK `LanguageModel`: the object returned by a provider factory (`createAnthropic(...)('claude-sonnet-4-20250514')`), not a provider name or an API-key string.
+**Vectors fail at query time** — the `AiAdapter`'s `dimensions` must equal your embedding model's output width and your vector column.
 
 ---
 
@@ -329,10 +260,10 @@ Three errors account for almost every failed integration.
     See the engine integrated end-to-end: admin-configurable sources, the ingest pipeline, and Structure-node mapping. Start at the [Cognitive Pipeline overview](/modules/cognitive-pipeline/).
   </Card>
   <Card title="Configuration reference" icon="setting">
-    Init prompts, environment variables, provider setup, and runtime config are on the [Cognitive Pipeline configuration page](/modules/cognitive-pipeline/configuration/).
+    Sources, processing levels, feature switches and runtime config are on the [Cognitive Pipeline configuration page](/modules/cognitive-pipeline/configuration/).
   </Card>
 </CardGrid>
 
 <Aside type="tip">
-The quickest path to a working system is not to wire `initConfig()` by hand — it is to run `npx cognitive-pipeline init` and let the module collect your provider keys, add every `cog_*` table to your Prisma schema, and generate the config file for you.
+The quickest path to a working system is not to wire `initConfig()` by hand. Install the [Cognitive Pipeline module](/modules/cognitive-pipeline/): it builds both adapters, seeds the engine's AI Core operations and connection types, and adds the `cog_*` tables to your schema.
 </Aside>
