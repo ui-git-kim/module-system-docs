@@ -56,9 +56,11 @@ There is **no backend init step.** Structure sets `hasInit: false` — the API r
 Sidebar navigation populates automatically — when the feature module loads post-login, it fetches node types and syncs the registry. If your app imports the feature before auth is ready, mount the optional `<StructureInit />` component (exported from `@/features/structure`) inside your authenticated layout for an explicit re-prime.
 
 <Aside type="note" title="Gotchas">
+- **Starter v2.13.0 or later.** Since v1.38.0 the generated backend imports the starter's web-session and step-up middleware and registers data-export handlers with its security registry, so it needs a host on starter v2.13.0 or later.
 - **No backend init call.** Structure sets `hasInit: false` — there is no `initStructure()`. Routes and the service self-register via side-effect imports (`route.registration.ts` / `service.registration.ts`) when the feature is imported.
 - **Route ordering matters.** Structure's protected routes use catch-all patterns (`/:nodeType`, `/:nodeType/:nodeId`). Spread them at the end of your route table — anything after them with a specific path will never match.
 - **Node types are not auto-seeded.** A fresh install has no node types — create them via Admin > App Structure or a JSON import. Modules that register their own node types should set `moduleId` (and typically `userId: null` for system-level types) for ownership tracking.
+- **Secret fields need `SECURITY_ENCRYPTION_KEY`.** Saving a `secret` field value on a server without a valid key returns `503` with code `encryption_key_missing`; the value is never stored unsealed.
 </Aside>
 
 ---
@@ -66,6 +68,8 @@ Sidebar navigation populates automatically — when the feature module loads pos
 ## Node Types
 
 Structure does **not** auto-seed any node types. A fresh install has an empty structure — there is no `initStructure()` and no default Container/Primary/Folder/Tag types. Create node types via the admin **App Structure** page, or import a JSON config (`POST /types/import`).
+
+Entries can only be created over the API for a type that has an **enabled `structure_node_type` row**. A create for a slug with no row is refused with a `400` (`Unknown node type`), and one for a disabled type with a `400` that says to enable it in App Structure. A node type registered only in frontend code is UI configuration — the app hides its create buttons — so a module that needs entries of its own type should seed the row from its backend (for example with an import).
 
 ### System vs User Node Types
 
@@ -77,11 +81,13 @@ Node types have two flags that control ownership and visibility:
 | `userId` | `string` | User-created type — visible to that user only |
 | `isSystem` | `true` / `false` | Marks the type as module/system-owned |
 
-`isSystem` does **not** gate editing or deleting. Creating, updating and deleting node types is admin-only for *every* type (`requireAdmin` on `POST`/`PATCH`/`DELETE /types`), and `deleteNodeType` blocks only on existing nodes or on subtypes that inherit the slug — it never reads `isSystem`. Its one enforced effect is at import time: a `replace`-mode import (`POST /types/import`, `POST /config/import`) deletes the types not present in the payload but **spares `isSystem: true` rows**.
+`isSystem` does **not** gate editing or deleting. Creating, updating and deleting node types is admin-only for *every* type (`requireAdmin` on `POST`/`PATCH`/`DELETE /types`), and `deleteNodeType` blocks only on live (non-deleted) entries or on subtypes that inherit the slug — it never reads `isSystem`. Its one enforced effect is at import time: a `replace`-mode import (`POST /types/import`, `POST /config/import`) deletes the types not present in the payload but **spares `isSystem: true` rows**.
 
 Module-registered node types should still set `isSystem: true` and `userId: null` so they are marked system-owned and survive a replace-mode import. User-created types from the admin panel have `isSystem: false` and the creating user's ID.
 
 `userId: null` is also what makes a **shared type** possible. A type is read-shared across users only when its row is app-level *and* it sets `primaryScope.global: true`; the flag on a per-user row is inert. Turning the toggle on migrates the row to `userId: null` in the same write — see [Shared types](#shared-types-global-true).
+
+If a slug has both an app-level row and the caller's own row, the **app-level row wins**: `GET /types` returns one row per slug, and that row is the config entries of the slug are rendered, validated and permission-checked against (reference-number formatting is the one exception and still reads the user's own row). To stop new clashes, an import that would create a type and a `system`-scope proposal approval both refuse a slug another user already owns.
 
 <Aside type="note">
 When a module registers a node type with `moduleId` set, the system tracks ownership. If the module is uninstalled, its node types can be cleaned up automatically.
@@ -196,8 +202,8 @@ Configuration for each node type.
 | `overviewTemplateId` | String? | FK → structure_template for overview |
 | `templateOverrides` | JSON | Local overrides on assigned templates |
 | `integrations` | JSON | Admin control of module tabs/widgets/extensions |
-| `isSystem` | Boolean | Protected from user editing |
-| `isEnabled` | Boolean | Whether the type is active |
+| `isSystem` | Boolean | Module/system-owned marker — spared by a `replace`-mode import; does not gate editing (see [System vs User Node Types](#system-vs-user-node-types)) |
+| `isEnabled` | Boolean | Whether the type is active — entries of a disabled type cannot be created over the API |
 | `sortOrder` | Int | Display order |
 | `proposalStatus` | String? | `null` = live type; `pending` = awaiting admin approval |
 | `proposalMeta` | JSON | Proposal metadata (proposing module, reason, source context) |
@@ -256,8 +262,9 @@ The column is an open bag — other modules may add their own keys. The keys Str
 | `treeExpanded` | `Record<nodeTypeSlug, string[]>` — expanded node ids per type | The tree list view, to persist expand state |
 | `filterPresets` | `Record<nodeTypeSlug, FilterPreset[]>` | Saved per-node-type list filter presets |
 | `currentScopeNodeId` | `string` — the selected primary-scope / enforced-space node id | The header scope selector; read server-side to resolve the active space |
+| `sidebarPrefs` | `Record<nodeTypeSlug, { entryFilter?, maxEntries? }>` | The list page's **Sidebar** menu — a user's own choice of sidebar entries for a type (see [Navigation](#navigation)) |
 
-`PATCH /settings` **merges** into this object rather than replacing it, so writing one key leaves the others intact.
+`PATCH /settings` **merges** into this object rather than replacing it, so writing one key leaves the others intact. The keys above are shape-checked (an invalid one is a `400`; other modules' keys pass through), and the merged object may be at most 64 KB.
 
 ### structure_node_type_group
 
@@ -269,7 +276,7 @@ Groups node types under collapsible sidebar section headers. Purely organisation
 | `userId` | String? | Owner (null = system default) |
 | `slug` | String | Unique identifier |
 | `name` | String | Display name (shown as sidebar section header) |
-| `icon` | String? | Lucide icon for the group |
+| `icon` | String? | Kept for data compatibility only — not rendered, because the host sidebar section has no icon slot, and the admin **Groups** tab no longer offers an icon picker |
 | `color` | String? | Theme colour |
 | `sortOrder` | Int | Display order (default 50) |
 
@@ -316,7 +323,7 @@ Per-user API keys for the public, key-authed [REST API](/modules/structure/publi
 | `keyPrefix` | String | First chars of the key, for display only (e.g. `sk_3f9a1c`) |
 | `scopes` | JSON | `string[]` — `read` and/or `write` |
 | `lastUsedAt` | DateTime? | Best-effort usage timestamp |
-| `expiresAt` | DateTime? | Optional expiry (null = never) |
+| `expiresAt` | DateTime? | Expiry (`null` = never). A write-scoped key always expires — at most 365 days out, and 365 days when none is given; only a read-only key may be non-expiring |
 | `revokedAt` | DateTime? | Set when revoked (null = active) |
 | `createdAt` | DateTime | Creation timestamp |
 | `updatedAt` | DateTime | Last update timestamp |
@@ -350,9 +357,9 @@ If your code queries these tables directly (outside of Prisma), note two things:
 
 - **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`, `structure_functions`, `structure_reference_counters`, `structure_chunks`). Use the plural names in raw SQL.
 - **`@map`-ed columns.** Two Prisma fields map to differently-named database columns (kept for historical reasons, no data move): `structure_node.stage` → column `workflowState`, and `structure_node_type.stageConfig` → column `workflowConfig`. Raw SQL must use the `workflowState` / `workflowConfig` column names.
-- **Unique constraints on `structure_node`.** Beyond the primary key there are three compound uniques. The first two are client-supplied and the API surfaces them as `400` errors:
+- **Unique constraints on `structure_node`.** Beyond the primary key there are three compound uniques. The first two are client-supplied, and a create, update, move or duplicate that breaks one gets a `409 Conflict` naming the clash ("An entry with this slug already exists", "An entry with this name already exists here"); a bulk-create row reports the same text in its `errors` entry:
   - `@@unique([userId, slug])` — a user can't have two nodes with the same slug
-  - `@@unique([userId, parentId, name])` — a user can't have two siblings with the same name under the same parent
+  - `@@unique([userId, parentId, name])` — a user can't have two siblings with the same name under the same parent. The index is not partial, so an entry in **Deleted** still holds its name until it is restored or permanently deleted
   - `@@unique([userId, reference])` — reference numbers are unique per user when present. Server-assigned rather than submitted, so it is not normally reachable from a request; Postgres allows any number of `NULL`s in a unique index, so types with references disabled are unaffected and the constraint is safe to add to a populated table
 
 ---
@@ -396,6 +403,9 @@ interface NodeTypeConfig {
   // type (enforced server-side across reads, search and the public API); the
   // others gate the write actions. 'system' = trusted in-process callers only
   // (e.g. the cognitive-pipeline engine) — no user or admin can perform it via UI or API.
+  // Restoring an entry reuses the gate that put it away: 'delete' for a deleted
+  // entry, 'archive' for an archived one. Deleting an entry also checks 'delete'
+  // on every type in the subtree it would take with it.
   permissions?: {
     read?: 'anyone' | 'admin' | 'system';
     create?: 'anyone' | 'admin' | 'system';
@@ -471,8 +481,10 @@ interface NodeTypeRules {
   allowedChildren?: string[];       // Slugs of types this can contain
   maxDepth?: number;                // Max nesting depth
   maxChildren?: number;             // Max number of direct children
-  isHierarchical?: boolean;         // Can form hierarchies
-  allowMultipleParents?: boolean;   // Tag-like behaviour
+  isHierarchical?: boolean;         // @deprecated — not read by Structure yet;
+                                    //   kept for config compatibility
+  allowMultipleParents?: boolean;   // @deprecated — not read by Structure yet;
+                                    //   kept for config compatibility
   allowCrossSpaceMove?: boolean;    // Permit moving a node of this type between two
                                     // enforced spaces (default off; audited)
   isConnection?: boolean;           // Is this a connection-type node?
@@ -485,7 +497,9 @@ interface NodeTypeRules {
 ```
 
 <Aside type="note">
-**Enforced server-side since v1.24.0.** `createNode` and `moveNode` validate these rules — a type with `isRoot: false` requires a parent, `allowedParents`/`allowedChildren` gate placement, and `maxChildren`/`maxDepth` are honoured. Each rule is **opt-in**: an unset field imposes no constraint, so a type with no rules configured behaves exactly as before. `allowedParents`/`allowedChildren` compare type **slugs**; `maxDepth` is 0-based (root = 0). (Not yet enforced on `bulkCreateNodes` / `POST /nodes/bulk`.)
+**Enforced server-side since v1.24.0.** Node create (single and bulk), move, and a duplicate into another parent (`targetParentId`) validate these rules — an in-place duplicate is not re-checked — a type with `isRoot: false` requires a parent, `allowedParents`/`allowedChildren` gate placement, and `maxChildren`/`maxDepth` are honoured. Each rule is **opt-in**: an unset field imposes no constraint, so a type with no rules configured behaves exactly as before. `allowedParents`/`allowedChildren` compare type **slugs**; `maxDepth` is 0-based (root = 0). On `POST /nodes/bulk` a violation fails only that row, reported in `errors`.
+
+`isHierarchical` and `allowMultipleParents` are **not rules**: nothing in Structure reads them, so setting them changes no behaviour. They stay in the type only so existing configs and imports that set them keep working.
 </Aside>
 
 ### Primary scope
@@ -646,7 +660,7 @@ interface NodeTypeFeatures {
   color?: boolean;           // Allow custom colour override
   icon?: boolean;            // Allow custom icon override
   favorites?: boolean;       // Allow marking as favourite
-  archiving?: boolean;       // Allow archive (soft delete)
+  archiving?: boolean;       // Allow archiving (hidden from the active list, restorable)
   publishing?: boolean;      // Enable draft/published workflow
   manualSort?: boolean;      // Allow drag-and-drop reordering
   stages?: boolean;  // Enable the stage machine (populate stageConfig)
@@ -668,18 +682,20 @@ interface NodeTypeNavigation {
     label?: string;
     icon?: string;
     order?: number;
-    showCount?: boolean;
+    showCount?: boolean;       // Badge with the number of active entries
   };
   sidebarNav?: {
+    // @deprecated — the next five are not read by Structure yet; kept for
+    // config compatibility
     parentType?: string;
     maxDepth?: number;
     showEmpty?: boolean;
     collapsible?: boolean;
     defaultExpanded?: boolean;
-    showEntries?: boolean;
-    entryFilter?: 'favorites' | 'recent' | 'all' | 'pinned';
-    maxEntries?: number;
-    userOverridable?: boolean;
+    showEntries?: boolean;     // List entries under the sidebar link
+    entryFilter?: 'favorites' | 'recent' | 'all' | 'pinned';  // default 'favorites'
+    maxEntries?: number;       // default 5, clamped 1–20
+    userOverridable?: boolean; // unset counts as on
   };
   pageNav?: {
     style: 'tabs' | 'sidebar' | 'none';
@@ -724,8 +740,17 @@ interface NodeTypeNavigation {
 }
 ```
 
-<Aside type="note" title="Wired in v1.37.0">
-`sidebarNav.showEntries` now lists a type's entries (by `entryFilter`: `favorites` / `recent` / `all` / `pinned`, up to `maxEntries`) under its sidebar link, refreshing live as nodes change; with `userOverridable`, each user can override the filter/count from the list page (stored in `structure_settings.sidebarPrefs`). `listPage.groupBy` groups the list view by a field (status / stage / a select field). Node-detail **sidebar sections** registered by other modules render from `integrations.sidebarSections`. The `'pinned'` filter reads the per-node `isPinned` flag (toggled from the node detail header).
+What the navigation keys do:
+
+- **`mainNav.showCount`** shows the type's number of active entries as a badge beside its sidebar link (admin toggle: **Show count badge**).
+- **`sidebarNav.showEntries`** lists some of the type's entries under its sidebar link. `entryFilter` picks which — `favorites` (**Favourites only**, the default), `recent` (**Recently updated**, newest first), `all` (**First N**, in the type's list order) or `pinned` (**User-pinned**: the per-node `isPinned` flag, toggled from the node detail header). `maxEntries` caps the list (default 5, clamped to 1–20).
+- **`sidebarNav.userOverridable`** lets each user choose their own filter and count from the **Sidebar** menu on the type's list page, stored in `structure_settings.sidebarPrefs`. An unset value counts as **on**, matching the admin form's default — set it to `false` to fix the list for everyone.
+- Entry lists and count badges refresh after node writes.
+- **`listPage.groupBy`** groups the list view by a field (status / stage / a select field).
+- Node-detail **sidebar sections** registered by other modules render from `integrations.sidebarSections`. Each collapses from its header unless the registration sets `collapsible: false`, and starts collapsed when it sets `defaultCollapsed: true`.
+
+<Aside type="caution" title="Not read yet">
+`sidebarNav.parentType`, `maxDepth`, `showEmpty`, `collapsible` and `defaultExpanded` are accepted and stored, but nothing in Structure reads them, so they change nothing in the sidebar. They are kept only for config compatibility, and the admin form no longer writes `collapsible` into new types. (`rules.maxDepth`, by contrast, is an enforced hierarchy rule.)
 </Aside>
 
 ### Fields
@@ -742,7 +767,7 @@ interface NodeTypeField {
   validation?: {
     min?: number;
     max?: number;
-    pattern?: string;
+    pattern?: string;    // Checked for safety when saved — see Validation patterns
     message?: string;
   };
   order?: number;
@@ -817,7 +842,17 @@ interface StageTransition {
 }
 ```
 
-When a node is created, the service auto-sets `stage` to `stageConfig.defaultStage`. Stage changes fire the `structure.node.stageChanged` action hook with `{ userId, node, oldStage, newStage, oldGroup, newGroup }` — the group keys are the `StageGroup.slug` of the old and new stages (`undefined` when the stage has no group). When `transitions` are defined, `updateNode` rejects a stage change the map does not permit — an unset from-stage (or an empty map) is unconstrained, so transition enforcement is fully opt-in.
+When a node is created without a stage and the type has `features.stages` on, the service sets `stage` to `stageConfig.defaultStage`. A stage supplied on create or update must be one of the configured `stages` (when any are configured), or the write is a `400`. Stage changes fire the `structure.node.stageChanged` action hook with `{ userId, node, oldStage, newStage, oldGroup, newGroup }` — the group keys are the `StageGroup.slug` of the old and new stages (`undefined` when the stage has no group).
+
+When `transitions` are defined, `updateNode` rejects a stage change the map does not permit — a from-stage with no rule (or an empty map) is unconstrained, so transition enforcement is fully opt-in. A transition map also stops a non-admin from going around it:
+
+- A new entry must start in `defaultStage` (when the type defines one).
+- An entry's stage cannot be cleared — move it to another stage instead.
+- An entry that has no stage can move only into `defaultStage` (when the type defines one).
+
+Admins and trusted system callers (in-process callers that pass `isSystem`) are exempt from these three rules, so an admin can still set or correct an entry's stage directly — including on an admin bulk import.
+
+The list API's `stageGroup` filter reads the same config: it resolves a group to the stages whose `group` is that slug — see [Query Parameters](#query-parameters).
 
 ### ConnectionTypeConfig
 
@@ -869,16 +904,18 @@ All endpoints are prefixed with `/api/v1/structure`.
 | GET | `/nodes/:id` | Get single node |
 | POST | `/nodes` | Create node |
 | PATCH | `/nodes/:id` | Update node |
-| DELETE | `/nodes/:id` | Soft delete |
+| DELETE | `/nodes/:id` | Soft delete — moves the entry and everything nested under it to **Deleted** (returns 204) |
 | POST | `/nodes/:id/move` | Move to different parent |
 | POST | `/nodes/bulk` | Bulk create nodes — also the module's **import** door, so a row may carry an explicit `reference` (per-row atomic, partial success — see the notes below) |
 | POST | `/nodes/bulk-archive` | Bulk archive — body `{ ids: string[] }` (min 1, max 500); partial success |
-| POST | `/nodes/bulk-delete` | Bulk soft-delete — same body; partial success |
-| POST | `/nodes/bulk-restore` | Bulk restore from archive — same body; partial success |
-| POST | `/nodes/:id/duplicate` | Duplicate node (subtree copy) |
+| POST | `/nodes/bulk-delete` | Bulk soft-delete — same body; partial success. Needs a web session (a device token gets `403`) |
+| POST | `/nodes/bulk-restore` | Bulk restore from Archived or Deleted — same body; partial success |
+| POST | `/nodes/purge` | Permanently delete entries in **Deleted** — body `{ ids?: string[] }` (max 500), returns `{ purged, skipped }`. Needs a web session and a step-up confirmation |
+| POST | `/nodes/:id/duplicate` | Duplicate node (subtree copy, up to 5,000 nested entries) |
 | POST | `/nodes/:id/archive` | Archive |
-| POST | `/nodes/:id/restore` | Restore from archive |
-| POST | `/nodes/:id/favorite` | Toggle favourite |
+| POST | `/nodes/:id/restore` | Restore an archived or deleted entry |
+| POST | `/nodes/:id/favorite` | Toggle favourite — returns `{ id, isFavorite, isPinned }` |
+| POST | `/nodes/:id/pin` | Toggle pin (the sidebar's **User-pinned** list) — returns `{ id, isFavorite, isPinned }` |
 | GET | `/nodes/:id/path` | Get ancestor path |
 | GET | `/nodes/:id/children` | Get direct children |
 | GET | `/nodes/:id/descendants` | Get all descendants |
@@ -886,6 +923,10 @@ All endpoints are prefixed with `/api/v1/structure`.
 | PATCH | `/nodes/:id/metadata` | Atomic namespaced metadata write |
 
 The three bulk status endpoints run each id through the single-node method (so cascades and per-node hooks are preserved), collect failures per id instead of aborting the batch, and return `{ succeeded: string[], errors: Array<{ id, error }> }`. When at least one id succeeds they fire one summary action hook — `structure.nodes.bulkArchived`, `structure.nodes.bulkDeleted` or `structure.nodes.bulkRestored` — carrying `{ userId, nodeIds }` for the ids that succeeded.
+
+**Deleted, restore and purge.** A delete is reversible: the entry and its subtree get `status: 'deleted'` and appear under the list page's **Deleted** filter (`?status=deleted`). Restore works on archived and deleted entries, but revives only the entry itself — nested entries are restored separately. It needs the permission that put the entry away: `delete` for a deleted entry, `archive` for an archived one. `POST /nodes/purge` removes entries permanently (deleting a node type also clears that type's deleted entries). It acts only on the caller's own deleted entries — the listed ones and their deleted descendants, or with no `ids` every deleted entry the caller owns. It removes the rows, any connections touching them and their chunk rows, and skips (and counts) any entry that still has a live entry under it. It fires `structure.node.purged`.
+
+**Connections are not nodes.** A node create (single or bulk) that names `nodeType: 'connection'` or carries `fromNodeId` / `toNodeId` / `connectionType`, and a request to update or duplicate a connection row through the node endpoints, is refused with a `400` pointing at the [connections endpoints](#connections) — create and edit connections there.
 
 <Aside type="note" title="Bulk create is partial-success, not all-or-nothing (v1.19.0)">
 `POST /nodes/bulk` creates each row atomically on its own and returns `{ created, errors }`, where
@@ -911,6 +952,8 @@ A node's [reference number](#reference-numbers) is server-assigned and immutable
 | GET | `/connections` | List connections with pagination (`?status=`, `?origin=`, `?connectionType=`, `?page=`, `?limit=`) |
 | POST | `/connections` | Create a connection (optional `origin` and `status` body fields) |
 | POST | `/connections/bulk` | Bulk create connections — per-row atomic, partial success; fires one `structure.connections.bulkCreated` (v1.27.0) |
+| GET | `/connections/:id` | Get one connection (404 if it is not the caller's, is deleted, or touches a type the caller may not read) |
+| PATCH | `/connections/:id` | Update a connection's `data` / `metadata` — replaces the record, validated against the connection type's fields |
 | POST | `/connections/:id/promote` | Promote a pending connection to active |
 | DELETE | `/connections/:id` | Remove a connection |
 
@@ -931,12 +974,14 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 | GET | `/types/:slug` | Get type config |
 | POST | `/types` | Create type (admin only) |
 | PATCH | `/types/:slug` | Update type (admin only) |
-| DELETE | `/types/:slug` | Delete type (admin only, fails if nodes exist — counted **across owners** for a shared type) |
+| DELETE | `/types/:slug` | Delete type (admin only, step-up). Fails while live entries exist — counted **across all owners** for an app-level type. Entries of the type already in **Deleted** are then permanently removed |
 | POST | `/types/reorder` | Batch `sortOrder` update — body `{ items: [{ slug, sortOrder }] }`, one transaction (admin only) |
 | GET | `/types/export` | Export **node types only** as JSON (admin only) |
-| POST | `/types/import` | Import types from JSON — `merge` or `replace` mode (admin only) |
+| POST | `/types/import` | Import types from JSON — `merge` or `replace` mode (admin only, step-up). A body that also carries connection types, field templates, groups or functions is refused with a `400` pointing at `/config/import` |
 | GET | `/config/export` | Export the **full config bundle** as one JSON payload (admin only) |
-| POST | `/config/import` | Atomic full-bundle import — `mode` and `dryRun` (admin only) |
+| POST | `/config/import` | Atomic full-bundle import — `mode` and `dryRun` (admin only; step-up unless `dryRun: true`) |
+
+"Step-up" means the request also needs a fresh identity confirmation at the starter's hardened and strict security tiers (at the standard tier the guard lets the request through): the starter answers `403` with code `step_up_required`, and its API client opens the "Confirm it's you" dialog and retries. A device token is always refused (`web_session_required`). The same guard covers deleting connection types, field templates and functions, creating API keys and purging deleted entries.
 
 `/types/export` returns node types alone (`{ version, exportedAt, nodeTypes }`). For the whole configuration — node types, field templates, groups, connection types and formula functions — use `GET /config/export`, which is what the App Structure page's **Export** button calls. `POST /config/import` is **atomic**: any failure rolls the entire import back. It accepts `mode` (`merge`, the default, or `replace`) and `dryRun: true`, which computes the per-category diff inside a rolled-back transaction without writing or firing hooks. Either way it returns a per-category summary of created / updated / deleted / unchanged rows.
 
@@ -949,11 +994,11 @@ Since v1.18.0, the list and get responses include two additive keys: `superClass
 | Endpoint | Refused when | Fix |
 |----------|--------------|-----|
 | POST `/types`, PATCH `/types/:slug` | Turning sharing **on** while another user already owns a live type with that slug — the app-level row would shadow theirs on every read | Rename or remove the conflicting type first |
-| PATCH `/types/:slug`, POST `/types/import`, POST `/config/import` (any mode) | Turning sharing **off** while live (non-deleted) entries of the type belong to other users — including by *omitting* `primaryScope.global` from an imported config, since import writes whole-row semantics | Delete or migrate those entries first, or keep the flag set in the payload |
-| DELETE `/types/:slug` | Entries of the type exist — counted **across all owners** for a shared type, not just the caller's | Delete or migrate the entries first |
-| POST `/types/import`, POST `/config/import` (`replace` mode) | A shared type is absent from the payload and entries of it exist across the app — replace mode would otherwise sweep it away silently | Include the type in the import, or delete or migrate its entries first |
+| PATCH `/types/:slug`, POST `/types/import`, POST `/config/import` (any mode) | Turning sharing **off** while live (non-deleted) entries of the type belong to other users — including by importing a `primaryScope` that *omits* `global`, since an import writes `primaryScope` as a whole (an import that leaves `primaryScope` out altogether keeps the stored value) | Delete or migrate those entries first, or keep the flag set in the payload |
+| DELETE `/types/:slug` | Live (non-deleted) entries of the type exist — counted **across all owners** for an app-level type, not just the caller's | Delete or migrate the entries first |
+| POST `/types/import`, POST `/config/import` (`replace` mode) | An app-level type is absent from the payload and live entries of it exist across the app — replace mode would otherwise sweep it away silently | Include the type in the import, or delete or migrate its entries first |
 
-The replace-mode guard runs through the same predicate as the delete it protects, so a shared type that is `isSystem: true` (or a pending proposal) is never swept and never blocks. `POST /config/import` is atomic — a refusal rolls the whole bundle back, and `dryRun: true` surfaces it without writing.
+Since v1.38.0 the last two rows apply to **every** app-level type row (`userId` `null`), shared or not: an app-level row is the config every user's entries of that slug are rendered and validated against, so it is guarded across owners even when it is not read-shared. Entries already in **Deleted** never block; they are permanently removed after the type is deleted. The replace-mode guard runs through the same predicate as the delete it protects, so a shared type that is `isSystem: true` (or a pending proposal) is never swept and never blocks. `POST /config/import` is atomic — a refusal rolls the whole bundle back, and `dryRun: true` surfaces it without writing.
 
 ### Node Type Proposals
 
@@ -961,10 +1006,12 @@ Modules can propose new node types for admin approval — see [Cognitive Foundat
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/types/proposals` | Propose a node type (any authenticated user) |
-| GET | `/types/proposals` | List pending proposals (admin only) |
-| POST | `/types/proposals/:slug/approve` | Approve a proposal — body `scope` of `user` (default) or `system` (admin only) |
-| POST | `/types/proposals/:slug/reject` | Reject and delete a proposal, freeing the slug (admin only, returns 204) |
+| POST | `/types/proposals` | Propose a node type (any authenticated user; at most 50 pending proposals per user) |
+| GET | `/types/proposals` | List **every user's** pending proposals, oldest first, at most 200 — each item carries its `id` and `proposedBy` (admin only) |
+| POST | `/types/proposals/:slug/approve` | Approve a proposal — body `scope` of `user` (default) or `system`, and optional `proposalId` (admin only) |
+| POST | `/types/proposals/:slug/reject` | Reject and delete a proposal, freeing the slug — optional body `proposalId` (admin only, returns 204) |
+
+When more than one user has a proposal pending under the same slug, approve and reject need the list item's `id` as `proposalId`; without it they answer `409`.
 
 ### Connection Types
 
@@ -974,7 +1021,7 @@ Modules can propose new node types for admin approval — see [Cognitive Foundat
 | GET | `/connection-types/:slug` | Get connection type config |
 | POST | `/connection-types` | Create connection type (admin only) |
 | PATCH | `/connection-types/:slug` | Update connection type (admin only) |
-| DELETE | `/connection-types/:slug` | Delete connection type (admin only) |
+| DELETE | `/connection-types/:slug` | Delete connection type (admin only, step-up). Fails while live connections use it — counted across all owners for an app-level type; its connections already in **Deleted** are then permanently removed |
 
 ### API Keys
 
@@ -983,8 +1030,10 @@ Session-authed management of keys for the [public REST API](/modules/structure/p
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api-keys` | List the current user's keys (no secrets) |
-| POST | `/api-keys` | Create a key (raw key returned once) |
+| POST | `/api-keys` | Create a key (raw key returned once) — body `{ name, scopes, expiresAt? }`; step-up |
 | DELETE | `/api-keys/:id` | Revoke a key |
+
+All three need a web session — a device token is refused with `403` (`web_session_required`) — and creating a key also needs a step-up confirmation. A key with the `write` scope always expires: with no `expiresAt` it gets one 365 days out, and an `expiresAt` further out than that is a `400` ("Write-scoped API keys can last at most 365 days"). Only a read-only key may be created without an expiry. Creating and revoking a key fire `structure.apiKey.created` and `structure.apiKey.revoked`.
 
 The public, API-key-authed data endpoints live under `/api/v1/public/structure/:type` — see the [Public REST API](/modules/structure/public-api/) page.
 
@@ -1018,7 +1067,7 @@ Reusable shared field sets (`structure_field_template`) attached to node types v
 | GET | `/field-templates/:id` | Get single field template |
 | POST | `/field-templates` | Create field template (admin only) |
 | PATCH | `/field-templates/:id` | Update field template (admin only) |
-| DELETE | `/field-templates/:id` | Delete field template (admin only) |
+| DELETE | `/field-templates/:id` | Delete field template (admin only, step-up) |
 
 ### Functions
 
@@ -1030,7 +1079,7 @@ The admin-defined named-expression library (`structure_function`) behind the `fo
 | GET | `/functions/:id` | Get a single function |
 | POST | `/functions` | Create a function (admin only, returns 201) |
 | PATCH | `/functions/:id` | Update a function (admin only) |
-| DELETE | `/functions/:id` | Delete a function (admin only, returns 204) |
+| DELETE | `/functions/:id` | Delete a function (admin only, step-up, returns 204) |
 
 ### Similarity
 
@@ -1045,7 +1094,7 @@ This is the endpoint behind the formula library's `semanticSimilarity()` functio
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/settings` | Get user settings |
-| PATCH | `/settings` | Update user settings (merges) |
+| PATCH | `/settings` | Update user settings (merges; known keys shape-checked, merged object at most 64 KB) |
 
 ### Query Parameters
 
@@ -1055,13 +1104,13 @@ This is the endpoint behind the formula library's `semanticSimilarity()` functio
 | `types` | Comma-separated list of type slugs |
 | `includeSubtypes` | `true` to expand the `type`/`types` filter to each type plus all of its subtypes (v1.18.0+) — see [Type Hierarchy](/modules/structure/type-hierarchy/) |
 | `parentId` | Filter by parent (use `null` for roots) |
-| `status` | `active`, `archived`, `deleted`, or `all` |
+| `status` | `active` (default), `archived`, `deleted`, or `all`. `all` means every status **except** `deleted`; deleted entries are listed only with an explicit `deleted`, which returns the caller's own deleted entries (the list page's **Deleted** filter) |
 | `isFavorite` | `true` or `false` |
 | `search` | Search name and description |
 | `page`, `limit` | Pagination |
 | `sortBy` | `name`, `createdAt`, `updatedAt`, or `sortOrder` |
 | `sortOrder` | `asc` or `desc` |
-| `includeChildren` | `true` to include child nodes |
+| `includeChildren` | `true` to include child nodes (at most 200 per parent — use `GET /nodes/:id/children` for a longer list) |
 | `includeChildrenDepth` | Depth of children to include |
 | `includePath` | `true` to include ancestor path |
 | `includeConnectionCounts` | `true` to include connection counts |
@@ -1071,7 +1120,7 @@ This is the endpoint behind the formula library's `semanticSimilarity()` functio
 | `dataSortType` | Type hint for data sort: `text`, `number`, or `date` |
 | `stage` | Filter by exact stage slug |
 | `stages` | Comma-separated list of stage slugs |
-| `stageGroup` | Filter by stage group slug |
+| `stageGroup` | Filter to the stages of one stage group — the stages whose `group` is this slug in the type's `stageConfig`. Needs `type` (not `types`), otherwise `400`; a group the type does not define is also a `400`, and a defined group no stage uses yet matches nothing. Combined with `stage` / `stages`, only stages in both are kept |
 
 There is deliberately no scope parameter here: when a node type uses `primaryScope.isolation: 'enforced'`, confinement to the active space is **ambient** — resolved server-side from `structure_settings.currentScopeNodeId` on every read. Only the [public REST API](/modules/structure/public-api/), which has no session to read that from, accepts an explicit `?scopeRootId=`.
 
@@ -1097,10 +1146,12 @@ type DataFilterOperator =
   | 'in' | 'not_in' | 'is_empty' | 'is_not_empty';
 ```
 
-Operators `is_empty` and `is_not_empty` do not require a `value`. The `between` operator expects `value` to be `[min, max]`. The `in` and `not_in` operators expect `value` to be an array. Set `valueType` whenever you compare a numeric or date custom field with `gt`/`gte`/`lt`/`lte`/`between` — without it the stored JSON value is cast as a number, so date fields compare lexicographically and sort wrongly.
+Operators `is_empty` and `is_not_empty` do not require a `value`. The `between` operator expects `value` to be `[min, max]`. The `in` and `not_in` operators expect `value` to be an array of at most 500 text or number values. Set `valueType` whenever you compare a numeric or date custom field with `gt`/`gte`/`lt`/`lte`/`between` — without it the stored JSON value is cast as a number, so date fields compare lexicographically and sort wrongly.
 
-<Aside type="caution" title="Filters run before shared-node sanitisation">
-`dataFilters` are applied in SQL against the raw `data` column, which is **before** a non-owner's view of a [shared type](#shared-types-global-true) has its `secret` values stripped. An equality probe against a secret field therefore matches the shape of the stored **sealed envelope**, not plaintext — it cannot reveal a secret's value, but it is a distinguisher. The real residual is legacy plaintext written *before* a field was marked `secret`; those values seal on the next write of the node.
+The comparison operators need a number (or an ISO date with `valueType: 'date'`) as their value, or the request is a `400`. On the stored side, a value that is not a valid number or date — a cleared field, a legacy `'TBD'` — simply does not match, rather than failing the whole list.
+
+<Aside type="caution" title="Secret fields cannot be filtered or sorted">
+A `dataFilters` entry or a `dataSortField` that targets a `secret` field — or a `field-group` that holds one — is refused with a `400`. The check runs against the listed type, or against every type the caller can read when the list has no `type`. Filters run in SQL against the stored `data` column, before a non-owner's view of a [shared type](#shared-types-global-true) is sanitised, so this refusal is what keeps secret values out of filter and sort matching. The list page never offers secret fields as filter or sort columns.
 </Aside>
 
 ---
@@ -1126,7 +1177,27 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 
 Request schemas type the `data` blob as an open bag, so there is a **second validation layer** underneath them. Every node create, update and bulk-create runs the submitted `data` against the node type's *resolved* field definitions — required presence, type, `validation.pattern`, `validation.min`/`max` and `select`/`multiselect` option membership — and throws a `400` on the first violation. This covers direct API, public API and module writes alike, not just the admin UI.
 
-Its scope is deliberately narrow: top-level fields only (`field-group` sub-fields are not walked); the `formula`, `section-break`, `hidden`, `field-group` and `secret` types are skipped; only *unconditional* `required` is enforced, so a field carrying `visibleWhen` is exempt; and data keys with no matching field definition are ignored. On update only the supplied keys are value-checked, though a required field cannot be cleared to empty.
+Its scope is deliberately narrow: top-level fields only (`field-group` sub-fields are not walked); the `formula`, `section-break`, `hidden`, `field-group` and `secret` types, and computed fields, are skipped; only *unconditional* `required` is enforced, so a field carrying `visibleWhen` is exempt; and data keys with no matching field definition are ignored. On update only the supplied keys are value-checked — a value left exactly as stored is not re-checked — though a required field cannot be cleared to empty.
+
+A few value **shapes** are checked on top, `field-group` rows included: a `secret` value must be text, a `node-reference` value must be a node id (or a list of them), and a `field-group` value must be a list of rows. On request writes (the in-app and public APIs) two more rules apply:
+
+- A `node-reference` field restricted by `allowedTypes` must point at a readable entry of one of those types, or of a subtype.
+- A field locked by `editableBy` cannot be set by a caller who may not edit it. On create such a field may be left empty — the server then fills in its default, if it has one — or sent at exactly its default; computed and formula fields are exempt.
+
+Connection `data` gets the same validation on `POST` and `PATCH /connections` against its connection type's fields. A module's in-process write is coerced where it can be instead of refused — a number written to a `secret` field becomes text, and a value that is not a node id is dropped from a `node-reference` field with a logged warning.
+
+### Validation patterns
+
+A field's `validation.pattern` is a JavaScript regular expression, and the server checks it **when it is saved**: on node types (field-group sub-fields included), field templates, connection types, both imports, and node-type proposals (again on approval). A pattern is refused with a `400` naming the field when it is longer than 500 characters, is not a valid regular expression, or could backtrack excessively on a long value (catastrophic backtracking, also called ReDoS). Common patterns — emails, URLs, phone numbers, postcodes, IP addresses, number formats — pass. The error says what to change; anchoring a pattern (`^…$`) or removing a repeat whose parts can match the same text usually fixes it. One field set — a node type, field template or connection type — can carry at most 50 distinct patterns and 2,000 fields, field-group sub-fields included.
+
+When a pattern runs, the value is length-capped first:
+
+| Pattern | Longest value tested |
+|---------|----------------------|
+| Matching time grows linearly with the value | Up to 100,000 characters — lower (down to 1,000) for patterns with wide counted repeats such as `\w{1,1000}`; the server works the cap out from the pattern |
+| Matching time can grow faster, as with `^.+@.+$` | 1,000 characters, or the field's `validation.max` up to 5,000 |
+
+A longer value is refused with a `400` ("too long to validate") on a request write; a module's in-process write logs a warning and skips the pattern test instead. A stored pattern saved before this check existed that fails it is logged and skipped rather than run — the value is then accepted without the pattern test — so fix such patterns in the field config.
 
 ---
 

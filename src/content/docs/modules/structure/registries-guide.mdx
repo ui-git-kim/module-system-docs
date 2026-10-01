@@ -68,8 +68,8 @@ import { nodeTypeRegistry } from '@/features/structure';
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `register(registration)` | `void` | Register a node type from code. The registration is remembered separately and survives every DB sync; a database row with the same slug wins |
-| `update(config)` | `void` | Replace one type's config and fire `onSync` |
+| `register(registration)` | `void` | Register a node type from code. The registration is remembered separately and survives every DB sync; a database row with the same slug wins. On its own it is UI configuration only — see the caution below |
+| `update(config)` | `void` | Replace one type's config (always a server response), mark the slug as database-backed, and fire `onSync` |
 | `unregister(slug)` | `void` | Remove a type from the registry |
 | `getEnabledTypes()` | `NodeTypeConfig[]` | All enabled types, sorted by `sortOrder` |
 | `getConfig(slug)` | `NodeTypeConfig \| undefined` | Get the bare config for a single type |
@@ -81,7 +81,9 @@ import { nodeTypeRegistry } from '@/features/structure';
 | `getSlugs()` | `string[]` | All registered slugs |
 | `has(slug)` | `boolean` | Check if a slug exists |
 | `isLoadedFromDb()` | `boolean` | Whether `syncFromDatabase` has completed |
-| `syncFromDatabase(types)` | `void` | Re-apply the code registrations, then overlay the database records (DB wins per slug); fires `onSync`. Code-registered module types without a DB row survive the sync |
+| `isDbBacked(slug)` | `boolean` | Whether the type has a database row. Every slug counts as backed until the first sync, so create buttons don't flicker away while types load (v1.38.0) |
+| `canCreateEntries(slug)` | `boolean` | Whether entries of the type can be created at all: it is registered, enabled and database-backed. Permissions are checked separately (v1.38.0) |
+| `syncFromDatabase(types)` | `void` | Re-apply the code registrations, then overlay the database records (DB wins per slug), and record which slugs have a database row; fires `onSync`. Code-registered module types without a DB row survive the sync |
 | `onSync(callback)` | `() => void` | Subscribe to sync events — returns an unsubscribe function |
 | `getGroups()` | `NodeTypeGroup[]` | All node type groups |
 | `syncGroups(groups)` | `void` | Replace group data in the registry |
@@ -90,19 +92,33 @@ import { nodeTypeRegistry } from '@/features/structure';
 `get(slug)` returns a `NodeTypeRegistration` wrapper that bundles the config with optional component overrides. Most of the time you want `getConfig(slug)` which returns the bare `NodeTypeConfig`. Use `getAll()` / `getAllTypes()` accordingly.
 </Aside>
 
+<Aside type="caution" title="A type registered only in frontend code is UI-only (v1.38.0)">
+The server creates entries only of a type that has a live, enabled `structure_node_type` row. A type that exists only through `register()` (or the `nodeTypes` array of `structureRegistry.register()`, which forwards to it) has UI configuration but no row, so:
+
+- **Create affordances are hidden.** `canCreateEntries(slug)` is false, so the list page's create button, the Children tab's create buttons, `NodeSelector` quick-create, `CreateNodeButton`, the header **New** menu and the sidebar's **New** link all leave the type out. A disabled type is treated the same way.
+- **HTTP creates are refused** with a 400: `Unknown node type` when there is no row, or a message saying the type is disabled.
+
+If your module needs users to add entries of its type, seed a database row from your module's backend, as shown below. Once the row exists it replaces the code registration for that slug on every sync.
+</Aside>
+
 **Reactive hooks:**
 
 ```typescript
-import { useEnabledNodeTypes, useStructureNavItems } from '@/features/structure';
+import { useEnabledNodeTypes } from '@/features/structure';
 
 // Re-renders when node types are synced from the database
 const enabledTypes = useEnabledNodeTypes();
-const navItems = useStructureNavItems();
 ```
+
+**Sidebar navigation.** Structure builds the app sidebar from this registry itself, so there is no navigation hook to call. Each enabled type with `mainNav.enabled` not set to `false` gets an item in the host `navigationRegistry`, rebuilt on every `onSync`. The registry is filled after login by `StructureInit`, which Structure registers with the starter's shell-init registry (Structure requires starter v2.13.0 or later). Nothing loads types at import time. A few related behaviours:
+
+- A type with `mainNav.showCount` shows its number of active entries as the nav item's badge (v1.38.0).
+- Sidebar entry lists and count badges refresh, debounced, after node writes.
+- A type in a group sits under that group's sidebar section, which shows the group's name and colour. The host sidebar section has no icon slot, so a group's `icon` is stored but never rendered, and the admin **Groups** editor no longer offers an icon picker (v1.38.0).
 
 **Registering a node type from a module (backend):**
 
-Seed shared node types from your module's backend init via `importNodeTypes` — the only service path that creates shared (`userId: null`) rows every user can see. `createNodeType` would pin the type to the passed user, and the existence check is load-bearing: merge-mode import updates existing slugs, so an unguarded import would clobber admin customisations on every boot. The actor string is only a visibility/audit label. See [Integration — Registering Node Types](/modules/structure/integration/#registering-node-types-from-your-module) for the full pattern.
+Seed shared node types from your module's backend init via `importNodeTypes` — the only service path that creates shared (`userId: null`) rows every user can see. `createNodeType` would pin the type to the passed user, and the existence check is load-bearing: merge-mode import updates existing slugs, so an unguarded import would clobber admin customisations on every boot. The actor string is only a visibility/audit label. Since v1.38.0 the import refuses to create an app-wide type whose slug another user already uses for a type of their own, because the app-wide row would shadow theirs. See [Integration — Registering Node Types](/modules/structure/integration/#registering-node-types-from-your-module) for the full pattern.
 
 ```typescript
 // backend/src/features/tasks/tasks.init.ts
@@ -145,7 +161,7 @@ Connection types are managed entirely through the admin UI and API — there is 
 | GET | `/api/v1/structure/connection-types/:slug` | Get a single type |
 | POST | `/api/v1/structure/connection-types` | Create (admin only) |
 | PATCH | `/api/v1/structure/connection-types/:slug` | Update (admin only) |
-| DELETE | `/api/v1/structure/connection-types/:slug` | Delete (admin only) |
+| DELETE | `/api/v1/structure/connection-types/:slug` | Delete (admin only, with [step-up](/starter-template/security-feature/#step-up-re-verification-sensitive-actions) re-verification). Refused while live connections use the type; its connections already in Deleted are permanently removed |
 
 **Configuration interface:**
 
@@ -270,7 +286,7 @@ nodeWidgetRegistry.register({
 | `moduleId` | `string` | Yes | Your module's ID |
 | `title` | `string` | Yes | Widget display title |
 | `icon` | `string` | -- | Lucide icon name |
-| `location` | `'node-overview' \| 'dashboard' \| 'node-sidebar'` | Yes | Where the widget renders |
+| `location` | `'node-overview' \| 'dashboard' \| 'node-sidebar'` | Yes | Where the widget renders. Structure itself renders only `node-overview` (the Overview tab); `dashboard` and `node-sidebar` widgets are collected for your module or the host to render. For content beside a node's detail page, use [`nodeSidebarSectionRegistry`](#9-nodesidebarsectionregistry) |
 | `nodeTypes` | `string[] \| '*'` | -- | Which node types show this widget |
 | `size` | `'1x1' \| '2x1' \| '1x2' \| '2x2' \| 'full'` | -- | Grid layout size |
 | `order` | `number` | -- | Position in widget layout (default 50) |
@@ -324,7 +340,7 @@ nodeCardExtensionRegistry.register({
 Declares action buttons for node detail headers, context menus, and bulk action bars.
 
 <Aside type="note" title="The bulk-action location is now rendered (v1.36.3)">
-Structure's **list page renders `bulk-action` registrations** in its selection toolbar: they appear once rows are selected, run over the selected rows the user **owns** (the same owner-filter the built-in Archive/Delete use), call `bulkHandler(nodes, nodeType)` once when present — otherwise fan the single-node `handler` out per node, tolerating partial failure — and honour `confirm`, `variant`, `icon`, `order`, and the admin's per-action `label` / `order` / `enabled` overrides. A declared `isVisible` doesn't hide the button but gates which selected nodes the action runs on. **`detail-header`** and **`context-menu`** are still yours to render: read them with `useNodeActions(location, node, nodeType)` and draw the buttons in your module or the host app. `shortcut` is declared and read by nothing yet.
+Structure's **list page renders `bulk-action` registrations** in its selection toolbar: they appear once rows are selected, run over the selected rows the user **owns** (the same owner-filter the built-in Archive/Delete use), call `bulkHandler(nodes, nodeType)` once when present — otherwise fan the single-node `handler` out per node, tolerating partial failure — and honour `confirm`, `variant`, `icon`, `order`, and the admin's per-action `label` / `order` / `enabled` overrides. A declared `isVisible` doesn't hide the button but gates which selected nodes the action runs on. Module bulk actions are not offered in the list's **Deleted** view (v1.38.0), which shows only Restore and Delete permanently. **`detail-header`** and **`context-menu`** are still yours to render: read them with `useNodeActions(location, node, nodeType)` and draw the buttons in your module or the host app. `shortcut` is declared and read by nothing yet.
 </Aside>
 
 ```typescript
@@ -520,6 +536,14 @@ Declares filter controls for list page filter bars, in a client-side or server-s
 
 <Aside type="tip" title="Rendered by Structure's list page (since v1.36.8)">
 `NodeListPage` renders your registered `component` in the filter bar (beside the built-in field filters) and drives it through `useNodeFilters`. A **server** filter's `toDataFilters(value)` merges into the list query's `dataFilters`, applied in the database across every page; a **client** filter's `filterFn` refines the loaded page. An active module filter also disables drag-reorder (a filtered list is not in stored order). A server filter refetches the list on every value change, so debounce fast-changing input (e.g. a text box) inside your `component` — the built-in field filters debounce for you, module filters do not. Structure's own list filtering (type-aware field filters, search, status, saved presets) stays a separate built-in path that runs alongside yours.
+
+Since v1.38.0 the server checks every `DataFilter` it receives, so shape `toDataFilters` to match:
+
+- A filter or sort on a secret field, or on a field-group that holds one, is refused with a 400. `useNodeFilters` drops a `DataFilter` aimed at a secret field before the request is sent.
+- The comparison operators (`gt`, `gte`, `lt`, `lte`, `between`) need a number, or an ISO date when `valueType` is `'date'`.
+- `in` / `not_in` take at most 500 values.
+
+A refused filter shows as an error on the list. To clear your filter, call `onChange(undefined)`: an undefined value skips `toDataFilters` entirely.
 </Aside>
 
 ```typescript
@@ -561,10 +585,14 @@ nodeFilterRegistry.register({
 
 ### 9. nodeSidebarSectionRegistry
 
-Collects sections intended for a detail-page sidebar.
+Adds sections to a column beside the content of a node's detail page.
 
-<Aside type="caution" title="Declared, not yet rendered by Structure">
-The `sidebar` page-nav style renders a **vertical list of tabs**, not these sections — there is no other sidebar surface in the generated detail page. Registrations are collected, listed on the **Registries** admin tab, admin-configurable on a node type's **Integrations** tab, and returned by `useNodeSidebarSections(node, nodeType)`, but nothing in Structure renders them; `collapsible` and `defaultCollapsed` are read by nothing.
+<Aside type="note" title="Rendered on the detail page">
+The detail page shows the sections that apply to a node in a column on the right, beside the tab content. The column appears whatever the type's page-nav style, and only when at least one section applies. The `sidebar` page-nav style is a different thing: a vertical list of tabs on the left. Each section renders as a card with its icon and title.
+
+Since v1.38.0 the card honours `collapsible` and `defaultCollapsed`. It collapses from its header unless the section registers `collapsible: false`, and it starts collapsed when the section registers `defaultCollapsed: true`. A non-collapsible section is always open.
+
+Admins can enable, retitle and reorder sections per node type on the **Integrations** tab. `useNodeSidebarSections(node, nodeType)` returns the same list, with those overrides applied, if you also want to render the sections somewhere else.
 </Aside>
 
 ```typescript
@@ -592,10 +620,10 @@ nodeSidebarSectionRegistry.register({
 | `title` | `string` | Yes | Section display title |
 | `icon` | `string` | -- | Lucide icon name |
 | `nodeTypes` | `string[] \| '*'` | Yes | Target node types |
-| `order` | `number` | -- | Position in sidebar (default 50) |
+| `order` | `number` | -- | Position in the sidebar column (default 50) |
 | `component` | `ComponentType<{ node, nodeType }>` | Yes | Section content component |
-| `collapsible` | `boolean` | -- | Whether section can collapse (default `true`). *Not yet consumed — declared on the type; nothing in Structure reads it* |
-| `defaultCollapsed` | `boolean` | -- | Start collapsed? (default `false`). *Not yet consumed — declared on the type; nothing in Structure reads it* |
+| `collapsible` | `boolean` | -- | Whether the card collapses from its header (default `true`) |
+| `defaultCollapsed` | `boolean` | -- | Whether a collapsible card starts collapsed (default `false`) |
 | `isVisible` | `(node, nodeType) => boolean` | -- | Dynamic visibility |
 
 ---
@@ -631,7 +659,8 @@ structureRegistry.register({
     },
   ],
 
-  // Optional: register whole node types (forwards to nodeTypeRegistry.register)
+  // Optional: register whole node types (forwards to nodeTypeRegistry.register).
+  // UI config only: seed a database row from your backend so entries can be created.
   nodeTypes: [/* NodeTypeRegistration[] */],
 
   // Optional: tabs, widgets, card extensions, actions, etc.
@@ -789,7 +818,7 @@ Admins see module-registered fields on the **Integrations tab** of each node typ
 
 ## Action Hooks
 
-Structure fires **50 action hooks** after every mutation — 47 on every install, plus 3 more when opt-in embeddings are enabled. Other modules subscribe to these via the starter template's `actionRegistry` to react to node events — cleaning up data on delete, setting up defaults on create, syncing state on update.
+Structure fires **57 action hooks** after every mutation — 54 on every install, plus 3 more when opt-in embeddings are enabled. Other modules subscribe to these via the starter template's `actionRegistry` to react to node events — cleaning up data on delete, setting up defaults on create, syncing state on update.
 
 ### Registering a Hook
 
@@ -811,17 +840,20 @@ actionRegistry.addActionAsync(
 );
 ```
 
-### Node Hooks (20)
+### Node Hooks (23)
 
 | Hook | Context | Fires when |
 |------|---------|------------|
 | `structure.node.created` | `{ userId, node, nodeType }` | A node is created |
 | `structure.node.updated` | `{ userId, node, changes }` | A node is updated |
-| `structure.node.deleted` | `{ userId, nodeId, nodeType }` | A node is deleted |
+| `structure.node.deleted` | `{ userId, nodeId, nodeType }` | A node is deleted. It moves to **Deleted**, where it can still be restored; see `structure.node.purged` for permanent removal |
 | `structure.node.moved` | `{ userId, node, oldParentId, newParentId }` | A node moves to a different parent |
 | `structure.node.archived` | `{ userId, node }` | A node is archived |
-| `structure.node.restored` | `{ userId, node }` | A node is restored from archive |
+| `structure.node.restored` | `{ userId, node }` | A node is restored from Archived or Deleted |
+| `structure.node.merged` | `{ userId, fromId, intoId, node, reparentedChildren, repointedConnections, droppedConnections }` | One node is merged into another. `node` is the surviving node; the merged-away one (`fromId`) has been archived or deleted, and the counts report what moved |
+| `structure.node.purged` | `{ userId, ids, count }` | Entries in Deleted are permanently removed by their owner (v1.38.0). `count` is the full number removed; `ids` is capped at 500. Entries removed because their type was deleted do not fire it — a type delete reports only a count, as `purgedNodes` on `structure.nodeType.deleted` |
 | `structure.node.favorited` | `{ userId, node, isFavorite }` | A favourite is toggled |
+| `structure.node.pinned` | `{ userId, node, isPinned }` | A pin is toggled |
 | `structure.node.published` | `{ userId, node }` | A node's `isPublished` changes to true |
 | `structure.node.unpublished` | `{ userId, node }` | A node's `isPublished` changes to false |
 | `structure.node.stageChanged` | `{ userId, node, oldStage, newStage, oldGroup?, newGroup? }` | A node's stage changes |
@@ -834,7 +866,7 @@ actionRegistry.addActionAsync(
 | `structure.nodes.bulkCreated` | `{ userId, count, nodeTypes, nodeIds }` | The bulk create API is called **with `skipHooks`** — one summary in place of the per-node hooks. Without `skipHooks` the bulk API fires `structure.node.created` per row and this hook does **not** fire, so subscribe to both if you must catch every create |
 | `structure.nodes.bulkArchived` | `{ userId, nodeIds }` | Nodes are bulk-archived from the list-page multi-select. Carries only the ids that succeeded, and fires *in addition* to each node's `structure.node.archived` |
 | `structure.nodes.bulkDeleted` | `{ userId, nodeIds }` | Nodes are bulk soft-deleted. Ids that succeeded; fires in addition to each node's `structure.node.deleted` |
-| `structure.nodes.bulkRestored` | `{ userId, nodeIds }` | Nodes are bulk-restored from archive. Ids that succeeded; fires in addition to each node's `structure.node.restored` |
+| `structure.nodes.bulkRestored` | `{ userId, nodeIds }` | Nodes are bulk-restored from Archived or Deleted. Ids that succeeded; fires in addition to each node's `structure.node.restored` |
 
 ### Chunk Hooks (1)
 
@@ -844,13 +876,16 @@ Opt-in embeddings only — fired by the `structureEmbeddings` service (see also 
 |------|---------|------------|
 | `structure.chunk.embeddingUpdated` | `{ userId, chunkId, embeddingModel }` | A chunk's embedding is stored |
 
-### Connection Hooks (5)
+### Connection Hooks (6)
+
+In every payload that carries a `connection`, secret-typed fields are removed from `connection.data` before the hook fires (v1.38.0). The service caller still receives the full connection.
 
 | Hook | Context | Fires when |
 |------|---------|------------|
 | `structure.connection.created` | `{ userId, connection }` | A connection goes live — created with status `active`, or promoted from pending |
 | `structure.connection.proposed` | `{ userId, connection }` | A connection is created with status `pending` (awaiting promotion) |
 | `structure.connection.promoted` | `{ userId, connection }` | A pending connection is promoted to active |
+| `structure.connection.updated` | `{ userId, connection }` | A connection's data or metadata is updated |
 | `structure.connection.deleted` | `{ userId, connectionId }` | A connection is deleted |
 | `structure.connections.bulkCreated` | `{ userId, count, connectionIds }` | The bulk create API is called **with `skipHooks`** — one summary in place of the per-connection hooks. Without `skipHooks` each row fires its own `structure.connection.created` / `.proposed` and this hook does **not** fire |
 
@@ -862,17 +897,18 @@ Opt-in embeddings only — fired by the `structureEmbeddings` service (see also 
 | `structure.connectionType.updated` | `{ userId, slug, changes }` | A connection type is updated |
 | `structure.connectionType.deleted` | `{ userId, slug }` | A connection type is deleted |
 
-### Node Type Hooks (7)
+### Node Type Hooks (8)
 
 | Hook | Context | Fires when |
 |------|---------|------------|
 | `structure.nodeType.created` | `{ userId, nodeType }` | A node type goes live — created directly, or a proposal is approved |
 | `structure.nodeType.proposed` | `{ userId, proposal }` | A node type proposal is created (awaiting admin approval) |
-| `structure.nodeType.proposalApproved` | `{ userId, nodeType, scope }` | A proposal is approved (fires alongside `structure.nodeType.created`) |
-| `structure.nodeType.proposalRejected` | `{ userId, slug, config, meta }` | A proposal is rejected — the row is deleted; the full proposed config rides on the payload |
+| `structure.nodeType.proposalApproved` | `{ userId, actorId, proposalId, nodeType, scope }` | A proposal is approved (fires alongside `structure.nodeType.created`). Since v1.38.0 `userId` is the user who proposed it and `actorId` the reviewing admin, which are the same for an in-process approval |
+| `structure.nodeType.proposalRejected` | `{ userId, actorId, proposalId, slug, config, meta }` | A proposal is rejected — the row is deleted; the full proposed config rides on the payload. `userId` and `actorId` as for approval |
 | `structure.nodeType.updated` | `{ userId, slug, changes }` | A node type is updated |
-| `structure.nodeType.deleted` | `{ userId, slug }` | A node type is deleted |
+| `structure.nodeType.deleted` | `{ userId, slug, purgedNodes? }` | A node type is deleted. `purgedNodes` (v1.38.0) counts the type's entries that were already in Deleted and have now been permanently removed |
 | `structure.nodeType.imported` | `{ userId, stats, mode }` | Node types are imported (merge or replace) |
+| `structure.nodeType.sharingChanged` | `{ userId, slug, sharing }` | A type starts (`'enabled'`) or stops (`'disabled'`) being shared with every user, through create, update or either import (v1.38.0) |
 
 ### Node Type Group Hooks (3)
 
@@ -920,8 +956,17 @@ Admin-defined formula functions (tier-2 named expressions, managed on App Struct
 |------|---------|------------|
 | `structure.settings.updated` | `{ userId, settings }` | User settings are updated |
 
+### API Key Hooks (2)
+
+New in v1.38.0. Neither payload ever carries the key itself or its hash.
+
+| Hook | Context | Fires when |
+|------|---------|------------|
+| `structure.apiKey.created` | `{ userId, apiKeyId, name, scopes, expiresAt }` | A public-API key is created. `expiresAt` is an ISO string, or `null` for a non-expiring read-only key |
+| `structure.apiKey.revoked` | `{ userId, apiKeyId }` | A public-API key is revoked |
+
 <Aside type="caution" title="Action hooks are the key to module integration">
-Without action hooks, modules are islands — they can display UI on nodes but cannot react to what happens to those nodes. Always register a `structure.node.deleted` listener to clean up your module's related data. Always register `structure.node.created` if your module needs to set up defaults for new nodes.
+Without action hooks, modules are islands — they can display UI on nodes but cannot react to what happens to those nodes. Always register a `structure.node.deleted` listener to clean up your module's related data. A deleted node can still be restored from Deleted, so keep anything you cannot rebuild until `structure.node.purged` reports it gone for good, or its type is deleted. Always register `structure.node.created` if your module needs to set up defaults for new nodes.
 </Aside>
 
 ---
@@ -956,7 +1001,7 @@ filterRegistry.register(
 
 | Hook | Receives | Returns | Purpose |
 |------|----------|---------|---------|
-| `structure.node.beforeCreate` | Node input data | Transformed input | Transform or validate data before a node is saved |
+| `structure.node.beforeCreate` | Node input data | Transformed input | Transform or validate data before a node is saved. Since v1.38.0 it also runs for each row of a bulk create. Field locks are checked against what the request sent, before the filter runs, so a filter may fill in a locked field |
 | `structure.node.response` | Node object | Enriched node | Add computed properties before sending to the client |
 | `structure.node.listQuery` | Query parameters | Modified query | Modify list queries before execution (add constraints, scoping) |
 | `structure.nodeType.response` | Node type object | Transformed type | Enrich node type data before sending to the client |

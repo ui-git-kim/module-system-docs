@@ -62,7 +62,7 @@ Only two parts of a type's configuration flow down the hierarchy:
 
 | Config | Inherited | Semantics |
 |--------|-----------|-----------|
-| `fields` | Yes | Own fields first, then fields from any [attached shared field templates](/modules/structure/fields/#shared-field-templates), then inherited fields in [resolution order](#resolution-order). Shadowed by field `id` — precedence is **own › template › inherited**: an own field wins over a template's and any ancestor's, a template field wins over an inherited one, and a nearer ancestor wins over a farther one. Inherited entries carry `inheritedFrom: '<ancestor-slug>'` in resolved output; attached-template entries carry `fieldTemplateId` instead. Only an ancestor's **own** `fields` flow down — shared field templates attached to an ancestor are **not** pulled through |
+| `fields` | Yes | Own fields first, then fields from any [attached shared field templates](/modules/structure/fields/#shared-field-templates), then inherited fields in [resolution order](#resolution-order). Shadowed by field `id` — precedence is **own › template › inherited**: an own field wins over a template's and any ancestor's, a template field wins over an inherited one, and a nearer ancestor wins over a farther one. Inherited entries carry `inheritedFrom: '<ancestor-slug>'` in resolved output; attached-template entries carry `fieldTemplateId` instead. Only an ancestor's **own** `fields` flow down — shared field templates attached to an ancestor are **not** pulled through, and neither are an ancestor's [template-local](#template-local-fields) fields |
 | `features` | Yes | Per-key **nearest-wins**. Each feature key resolves independently to the nearest type in the resolution order that defines it — starting with the type itself |
 
 <Aside type="tip" title="An own feature key always wins — even a falsy one">
@@ -89,6 +89,12 @@ Feature inheritance is computed into `resolved.features` on every `/types` respo
 <Aside type="caution" title="The built-in feature toggles read the type's own features">
 The built-in toggles — `slug`, `description`, `color`, `icon`, `favorites`, `archiving`, `publishing`, `manualSort`, `stages` and `publicApi` — are read from the type's **own** `features` column, not from `resolved.features`. Enabling one on a base type therefore does **not** switch it on for its subtypes; set those per type. Module code that wants the inherited value should read `config.resolved?.features ?? config.features`.
 </Aside>
+
+### Template-local fields
+
+When the admin who owns a shared field template has their account erased, the template is deleted with the account, but the types that outlive it keep its fields. In the same write, each surviving node type or connection type that attached the template gets the template's fields copied into its own `fields`, marked `templateLocal: true`, and the template is detached. The type itself resolves exactly as it did before (own fields still win, then its remaining templates in attached order).
+
+Like the template they came from, template-local fields belong to that type alone: its **subtypes do not inherit them**. The server skips an ancestor's `templateLocal` fields wherever it resolves fields — `resolved.fields`, write validation and sealing, and the secret guard — so the subtypes also resolve exactly as they did before the erasure. Deleting a field template on purpose is different: nothing is inlined, and the types that attached it lose its fields.
 
 ## Resolution order
 
@@ -131,8 +137,12 @@ The resolved fields for `court-order` are, in order:
 
 `event`'s `jurisdiction` is shadowed because `legal-document` comes first in the linearisation. Had `court-order` defined its own `jurisdiction`, that would shadow both.
 
-<Aside type="caution" title="Don't re-declare one field id at two depths">
-The BFS order described here governs `resolved.fields` — the API output and the rendered forms. The separate server-side field-definition resolver that backs write validation, secret sealing and `editableBy` enforcement walks parents **depth-first** (it descends into a parent's own parents before moving to the next declared parent), so for the diamond above it sees `legal-document, entity, event` rather than `legal-document, event, entity`. If `entity` and `event` both define the same field id, the form renders `event`'s definition while the server enforces `entity`'s. Declare a given field id at one depth of a hierarchy only.
+<Aside type="note" title="One resolution order everywhere (v1.38.0)">
+Every consumer of a type's fields resolves them the same way: own fields, then attached field templates, then inherited fields in the breadth-first order above, first `id` wins. That covers `resolved.fields` and the rendered forms, and on the server write validation, `editableBy` locks, secret sealing and unsealing, the public API's secret stripping, and the secret guard.
+
+Before v1.38.0 the server-side resolver walked parents **depth-first** (`legal-document, entity, event` for the diamond), so a multi-parent type that declared one field id at two depths could render one ancestor's definition while the server enforced another's. On upgrade, the server switches to the definition the form already showed. If that definition is a `secret` field, a value saved before the upgrade is withheld from the public API straight away and is encrypted the next time the entry is saved.
+
+One server-side refinement: when field-groups at different levels share an `id`, sealing and edit locks also cover sub-fields that only the shadowed group declares, so a secret sub-field stays encrypted whichever group declared it.
 </Aside>
 
 ## Connections and subsumption
@@ -169,7 +179,7 @@ Subsumption applies to connection allowlists only. The containment allowlists (`
 
 - `superClasses` — the raw declared parents (`string[]`)
 - `resolved` — the computed view: `{ fields, features, ancestors }`
-  - `resolved.fields` — own fields, then fields from [attached shared field templates](/modules/structure/fields/#shared-field-templates) (v1.29.0), then inherited fields in resolution order — a three-layer merge with same-`id` precedence **own › template › inherited**. Inherited entries carry `inheritedFrom`; attached-template entries carry `fieldTemplateId` instead. The template layer is the **type's own** attachments only — templates attached to an ancestor are not pulled down
+  - `resolved.fields` — own fields, then fields from [attached shared field templates](/modules/structure/fields/#shared-field-templates) (v1.29.0), then inherited fields in resolution order — a three-layer merge with same-`id` precedence **own › template › inherited**. Inherited entries carry `inheritedFrom`; attached-template entries carry `fieldTemplateId` instead. The template layer is the **type's own** attachments only — templates attached to an ancestor are not pulled down, and an ancestor's [template-local](#template-local-fields) fields are skipped
   - `resolved.features` — the per-key nearest-wins merge
   - `resolved.ancestors` — the full linearisation, nearest-first
 
@@ -232,12 +242,14 @@ For code running inside the Structure feature itself, `structure.service.ts` als
 
 Around the write paths themselves:
 
-- **Delete guard.** `deleteNodeType` is blocked while any live type lists the slug in its `superClasses` — the error names the referencing types. Detach the children first.
+- **Delete guard.** `deleteNodeType` is blocked while any live type lists the slug in its `superClasses` — the error names the referencing types. Detach the children first. It is also blocked while the type still has entries that are not in Deleted (archived entries count). For an app-level type (`userId` `null`) that count covers **every user's** entries, not just the caller's; a per-user type counts its owner's.
+- **Deleted entries go with the type.** Entries already in Deleted do not block the delete. Once the type is deleted they are permanently removed and can no longer be restored — for an app-level type, every user's (except a user who has their own type with that slug). A deleted entry that still has live entries nested under it is kept. The clean-up runs in batches after the type row is gone; if it stops partway, the type stays deleted and the owners can still purge the rest with `POST /nodes/purge`.
+- **Secret guard re-checks dependent types.** A stored computed field may not reference a [`secret`](/modules/structure/fields/#secret) field, and the check walks the same resolved field set as above, inherited fields included. Because one type's change can expose a secret through another, saving a node type (create, update, import or proposal approval) or a field template also re-checks, on the same transaction, the subtypes of the changed type and every node or connection type whose computed fields can now reach a newly added secret through a node reference. If any of them would leak a secret, the save is refused and the error names the affected type.
 - **Import is transactional.** [JSON import](/modules/structure/json-reference/) validates the *final* set of types: unknown parents, cycles, or survivors orphaned by a replace-mode deletion roll the **whole import** back.
 - **Proposals.** `proposeNodeType` accepts `superClasses`; they are validated at propose time **and re-validated at approval** (existence and cycles — the type graph may have changed in between; later-arising redundancy does not block approval).
 
-<Aside type="caution" title="Importing a pre-v1.18 export resets superClasses">
-Import uses whole-row semantics: each imported type replaces the stored row in full. An export taken before v1.18.0 has no `superClasses` key, so importing it writes `superClasses: []` — wiping any parents declared since. Re-export after upgrading before using import as a backup.
+<Aside type="note" title="Importing over an existing type keeps keys the payload leaves out">
+Since v1.38.0, an import that updates an existing type writes only the keys the payload carries. An export taken before v1.18.0 has no `superClasses` key, so importing it leaves the stored parents as they are; a type the import creates starts with none. To clear a type's parents through import, send `superClasses: []` explicitly.
 </Aside>
 
 ## Limitations

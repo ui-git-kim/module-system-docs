@@ -25,6 +25,113 @@ Check your installed version with `npx structure info`.
 
 ---
 
+## v1.38.0
+
+**Cleanup & security audit fixes — API keys, secrets, consistent write rules, data lifecycle** *(generated-output)*
+
+Fixes the findings from the 2026-09-30 cleanup and security audit (no critical findings; the moderate and minor ones were listed on the [Roadmap](/modules/structure/roadmap/)). The fixes landed in batches, each reviewed adversarially, and the release was then reviewed again as a whole. Configuration ownership stays **per-admin** (a recorded decision): node types can be app-wide, while field templates, connection types, functions, groups and display templates stay owned by the admin who created them. Only the knock-on bugs of that model were fixed.
+
+<Aside type="caution" title="Before you update">
+
+**Requires starter template v2.13.0 or newer.** The generated code now imports the starter's web-session and step-up middleware, its personal-data export registry and `getApiErrorMessage`, so on an older starter the app fails to build. Run `npm run template:update` in the app first, then `npx structure update`.
+
+Behaviour changes that can affect existing apps or integrations:
+
+- **API keys.** Listing, creating and revoking keys needs a signed-in web session; a device token is refused. A new **write-scoped** key always expires: with no expiry it gets 365 days, and an expiry further out is refused (400). Read-only keys can still be non-expiring. Existing keys are unchanged.
+- **Step-up confirmation** ("Confirm it's you", at the starter's hardened and strict security tiers; a pass-through at the standard tier) is now asked for when creating an API key, running a real config or node-type import (a config-import dry run is exempt), deleting a node type, connection type, field template or function, and permanently deleting entries. The starter's API client shows the prompt and retries; a script calling these routes must handle the step-up response.
+- **The list status filter `all` no longer includes deleted entries.** Ask for `status: 'deleted'` explicitly; it lists only your own deleted entries.
+- **Unsafe validation patterns.** A `validation.pattern` whose matching time can grow sharply with the length of the value is refused when it is saved (400 naming the field). A pattern already stored is logged and **not run**, so values pass without it until an admin replaces it. A value too long to test safely against its pattern is refused on request writes.
+- **Field locks (`editableBy`) now apply on create, bulk create, duplicate and connection writes**, not only on update, for request callers. In-process module writes are unaffected. Computed and formula fields are exempt, and an empty locked field is given its configured default.
+- **Connection field values are validated on request writes** (required, type, pattern, options), like node data. A connection `PATCH` replaces the whole data record, so it is validated as a whole.
+- **Stricter value shapes on request writes.** A node-reference value must be a node id, and, when the field sets `allowedTypes`, an entry of an allowed type the caller can read. A `secret` value must be text. A field-group value must be a list of rows. Each is a 400; in-process module writes are coerced instead, with a logged warning.
+- **HTTP creates need an enabled node-type row.** A type registered only in frontend code, or disabled, can no longer take new entries over HTTP; seed a database row for code-registered types. Connections can no longer be created or edited through the nodes API; use the connections API.
+- **Config import.** Slugs must be lowercase letters, digits, hyphens or underscores (at most 100 characters), and each list holds at most 1,000 items. `POST /types/import` refuses a full config bundle (use `/config/import`). A replace-mode import refuses to remove an app-wide node type that any user still has live entries of, and an import cannot create an app-wide type whose slug another user already owns.
+- **Smaller contract changes.** The favourite and pin toggles return only `{ id, isFavorite, isPinned }`. The `stageGroup` list filter now filters, and needs `type`. Restoring a deleted entry needs the type's delete permission. On a type with stage transitions, a non-admin cannot clear an entry's stage, and a non-admin's new entry can only start in the type's default stage (when it sets one). Public API create and update on a read-restricted type answer `{ id }` only. On a type with several parents that declare the same field id at different depths, the definition that wins can change: sealing and validation now resolve fields in the same order as the form.
+
+</Aside>
+
+**API keys and sensitive routes**
+
+- **Key management needs a web session, and creating a key needs step-up.** A lower-trust device token could previously mint a long-lived key that kept working after the device was revoked.
+- **Write-scoped keys expire.** The create dialog gets an **Expires** choice (30, 90 or 365 days, defaulting to 90, plus Never for read-only keys only), and the key list shows when each key expires.
+- **Key lifecycle events.** Creating and revoking a key fires `structure.apiKey.created` / `structure.apiKey.revoked` (never the key or its hash), both declared as audit events, and the creation log records the scopes and expiry granted.
+- **Sensitive routes.** Step-up on imports and on the config hard deletes listed above. `POST /nodes/bulk-delete` needs a web session, and the new permanent delete needs a web session plus step-up.
+
+**Secrets**
+
+- **The v1.37.3 secret guard closes its gaps.** A node-reference field with no `allowedTypes` (the default, meaning any type) now counts the secret fields of every type the user can read. The guard reads the type's resolved field set (own fields, attached field templates, inherited fields) plus built-in field configs; a field group holding a secret counts as secret; and a referenced secret field named `name`, `description` or `slug` is caught. It runs on node-type, field-template and connection-type saves and imports, a field-template save re-checks every type that attaches the template, and a change re-checks the types that depend on it (subtypes, and types whose computed fields reach a field that has just become secret). The client check in the type form agrees with the server.
+- **Formulas and merge templates never see another entry's secret values.** A read through `nodes()` or a reference token is stripped of secret values before evaluation, failing closed while the entry's type is not loaded. This also closes the dynamic `pluck` residual noted in v1.37.3.
+- **Secret values must be text.** A number, list or object sent to a `secret` field was stored unencrypted.
+- **No filtering or sorting by secret fields.** A list filter or sort on a secret field, or on a field group holding one, is refused (400), and the list UI no longer offers those columns.
+- **Connection hooks carry no secret values**, matching the node hooks.
+- **The read-only view of a field group masks secret sub-fields.** It printed the rows as raw JSON.
+- **An undecryptable secret survives a save.** It comes back to the owner as a marker instead of an empty string, keeps its stored value when the record is saved back, and shows as "cannot be decrypted" with a prompt to enter a new value. Previously the next save overwrote it with an empty value.
+- **A missing `SECURITY_ENCRYPTION_KEY` answers 503 (`encryption_key_missing`)** instead of an opaque 500. Structure encrypts secret fields at every security tier, so the key is needed whenever a type uses a secret field.
+
+**Consistent write rules**
+
+- **Single and bulk create share one path.** Bulk-imported rows now get the `beforeCreate` filter and the type's default stage, and keep `stage`, `classification` and `observedAt`, which were dropped.
+- **Field locks on every write path.** Only a change to a locked value is refused (on create: absent, empty or the field's default). The node form and the Add Connection dialog show locked fields read-only, and a required locked field with no default explains why that connection type cannot be added there.
+- **Duplicate validates its overrides**, and connection writes validate their data and the targets of new node references.
+- **Stage rules hold.** A supplied stage must be one of the type's configured stages, and with a transition map a non-admin can no longer skip it by creating into a later stage or clearing the stage first.
+- **Deleting an entry checks its whole subtree.** If the subtree holds entries of a type the caller may not delete, the delete is refused, naming that type.
+- **Side routes respect the type permissions.** Favourite and pin respect the read permission and return only the flags; `PATCH /nodes/:id/metadata` checks the edit permission for request callers; `GET /connections/:id` hides deleted connections and those with an endpoint the caller cannot read; updating or promoting a connection blanks an endpoint of a read-restricted type for a non-admin.
+- **One field order everywhere.** Sealing, validation, locks and the public strip resolve a multi-parent type's fields in the same order as the form.
+
+**Per-admin config knock-ons**
+
+- **Field templates resolve for every user.** A template attached to a type every user sees now applies for everyone, so its fields render and their sealing, locks and validation hold. Creating, listing and editing a template stays with its owner.
+- **Type deletes count every user's entries.** Deleting an app-wide node type or connection type, or removing an app-wide node type in a replace-mode import, is refused while any user has live entries of it, not just the deleting admin.
+- **Admins review every user's proposals.** The proposal list carries `id` and `proposedBy`; approve and reject take an optional `proposalId`, and answer 409 when more than one pending proposal uses the slug. The review hooks carry the proposer as `userId` and the reviewer as `actorId`.
+- **App-wide rows win slug clashes.** When a slug matches both an app-wide type and a user's own type, the app-wide row is used everywhere, and import or system approval no longer creates such a clash.
+- **Erasing a template owner keeps the fields.** When an admin's account is erased, the fields of their field templates are copied into each type that attached them (and not inherited by subtypes), so those types resolve exactly as before.
+
+**API and stability**
+
+- **The public API works server-to-server in production.** Its route now accepts requests with no `Origin` header (curl, Zapier, backend jobs), which the starter's origin gate refused. Every call still authenticates with an API key.
+- **Validation patterns are checked for catastrophic backtracking** on every save path, including field-group sub-fields, imports and proposals. At runtime a value is tested only up to a safe length: up to 100,000 characters for a pattern that runs in linear time (less when it has wide counted repeats — the server works the cap out from the pattern), and 1,000 (or the field's own maximum, up to 5,000) for one whose cost grows faster.
+- **Data filters are scoped to the list.** The candidate scan honours the list's type, status, parent and space before its 5,000-row cap; a stored value that is not a number or date no longer fails the whole list (it simply does not match); filter values are checked against `valueType`; and `in` / `not_in` take at most 500 values.
+- **Unique clashes answer 409**, naming what clashed (slug, a name already used under the same parent, reference number, public URL slug) on create, update, duplicate and move. Bulk responses show only client-safe error text per row.
+- **Bounded reads.** A node read includes at most 5,000 children, a list with `includeChildren` at most 200 per parent, and duplicating with children is refused above 5,000 nested entries.
+- **Bounded inputs.** Node and connection data are capped at 512 KB, settings and metadata at 64 KB, ids at 100 characters, and `sortOrder` at the database's integer limit. Settings writes validate the known keys and cap the stored settings at 64 KB. Through the HTTP route a user may hold at most 50 pending proposals, each size-bounded, and the admin proposal list returns at most 200.
+- **`stageGroup` works.** It was accepted but never applied; it now filters a single type's entries to the stages in that group.
+- **Public API `scopeRootId` is validated**: a repeated or over-long value is a 400 rather than silently ignored.
+
+**In-app fixes**
+
+- **Inline edits send only the changed fields.** Re-sending the whole record blocked edits once a locked field held a value, could overwrite another writer's changes, and could wipe a secret that failed to decrypt.
+- **Errors show the server's reason.** Toasts and the import panels use the starter's `getApiErrorMessage` instead of the generic status text; settings saves and scope switches now report a failure (a failed switch reverts), and bulk actions list each row's failure reason.
+- **Formula aggregates refresh after a change.** Formula traversal shares the cache of the Children, Path and Connections views, so a new child or connection is counted straight away instead of up to 30 seconds later.
+- **A node opened under the wrong type's URL redirects** to its real type's page, rather than rendering with the other type's fields.
+- **Node ids taken from field data are URL-encoded** in API paths, and the resolver skips values that are not ids.
+- **Create buttons follow the type's state.** They are hidden for types that are disabled or registered only in code.
+- **Field-group columns are not sortable** and show a row count; a failed sorted list offers **Clear sort**, and the sort resets when the type changes.
+
+**Compliance and data lifecycle**
+
+- **Deleted view and permanent delete.** The list's status filter gains **Deleted** (with a Deleted toggle when the status filter is hidden). There, the actions are **Restore** and **Delete permanently**, behind a confirm that says it cannot be undone. `POST /nodes/purge` takes optional `ids` (up to 500): your own deleted entries and their deleted descendants, or all of them. Like restoring, it needs the type's delete permission for every entry it would reach. An entry with a non-deleted entry under it is skipped; connections and chunks go with each purged entry; the response is `{ purged, skipped }`, and `structure.node.purged` fires. Delete confirms now say the entry moves to Deleted and can be restored, and the tree view falls back to the list outside the Active filter.
+- **Type deletes clear their tombstones.** Entries already in Deleted no longer block deleting their node type or connection type, and are permanently removed after the delete (for an app-wide type, every user's).
+- **Personal-data export includes Structure.** Six export handlers (seven on embeddings installs) cover entries and connections (secret values removed), settings, API keys (metadata only), the configuration the user created, reference counters and, on embeddings installs, retrieval chunk text; the entry, connection and chunk sections are paged and capped at 50,000 rows each, flagged when truncated.
+- **Durable audit trail.** Sensitive events (type and config changes, imports, proposal reviews, bulk deletes, merges, purges, API-key lifecycle) are recorded in the starter's audit sink, with ids, slugs and counts only (never field data). A new `structure.nodeType.sharingChanged` hook records when a type starts or stops being shared.
+- **Config export round-trips.** Exports include connection-type `contextHints` and `aiFields` and node-type `moduleId`, and an import update leaves a key the payload omits unchanged (except nullable columns an export leaves out when empty, which still clear).
+- **Exports and destructive operations are logged for audit.**
+- **Approved proposals keep only `proposedBy` and `approvedAt`**, so a proposer's source details no longer outlive their account on an app-wide type.
+
+**Cleanup**
+
+- **The v1.37.5 prime fallback is gone.** v1.37.5 kept the import-time prime as a fallback for starters below v2.7.0; it is removed, along with `primeStructureNavigation`. On such a starter the build failed before the fallback could run, and Structure now requires v2.13.0. The shell-init registration imports the starter's registry directly, `StructureInit` is the only primer, and `initStructureNavigation()` now also seeds the type and group cache.
+- **Sidebar entry lists refresh after Structure's own writes** (debounced) rather than after every list fetch, and read preferences from the cached settings.
+- **The "Show count badge" toggle works.** The nav link shows the type's number of active entries.
+- **`sidebarNav.userOverridable` left unset now means on** everywhere, matching the admin form.
+- **Node-detail sidebar sections** honour `collapsible` and `defaultCollapsed`.
+- **Copy and dead controls.** The group icon picker is removed (the host sidebar has no slot for it); the sidebar options read "Recently updated" and "First N (list order)"; and the publishing panel says "Marked as published" rather than claiming the entry is publicly visible.
+- **Unread config keys are marked deprecated** in the types: `rules.isHierarchical`, `rules.allowMultipleParents`, and `sidebarNav` `parentType`, `maxDepth`, `showEmpty`, `collapsible` and `defaultExpanded`.
+- **Duplicated code folded** (connection mapping, the favourite and pin toggles, field change handlers, a node-fetch helper, the settings hooks), and stale comments rewritten.
+
+Frontend + backend, no schema change. Host type-check against veradai: 0 errors (frontend and backend).
+
+---
+
 ## v1.37.5
 
 **Sidebar: stop duplicate registration, drive priming from the startup registry** *(generated-output)*
@@ -32,7 +139,7 @@ Check your installed version with `npx structure info`.
 Fixes the repeated `[NavigationRegistry] Section "structure-group-…" already registered. Skipping.` console warnings and consolidates navigation priming.
 
 - **Each sidebar section registers once.** `registerStructureNavigation` re-runs on every node-type sync, but the host navigation registry has no section-removal API (the `unregisterSection` probe was a silent no-op), so every pass re-registered the same section ids and the host warned. Section ids are now tracked for the module's lifetime and registered exactly once.
-- **One priming path, via the startup registry.** On a modern host, *both* the unconditional import-time auto-prime and the shell-init `StructureInit` fetched and synced the registries, double-firing the whole registration. The import-time auto-prime is removed: `StructureInit` — registered on the host `shellInitRegistry` and mounted once post-login by the authenticated shell — is now the sole primer and primes **both** node types and groups. The import-time prime (with its auth-race retry) is retained only as the fallback the shell-init registration calls when the host has no shell-init registry (starter &lt; v2.7.0), so exactly one prime path runs on any host.
+- **One priming path, via the startup registry.** On a modern host, *both* the unconditional import-time auto-prime and the shell-init `StructureInit` fetched and synced the registries, double-firing the whole registration. The import-time auto-prime is removed: `StructureInit` — registered on the host `shellInitRegistry` and mounted once post-login by the authenticated shell — is now the sole primer and primes **both** node types and groups. The import-time prime (with its auth-race retry) is retained only as the fallback the shell-init registration calls when the host has no shell-init registry (starter &lt; v2.7.0), so exactly one prime path runs on any host. *(That fallback is removed in [v1.38.0](#v1380), which requires starter v2.13.0.)*
 
 Frontend-only, no schema change. Host-tsc clean.
 

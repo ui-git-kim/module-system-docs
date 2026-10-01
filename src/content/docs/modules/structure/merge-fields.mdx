@@ -167,8 +167,8 @@ Index-based dereference also works:
 
 1. When the `NodeFieldRenderer` encounters a field with `computedTemplate`, it invokes `resolveTemplateAsync`
 2. The resolver parses all `{expression}` tokens and resolves them against the node's current data
-3. For `->` dereferences, the resolver fetches the referenced node via the API, caching results to avoid redundant requests
-4. The resolved value is set as the field's display value and, in a create/edit form, automatically synced back to the node's data object so it is captured on submit. In a read-only detail view the value is resolved and displayed but not written back (`NodeFieldRenderer`'s `autoPersistComputed` prop is `false` when not editing), so viewing a node never fires an update or an audit event
+3. For `->` dereferences, the resolver fetches the referenced node via the API, caching results to avoid redundant requests, and removes the referenced node's secret values before any token reads them (see [Computed values never copy secrets](#computed-values-never-copy-secrets))
+4. The resolved value is set as the field's display value and, in a create/edit form, automatically synced back to the node's data object so it is captured on submit. In a read-only detail view the value is resolved and displayed but not written back (`NodeFieldRenderer`'s `autoPersistComputed` prop is `false` when not editing), so viewing a node never fires an update or an audit event. A value that dereferenced a node whose type the browser has not loaded yet is displayed but never written back; it is resolved again once the type list loads
 5. The field renders as a read-only `<Input>` with a muted background
 
 <Aside type="tip">
@@ -176,7 +176,7 @@ Merge templates resolve asynchronously because node-reference dereferences requi
 </Aside>
 
 <Aside type="caution" title="Client-computes, server-accepts">
-Merge templates are resolved in the browser and the resolved value is submitted with the rest of the node. The API never recomputes a `computedTemplate`, and server-side field validation skips computed fields entirely — a direct API call can write any value into one. The form renders the field read-only, but that is a UI guard, not an enforcement boundary. Only `editableBy: 'admin' | 'system'` is enforced server-side, and it is enforced independently of the template.
+Merge templates are resolved in the browser and the resolved value is submitted with the rest of the node. The API never recomputes a `computedTemplate`, server-side field validation skips computed fields entirely, and an `editableBy` lock on a computed **custom** field is not enforced on the server either (the form submits the computed value itself, so a lock would refuse every normal save). A direct API call can therefore write any value into one. The form renders the field read-only, but that is a UI guard, not an enforcement boundary. What the server does enforce is the configuration: a computed field may not reference a secret (see [Computed values never copy secrets](#computed-values-never-copy-secrets)). On the built-in `name` / `description` / `slug`, `editableBy: 'admin' | 'system'` is still enforced server-side, independently of the template.
 </Aside>
 
 ### The same tokens in a formula
@@ -184,6 +184,29 @@ Merge templates are resolved in the browser and the resolved value is submitted 
 The [`formula` field type](/modules/structure/fields/#formula) reuses this exact token grammar. The difference is resolution: a merge template stringifies and concatenates each token (`resolveTemplateAsync`), while a formula binds each token to its raw, type-preserving value (`resolveTokenValue`), so `{price} * {qty}` multiplies two numbers instead of concatenating two strings.
 
 If a field carries both `computedTemplate` and `calcConfig`, the merge template wins outright — it owns both the render and the write-back, and the formula is ignored.
+
+### Computed values never copy secrets
+
+*(Enforced since v1.37.3, widened in v1.38.0.)* A merge template's or formula's result is stored **unencrypted** (in the node's data, or in its `name` / `description` / `slug`) and the public API returns it, so a computed value must never copy a [`secret`](/modules/structure/fields/#secret) field. Structure stops this twice: when configuration is saved, and again whenever a template or formula reads another node.
+
+#### When configuration is saved
+
+Saving configuration in which a computed field references a secret is refused with a `400` that names the computed field and the secret token (`Computed field "…" may not reference secret field "…"`). The admin forms run the same check before they submit, so the error shows straight away, but the server's check is the authoritative one. It covers:
+
+- **Every token that can reach a secret.** A secret field (`{api_key}`), a secret sub-field of a field-group (`{credentials.token}`, and its index and filter forms), and the field-group itself (`{credentials}`) when it holds a secret sub-field, because that token reads the group's rows, secret cells included. One-hop dereferences count the same way: `{ref->api_key}` and `{ref->credentials}`, including through a reference inside a field-group row.
+- **Unrestricted references.** A node-reference with no `allowedTypes` (the admin form's default, "every type") can point at a node of any type, so its `{ref->…}` tokens are checked against the secrets of every node type visible to the type's owner, including the type being saved (with the fields as they are being saved). For an app-level type, which every user's entries use, the check spans every owner's types. A restricted reference is checked against its allowed types, and the server refuses a request write whose reference points at an entry that is not of an allowed type (or a subtype of one).
+- **`{ref->name}`, `{ref->description}` and `{ref->slug}`.** These normally read the referenced node's built-in properties, but a dereference reads the node's data first. When the referenced type has a real field with one of those ids, the token reads that field instead, so a secret field called `name` makes `{ref->name}` a secret token. On the node itself a bare `{name}` always reads the built-in column, so a node type's own field called `name` is not affected. Connection types have no built-in columns, so on a connection type it is.
+- **Every computed field the type uses.** Its own fields, fields from attached [field templates](/modules/structure/fields/#shared-field-templates), fields inherited from parent types, and the `name` / `description` / `slug` built-in configs.
+- **Every place configuration is written.** Node types (create, update, proposals, proposal approval and import); connection types (create, update and the config import), checked against the connection's own fields and attached templates; and field templates, checked on their own and then, with the new fields, for every node type and connection type that attaches them.
+- **Types that depend on the change.** A type that passed can start to leak when *other* configuration changes. So saving a node type also re-checks the child types that inherit its fields, and saving a node type or field template re-checks every node or connection type whose computed fields dereference a secret the change adds, along with their child types. Sharing a per-user type app-wide counts as adding every secret it carries. If a dependent type fails, the whole save is rolled back and the error names that type.
+
+#### When a template or formula reads another node
+
+As a backstop for anything the save-time check cannot see (a formula's `nodes()` lookup, for example, names no field at all), every node fetched for a `->` dereference or a `nodes()` lookup has its secret values removed before any token can read it: secret fields, secret cells in field-group rows, and any sealed or undecryptable secret value. This happens whichever node fetcher supplied the node, so `{ref->api_key}` resolves to blank. The list reads behind `children()`, `parents()`, `scope()` and `connections()` return secrets still sealed, and sealed values are dropped from every record a formula sees.
+
+The browser can only tell which fields are secret once it has loaded the node's type. Until then, a referenced node reads as its built-in properties only (it fails closed). A computed or formula value that depended on such a node is displayed but not saved, and is resolved again once the type list loads.
+
+Values on the node being edited are not stripped, because the form needs them; the save-time check is what keeps them out of its computed fields.
 
 ### Admin UI — Merge Templates
 
@@ -299,7 +322,7 @@ interface MergeFieldToken {
 }
 ```
 
-The token set emits the resolver's **canonical, statically-enumerable token forms**: built-in `name` / `description` / `slug`; every top-level field; each `field-group` subfield as a first-item token (`{group.sub}`); and one-hop node-reference deref targets. For **every** `node-reference` field, the three built-in deref tokens `{ref->name}`, `{ref->description}`, and `{ref->slug}` are emitted unconditionally (independent of the reference's `allowedTypes`), plus one `{ref->field}` token per value field of each allowed referenced type. It includes own + inherited (Type Hierarchy) + module-registered fields. The resolver's parameterised forms — filtered lookups (`[sub=val]`), index access (`[0]`), and combined repeater + deref — are resolvable at runtime but are **not** surfaced as static tokens, since they depend on runtime data values. Pass `{ includeBuiltins: false }` to omit the built-ins — used by the connection-type field editor, where a connection has no `name` / `description` / `slug`. The node create/edit form and the node detail view merge `name` / `description` / `slug` into the resolution bag before resolving, so a custom field's `computedTemplate` can bind `{name}`, `{description}` and `{slug}`; the node-type admin form therefore passes `includeBuiltins: true`.
+The token set emits the resolver's **canonical, statically-enumerable token forms**: built-in `name` / `description` / `slug`; every top-level field; each `field-group` subfield as a first-item token (`{group.sub}`); and one-hop node-reference deref targets. For **every** `node-reference` field, the three built-in deref tokens `{ref->name}`, `{ref->description}`, and `{ref->slug}` are emitted (independent of the reference's `allowedTypes`), plus one `{ref->field}` token per value field of each allowed referenced type. A reference with no `allowedTypes` (the admin form's default) can point at any type, so it gets deref tokens for every referenced type supplied — in the app, every node type the user can see, including the type itself. If a referenced type has a real field called `name`, `description` or `slug`, that field's token replaces the built-in deref token, because a dereference reads node data before the built-in property; and when two referenced types share a field id, a `secret` type wins, so the [secret check](#computed-values-never-copy-secrets) never loses it. It includes own, attached field-template, inherited (Type Hierarchy) and module-registered fields. The resolver's parameterised forms — filtered lookups (`[sub=val]`), index access (`[0]`), and combined repeater + deref — are resolvable at runtime but are **not** surfaced as static tokens, since they depend on runtime data values. Pass `{ includeBuiltins: false }` to omit the built-ins — used by the connection-type field editor, where a connection has no `name` / `description` / `slug`. The node create/edit form and the node detail view merge `name` / `description` / `slug` into the resolution bag before resolving, so a custom field's `computedTemplate` can bind `{name}`, `{description}` and `{slug}`; the node-type admin form therefore passes `includeBuiltins: true`.
 
 The pure core, `flattenMergeFields(fields, refFieldsBySlug, options)`, is exported too — call it directly when you already have field descriptors and a map of referenced-type fields (e.g. a payload from the schema endpoint below).
 
@@ -321,7 +344,7 @@ It returns the flattener's **inputs** — not pre-baked tokens — so token gene
 }
 ```
 
-Run `flattenMergeFields(response.fields, response.referencedTypes)` on the payload to get the same `MergeFieldToken[]`. Secret fields (`type: 'secret'` or any field with a `secretConfig`) are dropped, and reference targets that are not themselves exposed are redacted — the endpoint never reveals a hidden type's existence or field shape. The read-tier test above is applied per referenced type as well, so a type whose read tier is `admin` or `system` is redacted from `nodeReferenceConfig.allowedTypes` and contributes no `->` deref tokens.
+Run `flattenMergeFields(response.fields, response.referencedTypes)` on the payload to get the same `MergeFieldToken[]`. Secret fields (`type: 'secret'` or any field with a `secretConfig`) are dropped, and reference targets that are not themselves exposed are redacted — the endpoint never reveals a hidden type's existence or field shape. The read-tier test above is applied per referenced type as well, so a type whose read tier is `admin` or `system` is redacted from `nodeReferenceConfig.allowedTypes` and contributes no `->` deref tokens. `referencedTypes` holds only the exposed types that some reference names in its `allowedTypes`, so a reference with no `allowedTypes` (or one whose allowed types were all redacted) gets `{ref->field}` tokens for those types only, besides the three built-in deref tokens.
 
 ### Resolving a template without React — `resolveMergeFields`
 
@@ -334,7 +357,7 @@ import { resolveMergeFields } from '@/features/structure/utils/merge-fields';
 const title = await resolveMergeFields('{matter_number} — {assigned_client->name}', node);
 ```
 
-`resolveTemplateAsync(template, data, cache?, fetchNode?)` is the lower-level primitive. Its `fetchNode` is injectable — supply your own node fetcher for a non-app runtime; it defaults to a query-cache-backed wrapper around `structureService.getNode` (keyed `['structure', 'node', id]` with a 30s `staleTime`, so repeated dereferences of the same node collapse into one request).
+`resolveTemplateAsync(template, data, cache?, fetchNode?, onFailClosed?)` is the lower-level primitive. Its `fetchNode` is injectable — supply your own node fetcher for a non-app runtime; it defaults to a query-cache-backed wrapper around `structureService.getNode` (keyed `['structure', 'node', id]` with a 30s `staleTime`, so repeated dereferences of the same node collapse into one request). Whichever fetcher you supply, each fetched node passes through the exported `withoutSecretValues` before a token reads it; that function looks up the node's secret fields in the client type registry. A node whose type the registry does not know reads as its built-in properties only and is not kept in `cache`. The optional `onFailClosed(nodeType)` callback hears of each such node, so a caller that saves the result can skip the write and resolve again later. `resolveMergeFields` does not take this callback.
 
 ### Merge-field-driven cards
 

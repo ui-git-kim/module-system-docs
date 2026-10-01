@@ -298,7 +298,8 @@ Method semantics:
 
 ### Chunk lifecycle
 
-- **No database cascade.** `nodeId` is a plain FK. A node's `deleteNode` is a *soft* delete (`status: 'deleted'`), and chunk search filters the parent node's status — so a soft-deleted (or archived) node's chunks simply stop surfacing, and `restoreNode` brings them back. Re-chunking is `replaceNodeChunks` (delete + insert). Chunks are hard-removed only at **account erasure**, via the `structure.chunks` deletion handler (generated only on embeddings-enabled installs).
+- **No database cascade.** `nodeId` is a plain FK. A node's `deleteNode` is a *soft* delete (`status: 'deleted'`), and chunk search filters the parent node's status — so a soft-deleted (or archived) node's chunks simply stop surfacing, and `restoreNode` brings them back. Re-chunking is `replaceNodeChunks` (delete + insert). Chunks are hard-removed only when their node is removed for good: when the owner **permanently deletes** it from the Deleted list (`POST /nodes/purge`, v1.38.0), when its node type is deleted (which clears out that type's soft-deleted entries), or at **account erasure**, via the `structure.chunks` deletion handler (generated only on embeddings-enabled installs).
+- **Account export.** On embeddings-enabled installs a `structure.chunks` export handler adds the user's chunk text and provenance — never the vectors — to their account data export (v1.38.0).
 - **Runtime self-heal.** `ensureInfrastructure()` also creates the chunk HNSW index, so the same lazy, idempotent repair covers chunk search.
 - **Shared source nodes.** Chunk readability follows the source node's type, so the chunks of a node whose type is shared are readable by every user — with the creator's `metadata` blanked, and the chunk omitted outright when that type declares any secret field. See [Shared node types in retrieval](#shared-node-types-in-retrieval).
 
@@ -484,7 +485,8 @@ A connection created with `status: 'pending'` is **not live**: it fires `structu
 - **Replace, not merge.** The caller does its own read-modify-write and passes the *full* merged object; Structure sets the field to exactly what is passed. (Read the current connection via `getConnection(id, userId)` — or `getNodeConnections` — change what you need, pass the whole `data` back.)
 - **`userId`-scoped, no silent no-op.** A missing or foreign connection id throws `NotFoundError` — it never quietly does nothing.
 - **Secret fields are re-sealed.** `getNodeConnections` returns *unsealed* `data`, so a round-tripped secret value is sealed again on write (already-sealed envelopes are skipped) — a read-modify-write never persists a plaintext secret.
-- Fires `structure.connection.updated` (`{ userId, connection }`).
+- **Requests are checked more strictly than in-process calls (v1.38.0).** Through `PATCH /connections/:id` the payload is validated against the connection type's fields as a whole record (required fields included), and a locked field cannot be changed. An in-process call keeps the value-shape rules only, with odd values coerced rather than refused — see [In-process writes](#in-process-writes).
+- Fires `structure.connection.updated` (`{ userId, connection }`), with secret values removed from `connection.data` — listeners never receive plaintext; the caller still gets the unsealed data.
 
 ### Cascade behaviour
 
@@ -501,7 +503,7 @@ A connection created with `status: 'pending'` is **not live**: it fires `structu
 
 `getConnectionsForNodes(nodeIds, userId, { status? })` is the **batch edge read** (serviceRegistry-only — no HTTP route): every connection touching any node in `nodeIds` as its from- **or** to-endpoint, in one query — `userId`-scoped, status-filtered (default `['active']`), endpoints **not** hydrated (callers read `fromNodeId` / `toNodeId`). Built for the engine's structural-gap diagnostics, which need all edges over a vertex set (up to ~5000) without an N-query storm; `nodeIds: []` returns `[]`, and there is no `scopeRootId` — the caller supplies an already-scoped vertex set.
 
-`getConnection(id, userId)` reads **one** connection by id (serviceRegistry + `GET /connections/:id`): `userId`-scoped and `nodeType: 'connection'`-guarded (it can never return a plain node), it returns **`null`** — not a throw — when the id is not one of the caller's connections, and unseals secret field values for the owner. It is the read-before-write for the strength / pattern-status updates that finish with `updateConnection` (which re-seals on write).
+`getConnection(id, userId, options?)` reads **one** connection by id (serviceRegistry + `GET /connections/:id`): `userId`-scoped and `nodeType: 'connection'`-guarded (it can never return a plain node), it returns **`null`** — not a throw — when the id is not one of the caller's connections, and unseals secret field values for the owner. As of v1.38.0 it also returns `null` for a soft-deleted edge, and for an edge with an endpoint of a type the caller may not read — unless `options` (`{ isAdmin?, isSystem? }`) marks the caller as an admin or a trusted system caller. It is the read-before-write for the strength / pattern-status updates that finish with `updateConnection` (which re-seals on write).
 
 New and extended endpoints (internal API, session-authed, relative to `/api/v1/structure`):
 
@@ -509,9 +511,9 @@ New and extended endpoints (internal API, session-authed, relative to `/api/v1/s
 |--------|------|-------------|
 | `POST` | `/connections` | Now accepts `origin` and `status` in the body |
 | `GET` | `/connections?status=active,pending&origin=discovered&connectionType=&page=&limit=` | List connections with provenance filters (paginated) |
-| `GET` | `/connections/:id` | Read one connection by id (userId-scoped; 404 on a foreign/absent id) |
+| `GET` | `/connections/:id` | Read one connection by id (userId-scoped; 404 on a foreign, absent or soft-deleted id, or an edge with an endpoint the caller may not read) |
 | `POST` | `/connections/:id/promote` | Promote a pending connection to active |
-| `PATCH` | `/connections/:id` | Replace a connection's `data` and/or `metadata` (userId-scoped; 404s a foreign id) |
+| `PATCH` | `/connections/:id` | Replace a connection's `data` and/or `metadata` (userId-scoped; 404s a foreign id; validated as a whole record) |
 | `GET` | `/nodes/:id/connections?status=&origin=` | Node connections; `status` comma-separated, default `active` |
 
 ### Relation kinds on connection types
@@ -567,17 +569,32 @@ const existing = await structureService.listNodes(
 );
 ```
 
+## In-process writes
+
+Cognitive modules write through the `serviceRegistry` rather than the HTTP routes, and the values they write come from their own code or from a model. One odd value should not abort a whole ingest, so as of v1.38.0 a write that does not come through a request has values that do not fit their field type **coerced rather than refused**. A request sending the same values gets a `400`.
+
+| Value written | Request (HTTP route) | In-process write |
+|---------------|----------------------|------------------|
+| A number or `true`/`false` in a `secret` field | `400` (must be text) | Converted to text, then sealed like any other secret |
+| A `node-reference` value that is not a node id | `400` | Dropped from the write; in a list, only the entries that are not ids are removed |
+| A `field-group` value that is not a list of rows | `400` (must be a list of rows) | A single row object becomes a one-row list, list entries that are not rows are removed, and an empty object or a plain value is dropped from the write |
+| A value too long to test safely against its field's validation pattern | `400` | Stored without running the pattern test |
+
+The same `secret` and `node-reference` rules apply to cells inside field-group rows. Coercion covers node creates (single and bulk), `updateNode`, the data overrides of `duplicateNode`, `createConnection` and `updateConnection`. Every dropped or reshaped value, and every skipped pattern test, is logged as a warning naming the fields. On an update, a value the write leaves **exactly as stored** is never coerced or re-checked, so a read-modify-write that echoes back an older value keeps working. Anything else that does not fit — an object or a list in a `secret` field, say — is still refused.
+
+A few checks are request-only, because in-process callers are trusted module code: the `allowedTypes` check on reference targets, field locks on creates, duplicates and connection writes (`updateNode` applies field locks to every caller), and whole-record validation of connection data.
+
 ## Node-type proposals
 
-A cognitive module that keeps meeting an entity with no matching node type can **propose** one instead of creating it. Proposing is deliberately **non-admin** (it's the low-privilege path); reviewing is admin-only.
+A cognitive module that keeps meeting an entity with no matching node type can **propose** one instead of creating it. Proposing is deliberately **non-admin** (it's the low-privilege path); reviewing through Structure's routes is admin-only.
 
 <Steps>
 
 1. **Propose.** The module calls `POST /types/proposals` (or `structureService.proposeNodeType`). The proposal is stored as a `structure_node_type` row with `proposalStatus: 'pending'` and `isEnabled: false`, owned by the user, with `moduleId` set to the proposer.
 
-2. **Review.** An admin lists pending proposals (`GET /types/proposals`) and approves or rejects each one.
+2. **Review.** An admin lists **every user's** pending proposals (`GET /types/proposals`) and approves or rejects each one.
 
-3. **Go live (or vanish).** Approval clears `proposalStatus` and enables the type — it is live immediately. Rejection **deletes the row**.
+3. **Go live (or vanish).** Approval clears `proposalStatus`, enables the type and trims the proposal metadata to who proposed it and when it was approved — the type is live immediately. Rejection **deletes the row**.
 
 </Steps>
 
@@ -591,20 +608,31 @@ await structureService.proposeNodeType(userId, config, {
 
 Semantics:
 
-- **Slug holding.** A pending proposal holds its slug — `proposeNodeType` raises distinct duplicate errors for a clash with a live type versus a pending proposal, and `createNodeType` cannot claim the slug either.
+- **Slug holding.** A pending proposal holds its slug for the proposing user — `proposeNodeType` raises distinct duplicate errors for a clash with a live type versus a pending proposal, and that user's `createNodeType` cannot claim the slug either. Slugs are per user, so several users can each have a proposal pending under the same slug (see `proposalId` below).
 - **Invariant: pending proposals are invisible everywhere else.** Every other node-type query filters `proposalStatus: null` — `listNodeTypes`, `getNodeType`, `updateNodeType`, `deleteNodeType`, JSON import (merge matching and replace-mode deletion both leave proposals alone), and the node create/update type lookups. A proposal cannot affect any behaviour until approved.
-- **`approveNodeTypeProposal(slug, userId, { scope? })`** — `scope: 'user'` (default) keeps the type owned by the proposing user; `scope: 'system'` promotes it to a shared system type (`userId: null`). Both scopes re-check the slug against **live** types first — one can appear between propose and approve (e.g. via JSON import). Fires `structure.nodeType.proposalApproved` **and** `structure.nodeType.created` — the type goes live now.
-- **`rejectNodeTypeProposal(slug, userId)`** — deletes the row, freeing the slug. The full proposed config rides on the `structure.nodeType.proposalRejected` hook, because "don't re-propose" memory belongs to the proposing module, not Structure.
-- **`listNodeTypeProposals(userId)`** — pending proposals, oldest first, as `NodeTypeProposal` (the config subset plus `proposalMeta`: `{ proposedBy, reason?, sourceContext?, proposedAt }`).
+- **Who can review what (v1.38.0).** The admin routes reach **every user's** pending proposals — the reviewing admin is rarely the proposer — by calling the list and review methods with `allOwners: true`. Without it, an in-process call reaches only the caller's own (and app-level) proposals, which is the per-user queue the cognitive pipeline works from.
+- **`approveNodeTypeProposal(slug, userId, { scope?, proposalId?, allOwners? })`** — `scope: 'user'` (default) keeps the type owned by the proposing user; `scope: 'system'` promotes it to a shared system type (`userId: null`). `proposalId` (the proposal's `id`) picks one proposal when the slug is pending for more than one user; without it an ambiguous slug is refused with a `ConflictError` (`409` over HTTP) rather than acting on whichever row comes first. Both scopes re-check the slug against **live** types first — one can appear between propose and approve (e.g. via JSON import) — and a `'system'` approval is also refused when **another user** already owns a type with that slug, because an app-level type would shadow theirs. Validation patterns are re-checked too (see [Proposal limits](#proposal-limits)). Approval **drops the proposal's `reason` and `sourceContext`** — they served the review only, and an approved app-level type outlives the proposer's account — so the live type's `proposalMeta` keeps only `{ proposedBy, approvedAt }`. Fires `structure.nodeType.proposalApproved` **and** `structure.nodeType.created` — the type goes live now.
+- **`rejectNodeTypeProposal(slug, userId, { proposalId?, allOwners? })`** — deletes the row, freeing the slug; `proposalId` works as for approve. The full proposed config rides on the `structure.nodeType.proposalRejected` hook, because "don't re-propose" memory belongs to the proposing module, not Structure. Both review hooks carry the **proposing user** as `userId` and the **reviewer** as `actorId` (the same user in-process), plus the `proposalId` — so a proposing module records the outcome against the user it proposed for, not the admin who reviewed it.
+- **`listNodeTypeProposals(userId, { allOwners? })`** — the caller's own (and app-level) pending proposals, oldest first, as `NodeTypeProposal`: the config subset plus `id` (the proposal row id), `proposedBy` (the proposing **user's** id) and `proposalMeta` (`{ proposedBy, reason?, sourceContext?, proposedAt }`, where `proposedBy` names the proposing **module**). The admin route lists every user's proposals, at most 200 at a time — reviewing them makes room for the next.
+
+### Proposal limits
+
+The propose route is open to every signed-in user and each proposal waits for an admin, so v1.38.0 bounds what one user can file:
+
+- **Pending cap.** `POST /types/proposals` refuses (`400`) a user who already has **50** proposals awaiting review. In-process callers (the cognitive pipeline) are not capped.
+- **Size.** The route accepts at most 200 fields, 100 attached field-template ids and a 256 KB proposed config (the `proposal` metadata aside), a `reason` of up to 2,000 characters and a `sourceContext` of up to 64 KB. `proposedBy` must be a kebab-case module id of up to 100 characters.
+- **Validation patterns.** A field whose `validation.pattern` could make matching take excessively long is refused (`400`, naming the field) when the proposal is filed — over HTTP or in process — and again on approval, so a proposal stored before the check existed cannot go live with one; reject it instead. The check walks field-group sub-fields too, and caps how many fields and distinct patterns one save may ask it to analyse.
 
 Proposal endpoints (declared before `/types/:slug` so `proposals` is never matched as a slug):
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `POST` | `/types/proposals` | session | Propose a node type (body: node-type config + required `proposal.proposedBy`) |
-| `GET` | `/types/proposals` | admin | List pending proposals |
-| `POST` | `/types/proposals/:slug/approve` | admin | Approve; body `{ scope?: 'user' \| 'system' }` |
-| `POST` | `/types/proposals/:slug/reject` | admin | Reject (deletes the proposal); returns `204` |
+| `POST` | `/types/proposals` | session | Propose a node type (body: node-type config + required `proposal.proposedBy`); returns `201`. Refused past 50 pending proposals per user |
+| `GET` | `/types/proposals` | admin | List every user's pending proposals (oldest first, at most 200); each item carries `id` and `proposedBy` |
+| `POST` | `/types/proposals/:slug/approve` | admin | Approve; body `{ scope?: 'user' \| 'system', proposalId?: string }`. `409` when the slug is pending for several users and no `proposalId` is given |
+| `POST` | `/types/proposals/:slug/reject` | admin | Reject (deletes the proposal); body `{ proposalId?: string }`; returns `204`, or `409` as for approve |
+
+Structure ships no proposal review screen. The frontend `structureService` exposes `listNodeTypeProposals()`, `approveNodeTypeProposal(slug, { scope?, proposalId? })` and `rejectNodeTypeProposal(slug, proposalId?)` for a host or module that builds one.
 
 ## features.cognitiveIngest
 
@@ -636,10 +664,12 @@ Eight hooks join the [Structure action hooks](/modules/structure/integration/#re
 | `structure.node.chunksReplaced` | `{ userId, nodeId, count }` | A node's chunk set is replaced by `replaceNodeChunks` |
 | `structure.chunk.embeddingUpdated` | `{ userId, chunkId, embeddingModel }` | A chunk embedding is stored by `setChunkEmbedding` |
 | `structure.nodeType.proposed` | `{ userId, proposal }` | A node type is proposed |
-| `structure.nodeType.proposalApproved` | `{ userId, nodeType, scope }` | A proposal is approved (the type is live) |
-| `structure.nodeType.proposalRejected` | `{ userId, slug, config, meta }` | A proposal is rejected — carries the full proposed config |
+| `structure.nodeType.proposalApproved` | `{ userId, actorId, proposalId, nodeType, scope }` | A proposal is approved (the type is live) |
+| `structure.nodeType.proposalRejected` | `{ userId, actorId, proposalId, slug, config, meta }` | A proposal is rejected — carries the full proposed config |
 
 The three embeddings hooks — `structure.node.embeddingUpdated`, `structure.node.chunksReplaced` and `structure.chunk.embeddingUpdated` — are declared only on embeddings-enabled installs; the other five are always registered.
+
+On the two review hooks, `userId` is the **proposing user** and `actorId` the **reviewer** (v1.38.0) — different when an admin reviews another user's proposal, the same in-process. Connection hook payloads (`structure.connection.proposed`, `promoted`, `created` and `updated`) carry the connection's `data` with secret values removed; the service caller still gets the plaintext.
 
 <Aside type="note" title="Amended semantics: created means went live">
 `structure.connection.created` and `structure.nodeType.created` now mean **"went live"** — they fire when something is created directly as active, *or* at promotion/approval. Listeners never hear `created` for a pending row, so existing listeners keep working unchanged.

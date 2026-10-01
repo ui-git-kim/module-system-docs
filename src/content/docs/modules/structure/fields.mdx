@@ -466,7 +466,7 @@ The `fields` array on the field definition contains the sub-field schema — eac
 }
 ```
 
-Renders as a list of `<Card>` components, each containing the sub-fields. An "Add" button appends a new empty row. Each row has a remove button.
+Renders as a list of `<Card>` components, each containing the sub-fields. An "Add" button appends a new empty row. Each row has a remove button. In the read-only detail view each row's sub-fields render through the read-only field renderer, so a `secret` sub-field is masked (with a reveal toggle) rather than printed raw (v1.38.0).
 
 **Stored value:**
 
@@ -477,12 +477,15 @@ Renders as a list of `<Card>` components, each containing the sub-fields. An "Ad
 ]
 ```
 
+**The value must be a list of rows (v1.38.0).** Each row is a plain object (or `null`). A request write that sends anything else — a single row object, or a list holding entries that are not rows — is refused with **400** (`must be a list of rows`), because encryption, the field locks and secret stripping all work row by row. A module writing in-process is not refused: a single row object is wrapped as a one-row list and non-row entries are dropped, with a server warning. A value already stored in the old single-object form is still sealed and stripped correctly, and is only re-checked when a write changes it.
+
 <Aside type="caution" title="required is top-level only">
 `required` (and `requiredWhen`) on a **sub-field** is not enforced. Neither the form's submit check nor
 the server-side validator descends into repeater rows — the client's missing-required scan is documented
 as top-level only, and the server skips every def carrying a group as well as the `field-group` type
 itself. A blank required sub-field still saves, so treat it as documentation of intent or validate rows
-in your own module.
+in your own module. (What does reach into rows: the `secret` and `node-reference` value rules, the
+`allowedTypes` check and `editableBy` locks.)
 
 `visibleWhen` on a sub-field **does** work: each sub-field is evaluated against the row merged over the
 node's data, so a condition can reference either a sibling in the same row or a top-level field.
@@ -541,6 +544,8 @@ Stores an array of node ID strings: `["clu1abc...", "clu2def..."]`.
 </Tabs>
 
 Renders as a `<NodeSelector>` component — a searchable dropdown that fetches nodes from the API. When `multiple` is true, each selected node appears as a row with its own selector and a remove button, plus an "Add" button to append more.
+
+**Value rules (v1.38.0).** The value must be a node id — letters, digits, `-` and `_`, at most 100 characters — or a list of them; an empty string marks an unset slot. Anything else in a request write is refused with **400** (`must be a node id`). When `allowedTypes` is set, a request write — create, update, duplicate, a connection's fields, or the public API — is also checked against it: each id the write **adds** must be an existing entry (the caller's own, or one of a shared type) whose type is one of `allowedTypes` or a subtype of one, otherwise the write is refused with 400 naming the field. Ids already stored in the field are not looked up again, and one write may add at most 5,000 distinct targets. A field with no `allowedTypes` is not type-checked. Both rules also apply to a `node-reference` sub-field inside field-group rows. A module writing in-process is not refused: a value that is not a node id is dropped from the write with a server warning, and `allowedTypes` is not checked.
 
 ---
 
@@ -613,12 +618,21 @@ Renders as a masked `<input type="password">` with three action buttons:
 - **Generate** — create a new random secret using the configured charset and length
 - **Copy** — copy the current value to clipboard (shows a checkmark on success)
 
+In the read-only detail view the value is masked (`••••••••••`) with a reveal toggle — a `secret` sub-field inside a [`field-group`](#field-group) row included.
+
+**The value must be text (v1.38.0).** A secret value is a string; `null` or `''` clears it, and a sealed envelope echoed back from a list read is accepted unchanged. A number, true/false, list or object in a request write is refused with **400** (`must be text`), at the top level and inside field-group rows — only a string is encrypted, so anything else would be stored in the clear. A module writing in-process has a number or true/false value converted to text (and so encrypted) instead.
+
 <Aside type="note" title="Encrypted at rest (v1.19.0)">
 Values of `secret` fields are **encrypted before they are stored**, using the starter's
 `encryptField` (AES-256-GCM, key from env/KMS, never in the database — see
 [Security Feature](/starter-template/security-feature/)). The stored shape is
 `{ "__sealed": "<envelope>" }`, so a sealed value is unambiguously detectable.
 
+- **A key is required** (v1.38.0): Structure encrypts secret values at every security tier — even
+  where the host's own field encryption is off — so the server needs a ready key provider, normally
+  `SECURITY_ENCRYPTION_KEY` (base64, 32 bytes). If that key is missing or invalid, a write carrying a
+  new secret value answers **503** with code `encryption_key_missing` instead of an opaque 500, and
+  nothing is stored unencrypted.
 - **Decryption is narrow**: only the owner's node **detail** read (`GET /nodes/:id`) returns the
   plaintext. Node list and tree responses deliberately keep the sealed envelope. Secret fields on
   **connection** types are the exception — the connection **list** endpoints unseal too, because a
@@ -630,7 +644,13 @@ Values of `secret` fields are **encrypted before they are stored**, using the st
 - **Nested secrets count too**: a `secret` sub-field inside a [`field-group`](#field-group) row is
   sealed and unsealed at `data[group][i][subId]` — the field resolver recurses one level into
   sub-fields for exactly this reason (v1.30.1).
-- A tampered or key-rotated envelope decrypts to an empty string rather than leaking the envelope.
+- **Undecryptable values are kept** (v1.38.0): an envelope the owner's read cannot open — tampered,
+  or sealed under a key the server no longer has — comes back as an opaque
+  `{ "__unreadable": "<tag>" }` marker, never the envelope and never an empty string. The edit form
+  shows an empty input with a "cannot be decrypted" notice, and the read-only view says *Stored value
+  cannot be decrypted*. Until someone enters or generates a new value, saving the entry — including
+  re-sending a whole field-group — puts the stored envelope back rather than wiping it, so the right
+  key can still recover it.
 </Aside>
 
 ### media — provided by a storage module
@@ -714,7 +734,14 @@ A node-view is carried **opaquely** — there is still no member-access operator
 **Similarity** is the anchor use case — numeric similarity is a plain formula (`numericSimilarity({a}, {b})`), string/set similarity uses `stringSimilarity` / `jaccard`, and **node-to-node semantic similarity** uses `semanticSimilarity({node_a}, {node_b})`, which returns the cosine similarity (0–1) of two nodes' embeddings off the module's [vector search](/modules/structure/). Where embeddings are not enabled, `semanticSimilarity` resolves to nothing.
 
 <Aside type="caution" title="Computed fields cannot reference secrets">
-A computed value — a `name` / `slug` / `description` `computedTemplate` or `calcConfig` formula, or a computed data field — is stored **unencrypted** and returned by the public API, so it must not reference a `secret`-typed field. As of **v1.37.3 this is enforced**: saving, proposing or **importing** a node type whose computed field references a secret token — `{secret}`, `{group.sub}` or `{ref->secret}`, whether the secret is the type's own, inherited, or from an attached field template — is rejected with a clear error (the admin form blocks it too). The one static shape that is *not* caught is a dynamic lookup — `pluck(nodes({refs}), 'aSecret')`, where the field name is a runtime string rather than a token — so don't derive a stored value that way. Traversal node-views (`children` / `scope` / `connections`) are additionally **stripped of secret-field values** (v1.37.2), so `pluck` / aggregation over them never surfaces one.
+A computed value — a `name` / `slug` / `description` `computedTemplate` or `calcConfig` formula, or a computed data field — is stored **unencrypted** and returned by the public API, so it must not reference a `secret`-typed field. As of **v1.37.3 this is enforced** on save: creating, updating, proposing, approving or **importing** a node type whose computed field references a secret token — `{secret}`, `{group.sub}` or `{ref->secret}` — is rejected with an error naming the field. The admin forms flag most cases before you save; the server check is the authoritative one. Since **v1.38.0** it covers:
+
+- every computed field the type's form evaluates — its own, those from attached field templates, and those inherited from parent types;
+- every secret those fields can reach — the type's own, its attached templates' and its inherited secret fields; a field-group holding a secret sub-field (its `{group}` token returns the rows, secrets included); and `{ref->secret}` / `{ref->group}` through a node-reference, checked against the allowed types' fields when `allowedTypes` is set and against **every** type's secrets when it is not;
+- connection types, whose computed fields are checked against the connection's own fields (there, a secret named `name`, `description` or `slug` counts too — connections have no built-in columns);
+- field templates — saving one re-checks every node type and connection type that attaches it — and dependent types: saving a type re-checks the types that inherit from it, and a save that adds a secret re-checks the types whose computed fields could now reach it. The error names the affected type.
+
+At runtime a formula is not handed secret values either. A node fetched by id — for `nodes()` or a `{ref->field}` deref — has every secret-typed field removed (field-group cells included) before the formula sees it, and traversal node-views (`children` / `parents` / `scope` / `connections`) drop every sealed or undecryptable value (v1.37.2). So a dynamic lookup such as `pluck(nodes({refs}), 'aSecret')` — where the field name is a runtime string the save-time check cannot see — resolves to nothing rather than the secret (v1.38.0). If a fetched node's type has not loaded in the browser yet, its data fields read blank and the computed result is not saved until the types load.
 </Aside>
 
 <Aside type="note">
@@ -785,7 +812,7 @@ These settings apply to **all field types**. They control identity, display, lay
 |---------|------|---------|-------------|
 | `required` | `boolean` | `false` | Whether the field must have a value. Enforced on the node and connection create/edit forms as of v1.33.19 — submit is blocked and the missing fields are listed |
 | `requiredWhen` | `object` | — | Make the field required **only when a condition holds** — same shape as `visibleWhen` (single condition or `rules[]` with `logic`). Combines with `required`; a field hidden by `visibleWhen` is never treated as required. Enforced on submit (v1.33.19) |
-| `defaultValue` | `unknown` | — | Default value for a **connection** field — the Add Connection dialog seeds a new connection from it (v1.14.0). **Not applied on node create**: the node create sheet opens with every custom field empty, and the API stores only what is submitted. On a `hidden` field it also pre-fills the muted input on create/edit forms when nothing is stored. The admin field editor exposes it for every type except `field-group`, `section-break` and `secret` |
+| `defaultValue` | `unknown` | — | Default value for a **connection** field — the Add Connection dialog seeds a new connection from it (v1.14.0). **Not generally applied on node create**: the node create sheet opens with every custom field empty, and the API stores only what is submitted. The exception (v1.38.0): on a request create — node or connection — a top-level field that is [`editableBy`-locked](#visibility--behaviour) for the caller and left absent or empty is filled with its default by the server. On a `hidden` field it also pre-fills the muted input on create/edit forms when nothing is stored. The admin field editor exposes it for every type except `field-group`, `section-break` and `secret` |
 | `validation` | `object` | — | Validation rules (see below) |
 
 **Validation object:**
@@ -794,27 +821,53 @@ These settings apply to **all field types**. They control identity, display, lay
 |----------|------|-------------|
 | `min` | `number` | Minimum. On `number` it applies as the HTML `min` attribute (value bound); on `text`, `email`, `url`, and `textarea` it applies as the HTML `minLength` attribute (character length). Enforced on the input by the browser as of v1.20.0 |
 | `max` | `number` | Maximum. On `number` it applies as the HTML `max` attribute (value bound); on `text`, `email`, `url`, and `textarea` it applies as the HTML `maxLength` attribute (character length). Enforced on the input by the browser as of v1.20.0 |
-| `pattern` | `string` | Regular expression pattern. Applied as the HTML `pattern` attribute on `text`, `email`, and `url` inputs and enforced by the browser as of v1.20.0 |
+| `pattern` | `string` | Regular expression pattern. Applied as the HTML `pattern` attribute on `text`, `email`, and `url` inputs and enforced by the browser as of v1.20.0, and on the server (below). A pattern that could backtrack catastrophically is refused when saved — see **Pattern safety** below (v1.38.0) |
 | `message` | `string` | Custom validation message. Surfaced via the input's `title` attribute (native browser tooltip) on `text`, `email`, `url`, and `textarea` |
 
 **Enforced server-side (v1.33.31).** The browser attributes and the form's submit check are convenience
 layers — since v1.33.31 `POST /nodes` and `PATCH /nodes/:id` (and the bulk create path) validate the
 submitted `data` blob against the type's resolved field definitions and reject the first violation with
-**400**, naming the offending field:
+**400**, naming the offending field. Since v1.38.0 the same checks also run on a duplicate's data
+overrides and, for request writes, on a connection's fields — `POST /connections` (single and bulk) and
+`PATCH /connections/:id`, which replaces the whole record and so is checked like a create:
 
 - unconditional `required` presence — on create for every field, on update whenever the key is supplied
   (so a required field cannot be cleared to empty);
 - `number` — must parse as a finite number, and honours `validation.min`/`max` as value bounds;
 - `boolean` / `toggle` — must be a real boolean;
 - `select` / `multiselect` — the value (or every array member) must be one of the declared `options`;
-- every other string-valued type — `validation.min`/`max` as character length, plus `validation.pattern`,
-  with `validation.message` used as the error text on a pattern failure.
+- every other string-valued type — `validation.min`/`max` as character length, plus `validation.pattern`
+  (see **Pattern safety** below), with `validation.message` used as the error text on a pattern failure;
+- `secret`, `node-reference` and `field-group` — value-shape rules only (v1.38.0): text, node ids, and a
+  list of rows — see [`secret`](#secret), [`node-reference`](#node-reference) and [`field-group`](#field-group).
 
-Not covered server-side: `requiredWhen` (the submit check is client-side only), field-group sub-fields, fields with a
-`computedTemplate`, and the `formula`, `section-break`, `hidden`, `field-group` and `secret` types.
-A field carrying a `visibleWhen` is skipped for the **required** check only — it may legitimately be
-hidden — but all of its value checks above still run. Data keys with no matching field definition are
-ignored.
+On an update (v1.38.0) only the values the write **changes** are checked: a value left exactly as stored
+passes, so a value saved before a rule existed does not block an unrelated edit.
+
+Not covered server-side: `requiredWhen` (the submit check is client-side only), field-group sub-fields
+(beyond the value-shape rules), fields with a `computedTemplate`, and the `formula`, `section-break` and
+`hidden` types. A field carrying a `visibleWhen` is skipped for the **required** check only — it may
+legitimately be hidden — but all of its value checks above still run. Data keys with no matching field
+definition are ignored.
+
+**Pattern safety (v1.38.0).** Because `validation.pattern` runs on the server, a pattern that can
+backtrack catastrophically — one that can match the same text in very many different ways, such as the
+nested repeat `(a+)+` — is **refused when it is saved**, with a 400 naming the field. The check runs on
+every path that saves field definitions: node types (field-group sub-fields included), field templates,
+connection types, the type and config imports, and node-type proposals and their approval. A pattern
+longer than 500 characters, one that is not a valid JavaScript regular expression, and one too complex to
+analyse are refused the same way, and one type, template or connection type may carry at most 50
+distinct patterns and 2,000 fields (field-group sub-fields included). Everyday shapes — email addresses, URLs, phone numbers, postcodes, IPv4 addresses,
+slugs such as `^[a-z0-9]+(?:-[a-z0-9]+)*$` — pass.
+
+- A **stored** pattern the check flags (one saved before v1.38.0) is not run: the server logs a warning
+  naming the field and accepts values without the pattern test until the pattern is fixed. The browser
+  still applies it as the input's `pattern` attribute.
+- A safe pattern runs only on a value of bounded length: up to 100,000 characters when its matching time
+  grows linearly with the value (lower, down to 1,000, for patterns with wide counted repeats), and, when it can grow faster (for example `^.+@.+$`), 1,000 characters
+  or the field's `validation.max` if that is longer, never more than 5,000. A longer value in a request
+  is refused with 400 (`too long to validate`); a module writing in-process skips the pattern test with a
+  warning instead.
 
 ### Layout
 
@@ -850,7 +903,7 @@ explicitly if you want them to match.
 |---------|------|---------|-------------|
 | `isHidden` | `boolean` | `false` | Hide the field from user-facing forms. The field still stores data in the node's `data` object, but the input is not rendered. Works on any field type |
 | `defaultCollapsed` | `boolean` | `false` | Render the field collapsed by default under a label + chevron; the user expands to reveal the input. The "hidden until revealed" complement to `visibleWhen`. Works on any field type (a whole `field-group` collapses too), in both edit and read-only. Added in v1.26.0 |
-| `editableBy` | `'anyone' \| 'admin' \| 'system'` | `'anyone'` | Per-field access control. `anyone` lets any user edit; `admin` restricts editing to admins; `system` makes the field API/module-only and read-only in forms. **Enforced server-side as of v1.19.0** — see below |
+| `editableBy` | `'anyone' \| 'admin' \| 'system'` | `'anyone'` | Per-field access control. `anyone` lets any user edit; `admin` restricts editing to admins; `system` makes the field API/module-only and read-only in forms. **Enforced server-side** — on update since v1.19.0, and on create, duplicate and connection writes since v1.38.0 — see below |
 | `computedTemplate` | `string` | — | [Merge template](/modules/structure/merge-fields/) that auto-computes this field's value from other fields. When set, the field becomes read-only |
 | `calcConfig` | `{ formula, precision?, prefix?, suffix? }` | — | Config for the [`formula`](#formula) field type — a safe calculation over merge-field tokens + the function library. The field is read-only |
 | `visibleWhen` | `object` | — | [Conditional visibility](/modules/structure/merge-fields/#conditional-visibility) rules that show or hide this field based on other field values |
@@ -860,23 +913,48 @@ explicitly if you want them to match.
 Use `section` to group related fields together visually, and `section-break` fields to add labelled dividers between groups. Combine `width: 'half'` fields to lay out two fields side by side in the form.
 </Aside>
 
-<Aside type="caution" title="editableBy is enforced server-side (v1.19.0)">
-`PATCH /nodes/:id` now rejects writes to locked fields with **400**, naming the offending field —
-`system` fields are refused for everyone, `admin` fields for non-admins. Before v1.19.0 the lock was
+<Aside type="caution" title="editableBy is enforced server-side">
+A write that sets or changes a locked field is refused with **400** (`Field "x" is not editable`) —
+`system` fields for everyone, `admin` fields for non-admins. Before v1.19.0 the lock was
 **browser-only**: the form hid the input, but a direct API call wrote the value happily.
+
+- **Update** (`PATCH /nodes/:id`, since v1.19.0) — since v1.38.0 only a **change** to a locked value is
+  refused. A value submitted unchanged passes, including the locked cells of a field-group, which is always
+  re-sent whole. Field-group rows are compared by their non-empty locked values in order, so adding or
+  removing a row whose locked cell is empty is fine, but adding, removing, changing or reordering a
+  non-empty locked value is not.
+- **Create** (`POST /nodes`, bulk create, the public API and `POST /connections` single and bulk, since
+  v1.38.0) — a locked field may be absent, empty, or exactly its configured `defaultValue`. A top-level
+  locked field left absent or empty is **filled with its default**, so a required locked field with a
+  default never blocks the create. A required locked field with **no** default cannot be filled by a
+  caller it is locked for, so that caller cannot create the entry or connection — the node create form
+  lists the field as missing, and the Add Connection dialog explains why it cannot add that type.
+- **Duplicate** (since v1.38.0) — data overrides may not change a locked value from the source entry's.
+- **Connection update** (`PATCH /connections/:id`, since v1.38.0) — the payload replaces the stored
+  fields, so leaving out a locked field that holds a value counts as changing it.
+
+The forms render a locked field read-only — in the Add Connection dialog and inside field-group rows
+too. The create, duplicate and connection checks bind request callers; a module writing in-process
+through the service is not checked there. Updates are checked for every caller, as before.
 
 Two consequences for integrators:
 - A module or script that writes a `system` field through the node API must move to a path that
-  legitimately owns it (a service call, or an `admin` lock plus an admin caller).
+  legitimately owns it (an in-process create through the service, which is not lock-checked, or an
+  `admin` lock plus an admin caller). No node update can change a `system` value — `updateNode` checks
+  every caller.
 - **Public API-key callers are never treated as admins**, so a key cannot write an `admin`-locked
   field regardless of who owns the key.
 
-A field with a `computedTemplate` (or a `formula`-type field) renders read-only in every form, but its
-`editableBy` is **unchanged and it is not locked server-side** — the client resolves the value and
-submits it, and the API accepts it. That is the same client-computes / server-accepts trust model
-documented for the [`formula`](#formula) type, and the backend calls it out explicitly for the
-built-in `name` / `description` / `slug` fields too. Set `editableBy: 'system'` yourself if you also
-want the API to refuse writes.
+A field with a `computedTemplate` (or a `formula`-type field) renders read-only in every form, but it
+is **not locked server-side**, on create or update — the client resolves the value and submits it,
+and the API accepts it. That is the same client-computes / server-accepts trust model documented for
+the [`formula`](#formula) type, and the backend applies it to the built-in `name` / `description` /
+`slug` fields too (a computed built-in is not locked just for being computed). Since v1.38.0 a computed
+**custom** field stays unlocked even when it carries `editableBy: 'admin'` or `'system'`: the forms
+auto-submit the computed value, so locking it would refuse every create, and every edit of one of its
+inputs. The built-ins differ: an `editableBy` lock on `name`, `description` or `slug` still holds on
+update, where the server ignores a change to the locked value rather than refusing the write. What a
+computed field may copy is policed instead by the [secret guard](#formula).
 </Aside>
 
 ---
@@ -904,7 +982,7 @@ Attached template fields become part of the type's **effective fields** — they
 A type's own field with the same `id` overrides a template's; a template's overrides an inherited one. Field templates are **attach-only** — they are not inherited through `superClasses`; a subtype that wants a bundle attaches it directly.
 
 <Aside type="note">
-Template fields are first-class for **security**: a `secret`-type field in an attached template is encrypted at rest, and an `editableBy: 'admin' | 'system'` template field is enforced on write — exactly like a field declared on the type itself. Deleting a field template simply stops attaching types from receiving its fields (existing node data is untouched).
+Template fields are first-class for **security**: a `secret`-type field in an attached template is encrypted at rest, and an `editableBy: 'admin' | 'system'` template field is enforced on write — exactly like a field declared on the type itself. Since v1.38.0 an attached template's fields resolve for **every** user of the type, whichever admin owns the template, so this holds on app-level types too. Deleting a field template simply stops attaching types from receiving its fields (existing node data is untouched). Erasing the template owner's account is different: the template's fields are first copied into every surviving type that attaches it (app-level types and other admins' types), so those types keep them.
 </Aside>
 
 ---
