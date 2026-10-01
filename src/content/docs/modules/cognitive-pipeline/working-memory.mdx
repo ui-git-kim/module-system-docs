@@ -1,7 +1,7 @@
 ---
 title: Working Memory
 description: The shared working-memory surface — a Structure-backed active set and notes that any module contributes to and reacts to via hooks
-lastUpdated: 2026-08-09
+lastUpdated: 2026-10-01
 sidebar:
   order: 3.5
   label: "Working Memory"
@@ -18,7 +18,7 @@ Working memory is the cross-module answer to **"what is the user working on righ
 | **Structure** | Stores the state — the `working-memory` node, its origin-`active` connections, and `data.notes`. Working memory adds no tables. |
 | **Cognitive Pipeline** | Owns the node type, the hook surface, and the orchestrating `workingMemory` service. It orchestrates and never stores records. |
 | **Any module** | Contributes items via the `assemble` filter, shapes context via the `context` filter, reacts via the action hooks. |
-| **The engine** (Phase 3) | Plugs in as a contributor like any other module — token-aware trimming in the `context` filter, consolidation from `updated` events. |
+| **The engine** (Phase 3) | Plugs in as a contributor like any other module — token-aware trimming in the `context` filter. Its consolidation reads the co-retrieval events `retrieve()` records, not the `updated` events (see [Consolidation & retention](#consolidation--retention)). |
 
 <Aside type="note">
 Backend-only in v1.12.0 — there are no HTTP routes and no dedicated frontend UI. Working-memory nodes render through the generic Structure node UI; presentation is a Phase 4 concern.
@@ -302,15 +302,31 @@ The full flow at the seam of a chat or LLM call:
 
 3. **Get context.** Call `getContext(userId, { sessionNodeId, maxTokens })`. The base context (notes + weight-ordered items) runs through the `context` filter, where modules add sections, re-rank, or trim. A second `updated` fires with `change.type: 'context'` carrying the usage summary (`itemIds`, `sections`, `maxTokens`).
 
-4. **Consume.** Feed the returned `WorkingMemoryContext` to the chat/LLM call. Listeners on `updated` (the engine, Phase 3) consolidate from the two change payloads.
+4. **Consume.** Feed the returned `WorkingMemoryContext` to the chat/LLM call. Listeners on `updated` can act on the two change payloads — the `context` one is a usage summary for them. Consolidation does not read these; it reads the co-retrieval events `retrieve()` records (see below).
 
 </Steps>
 
 ---
 
+## Consolidation & retention
+
+The engine turns repeated co-retrieval into `co-activated` graph edges. Its input is the co-retrieval events that `retrieve()` records in `cog_working_memory_events` — not the `updated` events above.
+
+<Aside type="caution" title="Wired, not yet live">
+Consolidation runs only when a working-memory session ends — the `session.ended` listener triggers it — so `endSession` must be called for it to run. Nothing in the app calls `endSession` yet. Until something does, events are recorded and pruned, but no `co-activated` edge forms.
+</Aside>
+
+- **Before engine 1.12.19, nothing formed.** Every co-retrieval event write and every consolidation read failed inside the engine (the module logged and skipped them), so no `co-activated` edge ever formed. Module v1.22.25 bundles engine 1.12.25, which includes the fix.
+- **What `retrieve()` records.** Under Structure-native storage, when a retrieval returns two or more nodes, it records one `'retrieved'` event for each of the top 10 nodes, listing the other node ids. An event holds node ids and the trigger only — never the query text. `retrieve()`'s optional `sessionId` labels the events; consolidation is user-wide either way.
+- **Retention — 7 days.** `retrieve()` prunes the user's aged events (at most every 6 hours per user), and backend startup sweeps everyone's. The **Ingest → Stats** tab shows how many events are kept. The table is indexed on `[userId, createdAt]`.
+- **What consolidation does.** It runs the engine's user-wide `consolidate()`. Once a pair of nodes has 3 settled co-retrievals (at least a few seconds old) in the 7-day window, it creates a `co-activated` connection with origin `consolidation` and a strength of co-retrievals ÷ 10, capped at 0.8. It strengthens an edge by 0.05 only after 3 new co-retrievals since the last one it absorbed, never lowers a value, and touches only its own edges.
+- **Erasure.** From v1.22.25, `cog_working_memory_events` is declared in the module's security data categories (its rows were already erased with the account).
+
+---
+
 ## Requirements & Notes
 
-- **Structure v1.16.0 or later, runtime-gated.** The service probes for the v1.16 cognitive-foundations surface (`getCognitiveCapabilities`) and throws `structure-version: working memory requires the structure module v1.16.0 or later` on older hosts — on those, the `origin` option would be silently ignored and active-set queries would return untagged garbage. The module declares `depends: { structure: '>=1.16.0' }`.
+- **Structure v1.16.0 or later, runtime-gated.** The service probes for the v1.16 cognitive-foundations surface (`getCognitiveCapabilities`) and throws `structure-version: working memory requires the structure module v1.16.0 or later` on older hosts — on those, the `origin` option would be silently ignored and active-set queries would return untagged garbage. The module itself declares `depends: { structure: '>=1.36.13' }` — raised from `>=1.16.0` for the engine's exact-name entity dedup.
 - **Sessions are `parentId`-linked only.** The per-session working-memory node is a child of the session node — there is no session-link connection (see [Granularity](#granularity)).
 - **`endSession` sweeps before archiving.** `archiveNode` does not cascade to connections, so `endSession` deletes the ephemeral active-set edges first — otherwise stale origin-`active` edges would pollute every content node's connection list — then archives the node. A re-opened session finds and restores the archived node via `ensureNode`.
 - **Deleted-session recovery.** Deleting a session node cascades its working-memory child to status `deleted`, and restoring the session does **not** restore children. `ensureNode`'s restore ladder therefore covers `deleted` as well as `archived` — the dead row is found and restored instead of colliding with the `[userId, parentId, name]` unique constraint.
