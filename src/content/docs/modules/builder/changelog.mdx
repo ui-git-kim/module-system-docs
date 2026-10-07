@@ -11,9 +11,58 @@ All notable changes to the Block Builder module are documented here.
 
 ---
 
+## v1.32.0 — October 2026
+
+**Current release.** Aligned with **starter v2.13.0** and **structure v1.37.5**, driven by a five-dimension alignment audit (42 findings, every one adversarially verified) and a second adversarial review of the change itself (25 further findings fixed). Verified on clean starter 2.13.0 hosts with structure **1.37.5 and 1.38.0**: 0 type errors on both sides, and a production build with every builder page in its own lazy chunk.
+
+<Aside type="caution" title="Breaking: requires starter ≥ 2.13.0 and structure ≥ 1.37.5">
+The builder now uses the starter's `@/components/data-table`, `react-router` v8, `requireWebSession`, `securityRegistry.registerExportHandler` and `getApiErrorMessage`, so it **will not compile on an older starter**. `depends` is now `{ structure: '^1.37.5' }` (was `'*'`). Update in this order, each in the foreground:
+
+1. `template:update` the host to starter 2.13.0
+2. `npx structure update` (to ≥ 1.37.5)
+3. `npx builder update` — approve removing the orphaned `structure-hooks.registration.ts` when asked (it's inert either way)
+4. Restart the backend. The first boot runs `initBuilderModule()` for the first time (see below).
+
+**Registry URLs changed** to `https://<handle>.<domain>/api/v1/r/…`, and **registry tokens minted before this version are retired**. Nothing could have installed from the old `/r/…` URLs or used those tokens (see the first fix), so: re-copy the `components.json` snippet from each project's Registry tab and, for a private project, generate a new token.
+</Aside>
+
+### Five breaks that had existed silently
+
+Every one of these type-checked cleanly — which is how they survived.
+
+- **The public registry was never reachable.** The `/r` router was registered with `versions: []`, which the starter's route registry treats as *mount nothing*, so no registry URL ever answered — every v1.31.10–v1.31.13 registry feature was dark. It's now mounted at **`/api/v1/r`** with `allowNoOrigin` (the shadcn CLI sends no `Origin` header, which the production CORS gate otherwise refuses), and the Registry tab and the listing's item URLs use the new path.
+- **`initBuilderModule()` never ran.** Since a January 2026 scaffold change nothing called it — the scaffold's `hasInit` flag only exports it — so seeding, the slug-lock retrofit and the first pristine sync never happened. It now runs from the gateable `init` the builder registers with the host's `moduleRegistry` (contract v1.3.0), which also mounts the public registry and subscribes the structure hooks, so a disabled builder stops all three.
+- **Projects never got a slug.** structure never generates one, and the builder's slug lock then made `null` permanent — so the namespace was `@null` and nothing resolved. The builder now assigns a kebab-case slug from the project name on every create path (a `structure.node.beforeCreate` filter, plus `node.created` / `nodes.bulkCreated` listeners for bulk creates), when the project node type changes, and in a boot backfill.
+- **A restorable delete destroyed the project's data.** structure 1.37.x deletes are soft (`status: 'deleted'`), but the builder hard-deleted the project's blocks, categories, collections and component snapshot on `structure.node.deleted`, so a restored project came back empty. That handler is gone: `/api/v1/r` serves only `status: 'active'` projects and attaching new data requires an active project. The data is erased when the project is **purged** — a new `structure.node.purged` handler for structure 1.38.0's permanent delete — or when the account is deleted.
+- **BuilderPage never applied the project theme.** It read `data.node` from structure's `GET /nodes/:id`, which returns the node itself — so the canvas preview never got the project's theme or dark mode. It now uses structure's `useNode` (sharing the node cache with the Registry tab).
+
+### Starter 2.13 conventions
+
+- **DataTable** — the admin page's native-components table (tree rows via `getSubRows`, a root-only Category filter, the source-update check in `toolbarEnd`, a destructive Delete with `confirm`), the **Component Sources** panel (bulk *Sync to Builder*, Type facet) and the **Field Templates** panel (now edited in an `AdminSheet`, and its Delete finally asks first) all moved onto `@/components/data-table`. AdminDataTable no longer exists in the starter.
+- **`react-router` v8** imports throughout; **`getApiErrorMessage`** for every API-failure toast and hook `error`, so users see the server's message (including `web_session_required`) instead of "Request failed with status code 403".
+- **Security** — the registry token mint / reveal / revoke, visibility and handle-claim routes require a **web session** (`requireWebSession`); a device token gets `403`. `/api/v1/r` accepts **only a sealed envelope bound to that project** (AAD `builder.registryToken:<projectId>`), so neither plaintext nor an envelope planted or copied through structure's generic node `PATCH` can become a working token. Tokens now live under `data.registryAccessToken`. A **personal-data export handler** contributes blocks, categories, collections and the handle to the account export. The deletion handler now also erases component snapshots (`order: 40`, ahead of structure's). The registry resolves handles from the raw `Host` header against a new backend `REGISTRY_DOMAIN` env var instead of `req.hostname` (which honours a client-supplied `X-Forwarded-Host` behind `trust proxy`), treats reserved labels (`api.`, `www.`, …) as the app rather than a handle, and adds `Host` and `Authorization` to `Vary`. **Production: set `REGISTRY_DOMAIN` in the backend's environment** if your registry domain isn't the default `usefoundryui.app` — `npx builder update` only writes the local `.env`. Legacy `preferences.handle` values are migrated once, which switches off an unindexed user-table scan on the public path.
+- **Lifecycle & data integrity** — a duplicated project (or a project inside a duplicated subtree) no longer inherits the original's bearer token and gets a clean slug; a merged project's blocks follow it to the canonical, row by row; a boot sweep strips tokens copied between projects. Duplicating a block fires `builder.block.created`; native-component actions carry the admin actor; new `builder.component.imported` and `builder.handle.claimed` hooks; registry writes bump `updatedAt` and log `audit: true` lines; `auditEvents` declared.
+- **Structure integration** — every tab, widget, badge and column is project-only (`isVisible` against one project node type, cached synchronously and loaded post-auth via `shellInitRegistry`); the block count is **persisted** to node metadata, so the Blocks column and card badge finally work on list views; the dead node actions and `getBadge` are removed; the Registry and Blocks tabs and the overview widget are owner-only on shared types; `NodeSelector` uses `variant="dialog"` inside the save dialog. The *All node types* setting is gone — one type serves the registry, slugs and tabs (an install that used *All* gets a boot warning listing where other blocks live).
+- **Bundle** — the frontend barrel no longer re-exports `BuilderPage` / `BlocksLibraryPage` / `CanvasPage` (a static re-export pinned CanvasPage's full lucide runtime scope into whichever chunk imported the barrel); the admin page is lazy; palette icons resolve through the starter's `IconRenderer` (one lazy chunk per icon shown) instead of lucide's whole namespace — with lucide's canonical keys, so digit names like `MousePointer2` still resolve.
+- **UI standards** — `Spinner`, `SectionHeader`, `PageHeader`, `Card size="sm"`, `Tabs` (`line`) for the preview and property-panel tab bars, `Collapsible`, `Input` with `aria-invalid`, `SelectTrigger size="sm"`; the no-op `text-xs` restyles on `Badge`/`Input` removed; the colour literals and `!important` widths replaced with semantic tokens and variant-scoped classes; a first, no-visual-change typography tranche. Companion property-panel tabs render inside their own `Suspense` + error boundary (which recovers on the next selection). New module-owned `npm run check:ui` guards against regressions.
+
+### Boot-time work on an existing host
+
+The first boot after updating runs init for the first time. Everything is idempotent and **none of it rewrites a project's `updatedAt`**: each step runs in its own guard (one failure doesn't skip the rest). It resolves and locks the project node type (honouring an admin's configured type, and never shadowing a private `projects` type), reports blocks attached to other node types, assigns missing slugs, retires the pre-v1.32 registry tokens, migrates legacy handles, backfills stored block counts, and — only if `shadcn:builder-synced` was never set — runs an **add-only** pristine sync (existing pristine files are never overwritten at boot).
+
+Also in this release: the twelve `shadcnComponents` the builder never imported are no longer installed, and `class-variance-authority` is declared; the service registration reports the real module version (`{{moduleVersion}}` — it had been frozen at a literal).
+
+**v1.31.14** (August 2026) fixed `npx builder update` aborting with *"Template path collision"*: four registrations were declared both as templates and in `registrations`.
+
+<Aside type="note">
+Deliberately left open — the registry state living in structure's `node.data` (a device token can still flip visibility through structure's generic `PATCH`), re-claimable freed handles, the remaining visual-review items — see the [roadmap](/modules/builder/roadmap/#from-the-starter-213-alignment-audit-2026-09-30).
+</Aside>
+
 ## v1.31.9 – v1.31.13 — August 2026
 
-**Current release.**
+<Aside type="caution" title="Correction (v1.32.0)">
+The registry described below was **not actually reachable** until v1.32.0: its router was registered with `versions: []`, which mounts nothing, and projects created in the structure UI never got a slug. Both are fixed in [v1.32.0](#v1320--october-2026), which also moves the URLs to `/api/v1/r/…`.
+</Aside>
 
 **The private per-project registry is live and usable** — the flagship "design → install pipeline" milestone. Each project now installs through the standard shadcn CLI (`npx shadcn add @project-slug/some-block`), optionally private behind a per-project bearer token. (The shared scaffold was synced to v1.31.10 / contract v1.3.0 along the way, moving the module build to the TS7 toolchain — v1.31.9.)
 

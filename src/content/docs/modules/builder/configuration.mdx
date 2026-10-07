@@ -13,14 +13,15 @@ The Block Builder module uses a database-driven configuration system. There is o
 
 ## Environment Variables
 
-| Variable | Required | Default | Description |
-|----------|:--------:|---------|-------------|
-| `VITE_REGISTRY_DOMAIN` | No | `usefoundryui.app` | Domain used for registry URLs. Override for custom domains or local development. |
+| Variable | Side | Required | Default | Description |
+|----------|------|:--------:|---------|-------------|
+| `VITE_REGISTRY_DOMAIN` | Frontend | No | `usefoundryui.app` | Domain used to build the registry install URLs shown on the Registry tab. Override for custom domains or local development. |
+| `REGISTRY_DOMAIN` | Backend | No | `usefoundryui.app` | The domain whose subdomains are user handles on the public registry: a request whose **raw `Host`** is exactly `<handle>.<REGISTRY_DOMAIN>` resolves to that handle. **Must match the frontend value.** Defaults to the same `usefoundryui.app` as the frontend. A **reserved** label (`api`, `www`, `app`, …) is never a handle — such a request falls through to `?handle=` (v1.32.0+). |
 
-The registry URL pattern is: `https://{handle}.{VITE_REGISTRY_DOMAIN}/r/{project-slug}/{block-name}.json`
+The registry URL pattern is: `https://{handle}.{REGISTRY_DOMAIN}/api/v1/r/{project-slug}/{block-name}.json`
 
 <Aside type="note">
-The module's env manifest declares this variable as `REGISTRY_DOMAIN`, but the generated frontend reads it as `import.meta.env.VITE_REGISTRY_DOMAIN`. The scaffold auto-prefixes every frontend env var with `VITE_`, so you set `REGISTRY_DOMAIN` in your `.env` and the built frontend picks it up under the prefixed name.
+The module's env manifest declares `REGISTRY_DOMAIN` on both sides. The scaffold auto-prefixes every frontend env var with `VITE_`, so the frontend reads it as `import.meta.env.VITE_REGISTRY_DOMAIN`, while the backend reads `process.env.REGISTRY_DOMAIN`. The backend matches the raw `Host` header, never `req.hostname`: with `trust proxy` on, `req.hostname` honours a client-supplied `X-Forwarded-Host`, which would let one request resolve another user's registry under this URL. Registry responses add `Host` and `Authorization` to `Vary`.
 </Aside>
 
 ---
@@ -33,11 +34,21 @@ The builder has **no interactive prompts** during `npx builder init`. It install
 
 ## Module Initialisation
 
-On first backend start, `initBuilderModule()` runs automatically and performs three tasks:
+`initBuilderModule()` runs on **every backend start**, from the builder's gateable `init` callback in `module.registration.ts` (module contract v1.3.0). The host runs module `init`s in dependency-first order after every module has registered and before routes mount, and **skips** it when the builder is disabled — or, under a non-`warn` `MODULES_DEPENDENCY_POLICY`, when `structure` is missing or out of range. On a starter with no module registry (pre-v1.48) it runs immediately instead.
 
-### 1. Seed the Projects Node Type
+The same `init` also mounts the public `/api/v1/r` registry and subscribes the builder's structure hooks (project slug assignment, duplicate/merge handling — see [Integration](/modules/builder/integration/#hooks-the-builder-listens-to)), so a **disabled builder** stops serving every project's registry and stops reacting to structure events.
 
-If no `projects` node type exists in the Structure module, the builder seeds one with these defaults:
+Every step is idempotent and runs in its own guard — a failing step is logged and retried on the next boot without skipping the steps after it. In order:
+
+<Aside type="caution" title="Before v1.32.0 this never ran">
+Since a scaffold change in January 2026 nothing called `initBuilderModule()` — the scaffold's `hasInit` flag only exports it. Seeding, the slug lock retrofit and the first pristine sync silently never happened on hosts installed or updated after that. From v1.32.0 the module registration calls it, so the **first boot after updating** does the catch-up work below in one go. None of it rewrites a project's `updatedAt`, and the pristine sync only *adds* missing files.
+</Aside>
+
+### 1. Resolve the project node type
+
+The type comes from the `projectNodeType` config. An absent row — or the `null` the old *All node types* option stored — means the `projects` default, and the row is then written as `projects` so admin settings reflect it. An admin's own choice is never overwritten. Every consumer resolves the type through one service method, `builderService.getProjectNodeType()`.
+
+When the type is `projects` and no live `projects` type exists anywhere, init seeds an app-level one with these defaults:
 
 ```typescript
 {
@@ -55,34 +66,54 @@ If no `projects` node type exists in the Structure module, the builder seeds one
   fields: [],
   navigation: {
     mainNav: { enabled: true, order: 30 },
-    sidebarNav: { style: 'list', showEmpty: true },
+    sidebarNav: { showEmpty: true },
     pageNav: { style: 'tabs' },
     listPage: { defaultView: 'grid' },
   },
 }
 ```
 
-The `builtInFieldConfig.slug.editableBy: 'system'` setting is what makes the project slug immutable: the slug is the permanent shadcn registry namespace (`npx shadcn add @slug/block`), so `structure` refuses slug changes in `updateNode` and renders the field read-only. `fields: []` seeds the type with no custom fields. See [Private Registries](/modules/builder/private-registries/) for the full token/visibility flow.
+If an admin already created a **private** `projects` type, nothing is seeded: `structure` treats a slug as unique across the app-level and per-user rows together (it refuses an app-level type that would shadow a user's), so init logs a warning and uses that type as is. Share it in Structure admin to make it available to everyone.
 
-<Aside type="note">
-If a node type with slug `projects` already exists (for example, one seeded by an earlier version before the slug lock shipped), init doesn't recreate it — but it does **retrofit** the registry-namespace lock onto it: it sets `builtInFieldConfig.slug.editableBy: 'system'` (logging `Locked "projects" slug`) while preserving any other `builtInFieldConfig` keys you've set. The retrofit is idempotent, so it's a no-op once the lock is already in place.
-</Aside>
+Then the **slug lock** is applied to whichever type the builder actually serves — `builtInFieldConfig.slug.editableBy: 'system'` on every live row with that slug, preserving any other `builtInFieldConfig` keys. The slug is the permanent shadcn registry namespace (`npx shadcn add @slug/block`), so `structure` ignores slug changes in `updateNode` and renders the slug read-only on the create form. Changing the project node type in admin settings applies the lock (and assigns missing slugs) immediately, without a restart.
 
-### 2. Seed the Starter Native Components
+### 2. Check for blocks on other node types (once — `builder:other-type-blocks-checked`)
+
+Before v1.32.0 an absent or `null` `projectNodeType` meant *all node types*, so blocks could attach to any node. Only the project type serves a registry and shows the builder tabs now, so init logs which other node types still have blocks attached. If that list isn't empty, pick the right **Project Node Type** under *Admin → Block Builder → Settings*.
+
+### 3. Assign missing registry slugs
+
+`structure` never *generates* a slug, so the builder assigns one: every new project gets a kebab-case slug derived from its name (made unique per user, `-2`, `-3`, … across all of the user's nodes) through a `structure.node.beforeCreate` filter. Bulk creates skip that filter, so they're covered by a `structure.node.created` listener (structure's default bulk path fires one per row) and a `structure.nodes.bulkCreated` listener (with `skipHooks`). Init backfills any project still missing a slug. The slug is written directly — structure's `updateNode` would drop it under the lock — and the node's `updatedAt` is preserved.
+
+### 4. Retire pre-v1.32 registry tokens
+
+Every boot, init clears the **retired pre-v1.32 token keys** (`data.registryToken` / `data.registrytoken`) from project nodes. Tokens minted before v1.32.0 were never usable — the public registry wasn't reachable until then — so they are retired rather than migrated: `/api/v1/r` never reads those keys, and owners mint a new token on the Registry tab (consumers re-copy their `components.json` for the new URL anyway). The step needs no key and decrypts nothing, so it can't fail on a key-provider problem. Only project nodes are touched — another node type's own fields with those names are left alone.
+
+### 5. Migrate legacy registry handles (once — `builder:handles-backfilled`)
+
+Every user whose `preferences.handle` predates the `registry_handle` table gets a mapping row (a handle another user already holds, or one that is invalid or reserved, is skipped — the table is authoritative). Until the flag is set, an unknown handle on the public resolver falls back to scanning `user.preferences`; the resolver reads the flag from the database, so once the migration has run that unindexed scan never runs again, however far a given boot got.
+
+### 6. Backfill stored block counts (once — `builder:blockcount-backfilled`)
+
+Writes `metadata.builder.blockCount` onto every project that has blocks, without touching `updatedAt` or firing structure hooks. The flag is set only when every write succeeded, so a failure is retried next boot. After that the count is maintained on every block write.
+
+### 7. Seed the Starter Native Components
 
 If the `native_component` table is empty, the builder imports a starter palette so the canvas is usable out of the box — `div`, the card family (`card`, `card-header`, `card-title`, `card-description`, `card-content`, `card-footer`), `button`, `input`, `label`, `badge`, and `separator`. It only seeds when the table has no rows, so your own component edits are never overwritten. (See [Seeding Components](#seeding-components) below.)
 
-### 3. Sync Pristine Shadcn Components
+### 8. Sync Pristine Shadcn Components
 
-On first run, the builder fetches shadcn component source files from the official registry and writes them to `features/builder/ui/pristine/`. These pristine files power the iframe preview — they render blocks exactly as shadcn intends, regardless of any app-level customisation.
+On first run (no `shadcn:builder-synced` flag), the builder fetches shadcn component source files from the official registry and writes them to `features/builder/ui/pristine/`. These pristine files power the iframe preview — they render blocks exactly as shadcn intends, regardless of any app-level customisation.
+
+The boot sync is **add-only**: a component whose pristine file already exists is skipped, so a checkout with committed or promoted pristine sources (say, a fresh database next to an existing repo) isn't silently rewritten. When every file is already present, the flag is set without fetching anything.
 
 The sync:
 
 - Fetches the shadcn component index from `https://ui.shadcn.com`
-- Downloads source for each preview component (accordion, alert, badge, button, card, etc.)
+- Downloads source for each missing preview component (accordion, alert, badge, button, card, etc.)
 - Rewrites cross-component imports to use relative paths within the pristine folder
 - Resolves `IconPlaceholder` references to the configured icon library (Lucide by default)
-- Stores sync status in `builder_config` so it only runs once (resyncable via API)
+- Stores sync status in `builder_config` so it only runs once
 
 <Aside type="tip">
 You can trigger a re-sync at any time via `POST /api/v1/builder/shadcn/sync-builder`. This is useful after changing the shadcn style or icon library.
@@ -97,7 +128,10 @@ The `builder_config` table stores key-value JSON pairs. These are the keys used 
 | Key | Description | Set By |
 |-----|-------------|--------|
 | `sharedFields` | Reusable field template definitions | Admin UI / API |
-| `projectNodeType` | Structure node type slug the builder treats as "projects" (defaults to `projects`). Read when resolving `/r` registry requests and filtering project blocks | Admin UI / API |
+| `projectNodeType` | Structure node type slug the builder treats as "projects" (seeded to `projects`; an unset value also means `projects`). The single source for the `/r` registry resolver, slug assignment, block counts, the project picker and which node types show the Blocks/Registry tabs. There is no "all node types" option — the registry can only serve one type | init / Admin UI / API |
+| `builder:blockcount-backfilled` | Set once the boot-time backfill of stored project block counts has run (only when every write succeeded) | init |
+| `builder:other-type-blocks-checked` | Set once init has checked for blocks attached to non-project node types | init |
+| `builder:handles-backfilled` | Set once legacy `preferences.handle` values have been migrated into `registry_handle` (switches off the per-request preferences scan) | init |
 | `pristineSourceUpdates` | Result of the last **Check for source updates** run — `{ checkedAt, slugs }`, the pristine components whose registry source has changed | Sync process (update check) |
 | `shadcn:index` | Cached shadcn component index | Sync process |
 | `shadcn:component:{style}:{name}` | Cached individual component source | Sync process |

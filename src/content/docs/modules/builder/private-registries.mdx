@@ -11,8 +11,8 @@ Every Block Builder project ships its **own shadcn registry**. A designer builds
 
 This page is the single reference for the registry surface. Per-page tables in [Usage](/modules/builder/usage/) and [Integration](/modules/builder/integration/) link back here.
 
-<Aside type="note">
-Shipped across v1.31.10–v1.31.13 (see the [changelog](/modules/builder/changelog/)). No schema migration is required — the token and visibility live in the project node's existing `data` JSON, and the slug lock in the node type's `builtInFieldConfig`. Hosts adopt it with `npx builder update` and a restart.
+<Aside type="caution" title="Reachable since v1.32.0 — at /api/v1/r">
+The registry logic shipped across v1.31.10–v1.31.13, but the router was registered with `versions: []`, which the starter's route registry treats as *mount nothing* — so until v1.32.0 no `/r` URL ever answered. It is now mounted at **`/api/v1/r`**, every URL on this page includes that prefix, and copies of the old `…/r/…` snippets must be re-copied from the Registry tab. v1.32.0 also assigns every project its slug automatically (structure never generates one). No schema migration is required — the token and visibility live in the project node's existing `data` JSON, and the slug lock in the node type's `builtInFieldConfig`. Requires starter ≥ 2.13.0 and structure ≥ 1.37.5 (see the [changelog](/modules/builder/changelog/)).
 </Aside>
 
 ## The namespace is the project slug
@@ -26,37 +26,43 @@ npx shadcn add @my-project/hero-section
 Here `@my-project` maps (via the consumer's `components.json`) to the project whose slug is `my-project`. Earlier builds keyed the namespace on the user **handle** (`@myhandle`), which collided when one user had several projects — installing from two of them registered the same alias twice. Since v1.31.11 the namespace is per-project, so no collision.
 
 <Aside type="caution">
-The project slug is your **permanent** registry namespace. The projects node type seeds (and idempotently retrofits) `builtInFieldConfig.slug.editableBy: 'system'`, so `structure` refuses slug changes in `updateNode` and renders the slug field read-only in the node editor. Renaming a live project's slug would orphan every app that has already run `npx shadcn add @old-slug/…`.
+The project slug is your **permanent** registry namespace. The projects node type seeds (and idempotently retrofits) `builtInFieldConfig.slug.editableBy: 'system'`, so `structure` ignores slug changes in `updateNode` and renders the slug read-only on the create form. Renaming a live project's slug would orphan every app that has already run `npx shadcn add @old-slug/…`.
 </Aside>
+
+You never type the slug: the builder derives it from the project's name when the project is created (kebab-case, made unique per user with `-2`, `-3`, …), including bulk creates. A **duplicated** project — or a project inside a duplicated subtree — gets a fresh slug from its own name and does *not* inherit the original's token, and init backfills a slug onto any older project that has none.
 
 The **URL** is separate from the namespace and carries both the user (as a subdomain, or a `?handle=` query param) and the slug (as a path):
 
 ```
-https://{handle}.usefoundryui.app/r/{project-slug}/{block-name}.json
+https://{handle}.usefoundryui.app/api/v1/r/{project-slug}/{block-name}.json
 ```
 
 ## Visibility: public vs private
 
 A project's registry is **public** by default. Toggle it on the project's **Registry** tab (an *Access* card with a public↔private `Switch`); the state is stored as `data.visibility` (`'public'` | `'private'`) on the project node.
 
-- **Public** — `GET /r/…` serves block JSON to anyone. Responses are cacheable (`Cache-Control: public, max-age=300`).
-- **Private** — every `/r` request must present a valid bearer token or it gets `401`. Responses are `Cache-Control: private, no-store` so a shared/CDN cache can't replay a token-gated response to an anonymous client.
+- **Public** — `GET /api/v1/r/…` serves block JSON to anyone. Responses are cacheable (`Cache-Control: public, max-age=300`).
+- **Private** — every `/api/v1/r` request must present a valid bearer token or it gets `401`. Responses are `Cache-Control: private, no-store` so a shared/CDN cache can't replay a token-gated response to an anonymous client.
 
 ## The token is encrypted at rest
 
 When you make a registry private you mint a token. The token is:
 
 - **Generated server-side** — a 256-bit `base64url` value (`crypto.randomBytes(32)`), so it drops into an `Authorization: Bearer` header and a `.env` value without escaping.
-- **Encrypted at rest** — sealed with `encryptField(token, { tenantId: ownerUserId })` (the same AES-256-GCM envelope `structure` uses for its `secret` fields) and stored as `{ __sealed: '…' }` on `data.registryToken`. It is **never** stored in plaintext.
-- **Encrypted-recoverable, not hashed** — so the owner can reveal and re-copy it. On `/r`, the route decrypts it with the resolved owner as `tenantId` (plain `decryptField`, no audit write on the hot path) and does a constant-time compare; a missing/undecryptable stored token, or a wrong/absent presented token, is a uniform `401`.
+- **Encrypted at rest** — sealed with `encryptField(token, { tenantId: ownerUserId, aad: 'builder.registryToken:<projectId>' })` (the AES-256-GCM envelope `structure` uses for its `secret` fields, plus a project-binding AAD) and stored as `{ __sealed: '…' }` on `data.registryAccessToken`. It is **never** stored in plaintext.
+- **Encrypted-recoverable, not hashed** — so the owner can reveal and re-copy it. On `/api/v1/r`, the route decrypts it with the resolved owner as `tenantId` (plain `decryptField`, no audit write on the hot path) and does a constant-time compare; a missing/undecryptable stored token, or a wrong/absent presented token, is a uniform `401`.
 
 <Aside type="note">
-The token is deliberately **not** a declared `structure` `secret` field, so it never appears in the generic node editor — the builder owns its whole lifecycle. A legacy plaintext `registrytoken` written by an earlier build is still honoured on read, but re-minting replaces it with the sealed form.
+The token is deliberately **not** a declared `structure` `secret` field, so it never appears in the generic node editor — the builder owns its whole lifecycle.
+
+**The envelope is bound to its project** (v1.32.0): it is sealed with the AAD `builder.registryToken:<projectId>`, and `/api/v1/r` accepts only an envelope that decrypts under the owner's key *with that project's AAD*. structure's generic node `PATCH` is not web-session gated, so without this a device token could plant a known token — either as plaintext, or as the envelope of a structure secret field it wrote itself (same key, no AAD) — and keep private access after the device was revoked. Binding also means a token copied onto another project (a duplicate, a merge, an import) simply doesn't authenticate there.
+
+**Tokens from before v1.32.0 are retired, not migrated.** They lived under `data.registryToken` and were never usable (the registry wasn't reachable until v1.32.0), so `/api/v1/r` ignores that key and init clears it at boot. A project that had one shows *private but no token yet*: generate a new token and give it to consumers along with the new `/api/v1/r` URL.
 </Aside>
 
 ### Token lifecycle
 
-All four actions live on the **Registry** tab and are ownership-guarded on the backend:
+All four actions live on the **Registry** tab, are ownership-guarded on the backend, and require a **web session** (`requireWebSession`, starter v2.13.0) — a device token is refused with `403 web_session_required`, since minting from the lower-trust, self-renewing device credential would be a persistence escalation and reveal / make-public would exfiltrate:
 
 | Action | Route | Notes |
 |--------|-------|-------|
@@ -73,7 +79,7 @@ All four actions live on the **Registry** tab and are ownership-guarded on the b
     ```json
     {
       "registries": {
-        "@my-project": "https://myhandle.usefoundryui.app/r/my-project/{name}.json"
+        "@my-project": "https://myhandle.usefoundryui.app/api/v1/r/my-project/{name}.json"
       }
     }
     ```
@@ -91,7 +97,7 @@ All four actions live on the **Registry** tab and are ownership-guarded on the b
     {
       "registries": {
         "@my-project": {
-          "url": "https://myhandle.usefoundryui.app/r/my-project/{name}.json",
+          "url": "https://myhandle.usefoundryui.app/api/v1/r/my-project/{name}.json",
           "headers": { "Authorization": "Bearer ${FOUNDRY_REGISTRY_TOKEN}" }
         }
       }
@@ -114,7 +120,7 @@ All four actions live on the **Registry** tab and are ownership-guarded on the b
     Install a single block without configuring `components.json`:
 
     ```bash
-    npx shadcn@latest add https://myhandle.usefoundryui.app/r/my-project/hero-section.json
+    npx shadcn@latest add https://myhandle.usefoundryui.app/api/v1/r/my-project/hero-section.json
     ```
 
     <Aside type="caution">
@@ -125,17 +131,17 @@ All four actions live on the **Registry** tab and are ownership-guarded on the b
 
 The **Registry** tab renders these snippets for you (with the current namespace and visibility baked in) plus copy buttons and the list of available blocks.
 
-## How `/r` resolves a request
+## How `/api/v1/r` resolves a request
 
 <Steps>
 
-1. **User** — the handle comes from the request subdomain (`handle.usefoundryui.app`) or a `?handle=` query param (useful on localhost / hosts without wildcard subdomains). It resolves to a user through the indexed `registry_handle` table (with a lazy legacy fallback that self-heals). Unknown handle → `404 Not found`.
+1. **User** — the handle comes from the request's **raw `Host` header** when it is exactly `<handle>.<REGISTRY_DOMAIN>` (backend env var, which must match the frontend's), otherwise — or when the label is reserved (`api`, `www`, …) — from a `?handle=` query param (localhost, or hosts without wildcard subdomains). `REGISTRY_DOMAIN` defaults to `usefoundryui.app`, like the frontend. `req.hostname` is never used — with `trust proxy` on it honours a client-supplied `X-Forwarded-Host`. It resolves to a user through the indexed `registry_handle` table. Unknown handle → `404 Not found`. Responses add `Host` and `Authorization` to `Vary`.
 
-2. **Project** — resolved by `{ userId, slug: projectSlug, nodeType: <configured projectNodeType> }`. The node type defaults to the seeded `projects` slug but is admin-settable via the `projectNodeType` builder config. Unknown slug → the same uniform `404` (so the endpoint can't be used to enumerate which slugs exist).
+2. **Project** — resolved by `{ userId, slug: projectSlug, nodeType: <configured projectNodeType>, status: 'active' }`. The node type defaults to the seeded `projects` slug but is admin-settable via the `projectNodeType` builder config. Unknown slug — or an **archived or deleted** project (structure's delete is a restorable soft delete) — → the same uniform `404` (so the endpoint can't be used to enumerate which slugs exist).
 
 3. **Visibility gate** — if `data.visibility === 'private'`, the presented bearer token is decrypted-and-compared against the stored one; failure → `401`.
 
-4. **Serve** — `GET /r/:projectSlug/:blockName.json` returns the block's `registry-item.json`; `GET /r/:projectSlug` returns the project's block listing.
+4. **Serve** — `GET /api/v1/r/:projectSlug/:blockName.json` returns the block's `registry-item.json`; `GET /api/v1/r/:projectSlug` returns the project's block listing (each item's `url` is a `/api/v1/r/…` path).
 
 </Steps>
 
@@ -145,12 +151,12 @@ A private project currently answers `401` (not `404`) for a missing/invalid toke
 
 ## Backend surface
 
-**Public registry routes** (`registry.routes.ts`, mounted at `/r`, `requiresAuth: false`):
+**Public registry routes** (`registry.routes.ts`, mounted at `/api/v1/r` with `versions: ['v1']`, `requiresAuth: false`, `allowNoOrigin: true`). `allowNoOrigin` is what lets the headless shadcn CLI through — it sends no `Origin` header, which the production CORS gate otherwise refuses with `403`. That is safe here because public projects are unauthenticated reads by design and private projects authenticate every request with the bearer token:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/r/:projectSlug` | List blocks in a project |
-| `GET` | `/r/:projectSlug/:blockName.json` | A block's `registry-item.json` |
+| `GET` | `/api/v1/r/:projectSlug` | List blocks in a project |
+| `GET` | `/api/v1/r/:projectSlug/:blockName.json` | A block's `registry-item.json` |
 
 **Authenticated token/visibility routes** (`builder.routes.ts`, mounted at `/api/v1/builder`, `requiresAuth: true`, ownership-guarded):
 
@@ -169,11 +175,13 @@ A private project currently answers `401` (not `404`) for a missing/invalid toke
 | `revealRegistryToken(userId, projectId)` | Decrypt + return the stored token |
 | `revokeRegistryToken(userId, projectId)` | Remove the token |
 | `setRegistryVisibility(userId, projectId, visibility)` | Set `data.visibility` |
-| `decryptStoredRegistryToken(projectData, ownerUserId)` | Pure decrypt used by the `/r` hot path |
-| `userOwnsProject(userId, projectId)` | Ownership guard shared by the block/registry routes |
+| `decryptStoredRegistryToken(projectData, ownerUserId)` | Pure decrypt used by the `/api/v1/r` hot path |
+| `userOwnsProject(userId, projectId, { attach? })` | Ownership guard shared by the block/registry routes. A soft-deleted project is never owned; with `attach: true` (creating a block, category, collection or component snapshot) archived projects are refused too |
+| `getProjectNodeType()` | The one resolver for the project node type (config, else `projects`; briefly cached) |
+| `uniqueProjectSlug(userId, name)` / `assignMissingProjectSlugs()` | Slug derivation and the backfill used by init and the structure hooks |
 
 <Aside type="note">
-All three write methods (`mint`/`revoke`/`setRegistryVisibility`) use a single atomic `$executeRaw` `jsonb` update on the current row value (v1.31.13), so a concurrent registry mutation can't clobber another's key.
+All three write methods (`mint`/`revoke`/`setRegistryVisibility`) use a single atomic `$executeRaw` `jsonb` update on the current row value (v1.31.13), so a concurrent registry mutation can't clobber another's key, and each bumps the node's `updatedAt` and writes an `{ audit: true }` log line (never the token). One residual remains: structure's node editor saves by sending its whole cached `node.data` back, so saving a project's fields from a tab opened *before* a rotate or visibility change writes the old values over it. Reload the project after a registry change in another tab before editing its fields.
 </Aside>
 
 **Action hooks** fired after registry writes (companion modules can listen via `actionRegistry`):

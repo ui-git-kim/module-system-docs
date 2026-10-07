@@ -159,30 +159,29 @@ The builder uses filter hooks on both frontend and backend to allow companion mo
 
 ### Backend Filters
 
-#### `structure.node.response` — Block Count Enrichment
+#### `structure.node.beforeCreate` — Project Slug Assignment
 
-**Hook:** `builder-enrich-node-metadata`
-**Priority:** 15 (runs early)
+**Hook:** `builder-project-slug`
+**Priority:** 20
 
-Adds `metadata.builder.blockCount` to structure node API responses. This powers the block count badge on project cards without requiring a separate API call.
+The project slug is the permanent registry namespace, and the projects type locks it — but `structure` never *generates* a slug. This filter gives every new node of the configured `projectNodeType` that arrives without one (`''` counts as missing) a kebab-case slug derived from its name, made unique per user with `-2`, `-3`, … (structure's `@@unique([userId, slug])` spans **every** node type, and soft-deleted nodes keep theirs, so the check covers all of the user's nodes).
 
-The enrichment is **scoped to the configured `projectNodeType`** — only nodes of the builder's project node type are counted, since blocks attach to projects (the node type is read from `builder_config`, briefly cached, and an unset config falls through to counting every node). It is also **omitted when the count is zero**: a node with no blocks is returned untouched, with no `metadata.builder` key at all.
+### Stored block count — `metadata.builder.blockCount`
+
+The block count is **persisted** to each project node's metadata through structure's `updateNodeMetadata(nodeId, userId, 'builder', { blockCount })` — an atomic, namespaced write — whenever a block is created, duplicated, deleted or moved between projects (plus a one-time boot backfill). Because it's stored, it arrives on **list** reads too, so the card badge and the Blocks column work on project lists without a request per row.
 
 ```typescript
-// What the filter adds to a project node that HAS blocks:
+// A project node's metadata:
 {
-  ...node,
   metadata: {
-    ...existingMetadata,
-    builder: {
-      blockCount: 5  // Number of blocks scoped to this node
-    }
-  }
+    ...otherModules,
+    builder: { blockCount: 5 },  // 0 once its last block is deleted
+  },
 }
 ```
 
-<Aside type="tip">
-Other modules can read this enriched metadata to make decisions — for example, a reporting module could use `metadata.builder.blockCount` to show project statistics. Because the key is omitted when there are no blocks, **consumers must treat an absent `metadata.builder.blockCount` as zero**, not as "unknown".
+<Aside type="note">
+This replaced the `structure.node.response` enrichment filter (v1.32.0). That filter only ran on single-node reads, so the list-view column always showed "—" and the card badge never rendered. Consumers should still treat an absent `metadata.builder.blockCount` as zero (a project with no blocks may never have had one written).
 </Aside>
 
 ### Frontend Filters
@@ -302,47 +301,40 @@ The builder both **listens to** and **fires** action hooks via the `actionRegist
 
 ### Hooks the Builder Listens To
 
-#### `structure.node.deleted` — Cleanup
+All structure subscriptions (this section and the `beforeCreate` filter above) are registered from the module's gateable `init` (`registerStructureHooks()` in `structure-hooks.ts`), so they stop when the builder is disabled — and so does the public registry, which `init` mounts too, so a registry is never served while its token-hygiene hooks aren't running. Payloads are typed from structure's published hook contract (`../structure/index.js`), so a breaking structure change fails the host build.
 
-**Hook:** `builder-cleanup-node-data`
-**Priority:** 20
+| Hook | Handler | What it does |
+|------|---------|--------------|
+| `structure.node.created` | `builder-project-slug-fallback` | A project that arrives without a slug gets one. Single creates already have it (from `beforeCreate`); this covers structure's **bulk** create, which skips `beforeCreate` and by default fires `node.created` per row |
+| `structure.nodes.bulkCreated` | `builder-bulk-project-slugs` | The same for a bulk create with `skipHooks`, which fires this one event instead: project rows among `nodeIds` that have no slug get one |
+| `structure.node.duplicated` | `builder-duplicated-project` | structure copies `node.data` verbatim, so the copy would accept the **original's** bearer token. The sealed token is stripped (visibility is kept — a private copy fails closed with `401` until its owner mints a token), structure's `<slug>-copy-<timestamp>` is replaced with a clean slug from the copy's name, and the stored block count is reset (blocks aren't copied). The event fires once, for the root copy, so with `includeChildren` every project-type **descendant** of the copy is handled too (the root may be a folder) |
+| `structure.node.purged` *(structure ≥ 1.38.0)* | `builder-purged-projects` | structure's permanent delete of soft-deleted entries. The purged projects' blocks, categories, collections and component snapshot are erased with them. structure caps the purged id list at 500 (its `count` has the total), so a truncated list falls back to an orphan sweep: builder rows whose project node no longer exists (never project-less rows or the app-wide `__global__` set) |
+| `structure.nodeType.deleted` *(with `purgedNodes`, structure ≥ 1.38.0)* | `builder-purged-node-type` | A node type deleted together with its soft-deleted entries carries only a count, so it runs the same orphan sweep |
+| `structure.node.merged` | `builder-merged-project` | The merged-away project's blocks, categories and collections are re-pointed to the canonical **row by row** — a name the canonical already has stays on the archived duplicate instead of failing the move. The canonical keeps its own component snapshot (the duplicate's moves only if it has none), and if structure's data backfill copied the duplicate's token onto a canonical that had none, that copy is stripped |
 
-When a project (or any structure node) is deleted, this action removes all associated builder data:
-
-1. All `block` rows with that `projectId`
-2. All `block_category` rows with that `projectId`
-3. All `block_collection` rows with that `projectId`
-4. All `builder_component_set` rows with that `projectId` (the project's pinned component snapshot)
-
-All four run in a single `prisma.$transaction` with an `{ audit: true }` log.
-
-```typescript
-// Context received:
-interface DeletedContext {
-  userId: string;
-  nodeId: string;     // The deleted node's ID (= projectId for blocks)
-  nodeType: string;
-}
-```
+<Aside type="caution" title="structure.node.deleted is deliberately not handled">
+In structure 1.37.x a node delete is a **restorable soft delete** (`status: 'deleted'`). Until v1.32.0 the builder hard-deleted the project's blocks, categories, collections and component snapshot on that event, so a restored project came back empty. Builder rows are now **kept**: the public `/api/v1/r` resolver only serves `status: 'active'` projects, and attaching new blocks/collections/snapshots requires an active project. They are erased when the project is **purged** (structure ≥ 1.38.0's permanent delete, handled above) or when the account is deleted. On structure 1.37.x, which has no purge, a deleted project's builder data is retained until account deletion.
+</Aside>
 
 ### Hooks the Builder Fires
 
-The builder fires 13 CRUD and registry action hooks from its backend service via `actionRegistry.doActionAll()`. Companion modules can subscribe to these hooks to react to builder lifecycle events — for example, updating analytics, triggering notifications, or syncing external systems.
+The builder fires 15 CRUD and registry action hooks from its backend service via `actionRegistry.doActionAll()`. Companion modules can subscribe to these hooks to react to builder lifecycle events — for example, updating analytics, triggering notifications, or syncing external systems.
 
 #### Native Component Hooks
 
-These are app-wide catalogue events (the `native_component` table has no `userId`), so their context carries the component `type`, not a `userId`.
+These are app-wide catalogue events (the `native_component` table has no owner). Their context carries the **actor** — the admin who made the change, or `'system'` for boot-time seeding — as both `userId` and `actorId`, matching the starter's actor convention.
 
 | Hook | Fired When | Context |
 |------|-----------|---------|
-| `builder.component.saved` | A native component is created or updated (upsert) | `{ type, component }` |
-| `builder.component.deleted` | A native component is deleted | `{ type }` |
+| `builder.component.saved` | A native component is created or updated (upsert) | `{ userId, actorId, type, component }` |
+| `builder.component.deleted` | A native component is deleted | `{ userId, actorId, type }` |
+| `builder.component.imported` | A bulk catalogue import finishes (one event, not one per row) | `{ userId, actorId, created, updated, errors }` |
 
 #### Block Hooks
 
 | Hook | Fired When | Context |
 |------|-----------|---------|
-| `builder.block.created` | A new block is saved | `{ userId, blockId, block }` |
+| `builder.block.created` | A new block is saved, or an existing one is **duplicated** (then `sourceBlockId` is set) | `{ userId, blockId, block, sourceBlockId? }` |
 | `builder.block.updated` | An existing block is updated | `{ userId, blockId, block }` |
 | `builder.block.deleted` | A block is deleted | `{ userId, blockId }` |
 
@@ -374,6 +366,9 @@ Fired after a project's registry token or visibility is written. See [Private Re
 | `builder.registryToken.minted` | A registry token is generated or rotated | `{ userId, projectId }` |
 | `builder.registryToken.revoked` | A registry token is removed | `{ userId, projectId }` |
 | `builder.registryVisibility.changed` | A registry is switched public↔private | `{ userId, projectId, visibility }` |
+| `builder.handle.claimed` | A user claims or changes their registry handle (it re-points every registry URL they've handed out) | `{ userId, handle }` |
+
+Each of these also writes an `{ audit: true }` log line (never containing the token), and they are declared as the manifest's `auditEvents`.
 
 #### Subscribing to Builder Hooks
 
@@ -393,7 +388,7 @@ actionRegistry.addActionAsync(
 );
 ```
 
-All 13 hooks follow the same pattern — use `actionRegistry.addActionAsync()` with the hook name and a unique registration ID.
+All 15 hooks follow the same pattern — use `actionRegistry.addActionAsync()` with the hook name and a unique registration ID.
 
 ---
 
@@ -401,8 +396,9 @@ All 13 hooks follow the same pattern — use `actionRegistry.addActionAsync()` w
 
 The builder registers with the starter's `securityRegistry` (via `security.registration.ts`) so its per-user data participates in the platform's data-classification and account-deletion flows.
 
-- **Data-classification manifest** — `securityRegistry.register()` classifies `block`, `block_category`, `block_collection` and `registry_handle` as **`owned`** user data. `native_component` and `builder_config` are deliberately **excluded** — they are app-wide shared state, not per-user data.
-- **Account-deletion handler** — `securityRegistry.registerDeletionHandler({ id: 'builder.user-data', … })` hard-deletes the subject's blocks, categories, collections and registry handle in a single `prisma.$transaction` when their account is deleted. It is idempotent and returns `{ action: 'hard-delete', recordsAffected }`. (Deleting the handle matters: a deleted user must not keep squatting a public registry handle.)
+- **Data-classification manifest** — `securityRegistry.register()` classifies `block`, `block_category`, `block_collection`, `registry_handle` and `builder_component_set` as **`owned`** user data, and declares the registry/handle `auditEvents`. `native_component`, `builder_config` and the app-wide `'__global__'` component set are deliberately **excluded** — they are shared state, not per-user data. No `encryptedFields` are declared: the registry token is sealed with `encryptField` on every write regardless of security tier, and that field declares *tier-dependent* encryption (declaring it would make the posture check falsely report the token as plaintext).
+- **Account-deletion handler** — `securityRegistry.registerDeletionHandler({ id: 'builder.user-data', order: 40, … })` hard-deletes the subject's blocks, categories, collections, registry handle and the component snapshots of **all** their projects (including soft-deleted ones) in a single `prisma.$transaction`. `order: 40` runs it before structure's handlers, because snapshots are keyed only by `projectId` and the project ids must be read before structure removes the nodes. It refuses to run without a subject id (conformance C9), is idempotent, and returns `{ action: 'hard-delete', recordsAffected }`.
+- **Personal-data export handler** (starter v2.13.0) — `securityRegistry.registerExportHandler({ id: 'builder.user-data', … })` contributes the subject's blocks, block categories, collections and registry handle to the account data export. Component snapshots (vendored shadcn source, not personal data) and the sealed registry token (a credential) are not exported.
 
 Companion modules or operators auditing the per-user data cascade can rely on this manifest to know exactly what the builder owns and removes on deletion.
 
@@ -412,6 +408,8 @@ Companion modules or operators auditing the per-user data cascade can rely on th
 
 The builder integrates deeply with the Structure module's frontend registries for project detail pages.
 
+Every registration below is **project-only**. Each keeps `nodeTypes: '*'` (admins still control per-type visibility under *Node Types → Integrations*) and adds an `isVisible` predicate — or, for the card badge, a `null` render — for any node type that isn't the configured `projectNodeType`, since blocks and the registry resolve only for that type. The predicates are synchronous, so they read a cached copy of the type (`config/project-node-type.ts`, default `projects`). A post-auth loader registered with the starter's `shellInitRegistry` fills it, usually before the first structure page renders; the admin Settings save updates it in place. If a predicate already answered with a stale value, structure's queries are reset so its memoised tab / widget / column lists recompute.
+
 ### Node Tab Registry
 
 Two tabs are registered for project node detail pages:
@@ -419,14 +417,15 @@ Two tabs are registered for project node detail pages:
 **Blocks Tab** (`builder-blocks`)
 - Shows all blocks scoped to the project
 - Provides "Open in Builder" and "Delete" actions (duplication is available from the Blocks Library page / `POST /blocks/:id/duplicate`, not this tab)
-- Displays a badge with block count (fetched async)
 - Supports toggling global blocks visibility
+- On a shared-type node viewed by someone other than its owner, shows a read-only notice instead of block tools (blocks attach only to projects you own)
 - Order: 45
 
 **Registry Tab** (`builder-registry`)
 - Shows the `components.json` configuration snippet for shadcn CLI
 - Displays the project's registry URL, install commands, and available blocks
 - Provides the public↔private visibility toggle and the full token lifecycle (generate/rotate, reveal, revoke)
+- Owner-only: other viewers get a read-only notice; a project with no slug yet gets an explanatory alert instead of `@null` commands
 - Order: 46
 
 See [Private Registries](/modules/builder/private-registries/) for the full token/visibility flow.
@@ -435,30 +434,28 @@ See [Private Registries](/modules/builder/private-registries/) for the full toke
 
 **Blocks Summary Widget** (`builder-blocks-summary`)
 - Appears on the node overview page
-- Shows a compact summary with recent blocks and quick-add button
+- Shows a compact summary with recent blocks and quick-add button (owner-only; other viewers of a shared-type project see a one-line notice)
 - Size: 2x1, Order: 40
 
 ### Node Card Extension Registry
 
 **Block Count Badge** (`builder-block-count`)
 - Small badge on node cards in list/grid views
-- Shows the number of blocks (sourced from `metadata.builder.blockCount`)
+- Shows the number of blocks (the stored `metadata.builder.blockCount`); hidden at zero
+- Rendered with `createElement` — the component is never called as a plain function, so its hooks follow React's rules
 - Position: badge, Order: 30
-
-### Node Action Registry
-
-| Action ID | Label | Location | Behaviour |
-|-----------|-------|----------|-----------|
-| `builder-new-block` | New Block | `detail-header` | Navigates to `/builder?projectId={nodeId}` |
-| `builder-view-blocks` | View Blocks | `context-menu` | Navigates to `/blocks?projectId={nodeId}` |
 
 ### Node Column Registry
 
 **Block Count Column** (`builder-block-count`)
-- Shows block count in table views
+- Shows block count in table views (`sortable`, by `getSortValue`)
 - Width: 80px, Alignment: centre
-- Reads from `node.metadata.builder.blockCount`
+- Reads the stored `node.metadata.builder.blockCount`
 - Order: 50
+
+<Aside type="note">
+v1.32.0 removed the builder's two node actions (`builder-new-block` in `detail-header`, `builder-view-blocks` in `context-menu`) and the Blocks tab's `getBadge` — structure 1.37.x never renders those action locations or `getBadge`, so all three were dead config. The Blocks tab's own **New Block** button covers the first.
+</Aside>
 
 ---
 
@@ -671,14 +668,19 @@ export {
 export { useNativeComponentsAdmin } from './hooks/useNativeComponentsAdmin';
 ```
 
+<Aside type="caution" title="Pages are no longer exported (v1.32.0)">
+The barrel no longer re-exports `BuilderPage`, `BlocksLibraryPage` or `CanvasPage`. The routes lazy-load them, and a static re-export pulled every page — and CanvasPage's full lucide runtime scope — into whichever chunk imported the barrel, defeating the code split (the same fix structure made in v1.34.20). Navigate to the routes (`/builder`, `/blocks`) instead of importing the pages.
+</Aside>
+
 ### Backend Exports
 
 These TypeScript interfaces are exported from the builder's backend barrel (`features/builder/index.ts`) for use by other modules:
 
 ```typescript
+export { BUILDER_SERVICE_KEY } from './service.registration.js'; // 'builder' — the serviceRegistry key
 export { builderService } from './builder.service.js';
 export { registryService } from './registry.service.js';
-export { initBuilderModule } from './builder.config.js';
+export { initBuilderModule } from './builder.config.js';      // called by module.registration's init
 export type {
   NativeComponentRow,
   NativeComponentProperty,
