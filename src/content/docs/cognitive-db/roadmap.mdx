@@ -98,10 +98,10 @@ The engine's purpose is to link everything together. These features stay and are
 1. **Links about links (meta-connections). Must have.** A link can carry its own links, so the engine records *why* two things are connected: "Kim loves purple", *because* "it reminds Kim of grandmother's garden". Two parts are needed:
    - **Storing them.** A Structure connection is itself a record, so a link can point at a link; the meta link type's `fromTypes` must allow `connection`. `createMetaConnection` throws under Structure on a premise that turned out to be wrong.
    - **Producing them.** No processing level asks the model for them yet. The density benchmark below expects at least two per rich sentence.
-2. **"This document mentions X" links, tied to the Suggestions inbox.** Under Structure, ingest writes no document → entity link: a new entity notes only its first document (`data.sourceContentId`), and later mentions are change-log rows. The plan:
+2. **"This document mentions X" links, tied to the Suggestions inbox.** Under Structure, ingest writes no document → entity link: a new entity notes only its first document (`data.sourceContentId`), and later mentions are change-log rows. The plan (confirmed 2026-10-07):
    - ingest writes a `mentions` link from each document to every entity it names, and the type joins `COGNITIVE_DB_CONNECTION_TYPES`;
    - links the engine infers rather than reads go to Cognitive Pipeline's Suggestions inbox to accept or dismiss. That covers "these documents are about similar things" and the below-threshold candidates in `cog_intelligence_discovery`. `listDiscoveries` / `promoteDiscovery` are the engine seams; the host does not call them yet.
-3. **Expected-but-missing questions.** When a record's type marks a detail as expected (a required field, such as a supplier's contact email) and a document leaves it out, raise a low-priority question ("What is Acme's contact email?") and ask extraction to look for it. It never guesses a value. Only the retiring v1 path does this today, from the engine's own ontology slots. Rebuild it on Structure's field definitions, with the questions shown in the Suggestions inbox. Proposed split: the engine detects at ingest, because it knows what was just extracted; Cognitive Pipeline switches it on, picks the types and shows the questions.
+3. **Expected-but-missing questions.** When a record's type marks a detail as expected (a required field, such as a supplier's contact email) and a document leaves it out, raise a low-priority question ("What is Acme's contact email?") and ask extraction to look for it. It never guesses a value. Only the retiring v1 path does this today, from the engine's own ontology slots. Rebuild it on Structure's field definitions, with the questions shown in the Suggestions inbox. Split (confirmed 2026-10-07): the engine detects at ingest, because it knows what was just extracted; Cognitive Pipeline switches it on, picks the types and shows the questions.
 4. **Search by meaning, by keyword and by links.** All three stay, plus the combined search.
    - Meaning: Structure's vector search (in use).
    - Keyword: move from the engine's approximation to Structure's ranked full-text search (`searchNodes`, which ranks with `ts_rank_cd` or BM25; not yet on the adapter).
@@ -210,20 +210,19 @@ Four decisions from the security profile still need a product answer before the 
 
 Related: **third-party AI processor disclosure** — content leaving to US-based LLM and embedding providers is a data-flow disclosure consideration under Australian privacy law (and potentially others depending on where an app's users sit).
 
-### Open decision — evidence-driven weakening vs never-decay
+### Decided — new evidence may lower confidence; time never may
 
-**Status:** Needs a decision. No stored data is affected yet, because nothing calls the pattern lane. (Time-based decay is separate and stays off: decided 2026-10-07, to be reviewed in future.)
+**Status:** Decided 2026-10-07. Time-based decay stays off (to be reviewed in future). When a new document contradicts something the engine believes, its confidence may go down. Nothing is deleted, and confidence can climb back when supporting evidence returns.
 
-The pattern and learning code lowers confidence when new evidence arrives:
+What this keeps, and what it changes:
 
-- `contradictPattern` takes 0.1 off a pattern's confidence.
-- `propagateChange` lowers a pattern when its `supported_by` evidence weakens, and lowers neighbouring nodes across `contradicts` / `contradicted_by`, `causes` / `explains` and `related_to` / `about` edges.
-- `confidence.service`'s default rules are written the same way: one lowers a pattern on a `contradicted_by` edge (it never fires today; see "Pattern evidence edges" above), and one lowers an effect whose cause is weak.
-- In the other direction, the Tier-3 recheck counts only `supported_by` evidence and ignores `contradicted_by`, so it can reactivate a pattern that contradictions questioned (see [Architecture](/cognitive-db/architecture/#lifecycle)).
-
-The v1.9.0 contradiction-caveat work took the opposite line. It emits only a non-destructive `qualifies` edge, because down-weighting a claim would break never-decay, which the code there calls "strengthen-only". [Foundations](/cognitive-db/foundations/) defines never-decay as no weakening by age or disuse, and the original design (`COGNITIVE_DB_PHILOSOPHY_V2.md`) expected conflicting information to lower confidence.
-
-Decide which reading holds. Then either state in Foundations that new evidence may lower confidence (time never may), or move these lanes to strengthen-only plus `qualifies` caveats. Settle this before wiring ingest-time pattern confirmation (§5).
+- **Kept as built.** The pattern and learning code already works this way:
+  - `contradictPattern` takes 0.1 off a pattern's confidence;
+  - `propagateChange` lowers a pattern when its `supported_by` evidence weakens, and lowers neighbours across `contradicts` / `contradicted_by`, `causes` / `explains` and `related_to` / `about` edges;
+  - `confidence.service`'s default rules do the same (its `contradicted_by` rule never fires today; see "Pattern evidence edges" above).
+- **To fix.** The Tier-3 recheck counts only `supported_by` evidence and ignores `contradicted_by`, so it can reactivate a pattern that contradictions questioned (see [Architecture](/cognitive-db/architecture/#lifecycle)). It should weigh both.
+- **Stored facts, unchanged for now.** The contradiction detector still flags a conflicting value for review and never resolves it automatically, and the optional `qualifies` caveat stays non-destructive. The v1.9.0 caveat work avoided down-weighting because it read never-decay as "strengthen-only"; that objection no longer applies, so whether a contradicted fact should also lose confidence can be decided on its merits.
+- [Foundations](/cognitive-db/foundations/) now states the rule.
 
 ### Append-only access-audit trail
 
@@ -339,7 +338,7 @@ These started as the deferred stubs the 2026-07-14 audit documented rather than 
 
 **Priority:** Medium · **Status:** Built, not wired
 
-`checkPatterns` confirms or contradicts a user's active patterns against a newly ingested item. It is a public export, but neither ingest path calls it, and `IngestResult` reports no pattern outcome. Cognitive Pipeline calls no pattern, propagation or batch API either, so in practice patterns never learn from new documents. The design intent stands: confirmation is cheap and runs per item at ingest, while detection is slow and periodic (Tier 3). Wiring it in after extraction needs a `patterns` switch gate, which `checkPatterns` lacks today, and should wait for the evidence-weakening decision in §3.
+`checkPatterns` confirms or contradicts a user's active patterns against a newly ingested item. It is a public export, but neither ingest path calls it, and `IngestResult` reports no pattern outcome. Cognitive Pipeline calls no pattern, propagation or batch API either, so in practice patterns never learn from new documents. The design intent stands: confirmation is cheap and runs per item at ingest, while detection is slow and periodic (Tier 3). Wiring it in after extraction needs a `patterns` switch gate, which `checkPatterns` lacks today; the evidence-weakening question it waited on is settled (§3).
 
 ### Token budgets → AI Core spending limits
 
