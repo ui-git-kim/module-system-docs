@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features, known issues, and future direction for Cognitive Pipeline
-lastUpdated: 2026-10-01
+lastUpdated: 2026-10-07
 sidebar:
   order: 6
 ---
@@ -154,7 +154,7 @@ The engine reached **v1.12.10** (re-vendored in **v1.21.24**). The bump is addit
 - **Already active (do not redo):** `seedEngineOperations` (v1.21.17, still catalogue-compatible), `scopeRootId` + `unreadableTypes` push on ingest and adapter scope-forwarding (v1.21.22), `updateConnection` adapter (v1.21.18), `cog_content_archive` + the seeded `cognitive-db/summarise` op (v1.21.22), and `retrieveToConnect` (v1.21.22).
 - **Opt-in feature flags — ✅ enabled (v1.21.28).** `expectationPass`, `structuralGaps` and `sequentialAdjacency` now default on (admin-overridable via a `features` config row). `sequentialAdjacency` takes effect at ingest; `expectationPass` is v1-only — inert under Structure-native storage, the default; `structuralGaps` is live in the proactive pass whenever Proactive Insights is on. `analogicalProxy` is a host-side assembly flag the engine does not branch on (left off). `emitCaveats` is **not** a feature flag — it is a `ProactiveOptions` argument passed when the host calls the proactive check.
 - **Graph-read adapter methods — ✅ wired (v1.21.25).** `buildStructureAdapter` now forwards `expandGraph` (surprise detector) and `getConnectionsForNodes` (structural-gap + centrality batch read), degrade-safe and with no behaviour change until called. The destructive lifecycle methods stay unwired — `deleteConnection` (no consumer for its `removeConnection` caller) and the parked `archiveNode` / `moveNode` / `mergeNode`.
-- **Read lane (decision):** the engine's storage-aware read services (algorithms / detection / confidence / degradation / metrics / search / similarity) are correct but dormant — they activate only when cognitive-pipeline's intelligence lane calls them (with `userId`). The adapter reads they rely on for full fidelity are now wired (above); what remains is a feature-surface decision about which to expose in the app and where.
+- **Read lane (decision):** the engine's storage-aware read services (algorithms / detection / confidence / metrics / search / similarity) are correct but dormant — they activate only when cognitive-pipeline's intelligence lane calls them (with `userId`). The adapter reads they rely on for full fidelity are now wired (above); what remains is a feature-surface decision about which to expose in the app and where.
 - **Connection-type seeding — ✅ shipped (v1.21.27).** cognitive-pipeline seeds the connection types the engine emits from the engine's `COGNITIVE_DB_CONNECTION_TYPES` export, each with its `relationClass` backbone — nine as of engine 1.12.25: the eight of v1.12.11 (`related_to` / `co-activated` / `qualifies` / `may_answer` / `answers` / `followed_by` / `analogous_to` / `proxy_for`) plus `about` (an emotion, concept or question record → the entity it is about; relation class `descriptive`). Per-user (Structure's `createConnectionType` pins `userId`), idempotent, degrade-safe, seeded on each user's first ingest after a restart — so a re-vendor that adds a type needs no module change. Structure's `createConnection` already accepts unregistered types, so this is ontology hygiene (named/typed edges) rather than a correctness fix — but it anchors the growing vocabulary to the fixed relation-class backbone.
 - **Parked (do not wire):** `archiveNode` / `moveNode` / `mergeNode` — these are the archive / merge / re-parent levers of the [parked data-minimisation work](#data-minimisation-storage-lifecycle--parked-reassess-via-a-design-process). Leaving them unwired is degrade-safe and consistent with that decision.
 
@@ -493,6 +493,28 @@ Move ingestion to a background job system so the API responds immediately with a
 3. **Queue integration** — use BullMQ or similar for reliable job processing
 
 This is the most impactful improvement for user experience with large documents.
+
+#### Retry failed ingests
+
+**Status:** Partly built. Moved from the [engine roadmap](/cognitive-db/roadmap/#reprocessing-queue) on 2026-10-01: retrying a failed ingest is the pipeline's job, not cognitive-db's. The engine's unused reprocessing helpers were removed in engine 1.12.26.
+
+A retry is another engine `ingest()` call. When an extraction call fails, including when AI Core refuses it, the engine throws before it writes the content record, so re-running the job starts clean.
+
+**Already built:**
+
+- A failed ingest sets the job to `failed`, stores the error message in `error`, and fires `cognitive-pipeline.ingest.failed`.
+- The job row keeps the whole request in `input`, including an uploaded file's bytes, so a job can be replayed without the original upload.
+- `runQueuedIngest` can re-run an existing job through `ingest()`'s re-entry path, but only for a job in `queued`.
+- `quarantined` is the dead-letter state for content that failed a quality gate; it is not a retry candidate.
+
+**Missing:**
+
+- **A retry action.** There is no retry route and no Retry button, on the job detail page, in Recent Jobs, or for an RSS entry in `error`. Proposed: `POST /jobs/:id/retry` moves a `failed` job back to `queued`, clears `error`, and enqueues the ingest job with the same id.
+- **Why it failed.** The catch in `ingest()` keeps only `error.message`. AI Core's `RefusedError` also carries a `reason` and `detail`; for `spend-limit-reached`, `detail.resetsAt` says when the limit resets. Record `{ reason, retryable, resetsAt, attempts }` on the job, using the existing `describeAiFailure` helper. Separately, the adapter's embed path turns every AI Core refusal into the misleading `ai-core-embed-unavailable` ("install AI Core and set a model") error.
+- **Automatic retry when a limit resets.** Re-queue a `spend-limit-reached` job at `detail.resetsAt`. A periodic sweep of `failed` jobs is more reliable than a delayed job, which survives a restart only with `JOBS_RUNNER=pg-boss`. Retry a `retryable` provider error after a short backoff, up to a fixed number of attempts. Never retry automatically a refusal an admin must fix (an unseeded operation, `operation-disabled`, `model-unpriced`, …); show on the job what to fix instead.
+- **Partly degraded ingests.** Under Structure, a refused summary or embedding call does not fail the ingest: the engine records a generic warning and the job completes without that output. A plain re-run then hits the engine's change gate and skips it, so it needs `force: true`. Telling these apart needs the engine to name the refusal in its warning (an [engine roadmap](/cognitive-db/roadmap/) item).
+- **RSS retries without a limit.** Each poll re-runs every entry left `detected` after a synchronous failure, with no backoff or attempt cap, so while a spending limit is reached every poll adds a failed job per entry. Apply the same policy, and hold auto-ingest until the limit resets.
+- **Optional pre-check.** Call AI Core's `assertUsageAllowed` before acquisition, so a job the limit would refuse does not first pay for fetching, OCR or Docling.
 
 #### Suggestions Inbox
 
