@@ -1,13 +1,13 @@
 ---
 title: v2 RFC — Structure-Native Architecture
-description: Proposed cognitive-db v2 — dissolve the engine's parallel node store into Structure, recast the engine as an intelligence filter, and incorporate the library cleanly into the module system.
+description: The cognitive-db v2 design (accepted; complete with engine v2.0.0) — dissolve the engine's parallel node store into Structure, recast the engine as an intelligence filter, and incorporate the library cleanly into the module system.
 sidebar:
   order: 7
   label: "v2 RFC (Structure-native)"
 ---
 
-> **Status:** Accepted — Phase 1 shipped (Structure v1.16.0, 2026-07-15) · **Date:** 2026-07-15 · **Supersedes:** the v1 "engine owns `cog_node`" model
-> This is a design map to redline, not an implementation. Phases 2–5 are not yet built.
+> **Status:** Accepted — complete. Phase 1 shipped in Structure v1.16.0 (2026-07-15); Phase 5 shipped as cognitive-db v2.0.0 (2026-10-09) · **Date:** 2026-07-15 · **Supersedes:** the v1 "engine owns `cog_node`" model
+> Kept as the design record; the outcome notes in §13 record where the build differs.
 
 ## 1. Motivation
 
@@ -126,10 +126,10 @@ Working memory is user-facing (Structure holds it) but *composed* by many source
 ## 9. Phased migration
 
 1. **Foundations** — Structure: `cognitiveIngest` flag, opt-in embedding column + index, connection `origin`/`status`, node-type proposal/approval API, semantic-search entrypoint. (Additive, ships first, harmless when unused.) ✅ **Shipped in [Structure v1.16.0](/modules/structure/cognitive/).**
-2. **Engine core** — retarget storage: records + ontology reads + embeddings + dedup against Structure; stand up `cog_intelligence_*`. Behind a flag alongside v1 if practical.
-3. **cognitive-pipeline rewire** — pipeline writes Structure nodes; make the mapping real; slim `cog_ingest_job`; content-as-field.
-4. **Intelligence** — patterns/questions/insights as nodes; discovered-connection promotion; provenance/working-memory.
-5. **Retire v1** — remove `cog_node` + the duplicated payloads; cut **cognitive-db v2.0.0** (breaking).
+2. **Engine core** — retarget storage: records + ontology reads + embeddings + dedup against Structure; stand up `cog_intelligence_*`. Behind a flag alongside v1 if practical. ✅ **Shipped** through engine v1.x, flag-guarded alongside v1 (Structure the default from Cognitive Pipeline v1.21.21).
+3. **cognitive-pipeline rewire** — pipeline writes Structure nodes; make the mapping real; slim `cog_ingest_job`; content-as-field. See the [Cognitive Pipeline roadmap](/modules/cognitive-pipeline/roadmap/) for its status.
+4. **Intelligence** — patterns/questions/insights as nodes; discovered-connection promotion; provenance/working-memory. ✅ **Shipped** — the intelligence lanes became storage-aware in engine v1.12.4–v1.12.16 (deviations in §13).
+5. **Retire v1** — remove `cog_node` + the duplicated payloads; cut **cognitive-db v2.0.0** (breaking). ✅ **Shipped as cognitive-db v2.0.0** (2026-10-09).
 
 ## 10. Risks & open questions
 
@@ -150,15 +150,15 @@ cognitive-db is a **library**, not a scaffold module — here is the clean patte
 
 - **Delivery — vendored into a module.** The library is not published to npm. `cognitive-pipeline` packs a pinned build (`vendor/cognitive-db.tgz`) and installs it into the host backend via its `onInstall`/`onUpdate` lifecycle hook — no registry or GitHub auth, version locked to the module release. App developers install *one module* and the library rides along. A local `npm link cognitive-db` overrides it for engine development.
 - **Docs — in the shared site under Libraries.** The library's *published* docs (this section) live in `module-system-docs` under the **Libraries** sidebar group — discoverable alongside the modules, versioned with the site — **not** siloed in the engine repo. The engine repo keeps only its working history (design notes, the code audit) and the canonical `CHANGELOG.md` that the site mirrors; forward-looking design (this RFC) is published here.
-- **Versioning — inline with the system.** Semantic versioning + a `CHANGELOG.md`, matching the module/starter convention, with `version:*` scripts in the library. (Engine currently at v1.0.0.)
+- **Versioning — inline with the system.** Semantic versioning + a `CHANGELOG.md`, matching the module/starter convention, with `version:*` scripts in the library. (Engine at v2.0.0.)
 - **Conventions — aligned.** The library's `CLAUDE.md` references the authoritative [LLM rules](/getting-started/llm-rules/) and captures the library-applicable subset (file headers, no `console.*`, SQL binding, public-export deprecation); `tenantId === userId` throughout.
-- **Consumed via a module, not app-installed directly.** App developers never wire the engine themselves — cognitive-pipeline generates the `initConfig` and owns the pipeline. The library's public surface is its named exports; breaking changes follow the deprecation cycle.
+- **Consumed via a module, not app-installed directly.** App developers never wire the engine themselves — cognitive-pipeline generates the `initConfig` and owns the pipeline. The library's public surface is its named exports; breaking changes follow the deprecation cycle once there are external consumers. Pre-launch they are clean breaks, as in v2.0.0.
 
 **The pattern in one line:** *vendored delivery through a module · published docs in the shared Libraries group · semver + changelog · `CLAUDE.md` aligned to the LLM rules.*
 
 ## 13. Handoff — for the implementation chat
 
-The design is settled enough to start; this section orients a fresh session.
+*Historical — the handoff as written on 2026-07-15.* The design is settled enough to start; this section orients a fresh session.
 
 **Repos** (work on `master`/`main` directly — module-system convention):
 - Engine: `C:/Users/kimbe/ReactApps/Cog/cognitive-db`
@@ -180,3 +180,16 @@ The design is settled enough to start; this section orients a fresh session.
 **Phase 1 outcome:** everything landed as specified (the §4 decisions are intact), with two deviations from the original sketch. The `data->>'origin'` expression index was dropped — Prisma's JSON path filter emits a different expression, so the index could never be used; revisit when the review UI's query shape settles. And the embeddings code ships as a separate when-gated service file registered as `structureEmbeddings` (not inline flags in existing files), so flipping the opt-in later regenerates cleanly. See [Cognitive foundations](/modules/structure/cognitive/) for the shipped surface.
 
 **Item 2 outcome:** the `working-memory` node type and the full `cognitive-pipeline.working-memory.*` hook surface shipped as specified in §7, with six recorded deviations. Hook contexts carry `sessionNodeId` (a Structure node id), not `sessionId`; the context filter's value is a structured `WorkingMemoryContext`, not a prompt string (add/trim/rank is not implementable over an opaque string); assemble is a **rebuild** (pinned items + fresh contributions), not append-over-current — nothing ratchets into permanent focus and `.item.removed` actually fires; a full flow emits two `updated` events (`assemble` then `context`), each carrying a change/usage payload the engine can consolidate from; no connection-type row is seeded for `working-memory` edges (Structure has no shared-row API for connection types — untyped connections skip validation by design); and session linkage is `parentId`-only for now (Structure doesn't enforce hierarchy rules server-side, so the "or a connection" alternative is deferred until it does). See [Working memory](/modules/cognitive-pipeline/working-memory/) for the shipped surface.
+
+**Phase 5 outcome (cognitive-db v2.0.0, 2026-10-09):** `cog_node` and every v1 code path were removed, and Structure is required, with no storage flag and no fallback. Where the build differs from §5 and §8:
+
+- **Consolidation input** stayed in the engine's `cog_working_memory_events` table. The planned `cog_intelligence_event` buffer was never used and was dropped.
+- **`cog_processing_log`** was kept for the propagation and batch queues and usage metrics, rather than being absorbed into `cog_intelligence_log`.
+- **Condensation** was removed, not re-pointed at Structure. Keeping originals and data minimisation went to Cognitive Pipeline (with Document Management), and `cog_content_archive` is host-owned.
+- **Entity matching** was re-implemented as structure-store `resolveEntity` (exact, normalised-name and semantic stages). The v1 alias functions were dropped; an alias stage on `data.aliases` is planned.
+- **Version chains** became `cog_intelligence_log` `previousState` snapshots, as designed.
+- **Discovery:** the v1 `discovery` module was removed. Immediate discovery runs inside ingest, buffering candidates in `cog_intelligence_discovery` before promotion, as designed.
+- **Removed outright:** storage accounting, the custom pattern-type registry and time-based confidence decay.
+- **Meta-connections** are stored (`createMetaConnection`), but extraction does not produce them yet.
+
+See the [changelog](/cognitive-db/changelog/) for the full list.

@@ -13,7 +13,7 @@ cognitive-db stores an unusually sensitive kind of data. It performs **psycholog
 This page explains how that posture is actually realised. The headline is that isolation is not a bolt-on multi-tenant layer — it is **ownership by `userId`**, inherited from the host starter's security foundation — and that "never decay" coexists with a real, lawful **right-to-erasure** pathway.
 
 <Aside type="note" title="What the engine stores, and where">
-cognitive-db has no datastore of its own. The text you ingest is kept in your own database as a content record: under Structure, in `data.content`, keyed back to your item by `sourceId` + `sourceType`; on the retiring v1 store, in `cog_node.rawContent` (see [apps own their data](/modules/cognitive-pipeline/engine/)). Around it the engine writes its *understanding* — extracted entities, emotions, concepts, questions, connections, and their embeddings — which is derived personal data about a named person, and is treated as such.
+cognitive-db has no datastore of its own. The text you ingest is kept in your own database as a Structure content record, in `data.content`, keyed back to your item by `sourceId` + `sourceType` (see [apps own their data](/modules/cognitive-pipeline/engine/)). Around it the engine writes its *understanding* — extracted entities, emotions, concepts, questions, connections, and their embeddings — which is derived personal data about a named person, and is treated as such.
 </Aside>
 
 ---
@@ -47,7 +47,10 @@ securityRegistry.register({
     { name: 'cog_ingest_config', classification: 'owned' },
     { name: 'cog_ingest_mappings', classification: 'owned' },
     { name: 'cog_ingest_rss_entries', classification: 'owned' },
-    { name: 'cog_engine_graph', classification: 'owned' },
+    { name: 'cog_intelligence_logs', classification: 'owned' },
+    { name: 'cog_intelligence_discoveries', classification: 'owned' },
+    { name: 'cog_processing_logs', classification: 'owned' },
+    { name: 'cog_working_memory_events', classification: 'owned' },
   ],
 });
 ```
@@ -58,12 +61,12 @@ PostgreSQL Row-Level Security is not part of the current design, but it is an *a
 
 ### Why `userId` is nullable — by design
 
-`userId` on the engine's `cog_node` (and its sibling tables) is **nullable**, and that is intentional, not a gap. Some nodes are **not owned by any one user** — the base ontology, shared system concepts, and relationship-type definitions are meant to be common infrastructure that every user's graph classifies against. A `null` `userId` marks a node as *shared/system*, distinct from a user-owned node.
+Shared types carry a **null** `userId`, and that is intentional, not a gap. Structure's system node types and connection types — the ontology every user's graph classifies against — are **not owned by any one user**: they are common infrastructure. A `null` `userId` marks a type as *shared/system*, distinct from a user-owned record. (The engine's own `cog_processing_log` and `cog_working_memory_event` also have a nullable `userId` column, but every engine write sets it; `cog_intelligence_log` and `cog_intelligence_discovery` require it.)
 
 | `userId` value | Meaning | Isolation behaviour |
 |----------------|---------|---------------------|
-| A concrete id | A user-owned node (content, entity, connection, pattern) | Isolated to that user by ownership; never visible to another user's scoped reads |
-| `null` | Shared system/ontology node (concepts, relationship types, base ontology) | Common infrastructure; not personal data; deliberately not user-scoped |
+| A concrete id | A user-owned record (content, entity, connection, pattern) or engine process row | Isolated to that user by ownership; never visible to another user's scoped reads |
+| `null` | A shared system/ontology type (Structure node and connection types with no owner) | Common infrastructure; not personal data; deliberately not user-scoped |
 
 <Aside type="caution" title="This is why 'enforce non-nullable userId' is the wrong fix">
 An earlier security assessment framed nullable `userId` as a defect to be closed by making the column non-nullable. Under the `tenantId === userId` model that reading is inverted: nullability is what lets shared ontology exist without being falsely attributed to — or deleted with — a single user. Ownership-scoped reads already exclude other users' rows; the null case is the *shared* case, handled explicitly (see the erasure cascade below).
@@ -81,19 +84,19 @@ Two of the engine's commitments look, at first glance, contradictory:
 These do not conflict, because they are about different things. "Never decay" is a statement about **relevance ranking over time** — the engine will not silently forget or bury data as it ages. Erasure is a **distinct, legally-mandated override** — an explicit, deliberate deletion of a specific subject's data, triggered by a lawful request, not by the passage of time.
 
 <Aside type="note" title="One principle is automatic; the other is a deliberate act">
-Never-decay is the engine's default behaviour on every read. Erasure is never automatic — it runs only when an account is erased, cascading through content, embeddings, versions, and derived data. Distinguishing the two is what lets both hold at once.
+Never-decay is the engine's default behaviour on every read. Erasure is never automatic — it runs only when an account is erased, cascading through records, embeddings, provenance and derived data. Distinguishing the two is what lets both hold at once.
 </Aside>
 
 ### The erasure pathway is implemented
 
-This is not a design aspiration — the deletion handler ships in the module. Cognitive Pipeline registers an account-erasure handler that hard-deletes the subject's ingest data **and** their slice of the engine graph. Child tables keyed by `sourceId` are cleared first, then the user-owned rows; shared/system ontology (the `null`-`userId` nodes) is left intact:
+This is not a design aspiration — the deletion handler ships in the module. Cognitive Pipeline registers an account-erasure handler that hard-deletes the subject's ingest data **and** the engine's process rows for them. Child tables keyed by `sourceId` are cleared first, then the user-owned rows. The subject's records themselves (content, entities, connections, patterns) are Structure nodes, erased by Structure's own deletion handler; shared/system types (`null` `userId`) are left intact:
 
 ```typescript
 securityRegistry.registerDeletionHandler({
   id: 'my-feature.ingest-and-engine-data',
   moduleId: 'my-feature',
   classification: 'owned',
-  description: "Hard-delete the subject's ingest sources, jobs, config, mappings, RSS entries and engine graph",
+  description: "Hard-delete the subject's ingest sources, jobs, config, mappings, RSS entries and engine process rows",
   async run(ctx) {
     const userId = ctx.subject.userId ?? ctx.subject.tenantId;
 
@@ -113,9 +116,10 @@ securityRegistry.registerDeletionHandler({
     recordsAffected += (await prisma.cog_ingest_job.deleteMany({ where: { userId } })).count;
     recordsAffected += (await prisma.cog_ingest_config.deleteMany({ where: { userId } })).count;
 
-    // Engine tables: only the subject's rows (userId match). Shared/system
-    // ontology carries a null userId and is deliberately left untouched.
-    recordsAffected += (await prisma.cog_node.deleteMany({ where: { userId } })).count;
+    // Engine process tables: only the subject's rows (userId match). The records
+    // themselves are Structure nodes, erased by Structure's own handler.
+    recordsAffected += (await prisma.cog_intelligence_log.deleteMany({ where: { userId } })).count;
+    recordsAffected += (await prisma.cog_intelligence_discovery.deleteMany({ where: { userId } })).count;
     recordsAffected += (await prisma.cog_working_memory_event.deleteMany({ where: { userId } })).count;
     recordsAffected += (await prisma.cog_processing_log.deleteMany({ where: { userId } })).count;
 
@@ -129,7 +133,7 @@ The cascade has three properties worth calling out:
 
 <CardGrid>
   <Card title="Complete" icon="approve-check">
-    It reaches everything derived from the subject: the unified graph (`cog_node`, which holds nodes, connections, patterns, and their **embeddings**), working-memory events, processing logs, and every module table — not just the visible ingest records. Under Structure storage the content records and the engine's understanding are Structure nodes, erased by Structure's own `structure.nodes` deletion handler.
+    It reaches everything derived from the subject: the engine's process tables (provenance, discovery buffer), working-memory events, processing logs and every module table — not just the visible ingest records. The content records and the engine's understanding (entities, connections, patterns and their **embeddings**) are Structure nodes, erased by Structure's own `structure.nodes` deletion handler.
   </Card>
   <Card title="Ownership-scoped" icon="list-format">
     Every delete filters on `userId`. Shared ontology (`null` `userId`) survives, so erasing one subject never degrades another user's classification base.
@@ -139,8 +143,8 @@ The cascade has three properties worth calling out:
   </Card>
 </CardGrid>
 
-<Aside type="note" title="Embeddings are deleted with the node">
-Because a node's embedding lives on the same `cog_node` row (a pgvector column), erasing the node erases its embedding. There is no separate vector store to sweep — which matters, because embeddings are themselves personal data (next section).
+<Aside type="note" title="Embeddings are deleted with the record">
+A record's embedding lives on the same `structure_node` row (a pgvector column), so Structure's erasure removes it with the record. There is no separate vector store to sweep — which matters, because embeddings are themselves personal data (next section).
 </Aside>
 
 ---
@@ -153,7 +157,7 @@ The reframing above closes the "multi-tenant / non-nullable `userId`" thread, bu
 
 An embedding is not an anonymised vector. It encodes what the model understood about a person — their psychology, emotional state, decisions, and relationships — densely enough to support semantic search and similarity. Treat embeddings with the **same sensitivity as the source understanding**, not as opaque numbers:
 
-- Include them in any data-subject export or erasure reasoning (the cascade above already deletes them with their node).
+- Include them in any data-subject export or erasure reasoning (Structure's erasure already deletes them with their record).
 - Do not ship embeddings to logging, analytics, or third-party sinks that would not be trusted with the underlying content.
 - Remember that similarity search over embeddings can re-identify or correlate individuals even without the original text.
 
@@ -221,7 +225,7 @@ Some choices are genuinely app- and deployment-specific, and the engine delibera
 The hardened posture is not just architectural. cognitive-db reached its **first stable release (v1.0.0)** on 2026-07-14 only after a comprehensive multi-agent **code audit** (96 files, ~28k LOC, 83 verified findings, all remediated). Security-relevant fixes in that pass included a **SQL-injection remediation** in the search service (raw string-interpolated `WHERE` clauses — including the `userId` filter — replaced with parameterised queries) and correctness fixes to graph traversal. Auditing implemented-versus-stubbed before extending anything is a standing practice for the engine, not a one-off.
 
 <Aside type="caution" title="The search-filter fix was security-critical">
-The pre-v1.0.0 search service concatenated caller-supplied values (including `userId`) straight into SQL, which — under the ownership model — was an isolation-bypass risk, not merely an injection risk. It was fixed to use numbered placeholders. When extending search or any query surface, keep every dynamic value parameterised.
+The pre-v1.0.0 search service concatenated caller-supplied values (including `userId`) straight into SQL, which — under the ownership model — was an isolation-bypass risk, not merely an injection risk. It was fixed to use numbered placeholders. (That raw search SQL left with the v1 store in v2.0.0: search now goes through the Structure adapter, and the engine's remaining raw SQL, on its working-memory table, binds every value the same way.) When extending any query surface, keep every dynamic value parameterised.
 </Aside>
 
 ---
@@ -232,10 +236,10 @@ The pre-v1.0.0 search service concatenated caller-supplied values (including `us
 |---------|---------|
 | Isolation | **Ownership by `userId`** (`tenantId === userId`); inherited from the host starter's security foundation; `ownedModels: []` |
 | Multi-tenant / RLS | **Not in the design** — solo-business model; RLS is an available opt-in escalation, not a plan |
-| Nullable `userId` | **Intentional** — marks shared system/ontology nodes; not a gap |
+| Nullable `userId` | **Intentional** — marks shared system/ontology types; not a gap |
 | Never-decay vs erasure | Reconciled — decay is about *ranking*; erasure is a **distinct lawful override** |
-| Right to erasure | **Implemented** — account-erasure deletion handler cascades through ingest data, the graph, embeddings, versions, and logs |
-| Embeddings | **Personal data** — deleted with their node; never treated as anonymised vectors |
+| Right to erasure | **Implemented** — the module's deletion handler cascades through ingest data, the engine's process tables and logs; Structure's handler erases the records and their embeddings |
+| Embeddings | **Personal data** — deleted with their record; never treated as anonymised vectors |
 | Ingested content | **Prompt-injection surface** at the extraction stage — perception is claims, not commands |
 | Overseas AI processing | **Disclosure decision** under Australian (and possibly EU/UK) privacy law |
 | Read/access audit trail | **Roadmap** — distinct from `cog_processing_log` (which logs processing, not reads) |

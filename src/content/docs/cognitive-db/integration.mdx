@@ -1,6 +1,6 @@
 ---
 title: Integration & Delivery
-description: How an app wires cognitive-db in via initConfig() (an AiAdapter onto AI Core, a StructureAdapter onto Structure), the sourceId/sourceType source-identity contract, storage modes, and how the engine is delivered — vendored into Cognitive Pipeline or installed standalone from Git.
+description: How an app wires cognitive-db in via initConfig() (an AiAdapter onto AI Core, a StructureAdapter onto Structure), the sourceId/sourceType source-identity contract, the Structure requirement, and how the engine is delivered — vendored into Cognitive Pipeline or installed standalone from Git.
 sidebar:
   order: 3
   label: "Integration & Delivery"
@@ -24,7 +24,7 @@ cognitive-db is deliberately **generic, not app-specific**. It hardcodes no data
 
 <CardGrid>
   <Card title="You provide" icon="laptop">
-    A Prisma client, an `AiAdapter` onto your AI Core (models and keys), a `StructureAdapter` onto your Structure module (records), and optional feature switches.
+    A Prisma client, an `AiAdapter` onto your AI Core (models and keys), a `StructureAdapter` onto your Structure module (records — required), and optional feature switches.
   </Card>
   <Card title="The engine provides" icon="puzzle">
     Perception, entity resolution, connection discovery, search, traversal, pattern detection, consolidation and proactive insights.
@@ -50,9 +50,8 @@ initConfig({
     embed: (opId, values, ctx) => aiCore.embed(opId, values, ctx),
   } satisfies AiAdapter,
 
-  // 3. Records — a StructureAdapter onto your Structure module
+  // 3. Records — a StructureAdapter onto your Structure module (required)
   storage: {
-    mode: 'structure',
     structure: structureAdapter,
     autoPromoteThreshold: 0.9,   // optional: auto-activate discovered connections at or above this
   },
@@ -66,7 +65,7 @@ initConfig({
 The engine never sees a provider name, a model id or an API key. It runs named operations (`cognitive-db/extract-entities`, …) through `runLanguage`, and AI Core decides which model answers and how the prompt is built. The operations and their context markers ship as `COGNITIVE_DB_OPERATIONS` (from `cognitive-db/operations`) for the host to seed into AI Core.
 </Aside>
 
-If you call an engine function before `initConfig()`, you get a clear `CognitiveDB: Not initialized` error. A storage adapter can also be injected later with `updateConfig({ storage: { structure } })`. When no explicit `mode` is set, the engine uses Structure whenever an adapter is present.
+If you call an engine function before `initConfig()`, you get a clear `CognitiveDB: Not initialized` error. `storage.structure` is required: `initConfig()` throws without it, because Structure is the engine's only record store (see [Storage](#storage)). `updateConfig({ storage: { structure } })` can replace the adapter later; an update without one keeps the current adapter.
 
 ### Processing levels
 
@@ -79,9 +78,9 @@ Each `ingest()` call takes a `processingLevel` that sets how much the model is a
 | `deep` | + `extract-concepts` | + decisions, intentions, memories, questions | 4,000 tokens |
 | `full` | + `infer-implicit`, run only when the earlier calls found entities or relationships | + implied entities and relationships | 8,000 tokens |
 
-- **Summary.** With the `understanding` switch on, a `summarise` call (capped at 500 tokens) follows whenever entities were found or the content is over 8,000 characters. This applies at `minimal` too: long content is still summarised, so its vector is never built from truncated text. Separately, when `retrieveToConnect` is on (Structure storage, above `minimal`, with a scope supplied and embeddings on), a short `summarise` call (capped at 300 tokens) and a query embedding run before extraction to find existing entities to link to; the `understanding` switch does not gate it.
+- **Summary.** With the `understanding` switch on, a `summarise` call (capped at 500 tokens) follows whenever entities were found or the content is over 8,000 characters. This applies at `minimal` too: long content is still summarised, so its vector is never built from truncated text. Separately, when `retrieveToConnect` is on (above `minimal`, with a scope supplied and embeddings on), a short `summarise` call (capped at 300 tokens) and a query embedding run before extraction to find existing entities to link to; the `understanding` switch does not gate it.
 - **Each call builds on the last.** `extract-concepts` gets the entity list, `infer-implicit` gets the entities and relationships, and `summarise` gets the entity names.
-- **Stated versus implied.** The seeded `extract-entities` operation asks only for what the content states (its `explicit-only` approach, editable in AI Core), so implied items come only from `infer-implicit`, at `full`. Under Structure storage they are written with evidence tier `inferred`; the retiring v1 store merges them in with the stated items.
+- **Stated versus implied.** The seeded `extract-entities` operation asks only for what the content states (its `explicit-only` approach, editable in AI Core), so implied items come only from `infer-implicit`, at `full`. They are written with evidence tier `inferred`.
 - **Caps are per call.** The cap limits each call's output. It is not a budget for the whole ingest: the engine keeps no token budgets, and spending limits are AI Core's (see [Providers](/cognitive-db/providers/)).
 
 Cognitive Pipeline sources offer `minimal`, `standard` and `deep`. To use `full`, call `ingest()` directly.
@@ -95,7 +94,7 @@ These seven default to **on**:
 - `entityExtraction` — entities, and so the relationships between them.
 - `relationshipDiscovery` — extracted, inferred and similarity-discovered connections.
 - `emotionDetection` — emotions.
-- `questionDetection` — questions, including "expected but missing" questions.
+- `questionDetection` — questions (and "expected but missing" questions, once the expectation pass is rebuilt).
 - `understanding` — the ingest summary and concept extraction.
 - `patterns` — every pattern-detection entry point.
 - `proactive` — `checkProactive` and `runFullCheck`. When off, they return an empty result marked `disabled: true`.
@@ -104,7 +103,7 @@ These default to **off**:
 
 - `sequentialAdjacency`
 - `structuralGaps`
-- `expectationPass`
+- `expectationPass` — accepted, but has no effect until the expectation pass is rebuilt on Structure's required fields ([Roadmap §3](/cognitive-db/roadmap/))
 - `retrieveToConnect`
 - `analogicalProxy`
 
@@ -145,12 +144,26 @@ The `sourceId` is how re-ingest stays idempotent:
 The engine follows a **`tenantId === userId`** model: in a solo-business design, one user *is* the tenant. There is no separate multi-tenant layer and no `tenantId` column. Isolation is by **ownership**: every read and write is scoped to the `userId` you pass, and every entry point rejects an empty one.
 </Aside>
 
-### Storage modes
+### Storage
 
-| Mode | Status | How it works |
-|------|--------|--------------|
-| **`structure`** | ✅ Primary | Records live in Structure, through the `StructureAdapter`. The engine keeps only its own `cog_intelligence_*` provenance and discovery tables and the working-memory events. |
-| **`cog_node`** (v1) | ⏳ Retiring | The original single-table graph. It is used only when no Structure adapter is configured, and is scheduled for removal. |
+Records live in **Structure**, reached through the `StructureAdapter`. Since v2.0.0 Structure is the engine's only record store: there is no storage mode and no fallback, and `initConfig()` throws without an adapter. (v2.0.0 removed the engine's own v1 `cog_node` table.)
+
+The engine keeps only its working tables, in your database through your Prisma client:
+
+| Model | Holds |
+|---|---|
+| `cog_intelligence_log` | Provenance — the engine's change log, with each update's reason and prior values |
+| `cog_intelligence_discovery` | Discovered-connection candidates awaiting promotion or review |
+| `cog_processing_log` | The propagation and batch queues, and usage metrics |
+| `cog_working_memory_event` | Co-retrieval events — the input to working-memory consolidation |
+
+A few engine functions need optional adapter methods:
+
+- `strengthenConnection`, `weakenConnection` and `updateConnectionStrength` need `getConnection` (Structure 1.37.1 or later). `createMetaConnection` uses it too when present, and falls back to `getNode`.
+- `findByConnectionType` needs `listConnections`; without it, it returns nothing.
+- `removeConnection` needs `deleteConnection`.
+
+Structure 1.38.0 or later is recommended, for complete secret redaction in change-log snapshots (`redactSecretValues`).
 
 The `database.mode` is `integrated`: you pass your app's own `PrismaClient`, and the engine's tables live in your database. A Prisma-free `standalone` mode is planned but not built.
 
@@ -225,7 +238,7 @@ To use the engine on its own, install it straight from GitHub. It is not on npm,
 npm install github:ui-git-kim/cognitive-db
 ```
 
-Then copy the engine's `cog_*` models from its `prisma/schema.prisma` into your own schema. Enable the pgvector extension, run your migration, and call `initConfig()` as shown in Part 1.
+Then copy the engine's `cog_*` models from its `prisma/schema.prisma` into your own schema. Enable the pgvector extension, run your migration, and call `initConfig()` as shown in Part 1. You still need a Structure module for the records: since v2.0.0 the engine cannot run without a `StructureAdapter`.
 
 ```prisma
 generator client {
@@ -240,7 +253,7 @@ datasource db {
 }
 
 // Copy the cog_* models (cog_intelligence_log, cog_intelligence_discovery,
-// cog_working_memory_events, …) from cognitive-db/prisma/schema.prisma.
+// cog_processing_log, cog_working_memory_event) from cognitive-db/prisma/schema.prisma.
 ```
 
 ### Delivery C — `npm link` for engine development
@@ -263,7 +276,9 @@ As noted above, the Cognitive Pipeline lifecycle hook detects this symlink and s
 
 **`CognitiveDB: Not initialized`** — an engine function ran before `initConfig()`. Call `initConfig()` once at startup. The root entry and every subpath share that config.
 
-**`userId cannot be empty`** — every entry point (`ingest`, `trackEvent`, `consolidate`, `runFullCheck`, …) requires the caller's `userId`. Some v1 reads would otherwise treat an empty id as "no user filter".
+**`CognitiveDB: storage.structure adapter is required (Structure is the engine's only storage)`** — `initConfig()` was called without a Structure adapter. Pass `storage: { structure }`. Since v2.0.0 there is no fallback store.
+
+**`userId cannot be empty`** — every entry point (`ingest`, `trackEvent`, `consolidate`, `runFullCheck`, …) requires the caller's `userId`.
 
 **`no Structure node type for content`** — ingest maps `sourceType` to a Structure node type, falling back to `content`, `document`, `note` or `source`. Seed one of these in Structure. This is checked before any model call, so no tokens are spent.
 
