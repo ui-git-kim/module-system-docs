@@ -138,6 +138,13 @@ export interface DocumentManagementServiceInterface {
    */
   resolveProvenance(userId: string, ref: ProvenanceQuery): Promise<ProvenanceResult | null>;
 
+  /**
+   * Storage Document Management holds for one user on app-provided storage
+   * (v1.18.1+). Computed on demand from the module's own records — see
+   * "Storage usage" below.
+   */
+  getUsage(userId: string): Promise<DocumentManagementUsage>;
+
   /** Whether the module is available (for optional detection by consumers). */
   isAvailable(): boolean;
 }
@@ -235,6 +242,7 @@ export interface ProvenanceResult {
 | `requestIngest(userId, input)` | `Promise<{ enqueued: boolean; documentId: string }>` | Ensure a durable reference exists (with `contentHash`), then re-emit `documents.document.uploaded` so manual ingest shares the auto-ingest job path. `enqueued` reflects whether a consumer was subscribed. |
 | `isIngestAvailable()` | `boolean` | Whether an ingest consumer is subscribed to `documents.document.uploaded` (drives the **Ingest to KB** button visibility). Never names a specific consumer. |
 | `resolveProvenance(userId, ref)` | `Promise<ProvenanceResult \| null>` | Read-only. Resolve a `documentId` (or `providerId`+`remotePath`) back to its document, source, and latest-per-format artefacts, for citations and chain-of-evidence — `null` when the source can't be resolved. Document-centric — the engine's own `sourceId` never appears here. |
+| `getUsage(userId)` | `Promise<DocumentManagementUsage>` | Read-only (v1.18.1+). The user's file storage on app-provided storage, as `ModuleUsageItem` lines plus a byte total — see [Storage usage](#storage-usage-v1181). |
 | `isAvailable()` | `boolean` | Always `true` once registered; lets soft consumers confirm the module is present. |
 
 <Aside type="tip" title="Reading the upload limits">
@@ -337,6 +345,40 @@ export const myFeatureService = {
 <Aside type="tip" title="get vs getOptional">
 `serviceRegistry.get('document-management')` throws if the module is not installed — use it only when you have declared `requiredModules: ['document-management']`. `serviceRegistry.getOptional('document-management')` returns `undefined` when absent — use it for soft dependencies and always null-check before calling.
 </Aside>
+
+### Storage usage (v1.18.1+)
+
+`getUsage(userId)` reports the file storage Document Management holds for one user, in the same `ModuleUsageItem` shape Structure introduced in v1.38.2 ([Structure → Storage Usage](/modules/structure/integration/#storage-usage-v1382)), so a host or Cognitive Pipeline can add the modules up. The types are declared locally in Document Management, so it does not depend on Structure.
+
+```typescript
+interface ModuleUsageItem { key: string; label: string; count: number; bytes: number | null }
+
+interface DocumentManagementUsage {
+  moduleId: 'document-management';
+  totals: { bytes: number };        // sum of the item bytes (null counted as 0)
+  items: ModuleUsageItem[];         // always the seven items below, in this order
+  generatedAt: string;              // ISO timestamp
+}
+
+const dm = serviceRegistry.getOptional('document-management');
+const usage = dm ? await dm.getUsage(userId) : null;
+```
+
+**What it counts.** The bytes Document Management holds for the user on **app-provided storage**: the app-wide shared default (current or former), organisation-owned stores, and the server-local folder. Files on the user's **own** storage — their bucket, their NAS, or their computer through Local Connect — use none of the app's storage, so they are not counted; nor are organisation-wide global files or references whose storage provider was removed.
+
+| Key | Label | Counts |
+|-----|-------|--------|
+| `files` | Files | Active document references on app storage |
+| `archived-files` | Archived files | Archived references (still stored — archiving does not delete) |
+| `staged-uploads` | Uploads waiting to sync to your computer | Offline uploads held on app storage until the user's computer reconnects |
+| `processed-copies` | Processed copies (for search and AI) | The latest parsed artefact per source and format |
+| `processed-copy-versions` | Earlier versions of processed copies | Superseded parsed artefacts the retention policy still keeps |
+| `awaiting-purge` | Processed copies awaiting clean-up | Parsed artefacts the retention policy would remove — exactly what `POST /artefacts/prune` deletes |
+| `size-unknown` | Stored items whose size couldn't be determined | Rows on app storage with no recorded size; `bytes` is `null` |
+
+The items never overlap — a staged upload is counted once, under `staged-uploads` — so `totals.bytes` is their sum. Original files are not versioned in V1, so parsed-artefact versions are the module's only "file versions". A row with no recorded size (over 2 GiB, or a reference created without one) is counted only under `size-unknown`, so every other item's `bytes` is exact.
+
+It reads the module's own records only — no storage provider is contacted — and scans the user's rows, so call it for a usage view, not per request. Two limits follow from that: an upload straight to the user's own storage creates no reference, and deleting a document reference leaves a shared-storage file's bytes in place until account erasure, so neither is visible here.
 
 ---
 
