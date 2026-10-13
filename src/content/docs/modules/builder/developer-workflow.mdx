@@ -55,6 +55,24 @@ Two more mechanical gates back the loop:
 - **`npm run conformance:check`** runs the C1–C29 module Conformance Contract checks — a regex-level guard over `src/templates/**` that catches contract regressions (a banned `console.*` in backend code, a registration left out of the barrel, a non-namespaced query key, and the like). It is a **soft gate** that also runs automatically inside every `version:*` / `release:*` bump (advisory in a non-interactive shell, prompt-to-continue in a TTY), so run it directly as a hard gate before committing.
 - **`npm run parity:check`** guards the paired `.ps1` / `.sh` scaffold scripts against behavioural drift — add a flag to one variant and it fails until the other matches.
 
+### Continuous integration
+
+Since v1.33.0 the module repository runs its quality gates in GitHub Actions (`.github/workflows/ci.yml`) on **every push to `main` and every pull request**, so a missed local step can't ship:
+
+| Step | What it checks |
+|------|----------------|
+| `npm ci` | Clean install from the lockfile (Node 24) |
+| `npm run build` | `tsup` bundle + `.d.ts` declarations |
+| `npm run type-check` | `tsc --noEmit` over the module source |
+| `npm run check:templates` | No unescaped `${...}` in a template string |
+| `npm run conformance:check` | The C1–C29 module Conformance Contract checks |
+| `npm run parity:check` | `.ps1` / `.sh` scaffold-script parity |
+| `npm run check:ui` | The module's UI-standards guard (see [Module checks](#module-checks)) |
+| `npm audit --omit=dev --audit-level=high` | **Blocking:** advisories in the dependencies the published package ships |
+| `npm audit --audit-level=high` | **Advisory** (`continue-on-error`): the dev toolchain (tsup, rollup, esbuild) |
+
+The docs submodule isn't checked out in CI. Type-checking the **generated** code against a real starter host is still a manual step, because it needs the starter and structure checkouts. The scaffold-owned `release:*` script still enforces only the build, so CI is the real gate. `npm audit` is at 0 vulnerabilities as of v1.33.0, after an `npm audit fix` and a `package.json` override that points `tsup` at the repo's own esbuild (`"overrides": { "tsup": { "esbuild": "$esbuild" } }`). That changes dev tooling only. Nothing a host installs is affected.
+
 ### 1. Edit Templates
 
 All your work happens in these locations:
@@ -104,6 +122,10 @@ npx builder info
 
 <Aside type="tip">
 Use `npx builder update --dry-run` before applying changes to see exactly which files would be modified. This is especially useful when testing schema changes.
+</Aside>
+
+<Aside type="caution" title="Updating a host to v1.33.0">
+Run `npx builder update` in the foreground and **don't** pass `--skip-schema`. Once builder ≥ 1.33 is in `node_modules`, run the builder update **before** any other module's update. Every module's update runs the builder's table-rename hook, and the host's pre-1.33 generated raw SQL (the orphan purge sweep and the one-off node-type check) names the old tables until the builder update regenerates it. The update renames the builder's tables to `builder_*` through a generated migration (see [below](#lifecycle-hook-onpreparedatabase)), and the module's raw SQL already uses the new names. Commit the new `<timestamp>_builder_prefix_tables` migration with the host app. To bring an old install up to date, use `update`, not `init --force`: a forced re-install still writes the rename migration, but the scaffold's own diff then fails in production on "already exists". No data is lost, but it needs manual repair. The update also offers five removed generated files as orphans, and installs `@tailwindcss/browser@4.3.3`.
 </Aside>
 
 ### 4. Verify in the App
@@ -291,6 +313,8 @@ The steps above add to the builder's **authenticated** API (`builder.routes.ts` 
 
 3. Remember: module schemas must be **self-contained** — use plain foreign key fields with `@@index`, never `@relation` directives
 
+4. **Prefix the table with the module id.** Name the model `builder_…`, or keep a shorter model name and `@@map("builder_…")` it, as `block` → `builder_block` does since v1.33.0. Renaming an **existing** table later isn't a schema-only change. A changed `@@map` diffs to `DROP TABLE` plus `CREATE TABLE`, so it needs a rename migration like the one the `onPrepareDatabase` hook writes.
+
 ### Adding a New Registry Registration
 
 1. Create the registration template (e.g. in `registrations.ts`)
@@ -354,13 +378,23 @@ depends: { structure: '^1.37.5' },   // id -> semver range (the verified minimum
 // In src/module.ts
 backend: {
   // ...
-  hasInit: true,  // exports initBuilderModule() from the backend barrel — it does NOT call it
+  indexTemplate: backend.INDEX_TEMPLATE, // the builder writes its own backend barrel
+  hasInit: false, // the scaffold's hasInit wiring doesn't apply — init runs via module.registration.ts
 },
 ```
 
-`hasInit` only makes the scaffold export `initBuilderModule()`. The builder **calls** it from the `init` callback it registers with the host's `moduleRegistry` in `MODULE_REGISTRATION` (`src/templates/backend/registrations.ts`), alongside `registerStructureHooks()`. The host runs `init` synchronously, dependency-first, before routes mount, and skips it when the builder is disabled — so work placed there is gateable. Keep `init` synchronous: async work is started with `void` (it catches its own errors). Route, service and security registrations stay at import time in the backend barrel.
+The scaffold's `hasInit` flag only affects its *fallback* barrel generator, which exports an `init` for `app.ts` to call. The builder supplies its own `indexTemplate`, so the flag never had a runtime effect, and since v1.33.0 it is `false` to say so. `initBuilderModule()` is exported from the builder's own barrel and **called** from the `init` callback the builder registers with the host's `moduleRegistry` in `MODULE_REGISTRATION` (`src/templates/backend/registrations.ts`), alongside `registerStructureHooks()`. The host runs `init` synchronously, dependency-first, before routes mount, and skips it when the builder is disabled, so work placed there is gateable. Keep `init` synchronous: async work is started with `void` (it catches its own errors). Route, service and security registrations stay at import time in the backend barrel.
 
-Lifecycle hooks (`onInstall`, `onUpdate`, `onUninstall`) can be defined in `src/module.ts` and run during the respective CLI operations.
+Lifecycle hooks (`onInstall`, `onUpdate`, `onUninstall`, `onPrepareDatabase`) can be defined in `src/module.ts` under `lifecycle` and run during the respective CLI operations. The builder uses one of them.
+
+### Lifecycle hook: `onPrepareDatabase`
+
+v1.33.0 maps five models (`native_component`, `block`, `block_category`, `block_collection`, `registry_handle`) onto `builder_*` tables. Prisma can't express a table rename. The scaffold applies schema changes by diffing the datamodel before and after the edit, and a changed `@@map` diffs to `DROP TABLE` plus `CREATE TABLE`, which production would replay as data loss. So `src/module.ts` registers `lifecycle: { onPrepareDatabase }` from `src/lifecycle/prefix-tables.ts`. This file is module-owned, not scaffold-owned. The scaffold runs the hook **before** it snapshots the schema, and the hook:
+
+1. Writes a real Prisma migration, `backend/prisma/migrations/<timestamp>_builder_prefix_tables/migration.sql`, timestamped after every existing migration. A guarded `DO $$ … $$` block renames each table and then its Prisma-named constraints and indexes (`block_pkey` becomes `builder_block_pkey`, and so on). It renames a table only when the old name exists, the new name doesn't, and the table has a builder-only column (`jsxTag`, `generatedCode`, `label`, `displayName`, `handle`). That way another module's same-named table is never touched, and a re-run is a no-op.
+2. Adds the `@@map("builder_…")` lines to the host's **existing** builder models, so the scaffold's own diff for the rename is empty.
+
+The migration is written before the schema edit. If anything after it fails, the scaffold's diff runs after the rename, so `CREATE TABLE` fails loudly on "already exists" rather than losing data. Dev and production both apply the same migration through Prisma (`prisma migrate deploy` in production). A fresh install replays it as a no-op and creates `builder_*` directly. The hook also runs from a **sibling module's** update, because the scaffold runs every installed module's `onPrepareDatabase`, loaded from `node_modules`. So it can fire before `npx builder update` has regenerated the host's builder code. Prisma model calls keep working through `@@map`, but pre-1.33 generated raw SQL (the orphan purge sweep and the one-off node-type check) still names the old tables and fails until the builder update runs. Hence the upgrade note: update the builder first. The hook always runs rather than trying to detect which module is driving the update, because skipping it during the builder's own update would let the scaffold's diff drop the tables. It was tested on a scratch Postgres: rows were preserved in dev and in a production replay, a fresh replay built the `builder_*` tables directly, there was zero drift, and re-runs were no-ops.
 
 ### Module checks
 
@@ -370,7 +404,7 @@ Alongside the scaffold's `type-check`, `check:templates`, `parity:check` and `co
 npm run check:ui
 ```
 
-`tools/check-ui-standards.cjs` fails if a frontend template reintroduces a hand-rolled spinner (`Loader2` / `animate-spin`), a `!important` Tailwind modifier, or a raw palette colour (`text-blue-500`, `bg-zinc-950`, …). It lives in `tools/`, not `scripts/` — `scripts/*` is scaffold-owned and `scaffold:update` takes the upstream copy on conflict.
+`tools/check-ui-standards.cjs` fails if a frontend template reintroduces a hand-rolled spinner (`Loader2` / `animate-spin`), a `!important` Tailwind modifier, or a raw palette colour (`text-blue-500`, `bg-zinc-950`, …). It lives in `tools/`, not `scripts/` — `scripts/*` is scaffold-owned and `scaffold:update` takes the upstream copy on conflict. Like the scaffold's checks, it runs in [CI](#continuous-integration) on every push and pull request.
 
 ---
 
@@ -442,7 +476,11 @@ If the iframe preview is blank or shows errors:
 1. Check that `POST /api/v1/builder/shadcn/sync-builder` has run successfully
 2. Verify `features/builder/ui/pristine/` contains `.tsx` files
 3. Check the `shadcn:builder-synced` config key has a truthy value
-4. Try a manual re-sync via the API
+4. Try a manual re-sync via the API (admin, with step-up at the `hardened` and `strict` tiers)
+
+Pristine sources are written only in **development** (v1.33.0). With `NODE_ENV=production` the boot sync is skipped and `sync-builder` and `source-promote` answer `409`. Commit the pristine files you want from a development checkout, and rely on the database-backed global set and project snapshots in production.
+
+If the preview renders **unstyled** with a "Preview styles failed to load" banner, the bundled Tailwind runtime (`@tailwindcss/browser`) failed to load. Check that the package is installed in `frontend/`, and that a stale deploy hasn't removed its hashed asset. The failure is also reported through `reportError`. If the preview never loads (the 15-second "The preview didn't load" overlay) only in a deployed environment, check your Content Security Policy (see [Integration → Content Security Policy](/modules/builder/integration/#content-security-policy)).
 
 ---
 

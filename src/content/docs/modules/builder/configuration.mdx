@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The Block Builder module uses a database-driven configuration system. There is one optional frontend environment variable — all other configuration lives in the `builder_config` table and is managed via the admin UI or API.
+The Block Builder module uses a database-driven configuration system. Its one environment variable, `REGISTRY_DOMAIN`, is optional and declared for both the frontend and the backend. Private registries also need the host's `SECURITY_ENCRYPTION_KEY`. All other configuration lives in the `builder_config` table and is managed through the admin UI or API.
 
 ---
 
@@ -15,8 +15,9 @@ The Block Builder module uses a database-driven configuration system. There is o
 
 | Variable | Side | Required | Default | Description |
 |----------|------|:--------:|---------|-------------|
-| `VITE_REGISTRY_DOMAIN` | Frontend | No | `usefoundryui.app` | Domain used to build the registry install URLs shown on the Registry tab. Override for custom domains or local development. |
-| `REGISTRY_DOMAIN` | Backend | No | `usefoundryui.app` | The domain whose subdomains are user handles on the public registry: a request whose **raw `Host`** is exactly `<handle>.<REGISTRY_DOMAIN>` resolves to that handle. **Must match the frontend value.** Defaults to the same `usefoundryui.app` as the frontend. A **reserved** label (`api`, `www`, `app`, …) is never a handle — such a request falls through to `?handle=` (v1.32.0+). |
+| `VITE_REGISTRY_DOMAIN` | Frontend | No | `usefoundryui.app` | Domain used to build the registry install URLs shown on the Registry tab, and the domain named in the Registry Handle field's description. Override for custom domains or local development. The tab always builds `https://<handle>.<domain>` URLs. |
+| `REGISTRY_DOMAIN` | Backend | No | `usefoundryui.app` | The domain whose subdomains are user handles on the public registry: a request whose **raw `Host`** is exactly `<handle>.<REGISTRY_DOMAIN>` resolves to that handle. **Must match the frontend value.** If it is **unset or empty**, it defaults to the same `usefoundryui.app` as the frontend, so there is no disabled mode. The value is trimmed and lowercased. On any host that isn't a handle subdomain (the API's own domain, localhost, an IP), the handle comes from the `?handle=` query parameter instead. A **reserved** label (`api`, `www`, `app`, …) is never a handle — such a request falls through to `?handle=` (v1.32.0+). |
+| `SECURITY_ENCRYPTION_KEY` | Backend (host) | For private registries | — | The starter's field-encryption key (base64, 32 bytes, for example from `openssl rand -base64 32`). Registry tokens are sealed with it at **every** security tier, including `standard`, where the host's posture check doesn't ask for a key. Without a usable key, minting a token answers `503` with code `encryption_key_missing`, and init logs a warning at boot. It isn't a builder variable, so set it the way you set the host's other secrets. |
 
 The registry URL pattern is: `https://{handle}.{REGISTRY_DOMAIN}/api/v1/r/{project-slug}/{block-name}.json`
 
@@ -89,23 +90,33 @@ Before v1.32.0 an absent or `null` `projectNodeType` meant *all node types*, so 
 
 Every boot, init clears the **retired pre-v1.32 token keys** (`data.registryToken` / `data.registrytoken`) from project nodes. Tokens minted before v1.32.0 were never usable — the public registry wasn't reachable until then — so they are retired rather than migrated: `/api/v1/r` never reads those keys, and owners mint a new token on the Registry tab (consumers re-copy their `components.json` for the new URL anyway). The step needs no key and decrypts nothing, so it can't fail on a key-provider problem. Only project nodes are touched — another node type's own fields with those names are left alone.
 
-### 5. Migrate legacy registry handles (once — `builder:handles-backfilled`)
+### 5. Check the registry token key (v1.33.0)
+
+Registry tokens are sealed with the host's field-encryption key at **every** security tier. If `getKeyProviderStatus()` reports that no key is ready, init logs a warning that private registry tokens can't be minted until `SECURITY_ENCRYPTION_KEY` (base64, 32 bytes) is configured. Minting then answers `503` (`encryption_key_missing`). Nothing is changed.
+
+### 6. Migrate legacy registry handles (once — `builder:handles-backfilled`)
 
 Every user whose `preferences.handle` predates the `registry_handle` table gets a mapping row (a handle another user already holds, or one that is invalid or reserved, is skipped — the table is authoritative). Until the flag is set, an unknown handle on the public resolver falls back to scanning `user.preferences`; the resolver reads the flag from the database, so once the migration has run that unindexed scan never runs again, however far a given boot got.
 
-### 6. Backfill stored block counts (once — `builder:blockcount-backfilled`)
+### 7. Backfill stored block counts (once — `builder:blockcount-backfilled`)
 
 Writes `metadata.builder.blockCount` onto every project that has blocks, without touching `updatedAt` or firing structure hooks. The flag is set only when every write succeeded, so a failure is retried next boot. After that the count is maintained on every block write.
 
-### 7. Seed the Starter Native Components
+### 8. Sweep orphaned component snapshots (once — `builder:orphan-snapshots-swept`, v1.33.0)
+
+Account deletions before v1.32.0 didn't erase component snapshots, so an upgraded install can hold `builder_component_set` rows whose project node no longer exists. This step deletes those rows, never the app-wide `__global__` set, and logs `{ audit: true, removed }` when it removed any. Only snapshots are swept, because they are vendored shadcn sources, not user content. Blocks, folders and collections are never swept at boot. The flag is set only after a clean run, so a failure is retried next boot.
+
+### 9. Seed the Starter Native Components
 
 If the `native_component` table is empty, the builder imports a starter palette so the canvas is usable out of the box — `div`, the card family (`card`, `card-header`, `card-title`, `card-description`, `card-content`, `card-footer`), `button`, `input`, `label`, `badge`, and `separator`. It only seeds when the table has no rows, so your own component edits are never overwritten. (See [Seeding Components](#seeding-components) below.)
 
-### 8. Sync Pristine Shadcn Components
+### 10. Sync Pristine Shadcn Components
 
 On first run (no `shadcn:builder-synced` flag), the builder fetches shadcn component source files from the official registry and writes them to `features/builder/ui/pristine/`. These pristine files power the iframe preview — they render blocks exactly as shadcn intends, regardless of any app-level customisation.
 
 The boot sync is **add-only**: a component whose pristine file already exists is skipped, so a checkout with committed or promoted pristine sources (say, a fresh database next to an existing repo) isn't silently rewritten. When every file is already present, the flag is set without fetching anything.
+
+**Development only (v1.33.0).** Pristine sources are written into the frontend *source tree*, so when `NODE_ENV` is `production` this step is skipped (with a debug log). A production server runs a prebuilt bundle, and its previews use the database-backed component snapshots and global set. The admin sync and promote routes follow the same rule (see [Component Sources Tab](#component-sources-tab)).
 
 The sync:
 
@@ -116,14 +127,14 @@ The sync:
 - Stores sync status in `builder_config` so it only runs once
 
 <Aside type="tip">
-You can trigger a re-sync at any time via `POST /api/v1/builder/shadcn/sync-builder`. This is useful after changing the shadcn style or icon library.
+In development you can trigger a re-sync at any time with `POST /api/v1/builder/shadcn/sync-builder` (admin only, with step-up at the `hardened` and `strict` tiers). This is useful after changing the shadcn style or icon library. In production the route answers `409`.
 </Aside>
 
 ---
 
 ## Builder Config Table
 
-The `builder_config` table stores key-value JSON pairs. These are the keys used by the module:
+The `builder_config` table stores key-value JSON pairs. These are the keys used by the module. Since v1.33.0 their names are exported from the backend barrel as `CONFIG_KEYS` (`import { CONFIG_KEYS } from '../builder/index.js'`), for use with `builderService.getConfig(key)`.
 
 | Key | Description | Set By |
 |-----|-------------|--------|
@@ -132,31 +143,32 @@ The `builder_config` table stores key-value JSON pairs. These are the keys used 
 | `builder:blockcount-backfilled` | Set once the boot-time backfill of stored project block counts has run (only when every write succeeded) | init |
 | `builder:other-type-blocks-checked` | Set once init has checked for blocks attached to non-project node types | init |
 | `builder:handles-backfilled` | Set once legacy `preferences.handle` values have been migrated into `registry_handle` (switches off the per-request preferences scan) | init |
-| `pristineSourceUpdates` | Result of the last **Check for source updates** run — `{ checkedAt, slugs }`, the pristine components whose registry source has changed | Sync process (update check) |
+| `builder:orphan-snapshots-swept` | Set once init has deleted the component snapshots of projects that no longer exist (only after a clean run) | init |
+| `pristineSourceUpdates` | Result of the last **Check for source updates** run — `{ checkedAt, slugs }`, the pristine components whose registry source has changed. Since v1.33.0 the admin Native Components table reads it back on load, so its "source update available" marks survive a reload | Sync process (update check) |
 | `shadcn:index` | Cached shadcn component index | Sync process |
 | `shadcn:component:{style}:{name}` | Cached individual component source | Sync process |
-| `shadcn:builder-style` | Current shadcn style (e.g. `radix-vega`) | Admin UI / API |
+| `shadcn:builder-style` | Current shadcn style (e.g. `radix-vega`) | API (no admin UI yet) |
 | `shadcn:builder-synced` | Sync completion status | Sync process |
-| `shadcn:icon-library` | Current icon library (e.g. `lucide`) | Admin UI / API |
+| `shadcn:icon-library` | Current icon library (e.g. `lucide`) | API (no admin UI yet) |
+
+Only two keys are reachable through the generic config routes. `GET /config/:key` serves `projectNodeType` and `pristineSourceUpdates`, and `PUT /config/:key` sets only `projectNodeType` (admin only, with step-up). Shared fields, the builder style and the icon library have their own routes, and the `shadcn:*` caches and `builder:*` flags are managed by the server only.
 
 ### Shadcn Style
 
-The builder supports 10 shadcn style combinations — a **base** (Radix or Base UI) paired with a **theme** (Vega, Nova, Maia, Lyra, Mira):
+The builder supports 16 shadcn style combinations — a **base** (Radix or Base UI) paired with one of eight **styles** (Vega, Nova, Maia, Lyra, Mira, Luma, Sera, Rhea), the same set the [Style module](/modules/style/) offers. Since v1.33.0 one exported allowlist, `SHADCN_STYLES`, is checked on every route that takes a style, and anything else answers `400`:
 
-| Style Key | Base | Theme |
+| Style Key | Base | Style |
 |-----------|------|-------|
-| `radix-vega` | Radix UI | Vega |
-| `radix-nova` | Radix UI | Nova |
-| `radix-maia` | Radix UI | Maia |
-| `radix-lyra` | Radix UI | Lyra |
-| `radix-mira` | Radix UI | Mira |
-| `base-vega` | Base UI | Vega |
-| `base-nova` | Base UI | Nova |
-| `base-maia` | Base UI | Maia |
-| `base-lyra` | Base UI | Lyra |
-| `base-mira` | Base UI | Mira |
+| `radix-vega` / `base-vega` | Radix UI / Base UI | Vega |
+| `radix-nova` / `base-nova` | Radix UI / Base UI | Nova |
+| `radix-maia` / `base-maia` | Radix UI / Base UI | Maia |
+| `radix-lyra` / `base-lyra` | Radix UI / Base UI | Lyra |
+| `radix-mira` / `base-mira` | Radix UI / Base UI | Mira |
+| `radix-luma` / `base-luma` | Radix UI / Base UI | Luma |
+| `radix-sera` / `base-sera` | Radix UI / Base UI | Sera |
+| `radix-rhea` / `base-rhea` | Radix UI / Base UI | Rhea |
 
-Changing the style only persists the new style key. To regenerate the pristine components for the selected variant, run a re-sync from the admin **Component Sources** tab or `POST /api/v1/builder/shadcn/sync-builder` — setting the style does not sync automatically.
+If the stored builder style isn't a supported one, the builder falls back to `radix-vega`. Changing the style only persists the new style key. To regenerate the pristine components for the selected variant, run a re-sync from the admin **Component Sources** tab or `POST /api/v1/builder/shadcn/sync-builder` — setting the style does not sync automatically.
 
 ### Icon Library
 
@@ -180,7 +192,7 @@ Shared fields are reusable property template definitions stored under the `share
 
 ## Native Component Registry
 
-The `native_component` table is the palette of available components. It is **public** (no `userId` column) — all users share the same component definitions. Key fields:
+The `native_component` model (the `builder_native_component` table since v1.33.0) is the palette of available components. It is **public** (no `userId` column) — all users share the same component definitions. Key fields:
 
 | Field | Description |
 |-------|-------------|
@@ -195,7 +207,9 @@ The `native_component` table is the palette of available components. It is **pub
 | `properties` | JSON array of `NativeComponentProperty` definitions |
 | `allowedChildren` | Array of allowed child component types |
 | `defaultChildren` | Default child nodes added when this component is dropped onto the canvas |
-| `codeStructure` | Code generation hints (conditional wrappers, siblings) |
+| `codeStructure` | Code generation hints: a `conditionalWrapper` (`{ tag, conditionProp, classNameProp? }`) |
+
+Since v1.33.0 the catalogue fields that are written into generated code are **validated** on save and import. `jsxTag` must be a `$prop` dynamic tag, a component or member expression (`Card`, `Foo.Bar`) or an HTML or custom-element tag. Property keys and `codeAlias` must be attribute names (`^[A-Za-z_][A-Za-z0-9_-]*$`). `conditionalWrapper.tag` must be a component or HTML tag, and `importPath` may contain only module-path characters. `type`, `jsxTag`, `category` and `label` are required strings of at most 100 characters. Rows stored before v1.33.0 are served as they are. So the frontend code generator applies the same shapes and skips an unsafe tag, prop name or import path rather than emitting it. See [JSON Import & Export → Import behaviour](/modules/builder/json-reference/#import-behaviour).
 
 ### Property Definition Fields
 
@@ -208,17 +222,17 @@ Each property in the `properties` JSON array supports these fields:
 | `type` | `string` | Field type: `string`, `number`, `boolean`, `select`, `icon`, `textarea`, `id`, `className` |
 | `defaultValue` | `string?` | Default value for the property |
 | `placeholder` | `string?` | Placeholder text for the input |
-| `description` | `string?` | Help text shown below the field |
+| `description` | `string?` | Help text shown under the field in the Properties panel (v1.33.0). An unlabelled boolean uses it as its label instead |
 | `codePlacement` | `string?` | How this field appears in generated code (see below) |
 | `codeAlias` | `string?` | JSX attribute name override (see below) |
 | `codeFormat` | `string?` | Value format in JSX output (see below) |
-| `isRequired` | `boolean?` | Field must have a value |
+| `isRequired` | `boolean?` | Shows a required marker on the field in the Properties panel (v1.33.0). A hint only: blocks still save without a value |
 | `isUnique` | `boolean?` | Auto-generates a unique value per instance |
 | `invertValue` | `boolean?` | Boolean is flipped — checked = false in code |
 | `variant` | `'radix' \| 'base'?` | Which shadcn variant this field belongs to (see below); omit = both |
-| `richText` | `boolean?` | Enable rich text editing for textarea fields |
-| `classNameKey` | `string?` | Companion className prop key (for icon fields) |
 | `options` | `array?` | Array of `{ label, value }` for select fields |
+
+(`richText` and `classNameKey` were never implemented and were removed in v1.33.0. Stored JSON that still has them is ignored.)
 
 ### Code Generation Fields
 
@@ -330,10 +344,25 @@ On first backend boot the init function seeds a small starter palette (`div`, th
 
 Two further Prisma models back the registry and preview features. (The block trees themselves live in `block`, `block_category`, and `block_collection` — see the [JSON Import & Export reference](/modules/builder/json-reference/).)
 
-| Table | Purpose |
+| Model (table) | Purpose |
 |-------|---------|
-| `registry_handle` | Maps a registry `handle` (lowercase `[a-z0-9-]`, 3–30 chars) to a `userId`. It's the indexed lookup that resolves the `{handle}` URL segment on the public `/r` endpoint, and the DB-level uniqueness authority for handles; handles saved before the table existed are lazily backfilled on first lookup. See [Private Registries](/modules/builder/private-registries/) for the full resolver flow. |
+| `registry_handle` (`builder_registry_handle`) | Maps a registry `handle` (lowercase `[a-z0-9-]`, 3–30 chars) to a `userId`. It's the indexed lookup that resolves the `{handle}` URL segment on the public `/api/v1/r` endpoint, and the DB-level uniqueness authority for handles. Handles saved before the table existed are copied in by the one-time boot migration ([init step 6](#6-migrate-legacy-registry-handles-once--builderhandles-backfilled)). See [Private Registries](/modules/builder/private-registries/) for the full resolver flow. |
 | `builder_component_set` | Per-project snapshot of the vendored shadcn component sources for the project's library + style, with a reserved `__global__` row for the app-wide fallback set. The preview compiles these at runtime so a project's blocks render in its exact style; a derived `baseClasses` manifest (keyed by data-slot) is rebuilt on every sync. |
+
+### Table names (v1.33.0)
+
+Every builder table now carries the module prefix. The Prisma **model** names are unchanged, so `prisma.block` and the other callers don't change, but five models now `@@map` onto prefixed tables:
+
+| Model | Table (v1.33.0+) | Table before v1.33.0 |
+|-------|------------------|----------------------|
+| `native_component` | `builder_native_component` | `native_component` |
+| `block` | `builder_block` | `block` |
+| `block_category` | `builder_block_category` | `block_category` |
+| `block_collection` | `builder_block_collection` | `block_collection` |
+| `registry_handle` | `builder_registry_handle` | `registry_handle` |
+| `builder_config`, `builder_component_set` | unchanged | unchanged |
+
+On an existing host, `npx builder update` renames the tables **in place**, so no data is lost. Its `onPrepareDatabase` hook writes a migration `<timestamp>_builder_prefix_tables` before the scaffold snapshots the schema. The migration renames each table and its Prisma-named indexes and constraints. It is idempotent, and it renames only a table that has a builder-only column, so another module's table with the same name is never touched. The same hook then adds the `@@map` lines to your existing models, so the scaffold's own diff is empty. Commit the migration with your app so production applies it with `prisma migrate deploy`, and don't skip the schema step (`--skip-schema`) for this update. Run the builder's update **before** any other module's: every module's update runs this hook, and the host's pre-1.33 generated raw SQL names the old tables until the builder update regenerates it. A fresh install creates the `builder_*` tables directly. See the [developer workflow](/modules/builder/developer-workflow/#lifecycle-hook-onpreparedatabase) for how the hook works.
 
 ---
 
@@ -343,11 +372,13 @@ The Block Builder admin page is at **Admin > Block Builder** (`/admin/block-buil
 
 ### Native Components Tab
 
-Lists all component definitions with an inline category filter (All, Containers, Elements, Layouts, Primitives). A **Check for source updates** button diffs each synced component's pristine source against the latest shadcn registry version and flags the ones that changed (with a count badge); a per-row source action then opens a side-by-side **diff** (current vs latest) and lets you **Promote** — overwriting the pristine file with the latest source. Each component is edited in a side sheet with three sub-tabs:
+Lists all component definitions with an inline category filter (All, Containers, Elements, Layouts, Primitives). A **Check for source updates** button diffs each synced component's pristine source against the latest shadcn registry version and flags the ones that changed (with a count badge). Since v1.33.0 those marks are restored from the last stored check when the page loads. A per-row source action then opens a side-by-side **diff** (current vs latest; a failed request shows the server's error) and lets you **Promote**, which overwrites the pristine file with the latest source. Promote is development-only (`409` in production) and asks for step-up at the `hardened` and `strict` tiers. Each component is edited in a side sheet that starts fresh on every open, with three sub-tabs:
 
 - **General** — Component key, label, library, category, JSX tag, import path, icon, description, parent type, and behaviour flags (accepts children, any child type, self-closing, dynamic HTML tag)
 - **Children** — Allowed children types and default template configuration
-- **Fields** — Property definitions with drag reordering. Each field shows its key, type, options count, required status, and code placement/alias at a glance
+- **Fields** — Property definitions with drag reordering. Each field shows its key, type, options count, required status, and code placement/alias at a glance. The **Required** toggle shows a marker in the Properties panel. It is a hint and doesn't block saving.
+
+Saving runs the catalogue validation described [above](#native-component-registry). A component whose `jsxTag`, property keys, `codeAlias`, wrapper tag or `importPath` fails it can't be saved until the field is fixed, and the editor shows the reason.
 
 An **Export** button downloads the current catalogue (plus field templates) as JSON, and the **Import** button opens the Import tab (below).
 
@@ -362,17 +393,17 @@ Bulk-import components by pasting a JSON payload or uploading a file. The panel 
 - **Builder export** — `{ components: [...], sharedFields: {...} }` (or a bare `components` array), as produced by the **Export** button. Round-trips your own catalogue between environments.
 - **shadcn-components.json** — `{ imports: {...}, components: {...} }`, the `importGroup`-based format.
 
-Before importing, the panel shows a summary of the detected format and counts, and flags malformed JSON or an unrecognised shape inline. Import runs server-side in bulk (`POST /components/import` and `/components/import-json`), so a single bad row does not abort the batch, and a results report lists how many components imported plus any per-row errors.
+Before importing, the panel shows a summary of the detected format and counts, and flags malformed JSON or an unrecognised shape inline. Import runs server-side in bulk (`POST /components/import` and `/components/import-json`), so a single bad row does not abort the batch, and a results report lists how many components imported plus any per-row errors. Rows that fail catalogue validation are skipped and reported. Since v1.33.0 the report also lists failures of the global preview-set sync (prefixed "Global preview set:") and counts them in the "Imported with N issues" toast.
 
 See the [JSON Import & Export reference](/modules/builder/json-reference/) for the full schema and copy-paste examples of both formats.
 
 ### Component Sources Tab
 
-Syncs the pristine shadcn components used by the preview from the official registry in the configured style, and shows the current sync status. See [Sync Pristine Shadcn Components](#3-sync-pristine-shadcn-components) above.
+Syncs the pristine shadcn components used by the preview from the official registry in the configured style, and shows the current sync status. See [Sync Pristine Shadcn Components](#10-sync-pristine-shadcn-components) above. Pristine files are written into the frontend source tree, so the sync is **development-only** since v1.33.0: in production `POST /shadcn/sync-builder` answers `409`. It is admin-only, takes at most 200 component names, and asks for step-up at the `hardened` and `strict` tiers.
 
 ### Settings Tab
 
-Module-level configuration values stored in the `builder_config` table. Includes shadcn style selection and icon library configuration.
+Module-level configuration stored in the `builder_config` table. Today that is the **Project Node Type**, the structure node type the builder treats as projects. Since v1.33.0, choosing a different type opens a confirmation first. It explains that the new type's node slugs become permanent registry namespaces, and that the current type's registries stop being served (those nodes also lose their Blocks and Registry tabs) until you switch back. The setting is saved only from the confirmation. Saving it asks for step-up at the `hardened` and `strict` tiers, and is audited as `builder.projectNodeType.changed`. (The shadcn style and icon library have API routes but no admin UI yet; see the [roadmap](/modules/builder/roadmap/).)
 
 ---
 
@@ -387,6 +418,7 @@ The module installs these npm packages automatically:
 | `@dnd-kit/utilities` | DnD utility functions |
 | `react-resizable-panels@^4.6.5` | Resizable panel layout (v4 API — `orientation` prop, string sizes; matches the starter's shadcn wrapper) |
 | `sucrase` | Runtime JSX compilation for the iframe preview |
+| `@tailwindcss/browser@4.3.3` | The preview's Tailwind runtime (v1.33.0). Installed at 4.3.3: npm saves `^4.3.3`, the same range as the starter's `tailwindcss`, and the lockfile pins the exact version. Bundled through Vite's `?url` import as a same-origin hashed asset, so no CDN is involved. If its install is declined during `npx builder update`, the frontend build fails on `@tailwindcss/browser?url`. Run `npm install @tailwindcss/browser@4.3.3` in `frontend/` to fix it |
 | `embla-carousel-react` | Carousel support for pristine components |
 | `recharts` | Chart support for pristine components |
 | `@base-ui/react` | Base UI primitives for Base UI shadcn styles |
@@ -395,18 +427,17 @@ The module installs these npm packages automatically:
 | `vaul` | Drawer primitive (the `drawer` component) |
 | `react-day-picker` | Date picker (the `calendar` component) |
 | `input-otp` | One-time-passcode input (the `input-otp` component) |
+| `class-variance-authority` | `cva`, handed to snapshot components by the preview's runtime compiler (declared rather than relying on a transitive install) |
 | `@babel/parser` | JSX/TSX → AST parsing for the block importer (lazy-loaded by the import dialog only) |
 
 ### shadcn Components
 
-The module installs a large set of shadcn components, split into two groups:
+`npx builder init` runs `shadcn add` only for the components the builder's **own UI** imports from `@/components/ui/`: its panels, toolbar, admin page and structure tabs. Every entry is imported by a template:
 
-**Builder UI** — used by the builder's own panels, toolbar, and canvas:
-`button`, `checkbox`, `collapsible`, `combobox`, `empty`, `input`, `input-group`, `label`, `resizable`, `scroll-area`, `select`, `separator`, `sidebar`, `spinner`, `tabs`, `textarea`, `toggle-group`
+`alert`, `alert-dialog`, `badge`, `button`, `card`, `checkbox`, `collapsible`, `dialog`, `dropdown-menu`, `empty`, `input`, `label`, `radio-group`, `resizable`, `scroll-area`, `select`, `separator`, `sidebar`, `skeleton`, `spinner`, `switch`, `table`, `tabs`, `textarea`, `toggle`, `toggle-group`, `tooltip`
 
-**Preview Render** — used to render user-built blocks in the live preview:
-`accordion`, `alert`, `alert-dialog`, `aspect-ratio`, `avatar`, `badge`, `breadcrumb`, `calendar`, `card`, `command`, `context-menu`, `dialog`, `drawer`, `dropdown-menu`, `hover-card`, `input-otp`, `menubar`, `navigation-menu`, `pagination`, `popover`, `progress`, `radio-group`, `sheet`, `skeleton`, `slider`, `switch`, `table`, `toggle`, `tooltip`
+These are the app's own, possibly customised, copies. v1.33.0 stopped declaring `accordion`, `avatar`, `hover-card`, `popover`, `progress`, `sheet` and `slider`, which only a dead barrel used. Nothing is removed from a host that already has them.
 
 <Aside type="caution">
-Preview render components are imported via a local `ui/` barrel file to ensure they remain pristine and untouched by app customisation. The preview always uses the original shadcn defaults, synced from the official registry in the style you've configured.
+The **preview** never renders through these app copies. It uses pristine copies synced from the official registry into `features/builder/ui/pristine/` (globbed by `ui/component-map.ts`), overlaid by the global component set and the project's own snapshot. So user blocks always preview with the original shadcn defaults, in the style you've configured. The old `ui/index.ts` "pristine barrel", which actually re-exported the app's copies, was removed in v1.33.0.
 </Aside>
