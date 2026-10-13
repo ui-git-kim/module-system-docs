@@ -16,6 +16,7 @@ The user feature includes:
 - **Profile** - Name, bio, avatar management
 - **Preferences** - Theme, timezone, language, notifications
 - **Settings Pages** - Extensible settings panel at `/settings`
+- **Storage** - What the user stores in each module, at the end of Personal Information (v2.14.0)
 - **GDPR Compliance** - Data export and account deletion
 
 ---
@@ -66,10 +67,13 @@ frontend/src/features/user/
 ├── navigation.registration.ts      # Registers "Settings" in user menu
 ├── settings-pages.registration.ts  # Registers settings pages
 ├── hooks/
-│   └── useUserProfile.tsx          # Profile context and hook
+│   ├── useUserProfile.tsx          # Profile context and hook
+│   └── useStorageUsage.ts          # Storage usage query + refresh (v2.14.0)
 ├── lib/
 │   ├── debounced-save.ts           # Save once the user pauses (avatar colour)
-│   ├── preferences-mutation.ts     # Profile query key + ordered preference saves
+│   ├── format-bytes.ts             # Byte sizes for the Storage section (v2.14.0)
+│   ├── preferences-mutation.ts     # Profile query key + ordered profile/preference saves
+│   ├── storage-usage-view.ts       # What the Storage section shows (v2.14.0)
 │   └── timezones.ts                # Time-zone list, built once per session
 ├── services/
 │   └── user.service.ts             # API client
@@ -84,6 +88,7 @@ frontend/src/features/user/
 └── components/
     ├── SettingsLayout.tsx          # Settings sidebar layout
     ├── AccountDeletionGate.tsx     # "Finish deleting your account" screen
+    ├── StorageUsageSection.tsx     # Storage section on Personal Information (v2.14.0)
     ├── UserAvatar.tsx              # Avatar component
     └── settings/
         ├── avatar-colors.ts        # Avatar presets + contrast/default helpers
@@ -249,6 +254,8 @@ await updatePreferences({
 
 **Saves run in order (v2.13.1).** Every preference save shares one TanStack Query mutation scope (`scope: { id: 'user-preferences' }`), so saves run one at a time in the order they were made. A colour change followed by a time-zone change can't land the wrong way round. The server answers with `{ preferences }` only (the merged preferences, not the whole profile), and the hook merges that into the cached profile. `updatePreferences()` still resolves to the full, updated `UserProfile`, so callers don't change.
 
+Since v2.14.0, profile saves join the same scope. `updateProfile()` (name, bio, avatar uploads and removals, and personal-info fields with `storage: 'profile'`) and `updatePreferences()` now queue behind each other in call order. A profile save answers with the whole profile, preferences included, so before this it could finish between a preference save and its merge and briefly put the older preferences back in the cache. The options live in `updateProfileMutationOptions(queryClient)` in `lib/preferences-mutation.ts`. `useUserProfile()` itself is unchanged.
+
 **Size limits (v2.13.0).** Module preferences can use any key name, so the server caps them. It rejects an update with a **400** when:
 
 - a module value is more than 4 KB once saved as JSON, or a key name is longer than 100 characters;
@@ -263,13 +270,101 @@ An update that shrinks preferences that are already too big is still accepted, s
 
 ---
 
+## Storage Usage
+
+Since v2.14.0, **Settings → Personal Information** ends with a **Storage** section. It lists what the user stores in each module, under a grand total. The figures come from `GET /api/v1/usage`, which collects them from every module registered in the backend `usageRegistry`. The backend side (the provider contract, the endpoint, caching and timeouts, and how a module registers) is on the usage feature's page, [Storage Usage](/starter-template/usage-feature/).
+
+<Aside type="note" title="Hidden until a module reports">
+  The section appears only when at least one module reports usage. With no reporting module the server answers with an empty `modules` list, and nothing is drawn: no heading, no empty section, no layout shift. A backend without the usage endpoint (older than v2.14.0, or a frontend deployed ahead of its backend) answers **404**, and `userService.getStorageUsage()` reads that as the same empty answer. Nothing is drawn while the first load is in flight either.
+</Aside>
+
+### What it shows
+
+From top to bottom:
+
+- **Total**: the size of everything the counted modules store.
+- **One block per module**, in the server's order: the module's label and its total, then a table of its items (**Item**, **Count**, **Size**).
+- An error, if the last load or refresh failed.
+- **Calculated at 3:41 PM**: when the server worked the figures out, in local time and the user's language. Next to it, a **Refresh** button.
+
+Some figures are incomplete, and the section says so:
+
+| State | What the user sees |
+|-------|--------------------|
+| A module couldn't be counted (it failed, timed out or answered in the wrong shape) | The module reads **Couldn't be counted right now** and is left out of the total. The Total row adds **Some items couldn't be counted right now** (`partial: true`) |
+| An item's size is unknown (`bytes: null`) | The item's size reads **Size unknown**. Its module total, and the grand total, read **At least 12 MB**, because the unknown size isn't in them |
+| An item is empty (count 0, size 0 or unknown) | The item is hidden. A module whose items are all hidden reads **Nothing stored yet** |
+
+An empty item doesn't turn the total into "At least": only an item that is actually shown with an unknown size does. Sizes use 1024-based units (B, KB, MB, GB, TB) with at most one decimal and no trailing ".0"; counts are grouped the Australian English way (1,234).
+
+### Refresh and errors
+
+The server keeps each user's figures for a minute, and the hook treats them as fresh for the same minute (it doesn't refetch on window focus). **Refresh** asks the server to count again (`?fresh=1`). If the server's copy is less than 10 seconds old it sends that copy back instead of counting again. While a refresh or reload runs, the button is disabled and shows a spinner.
+
+If a load or refresh fails, the reason shows above the footer and the button reads **Retry**. A failed refresh keeps the figures already on screen, and its error clears once newer figures load. If the very first load fails with anything other than a 404 (a 500 or a dropped connection, say), the section shows with just the error and **Retry**, because there are no figures yet to tell whether any module reports.
+
+### Using the figures elsewhere
+
+The user feature exports the hook, its query key and the response types (v2.14.0):
+
+```tsx
+import { useStorageUsage } from '@/features/user';
+
+function StorageSummary() {
+  const { usage, isLoading, isRefreshing, error, refresh } = useStorageUsage();
+
+  if (isLoading || !usage || usage.modules.length === 0) return null;
+  // usage.totalBytes, usage.modules, usage.generatedAt ...
+}
+```
+
+| Export | What it is |
+|--------|------------|
+| `useStorageUsage()` | Returns `{ usage, isLoading, isRefreshing, error, refresh }`. `usage` is `undefined` until the first load succeeds. `isLoading` is true until the first load settles. `isRefreshing` is true whenever a request is in flight: a refresh, a refetch, or the first load itself. Check `isLoading` first, as the example does. `error` is a message ready to show (built with [`getApiErrorMessage`](/starter-template/data-fetching/#showing-api-errors)), or `null`. `refresh()` asks for a recount and is also the retry |
+| `STORAGE_USAGE_KEY` | The query key, `['user', 'storage-usage']`. `staleTime` is 60 s and `refetchOnWindowFocus` is off; everything else uses the [global defaults](/starter-template/data-fetching/#opinionated-defaults). Invalidating `['user']` refetches it too |
+| `UseStorageUsageResult` | The hook's return type |
+| `StorageUsageResponse`, `ModuleStorageUsage`, `ModuleUsageItem` | The response types (below) |
+| `userService.getStorageUsage({ fresh?, signal? })` | The call behind the hook. It sends `?fresh=1` only when `fresh` is `true` and passes `signal` to the request. A 404 resolves to an empty answer; any other failure throws |
+
+```typescript
+interface ModuleUsageItem {
+  key: string;
+  label: string;
+  count: number;
+  bytes: number | null;   // null: the module can't tell the size
+}
+
+type ModuleStorageUsage =
+  | {
+      moduleId: string;
+      label: string;
+      status: 'ok';
+      bytes: number;      // sum of the items' bytes, unknown sizes counted as 0
+      items: ModuleUsageItem[];
+      generatedAt: string;
+    }
+  | { moduleId: string; label: string; status: 'unavailable' };
+
+interface StorageUsageResponse {
+  modules: ModuleStorageUsage[];  // display order; empty when no module reports
+  totalBytes: number;             // sum over the 'ok' modules
+  partial: boolean;               // some module couldn't be counted
+  hasUnknownSizes: boolean;       // some item's size is unknown
+  generatedAt: string;            // ISO time the figures were calculated
+}
+```
+
+`refresh()` writes its answer only into the cache entry that existed when it started. Signing out (`signOutAndClear()`) clears the whole query cache, so a refresh that finishes after sign-out writes nothing, and the next person to sign in on that browser can't see the previous account's figures.
+
+---
+
 ## Settings Pages
 
 ### Built-in Pages
 
 | Page | Path | Purpose | Order |
 |------|------|---------|-------|
-| Personal Information | `/settings/personal-info` | Profile, avatar, display name | 10 |
+| Personal Information | `/settings/personal-info` | Profile, avatar, display name; [Storage](#storage-usage) at the end | 10 |
 | Security | `/settings/security` | Password, 2FA, sessions | 20 |
 | Preferences | `/settings/preferences` | Theme, notifications | 30 |
 | Integrations | `/settings/integrations` | Third-party services | 40 |
@@ -620,6 +715,7 @@ If the deletion doesn't fully finish, the account is locked as "pending deletion
 | `/api/v1/user/preferences` | PATCH | Update preferences; answers `{ preferences }` (the merged preferences only) |
 | `/api/v1/user/export` | POST | Request data export (web session only) |
 | `/api/v1/user` | DELETE | Delete account (web session + step-up code) |
+| `/api/v1/usage` | GET | Storage used, per module (owned by the [usage feature](/starter-template/usage-feature/); `?fresh=1` asks for a recount). Read by the [Storage section](#storage-usage) |
 
 Since v2.13.1, `PATCH /preferences` answers `{ preferences }` instead of the whole profile, so a preference save no longer sends the avatar image back each time. Backend code calling `userService.updatePreferences(userId, prefs)` gets `{ preferences }` too. This is a clean break: anything that read the profile from this response should read `preferences`, or use `useUserProfile().updatePreferences()`, which still resolves to the merged profile.
 
@@ -696,6 +792,8 @@ personalInfoFieldsRegistry.registerCategory({
 
 **Field types:** `text`, `textarea`, `select`, `custom`
 
+**Custom fields may be lazy (v2.14.0).** A `custom` field's `component` can be a `React.lazy()` component. Each one renders inside its own [`SlotBoundary`](/starter-template/dashboard-feature/#lazy-widgets): a row-sized skeleton holds its place while its code loads, and if it throws or its code fails to load, the page shows the caption "The *label* field failed to load." in its place and reports the error. Before v2.14.0 a throwing custom field replaced the whole app shell with the route error page.
+
 **Storage:** Fields are stored in `user.preferences` JSON by default. Values are automatically saved when changed.
 
 ### Adding Preference Sections
@@ -714,6 +812,8 @@ preferencesRegistry.register({
   order: 50,
 });
 ```
+
+Since v2.14.0 `component` may be a `React.lazy()` component. Each section has its own boundary: a skeleton shows while its code loads, and a section that throws or fails to load shows "The *title* section failed to load." without taking the page down. Integration cards (`integrationsRegistry`) work the same way, with a card-sized skeleton and "*name* failed to load."
 
 Your component receives no props - use `useUserProfile()` to read/write preferences:
 
@@ -807,6 +907,7 @@ languageOptionsRegistry.register({
 | `notificationPreferencesRegistry` | Email toggles | Preferences page (notification group) |
 | `languageOptionsRegistry` | Language dropdown | Preferences page |
 | `settingsPagesRegistry` | Entire pages | Settings sidebar |
+| `usageRegistry` (backend, v2.14.0) | Storage figures | Personal Information page, [Storage section](#storage-usage). See [Storage Usage](/starter-template/usage-feature/) |
 
 ---
 

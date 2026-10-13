@@ -17,6 +17,69 @@ Check your current version in the `VERSION` file at the project root.
 
 ---
 
+## v2.14.0
+
+**Storage used per account, and lazy module components in every host slot**
+
+This release adds a **usage registry**: modules report how much each user stores, and Settings → Personal information shows it in a new **Storage** section. Dashboard widgets, header toolbar items, preference sections, integration cards, personal-info custom fields and shell-init components may now be `React.lazy()`, each with its own loading and error boundary. It also fixes seven of the [Performance follow-ups (v2.13.1)](/starter-template/roadmap/#performance-follow-ups-v2131). What other repos need to do is listed under [Usage registry follow-ups (v2.14.0)](/starter-template/roadmap/#usage-registry-follow-ups-v2140).
+
+<Aside type="caution" title="Before you update">
+- **A custom icon line in `frontend/index.html`.** The file is template-owned, and this release changes its icon line. If you changed that line, `template:update` stops on a conflict there: keep your own line. If the merge is clean, the whole file is replaced with the template's copy, so put back any other edits you made to it, such as the `<title>`.
+- **Stale compiled files beside the sources.** Earlier builds (`tsc -b`) wrote `frontend/src/config/env.schema.js` / `.d.ts` and, since v2.13.1, `frontend/src/lib/neon-auth-zod.plugin.js` / `.d.ts`. Vite's dev server and vitest load these before the `.ts`. From the app root, `npm run dev`, `npm run build` and `npm test` now delete them when git shows them as ignored and untracked. A copy you committed is only warned about: remove it with `git rm` (`template:update` prints the command). veradai and use-foundry-ui both track `src/config/env.schema.js` and `.d.ts`.
+- **A root `pretest` script is added.** `template:update` reconciles `"pretest": "node ./scripts/check-vite-shadow.mjs"` into the root `package.json`, beside `predev` and `prebuild`. If your root `package.json` already has a `pretest`, it is replaced.
+- **The Storage section stays hidden for now.** It appears once a module registers a usage provider, and none does yet (see [For module repos](#for-module-repos) below). A frontend deployed ahead of its backend gets a 404 from `GET /api/v1/usage` and hides the section too.
+</Aside>
+
+### Storage usage (new)
+
+- **`usageRegistry`**, in a new foundation feature, `backend/src/features/usage/` (imported in `app.ts` after notifications). A module registers one provider: `{ moduleId, label, order?, getUsage({ userId, signal }) }`. `getUsage` resolves to a `ModuleUsage`: `{ moduleId, totals: { bytes }, items: [{ key, label, count, bytes }], generatedAt }`, where an item's `bytes` is `null` when the module can't tell. One provider per `moduleId`: a duplicate is skipped with a warning. `getAll()` sorts by `order` (default 50), then label. Like `securityRegistry`, it is a custom registry keyed by `moduleId`, not a `BaseRegistry`. See [Storage Usage](/starter-template/usage-feature/).
+- **`GET /api/v1/usage`** returns the signed-in user's `StorageUsageResponse`: `modules` (each `ok`, with its `bytes` and `items`, or `unavailable`), `totalBytes`, `partial`, `hasUnknownSizes` and `generatedAt`. The user is always the authenticated caller; a `userId` in the query is ignored. Device tokens are accepted. `?fresh=1` (or `true`) asks for a recount, and `0` / `false` (or no `fresh`) use the cache. Any other value, an empty value or a repeated `fresh` gets a 400.
+- **A provider can't break the page.** Providers run in parallel, each with a 15-second limit, after which its `signal` aborts. A provider that throws, times out or returns a bad shape (a count or size that isn't a whole number of 0 or more, duplicate item keys, a total past `Number.MAX_SAFE_INTEGER`) is reported `unavailable`, and the details go only to the server log. A module keeps at most 100 items. The host adds up each module's bytes itself, so the total always matches the listed items. A scan that runs past its limit isn't started again by the same server: later requests there wait on it.
+- **Cached per user for 60 seconds** in each server process. `?fresh=1` recounts only when the cached figures are at least 10 seconds old, and concurrent requests for the same user share one count. The cache holds up to 1,000 users.
+- **The Storage section** (`StorageUsageSection`) sits at the end of Settings → Personal information. It shows the total, then each module's items (Item / Count / Size), with "At least" before a total that includes an unknown size, "Couldn’t be counted right now" for an unavailable module, and a Refresh button. It is hidden while no module reports usage. See [User feature](/starter-template/user-feature/).
+- **New exports** from `@/features/user`: `useStorageUsage`, `STORAGE_USAGE_KEY` and the types `UseStorageUsageResult`, `ModuleUsageItem`, `ModuleStorageUsage` and `StorageUsageResponse`. `userService` gains `getStorageUsage({ fresh?, signal? })`.
+- **The modules' shapes are checked when the starter compiles.** `backend/src/features/usage/usage.types.compat.ts` holds copies of Structure's (1.38.2) and Document Management's (1.18.1) usage types. `npm run type-check` and the build fail if `ModuleUsage` or `UsageProvider` change so that either module could no longer register its existing `getUsage` unchanged.
+
+### Lazy module components
+
+- **`SlotBoundary`** (`@/components/SlotBoundary`) wraps one contributed component in an error boundary (outside) and a `Suspense` (inside), with optional `loading` and `fallback` props that render nothing by default. The host renders one per item, so a slow or broken item never blanks its siblings. `<EmbeddedSlot>` now uses it, with no change in behaviour. Modules can use it for their own registries.
+- **Slots that now accept `React.lazy()` components**, with what each shows while loading, and on an error:
+  - **Dashboard widgets:** a skeleton in the widget's place (under its card title when it has one); "This widget failed to load."
+  - **Header toolbar items**, in every placement (the top bar included): a `custom` item shows an icon-button-sized skeleton, and nothing on an error (the error is still reported). `dropdown` content shows a spinner when the menu opens, and "This menu failed to load."
+  - **Preference sections, integration cards and personal-info custom fields:** a skeleton; a one-line caption naming the item.
+  - **Shell-init components:** nothing in either case. A lazy one mounts when its code arrives, without holding up the shell.
+- **A throwing item no longer takes down the page.** Before, a preference section, integration card, custom personal-info field, custom toolbar item or shell-init component that threw replaced the whole route with the error page. Now only that item shows its fallback, and the error goes to `reportError` (Sentry when configured). The boundaries don't reset: the item recovers when the page remounts.
+- **Lazy routes show a spinner on a hard load.** The shell's `<Outlet />` (`AppShell`) sits in a `Suspense` with `LoadingState`, so the navigation and header stay on screen. Bare routes get the same full-screen spinner as the session check, from a `Suspense` inside `AuthProtectedRoute`. `routes.tsx` is app-owned, so it is unchanged and this reaches apps without a merge conflict. Both boundaries are unkeyed: on a client-side navigation React Router keeps the current page up until the next one is ready. A failed chunk still reaches the route's `errorElement`.
+- Icons stay static: they render without a boundary.
+
+### Frontend and build
+
+- **No more favicon 404.** `frontend/index.html` pointed at `/vite.svg`, which the template doesn't ship. It now declares an empty inline icon, `<link rel="icon" href="data:," />`, so the browser requests no icon at all. To brand an app, put the icon in `frontend/public/` and point that line at it, for example `href="/favicon.svg" type="image/svg+xml"`. An app whose CSP leaves `data:` out of `img-src` should do the same (the [Cloudflare edge](/getting-started/cloudflare-edge/) starter policy allows it).
+- **`tsc -b` writes nothing beside the sources.** `frontend/tsconfig.node.json` now sends its declarations and build info to `frontend/node_modules/.tmp/` (`emitDeclarationOnly`, `outDir`, `tsBuildInfoFile`), and `tsconfig.json` sends its build info there too. `noEmit` isn't possible: a referenced project must be composite and may not disable emit (TS6306 / TS6310). A new `frontend/src/.gitignore` ignores the four stale files, and `scripts/check-vite-shadow.mjs` removes untracked copies (see above). At the end of an update, `template:update` lists any it finds, with the `git rm` or `rm` command. The old `frontend/tsconfig.node.tsbuildinfo` and `frontend/tsconfig.tsbuildinfo` are no longer written; they are git-ignored and safe to delete.
+- **Profile saves run in order with preference saves.** `updateProfile` (avatar changes included) now shares the `'user-preferences'` mutation scope with preference saves, through `updateProfileMutationOptions(queryClient)` in `features/user/lib/preferences-mutation.ts`. A profile save can no longer briefly put older preferences back in the cache. `useUserProfile()` is unchanged.
+- **The template's CI generates the shadcn baseline before the frontend tests**, because the Storage section's render test imports `components/ui`. Cloned apps skip that step.
+- The time-zone list test counts builds through `Intl.supportedValuesOf`, so it passes on vitest 4.
+
+### Server and audit log
+
+- **Buffered audit rows are written at shutdown.** A new `app.shutdown` handler, `audit.flush` at order 90, flushes the active audit sink after `http.close` (5), `jobs.drain` (10) and module handlers at the default order (50), and before the database disconnects. It stops waiting at the shutdown deadline and logs a warning, so a stuck flush can't hold the exit. See [The `app.shutdown` seam](/starter-template/jobs-feature/#the-appshutdown-seam).
+  - The `app.shutdown` context is now `{ signal, deadline }`, where `deadline` is the epoch ms when `SHUTDOWN_TIMEOUT` runs out.
+  - `AuditSink` gains an optional `flush()`. A custom sink passed to `setAuditSink()` that queues its writes should implement it.
+  - While a flush waits, `SqlAuditSink` (and so `ComplianceAuditSink`) retries a failed batch every `retryBaseMs` instead of backing off.
+  - Module handlers that record audit rows should keep an order below 90.
+- **`requireAuth` verifies each request once.** A request that falls through nested mounts (for example `/api/v1/admin`, then `/api/v1/admin/security`) reuses the identity verified at the first mount, as long as the `Authorization` header is the same. A device token now costs one database lookup per request, not two. A missing or invalid token still gets 401 at the first mount, and `requireAdmin` still runs on each mount. Listing `requireAuth` in a route's `middleware` is now merely redundant.
+- **Exact audit counts on demand.** Admin → Console shows a **Count exactly** button while the audit storage figure is an estimate ("≈"). It calls the new admin-only `GET /api/v1/admin/system/audit/count`, which runs `COUNT(*)` under a 10-second statement timeout and returns `{ persisted }` (`AuditExactCountResponse`). Past the limit it returns the estimate flagged `timedOut: true`, and the page says the figure is still an estimate. Concurrent requests share one count. The exact figure lasts until the page is reopened. See [System](/starter-template/system/).
+
+### For module repos
+
+- **Structure 1.38.2 and Document Management 1.18.1 already have a compatible `getUsage`**, but neither registers it yet. Each needs a `usage.registration.ts` in its own repo. It must use a guarded dynamic import (`const USAGE_FEATURE = '../usage/index.js'`, then `await import(USAGE_FEATURE)` inside `try`/`catch`), as Document Management already does for `moduleRegistry`: a static import crashes the boot on a starter older than 2.14.0.
+- **Lazy slot components need a 2.14.0 host.** Older hosts have no loading (`Suspense`) boundary around these slots, and a `ModuleContract` can't declare a minimum starter version yet. The module starter's generated registrations still say widgets, toolbar components, preference sections and integration cards must stay static.
+- The snippet and the rest of the cross-repo work are under [Usage registry follow-ups (v2.14.0)](/starter-template/roadmap/#usage-registry-follow-ups-v2140).
+
+**Propagation:** frontend + backend `src`, `frontend/index.html`, the frontend tsconfigs, a new `frontend/src/.gitignore`, the scripts (`check-vite-shadow.mjs`, and `sync-package-scripts.mjs` for the root `pretest`), both `update-template` twins and the template's CI. No schema, migration, env or dependency change. A new foundation feature and registry → **minor**.
+
+---
+
 ## v2.13.1
 
 **Performance audit fixes: a smaller first load, no flash on refresh, no lockout from the colour picker**

@@ -327,10 +327,26 @@ interface AuditRowCounts {
   approximate: boolean;
   activity?: number;      // exact per-mode split; only when approximate is false
   compliance?: number;
+  timedOut?: boolean;     // v2.14.0: an exact count ran past its time limit; total is the estimate
 }
 ```
 
 Before v2.13.1, `persisted` was `{ total, activity, compliance }`, always exact.
+
+### AuditExactCountResponse
+
+Exact audit-row counts on demand (v2.14.0). `GET /api/v1/admin/system/audit/count` (admin only) counts the rows per mode under a 10-second database statement timeout. Requests that reach the same server process while a count is running share it.
+
+```typescript
+interface AuditExactCountResponse {
+  // Exact counts ({ total, approximate: false, activity, compliance }), or,
+  // when the count ran past 10 s, the estimate flagged timedOut: true.
+  // null with the memory sink, or when there is no AuditLog table.
+  persisted: AuditRowCounts | null;
+}
+```
+
+On the frontend, `systemAdminService.countAuditRowsExactly()` returns `persisted`, and `useExactAuditCount(persisted)` drives the **Count exactly** button on Admin → Console. The frontend service declares `AuditRowCounts` with the same `timedOut` field.
 
 ### AuditVerifyStatus
 
@@ -501,6 +517,72 @@ interface DataExportCollection {   // Returned by collectDataExport()
   failed: Array<{ handlerId: string; moduleId: string }>;
 }
 ```
+
+---
+
+## Usage Types
+
+Exported from the backend usage barrel (`features/usage/index.js`). Added in v2.14.0. See [Storage Usage](/starter-template/usage-feature/) for how the host validates and adds up what providers return.
+
+### Provider contract
+
+What a module registers with `usageRegistry`, and what its `getUsage` returns. Modules may return extra fields; the host reads only these.
+
+```typescript
+interface ModuleUsageItem {
+  key: string;          // Unique within the module
+  label: string;
+  count: number;        // Whole number, 0 or more
+  bytes: number | null; // Stored size (whole number, 0 or more), or null when unknown
+}
+
+interface ModuleUsage {
+  moduleId: string;
+  totals: { bytes: number };  // Ignored by the host, which recomputes it from items
+  items: ModuleUsageItem[];
+  generatedAt: string;        // ISO time
+}
+
+interface UsageContext {
+  userId: string;       // Always the authenticated user
+  signal: AbortSignal;  // Aborted after 15 s; stop scanning when it fires
+}
+
+interface UsageProvider {
+  moduleId: string;
+  label: string;        // Section heading in the Storage section
+  order?: number;       // 0-100, lower first (default 50)
+  getUsage(ctx: UsageContext): Promise<ModuleUsage>;
+}
+```
+
+### StorageUsageResponse
+
+Returned by `GET /api/v1/usage` and `getUserUsage(userId, options?)`.
+
+```typescript
+type ModuleStorageUsage =
+  | { moduleId: string; label: string; status: 'ok'; bytes: number; items: ModuleUsageItem[]; generatedAt: string }
+  | { moduleId: string; label: string; status: 'unavailable' };
+
+interface StorageUsageResponse {
+  modules: ModuleStorageUsage[]; // Provider order (order, then label)
+  totalBytes: number;            // Sum over the 'ok' modules
+  partial: boolean;              // Some module is unavailable
+  hasUnknownSizes: boolean;      // Some 'ok' module has an item with bytes: null
+  generatedAt: string;           // ISO time the summary was computed
+}
+
+interface GetUserUsageOptions {
+  fresh?: boolean;  // Recount unless the cached summary is under 10 s old
+}
+
+// UsageQuerySchema (zod) checks the GET /api/v1/usage query: fresh is optional and
+// one of '1' | 'true' | '0' | 'false'; it parses to true for '1' or 'true'.
+type UsageQuery = { fresh: boolean };  // z.infer<typeof UsageQuerySchema>
+```
+
+The frontend declares `ModuleUsageItem`, `ModuleStorageUsage` and `StorageUsageResponse` in `features/user/types.ts` and exports them from `@/features/user`.
 
 ---
 

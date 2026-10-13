@@ -185,25 +185,22 @@ export const router = createBrowserRouter([
 ```
 
 The `AuthProtectedRoute` component:
-1. Shows a loading spinner while checking the session
+1. Shows a full-screen loading spinner while checking the session
 2. Redirects to `/auth/sign-in` if the user is not authenticated
-3. Renders children if authenticated
+3. Renders children if authenticated, inside a `<Suspense>` that shows the same spinner (v2.14.0)
 
 ```tsx
 // frontend/src/features/auth/components/AuthProtectedRoute.tsx
+import { Suspense } from 'react';
 import { Navigate, useLocation } from 'react-router';
-import { Spinner } from '@/components/ui/spinner';
+import { LoadingState } from '@/components/page-blocks';
 
 export function AuthProtectedRoute({ children }: { children: React.ReactNode }) {
   const { data, isPending } = useSession();
   const location = useLocation();
 
   if (isPending) {
-    return (
-      <div className="flex min-h-screen items-center justify-center">
-        <Spinner className="size-8 text-muted-foreground" />
-      </div>
-    );
+    return <LoadingState className="min-h-screen" />;
   }
 
   // Remember where the user was headed so sign-in can return them there.
@@ -211,9 +208,12 @@ export function AuthProtectedRoute({ children }: { children: React.ReactNode }) 
     return <Navigate to="/auth/sign-in" replace state={{ from: location }} />;
   }
 
-  return <>{children}</>;
+  // The loading boundary for bare routes (v2.14.0)
+  return <Suspense fallback={<LoadingState className="min-h-screen" />}>{children}</Suspense>;
 }
 ```
+
+**The loading boundary for bare routes (v2.14.0).** `routes.tsx` also wraps the bare routes (`handle: { layout: 'bare' }`: full-screen views with no app shell) in `AuthProtectedRoute`, around an `<Outlet />`. Its `<Suspense>` is their loading boundary, so a bare route's `element` may be a `React.lazy()` component. While the page's code loads on a hard load, the same full-screen spinner as the session check stays up instead of a blank page. The boundary lives here rather than around the outlet in `routes.tsx` because `routes.tsx` is app-owned (the module CLI writes into it, and `template:update` keeps your side of a conflict), while `AuthProtectedRoute.tsx` is template-owned and reaches every app with its next update. Shell routes meet the closer `<Suspense>` in `AppShell` first, so their navigation and header stay on screen (see [Shell Layout](/starter-template/shell-layout/#while-a-lazy-page-loads)). A page whose code fails to load still reaches the route's `errorElement`, because `AuthProtectedRoute` sits in the route's `element`.
 
 ### Getting Session Data
 
@@ -444,6 +444,16 @@ router.get('/', async (req, res) => {
   // ...
 });
 ```
+
+**Verified once per request (v2.14.0).** Express runs every route mount whose path prefix matches, so one request can meet `requireAuth` more than once. A request to `/api/v1/admin/security/...` passes the `/api/v1/admin` mount first and then the `/api/v1/admin/security` mount. `requireAuth` now remembers each request it has verified, in a module-private `WeakMap` keyed on the request object. When it runs again for the same request with the same `Authorization` header, it attaches a fresh copy of the identity it verified the first time and skips the check. A JWT is verified once per request, and a [device token](#device-tokens-external--desktop-apps) costs one database lookup per request instead of one per mount.
+
+- A different `Authorization` header is verified from scratch.
+- Only a successful check inside `requireAuth` marks a request. A `req.user` set by any other middleware never counts.
+- A request without a valid token still gets **401** at the first mount.
+- Per-route middleware such as `requireAdmin` still runs at each mount, and each mount starts from the verified identity, so a role one mount attached doesn't carry over to the next.
+- Public routes (`registerPublic`) are unaffected.
+
+Listing `requireAuth` in a route's `middleware` array is still redundant (`mountAll` applies it), but it no longer verifies the token twice.
 
 ### Extended Request Type
 

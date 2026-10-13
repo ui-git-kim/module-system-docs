@@ -1,0 +1,267 @@
+---
+title: Storage Usage
+description: The foundation storage-usage seam — modules register a usage provider, GET /api/v1/usage adds them up per user, and the account page shows the total in a Storage section.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The starter ships storage usage as a **foundation feature** (added in v2.14.0): `backend/src/features/usage/` on the backend, plus a Storage section on the account page in the [user feature](/starter-template/user-feature/). It is a sibling to `auth`, `user`, `admin`, [`email`](/starter-template/email-feature/), [`notifications`](/starter-template/notifications-feature/) and [`jobs`](/starter-template/jobs-feature/), **not a module**. It answers one question for the signed-in user: how much does this account store, across every module?
+
+<Aside type="tip" title="Who counts what">
+Each module counts its own storage, because only the module knows its tables and files. The foundation calls every module that registered, checks what comes back, adds it up and shows it. The feature stores nothing itself: it has no Prisma model and no environment variables.
+</Aside>
+
+## How it works
+
+- **Modules register a provider at import time.** A module that holds per-user storage registers one `UsageProvider` in `usageRegistry` from a side-effect `usage.registration.ts`, imported from its feature's `index.ts`. A module that registers nothing doesn't appear.
+- **`GET /api/v1/usage` adds them up.** It calls every provider in parallel, each with its own abort signal and a 15-second timeout. It checks each result, recomputes the byte totals from the listed items, and returns one `StorageUsageResponse`.
+- **A failing module doesn't fail the request.** A provider that throws, times out or returns something invalid is reported as `unavailable`, and the response is marked `partial`. The error is logged on the server and never sent to the client.
+- **Results are cached per user.** Counting is usually a scan, so a summary is reused for 60 seconds, and a forced refresh can recount at most every 10 seconds.
+- **The account page shows it.** Settings → Personal Information ends with a Storage section that lists each module's items and a grand total. It is hidden when no module reports usage.
+
+`backend/src/app.ts` imports the feature with `import './features/usage/index.js';`, after notifications and before jobs.
+
+## The provider contract
+
+All types are exported from `backend/src/features/usage/index.ts` (defined in `usage.types.ts`).
+
+```typescript
+/** One line of a module's storage usage. */
+interface ModuleUsageItem {
+  key: string;          // Stable machine key, unique within the module (e.g. 'files')
+  label: string;        // Shown on the account page
+  count: number;        // How many stored things this line covers (whole number, 0 or more)
+  bytes: number | null; // Stored size in bytes (whole number, 0 or more), or null when unknown
+}
+
+/** A module's storage usage for one user. Extra fields are allowed and ignored. */
+interface ModuleUsage {
+  moduleId: string;
+  totals: { bytes: number }; // The module's own total; the host recomputes it from items
+  items: ModuleUsageItem[];
+  generatedAt: string;       // ISO time the module computed the figures
+}
+
+/** What the host passes a provider for one computation. */
+interface UsageContext {
+  userId: string;       // The signed-in user, always from the authenticated request
+  signal: AbortSignal;  // Aborted when the host stops waiting (15 s)
+}
+
+/** What a module registers. */
+interface UsageProvider {
+  moduleId: string;     // One provider per module
+  label: string;        // Section heading in the Storage section
+  order?: number;       // Display order, 0-100, lower first (default 50)
+  getUsage(ctx: UsageContext): Promise<ModuleUsage>;
+}
+```
+
+### Conventions
+
+- **Scope everything to `ctx.userId`.** Count only that user's storage. The host takes the id from the authenticated request and rejects an empty id with a `BadRequestError` before any provider runs, so a query such as `where: { userId }` can never run with an empty value.
+- **Count on demand; let the host cache.** `getUsage` may scan. The host caches the result, so don't add your own per-request caching or call `getUsage` from your own routes on every request.
+- **`bytes` is the stored size.** Report the bytes the item takes up in storage, as a whole number. Use `null` when the module can't tell (the Storage section then shows "Size unknown" and reads the total as a lower bound). `count` is a whole number too.
+- **Count only storage your module holds.** Every module reports its own rows and files, and the host adds the modules together, so counting another module's data counts it twice.
+- **Keep item keys unique within the module.** They identify the rows on the account page. A duplicate key makes the whole module `unavailable`.
+- **Stop when `ctx.signal` aborts.** After 15 seconds the host stops waiting for that request and reports the module `unavailable`. A scan that keeps going isn't cancelled by the host (it can't be). It isn't started again either: later requests for the same user wait on it, and use its result if it arrives within their own 15-second limit.
+
+## Registering a provider
+
+Register from a side-effect `usage.registration.ts`, imported from the feature's `index.ts`. Modules are installed beside the foundation features, so the path is `'../usage/index.js'`.
+
+### In an app's own feature
+
+An app's own feature ships with a starter that has the usage feature, so a static import is safe:
+
+```typescript
+// features/invoices/usage.registration.ts
+import { usageRegistry } from '../usage/index.js';
+import { invoiceService } from './invoice.service.js';
+
+usageRegistry.register({
+  moduleId: 'invoices',
+  label: 'Invoices',
+  getUsage: ({ userId, signal }) => invoiceService.getUsage(userId, { signal }),
+});
+```
+
+### In a module that must also run on older starters
+
+On a starter older than v2.14.0, `../usage/index.js` doesn't exist and a static import crashes the boot. A module generated into hosts of any age uses a guarded dynamic import instead, the same idiom modules use for the [`moduleRegistry`](/starter-template/modules-feature/):
+
+```typescript
+// features/structure/usage.registration.ts
+import { structureService } from './structure.service.js';
+
+// A variable specifier + top-level await: on a starter without usageRegistry
+// the import rejects and this does nothing, where a static import would crash.
+// The import is untyped, so annotate the getUsage argument.
+const USAGE_FEATURE = '../usage/index.js';
+try {
+  const { usageRegistry } = await import(USAGE_FEATURE);
+  usageRegistry.register({
+    moduleId: 'structure',
+    label: 'Structure',
+    getUsage: ({ userId }: { userId: string }) => structureService.getUsage(userId),
+  });
+} catch {
+  // Starter predates the usage registry; nothing to register.
+}
+```
+
+A module that requires starter v2.14.0 or later can use the static import.
+
+### Registry methods
+
+| Method | Description |
+|--------|-------------|
+| `usageRegistry.register(provider)` | Register a module's provider. The first registration for a `moduleId` wins; a duplicate logs a warning and is skipped. A provider without a `moduleId` logs a warning and is ignored |
+| `usageRegistry.get(moduleId)` | One provider, or `undefined` |
+| `usageRegistry.getAll()` | Every provider, sorted by `order` (default 50), then by `label` |
+| `usageRegistry.clear()` | Remove every provider (testing only) |
+
+`usageRegistry` is a custom registry keyed by `moduleId`, like the `securityRegistry`; it doesn't extend `BaseRegistry`. See [Registry Reference](/starter-template/registries/#usageregistry-backend).
+
+## The API
+
+`GET /api/v1/usage` returns the signed-in user's combined storage summary. It is registered through the route registry (`path: '/usage'`, `feature: 'usage'`, `versions: ['v1']`, `requiresAuth: true`).
+
+- **Auth.** A missing or invalid bearer token gets 401 and nothing is counted. [Device tokens](/starter-template/device-tokens/) are accepted, since the figure is read-only. The per-user [rate limit](/starter-template/configuration/#rate-limits) applies.
+- **Whose usage.** Always the authenticated caller (`req.user.id`). Unknown query keys, such as a `userId`, are ignored.
+- **Caching headers.** The API-wide `Cache-Control: no-store` applies unchanged.
+
+| Query | Meaning |
+|-------|---------|
+| *(none)*, `fresh=0`, `fresh=false` | Use the cached summary when it is under 60 seconds old |
+| `fresh=1`, `fresh=true` | Recount, unless the cached summary is under 10 seconds old |
+| Any other value, an empty value, or `fresh` given twice | 400 `{ error: 'Validation failed', details }` |
+
+The response is a `StorageUsageResponse`:
+
+```typescript
+type ModuleStorageUsage =
+  | {
+      moduleId: string;
+      label: string;
+      status: 'ok';
+      bytes: number;              // Host-computed sum of the items' bytes (null counted as 0)
+      items: ModuleUsageItem[];
+      generatedAt: string;
+    }
+  | {
+      moduleId: string;
+      label: string;
+      status: 'unavailable';      // The provider failed, timed out or returned an invalid shape
+    };
+
+interface StorageUsageResponse {
+  modules: ModuleStorageUsage[]; // In provider order (order, then label)
+  totalBytes: number;            // Sum of bytes over the 'ok' modules
+  partial: boolean;              // Some module is unavailable, so the total is incomplete
+  hasUnknownSizes: boolean;      // Some 'ok' module has an item with bytes: null
+  generatedAt: string;           // When the summary was computed (a cached answer keeps its time)
+}
+```
+
+An example answer, with one module counted and one that failed:
+
+```json
+{
+  "modules": [
+    {
+      "moduleId": "invoices",
+      "label": "Invoices",
+      "status": "ok",
+      "bytes": 1536,
+      "items": [
+        { "key": "invoices", "label": "Invoices", "count": 3, "bytes": 1536 },
+        { "key": "attachments", "label": "Attachments", "count": 2, "bytes": null }
+      ],
+      "generatedAt": "2026-10-14T05:41:00.000Z"
+    },
+    { "moduleId": "projects", "label": "Projects", "status": "unavailable" }
+  ],
+  "totalBytes": 1536,
+  "partial": true,
+  "hasUnknownSizes": true,
+  "generatedAt": "2026-10-14T05:41:00.000Z"
+}
+```
+
+With no provider registered, the endpoint answers at once with `{ modules: [], totalBytes: 0, partial: false, hasUnknownSizes: false, generatedAt }`, without using the cache.
+
+On the backend, the same summary is available as `getUserUsage(userId, { fresh? })` from the usage barrel. Pass it an id from `req.user`, never from client input.
+
+## Caching and timeouts
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `USAGE_CACHE_TTL_MS` | `60_000` | How long a summary is served from the cache |
+| `USAGE_FRESH_MIN_AGE_MS` | `10_000` | A `fresh` request recounts only when the cached summary is at least this old |
+| `USAGE_CACHE_MAX_USERS` | `1000` | Most users cached at once; the oldest summary is dropped first |
+| `USAGE_PROVIDER_TIMEOUT_MS` | `15_000` | How long one provider may take before its signal is aborted and it is reported `unavailable` |
+| `USAGE_MAX_ITEMS_PER_MODULE` | `100` | Most items kept per module; the rest are dropped and logged |
+
+All five are exported from the usage barrel, with `clearUsageCache()`, which empties the cache and stops a count already running from writing its result back.
+
+- **The cache is in memory, per process.** It is keyed by user id and isn't shared between server instances, so each instance keeps its own 60-second cache and its own 10-second floor.
+- **Concurrent requests share one count.** A request the cache can't answer joins a count already running for that user instead of starting another. This covers a cache miss, a summary 60 seconds old or more, and a `fresh` request on a summary at least 10 seconds old. A request the cache can answer gets the cached summary, even while a recount is running.
+- **Failures are cached too.** A summary with an `unavailable` module is cached like any other, so the module is asked again after 60 seconds, or on a `fresh` request at least 10 seconds later.
+- **A slow scan is never started twice.** When a provider ignores its signal and keeps scanning past the timeout, later requests for the same user wait on that scan (each with its own 15-second limit) instead of calling the provider again. A result that arrives within a request's limit is used. A new scan starts only after the old one has finished.
+
+## When a module is unavailable
+
+The host checks every provider's result before using it. The module is reported as `{ status: 'unavailable' }`, and `partial` is `true`, when:
+
+- `getUsage` throws (synchronously or by rejecting) or takes longer than 15 seconds.
+- `items` is not an array.
+- Any item is invalid. Each item needs a non-empty string `key`, a string `label`, a `count` that is a safe whole number of 0 or more, and `bytes` that is `null` or a safe whole number of 0 or more.
+- Two items share a `key` (checked over all items, before the 100-item cap).
+- The items' bytes add up past `Number.MAX_SAFE_INTEGER`, or adding the module would push the grand total past it.
+
+The reason is logged at warn level by the `usage` logger, with the `moduleId`. It never reaches the client.
+
+For a module that passes, the host:
+
+- Keeps the first 100 items and drops the rest (with a warning in the log).
+- Copies only `key`, `label`, `count` and `bytes` from each item. Any other field the module returns is dropped.
+- Adds up the module's `bytes` from the kept items (`null` counts as 0). The module's own `totals.bytes` is ignored, so the total always matches the listed items.
+- Uses the module's `generatedAt` when it parses as a date, and the host's time otherwise.
+
+## The Storage section
+
+The Storage section is the last section of **Settings → Personal Information** (`/settings/personal-info`), after the registry-provided fields. The component is `frontend/src/features/user/components/StorageUsageSection.tsx`.
+
+- **Hidden when there is nothing to show.** It renders nothing while the first load is in flight, and nothing when the answer has no modules. A backend without the usage endpoint answers 404, which the frontend reads as "no module reports usage", so the section stays hidden there too. Any other failed first load shows the section with the error and a Retry button.
+- **Layout.** A divider and a "Storage" header, then a **Total** row with the grand total. Each module follows in server order: a row with its label and total, and a table with Item, Count and Size columns. A footer shows "Calculated at" (the summary's time, in the browser's local time and the user's language) and a **Refresh** button.
+- **Display rules.**
+  - An item with a count of 0 and a size of 0 or unknown is hidden. A module whose items are all hidden says "Nothing stored yet".
+  - An unavailable module says "Couldn’t be counted right now", and the Total row notes "Some items couldn’t be counted right now".
+  - An unknown size reads "Size unknown", and a total that includes a shown item of unknown size reads "At least …".
+  - Sizes use 1024-based units (B, KB, MB, GB, TB) with at most one decimal; sizes and counts use Australian English digit grouping.
+- **Refresh.** The button asks the server to recount (`?fresh=1`), which the server answers from its cache when the summary is under 10 seconds old. It shows a spinner and is disabled while a refresh or reload is in flight, and reads **Retry** while an error is showing.
+
+The frontend pieces are exported from `@/features/user`:
+
+| Export | Description |
+|--------|-------------|
+| `useStorageUsage()` | Returns `{ usage, isLoading, isRefreshing, error, refresh }`. Query key `['user', 'storage-usage']`, fresh for 60 seconds, no refetch on window focus. `refresh()` recounts and writes the answer only into the cache entry that existed when it started, so a refresh that finishes after sign-out can't fill the next account's cache |
+| `STORAGE_USAGE_KEY` | The query key, `['user', 'storage-usage']`. Invalidating `['user']` also refetches it |
+| `UseStorageUsageResult` | The hook's return type |
+| `ModuleUsageItem`, `ModuleStorageUsage`, `StorageUsageResponse` | The response types, mirroring the backend |
+
+The hook calls `userService.getStorageUsage({ fresh?, signal? })`, which sends `fresh=1` only when `fresh` is true.
+
+## Structure and Document Management
+
+Structure (v1.38.2) and Document Management (v1.18.1) already return per-user usage from their services (`getUsage(userId)`), and both shapes fit `ModuleUsage` as they are. Structure's extra fields (`totals.entries`, `totals.connections`, `byType` and `nodeId`) are ignored. The starter checks this at compile time: `backend/src/features/usage/usage.types.compat.ts` holds copies of both modules' types and fails the type-check if `ModuleUsage` or `UsageProvider` change so far that either module couldn't register its existing `getUsage`.
+
+Neither module registers yet. Each needs its own `usage.registration.ts`, using the guarded import above and a one-line adapter, `({ userId }) => service.getUsage(userId)`. That change belongs in each module's own repository. Until it ships, neither module appears in the Storage section.
+
+## What the foundation deliberately does not do
+
+- **Keep a history.** Figures are counted on demand and cached in memory only; nothing is written to the database.
+- **Share the cache between instances.** Each server process keeps its own cache.
+- **Show other users' usage.** The endpoint only ever counts the signed-in user's storage; there is no admin view across accounts.
+- **Stop a provider that ignores its signal.** The host stops waiting after 15 seconds, but the scan itself runs until it finishes.

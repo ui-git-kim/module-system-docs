@@ -148,6 +148,10 @@ export default defineConfig({
                   slug: "starter-template/notifications-feature",
                 },
                 {
+                  label: "Storage Usage",
+                  slug: "starter-template/usage-feature",
+                },
+                {
                   label: "Modules",
                   slug: "starter-template/modules-feature",
                 },

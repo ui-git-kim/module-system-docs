@@ -60,6 +60,7 @@ src/content/docs/
 │   ├── dashboard-feature.mdx
 │   ├── admin-feature.mdx
 │   ├── security-feature.mdx
+│   ├── usage-feature.mdx        # Storage usage (usageRegistry, GET /api/v1/usage)
 │   ├── header-toolbar.mdx
 │   ├── breadcrumbs.mdx
 │   ├── theme.mdx

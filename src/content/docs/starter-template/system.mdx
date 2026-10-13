@@ -122,11 +122,23 @@ The `"AuditLog"` table is created at runtime via `CREATE TABLE IF NOT EXISTS` �
 
 Every run checks the whole chain from the start. The status lives in the memory of the server process that ran it, and the last result is kept until the next run or a restart. With several server instances, a poll can reach one that didn't run the check; the page then says it lost track and asks you to start it again.
 
-**Writes are batched (v2.13.1).** Both SQL sinks buffer rows in the process and write up to 200 at a time in one `INSERT`. The compliance sink takes the advisory lock and reads the previous hash once per batch, not once per row. A passing failure (the database asleep or unreachable, a pool timeout) is retried with a growing delay, from 1 second up to 60. Only an error that can never succeed (no table, no rights) turns database writes off for the process, with one warning. Rows still in the buffer when the server shuts down are lost; flushing at shutdown is on the [roadmap](/starter-template/roadmap/).
+**Writes are batched (v2.13.1).** Both SQL sinks buffer rows in the process and write up to 200 at a time in one `INSERT`. The compliance sink takes the advisory lock and reads the previous hash once per batch, not once per row. A passing failure (the database asleep or unreachable, a pool timeout) is retried with a growing delay, from 1 second up to 60. Only an error that can never succeed (no table, no rights) turns database writes off for the process, with one warning.
 
-`SqlAuditSink` and `ComplianceAuditSink` are exported from the admin barrel. Their constructors take optional `{ batchSize, retryBaseMs, retryMaxMs }`, and `flush()` resolves once every row buffered so far is written or given up on. A subclass that overrode `writeRow(row)` now overrides `writeBatch(rows, isRetry)` instead, and the protected `ready` member is gone (clean break, v2.13.1).
+**Buffered rows are flushed at shutdown (v2.14.0).** Before v2.14.0, rows still in the buffer when the server shut down were lost. Now the admin feature registers an `audit.flush` handler on the [`app.shutdown` seam](/starter-template/jobs-feature/#the-appshutdown-seam) (`features/admin/shutdown.registration.ts`, order 90). It runs after the HTTP server has closed (5), the job runner has drained (10) and module handlers at the default order (50), since all of these can record audit rows, and before the database disconnects. It waits for the active sink to write what it has queued, but only until the shutdown deadline (`SHUTDOWN_TIMEOUT`, default 10 seconds, counted from the signal). Rows not written by then are lost, and the log says so with a warning. A second SIGTERM/SIGINT skips the drain, and a crash or a hard kill never reaches it, so in those cases buffered rows are still lost.
+
+`SqlAuditSink` and `ComplianceAuditSink` are exported from the admin barrel. Their constructors take optional `{ batchSize, retryBaseMs, retryMaxMs }`, and `flush()` resolves once every row buffered so far is written or given up on. Since v2.14.0 `flush()` also ends a retry delay that is already running, and while a flush is waiting a failed batch is retried every `retryBaseMs` (default 1 second) instead of backing off further. A subclass that overrode `writeRow(row)` now overrides `writeBatch(rows, isRetry)` instead, and the protected `ready` member is gone (clean break, v2.13.1).
+
+The `AuditSink` interface has an optional `flush?(): Promise<void>` (v2.14.0), and the `auditSink` facade's `flush()` passes the call to the active sink. A custom sink passed to `setAuditSink()` that queues its writes should implement it, so its rows are flushed at shutdown too. Only the sink that is active at shutdown is flushed.
 
 **Row counts can be estimates (v2.13.1).** An `"AuditLog"` table of 10,000 rows or more reports the database's own estimate, shown with **≈** in the storage summary, so opening the page never counts a large log row by row. **Verify integrity** reports the exact number it checked.
+
+**Exact counts on demand (v2.14.0).** While the Console page's storage figure is an estimate, a **Count exactly** button under the page header asks for the real number. `GET /api/v1/admin/system/audit/count` runs a per-mode `COUNT(*)` inside a transaction under `SET LOCAL statement_timeout` of 10 seconds (`EXACT_COUNT_TIMEOUT_MS`), so a very large log can't hold a database connection for long.
+
+- **The count finishes:** the response carries exact figures (`approximate: false`, with the `activity` / `compliance` split). The page shows them without the **≈** and hides the button. The result is kept only in the page, so reopening the Console shows the estimate again.
+- **The database cancels it at the time limit:** the response carries the estimate again, flagged `timedOut: true`. The page keeps the **≈** figure and the button, with the note "Counting exactly took too long, so the figure is still an estimate."
+- **Any other error:** the endpoint returns 500 through the error handler, and the page shows the error message.
+
+Requests that arrive while a count is running share that count instead of starting another. This sharing works within one server process only. The response is `{ persisted }`, where `persisted` is `null` with the in-memory sink or when there is no `"AuditLog"` table. The storage summary itself is unchanged: it still counts exactly below 10,000 estimated rows and shows the estimate above that.
 
 ## API
 
@@ -140,6 +152,7 @@ All endpoints are admin-only (reads included — diagnostics reveal where the ap
 | `GET` | `/api/v1/admin/system/history?kind=&limit=` | Durable DB history (P2) — empty when in-memory only |
 | `POST` | `/api/v1/admin/system/audit/verify` | Start the compliance hash-chain check in the background, or join the one running (P3). **202** with its status |
 | `GET` | `/api/v1/admin/system/audit/verify` | The current or last check's status (`AuditVerifyStatus`). Never scans. Before v2.13.1 this ran the whole check itself |
+| `GET` | `/api/v1/admin/system/audit/count` | Exact persisted row counts on demand (v2.14.0): `{ persisted }` (`AuditExactCountResponse`). The figures are exact, or the estimate flagged `timedOut: true` if the 10-second limit ran out. `persisted` is `null` with the in-memory sink or with no `"AuditLog"` table |
 | `GET` | `/api/v1/admin/system/audit/export?limit=` | Export compliance rows for offline archival (P3) |
 
 ## Security

@@ -83,7 +83,7 @@ dashboardRegistry.register({
 | `id` | string | Yes | Unique identifier |
 | `title` | string | Yes | Display title (shown in header) |
 | `description` | string | No | Tooltip/aria description |
-| `component` | ComponentType | Yes | React component to render |
+| `component` | ComponentType | Yes | React component to render. May be a `React.lazy()` component (v2.14.0, see [Lazy widgets](#lazy-widgets)) |
 | `size` | WidgetSize | Yes | Grid size (see below) |
 | `order` | number | No | Sort order (lower = first). Default: 50 |
 | `category` | string | No | Grouping category |
@@ -135,6 +135,58 @@ export function AnalyticsWidget({ isCompact }: DashboardWidgetProps) {
 <Aside type="tip">
   Widgets should be self-contained and handle their own data fetching. Use React Query or SWR for data that needs caching/revalidation.
 </Aside>
+
+### Lazy widgets
+
+Since v2.14.0 a widget's `component` may be a `React.lazy()` component, so a heavy widget's code downloads only when the dashboard shows it. `lazy()` needs a default export, so map a named export onto `default`:
+
+```tsx
+// features/analytics/dashboard.widgets.ts
+import { lazy } from 'react';
+import { dashboardRegistry } from '@/config/dashboard.registry';
+
+const AnalyticsWidget = lazy(() =>
+  import('./components/widgets/AnalyticsWidget').then((m) => ({ default: m.AnalyticsWidget })),
+);
+
+dashboardRegistry.register({
+  id: 'analytics-overview',
+  title: 'Analytics Overview',
+  component: AnalyticsWidget,
+  size: '2x1',
+});
+```
+
+Each widget renders inside its own `SlotBoundary` (`@/components/SlotBoundary`): an error boundary on the outside, a `<Suspense>` inside.
+
+| Situation | `WidgetWrapper` (the default grid) | `RawWidgetWrapper` |
+|-----------|------------------------------------|--------------------|
+| The widget's code is loading | The card and its title show straight away, with a skeleton (`h-24 w-full`) in the card content | A taller skeleton (`h-32 w-full`) stands in for the whole widget |
+| The widget throws, or its code fails to load | "This widget failed to load." in the card | "This widget failed to load." in its place |
+
+Every other widget renders as soon as it is ready, so one slow or broken widget never blanks the grid. Errors are reported through `reportError` (sent to Sentry when it is configured, always logged). The boundary doesn't reset. A widget that threw renders again when the page remounts, for example after navigating away and back. A widget whose code failed to download needs a page reload, because React remembers a failed `lazy()` load.
+
+A module that ships lazy widgets needs a starter of v2.14.0 or later. Older versions have no `<Suspense>` around the widgets.
+
+**`SlotBoundary` in your own code.** The same wrapper now surrounds the components the shell renders into registry slots: dashboard widgets, [header toolbar items](/starter-template/header-toolbar/#lazy-components), preference sections, integration cards, custom personal-info fields, shell-init components and `<EmbeddedSlot>`. Whole pages from `adminPagesRegistry` and `settingsPagesRegistry` keep a plain `<Suspense>`, so a page that throws still reaches the route's `errorElement`. A module that renders components from its own registry can use it as well. Render one per item, keyed by the item's id:
+
+```tsx
+import { SlotBoundary } from '@/components/SlotBoundary';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Text } from '@/components/typography';
+
+{items.map((item) => (
+  <SlotBoundary
+    key={item.id}
+    loading={<Skeleton className="h-24 w-full" />}
+    fallback={<Text variant="caption">{item.title} failed to load.</Text>}
+  >
+    <item.component />
+  </SlotBoundary>
+))}
+```
+
+`loading` and `fallback` both default to `null`, which renders nothing. The error is reported either way.
 
 ### Widget Order
 
@@ -471,7 +523,7 @@ export function RecentActivityWidget({ isCompact }: DashboardWidgetProps) {
 
 ### Performance
 
-1. **Lazy loading** - Consider `React.lazy()` for heavy widgets
+1. **Lazy loading** - Register heavy widgets as `React.lazy()` components (see [Lazy widgets](#lazy-widgets))
 2. **Data caching** - Use React Query/SWR for API data
 3. **Memoization** - Memoize expensive calculations
 
