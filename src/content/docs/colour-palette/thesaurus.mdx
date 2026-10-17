@@ -49,7 +49,7 @@ model colour_name_source {
 
 ### `colour_name_entry`
 
-One row per `(sourceId, sourceCode, hex)` tuple — every imported colour record gets an entry. Hex is **indexed but not unique**: three sources can all describe `#f5f5f5` with their own names and their own source codes, giving three entries that later share a group.
+One row per `(sourceId, sourceCode, hex)` tuple — or `(sourceId, hex, name)` for a source without codes — so every imported colour record gets an entry. Hex is **indexed but not unique**: three sources can all describe `#f5f5f5` with their own names and their own source codes, giving three entries that later share a group.
 
 ```prisma
 model colour_name_entry {
@@ -158,8 +158,16 @@ For each incoming record `{ hex, name, altNames?, sourceKey, sourceCode, oklch? 
 
 ### Rule 1 — exact row match
 
-An entry with the same `(sourceId, sourceCode, hex)` already exists.
+An entry with the same `(sourceId, sourceCode, hex)` already exists. For a source **without codes** (XKCD, Resene), the identity is `(sourceId, hex, nameNorm)` instead.
 → **Upsert:** update `name`, `altNames[]`, `oklch*` fields if changed. Membership rows untouched.
+
+<Aside type="note" title="Two names at one colour (v2.50.1+)">
+CSS has both `aqua` and `cyan` at `#00ffff`. Before v2.50.1, a code-less source matched on source + hex alone, so the second name overwrote the first. Now each name is its own row, and the second joins the first's group by colour (rule 2).
+
+The trade-off: if a later file from a code-less source respells a name, the new spelling arrives as a new name in the same group. Delete the old one by hand.
+
+To recover names lost to the old behaviour, re-import XKCD or Resene. Any restored names show up in the report as `merged-by-hex`.
+</Aside>
 
 ### Rule 2 — hex match only
 
@@ -195,7 +203,7 @@ Incoming hex matches an entry in group `X`; incoming name matches an entry in gr
 
 ### Transaction scope
 
-Each record ingests inside its **own** `withTransaction` block. There is no batch-wide transaction, so a failed record is reported and skipped while the rest still land. `/ingest` accepts at most **1,000 records per request** (v2.49.0+), and an oversized body gets a 400 whose message names the cap. The admin Import tab sends larger pastes in chunks automatically, and the editorial path uses 25-record chunks. Reports collect per-record outcomes (`created`, `merged-by-hex`, `merged-by-name`, `ambiguous`, `upserted`, `failed`) for the admin UI.
+Each record ingests inside its **own** transaction. That transaction takes the thesaurus write lock (a transaction-scoped Postgres advisory lock, v2.50.1+), so a record can't join a group that a source delete running at the same moment is removing. There is no batch-wide transaction, so a failed record is reported and skipped while the rest still land. `/ingest` accepts at most **1,000 records per request** (v2.49.0+), and an oversized body gets a 400 whose message names the cap. The admin Import tab sends larger pastes in chunks automatically, and the editorial path uses 25-record chunks. Reports collect per-record outcomes (`created`, `merged-by-hex`, `merged-by-name`, `ambiguous`, `upserted`, `failed`) for the admin UI.
 
 ## Derived Views
 
@@ -265,13 +273,42 @@ const siblings = entry.scaleKey
 
 ## Merge, Split, Rename
 
-Editorial operations on groups that the admin UI surfaces:
+Editorial operations on groups. Their endpoints exist, but **merge and split have no admin screen yet**; that's roadmap Batch S.
 
 - **Merge** `groupA` → `groupB`: update every `colour_name_entry_group` row with `groupId = groupA` to `groupId = groupB`, de-duping on `(entryId, groupId)` by keeping the stronger reason (`primary` over others). Union the editorial string arrays. Delete `groupA`.
-- **Split**: move an entry's primary membership to a new group. Create the new group, flip one row's `groupId`, optionally seed the new group's master pointers from that entry.
+- **Split** (v2.50.1+): moves a name out of its home group into a new group, where it becomes the headline name and colour.
+  - Every headline pointer aimed at the name is released first, because both pointers are unique.
+  - The old group's headline passes to its oldest remaining name.
+  - Splitting a group's **only** name is refused with a 409; there's nothing to split it from.
+  - A split that waits more than 20 seconds behind another structural write gets a "busy" 409 rather than a server error.
+  - Before v2.50.1, splitting a headline name failed with a 500.
 - **Rename** the group's master name or master hex: repoint `masterNameEntryId` / `masterHexEntryId` to a different entry that is already a primary member of this group. The service validates membership before accepting.
 
-All three run inside `withTransaction`.
+All three run inside one transaction each.
+
+### Deleting a source (v2.50.1+)
+
+`DELETE /sources/:id` (admin-only) runs in one transaction under the thesaurus write lock. In order, it:
+
+1. releases every headline pointer aimed at the source's names;
+2. deletes those names' links, plus any other name's see-also links into the groups being removed;
+3. deletes the names;
+4. deletes **only the groups this source leaves without a home name**;
+5. gives each surviving group that lost its headline its oldest remaining name;
+6. deletes the source.
+
+Groups that have no home names from the source keep their names and notes, including any that were already empty. The only changes to them:
+
+- they lose any see-also links from the deleted names;
+- a group whose headline pointed at one of those names gets a new headline.
+
+Before v2.50.1, the delete removed *every* group in the thesaurus that had no home name, even ones unrelated to the source.
+
+**Preview first.** `GET /sources/:id/impact` (admin-only) returns what the delete would remove: `entriesDeleted`, `groupsDeleted`, `groupsDeletedWithNotes`, `groupsRepointed` and `seeAlsoLinksRemoved`. The preview and the delete share one planning function, so the numbers match. The delete answers 200 with the same counts.
+
+In the admin Sources tab, Delete opens this preview and enables Delete only once the source key is typed.
+
+On the e2e host, the numbers for deleting XKCD's 949 names were: 339 groups deleted, 68 headlines reassigned, about 3 seconds. Headline repairs are written in one statement, so a source that heads hundreds of groups doesn't take a database round trip per group. The transaction allows 60 seconds. Structural writes wait for each other. Any write that can't get the lock within 20 seconds gives up with a 409, "The colour thesaurus is busy with another change. Try again in a moment.", so an import record running at the same time reports that message and can be re-run.
 
 ---
 
@@ -348,7 +385,7 @@ The thesaurus admin imports through `/api/v1/colour/thesaurus/ingest`. The Impor
 |---|---|---|---|
 | `masterName` | ✅ | Entry's `name` (the display label, capitalisation preserved) | The display name your admin sees. Source-specific labels go in `sources[].name` and become altNames automatically when they differ. |
 | `hex` | ✅ | Entry's `hex` if a source doesn't override | `#rrggbb`, lowercase preferred. |
-| `sources[]` | ✅ | One ingest record per source — drives the `(sourceId, sourceCode, hex)` dedupe key | At least one. See source shape below. |
+| `sources[]` | ✅ | One ingest record per source — drives the `(sourceId, sourceCode, hex)` dedupe key (`(sourceId, hex, name)` when there is no code) | At least one. See source shape below. |
 | `altNames[]` | optional | Entry-level altNames (searchable aliases) | For names like BS381 codes, brand variants, or stylised spellings — anything you want autocomplete to find. |
 | `deprecatedNames[]` | optional | **Group** field — historical aliases not tied to a live entry | E.g. `"Mulbery"` (sic) for a renamed colour. Survives re-import via union merge. |
 | `oklch` | optional | Entry's OKLCH (preserved on the master-hex record only) | Skip for hex-only sources; the backend accepts null. |
@@ -371,7 +408,7 @@ The thesaurus admin imports through `/api/v1/colour/thesaurus/ingest`. The Impor
 | Field | Required | Used for |
 |---|---|---|
 | `source` | ✅ | Lowercased namespace key. Auto-creates a `colour_name_source` row if new. |
-| `code` | optional | Source-local identifier (`"B11"`, `"neutral-100"`, `"642"`). Combined with `source` and `hex` for the dedupe key — re-importing the same `(source, code, hex)` upserts in place. |
+| `code` | optional | Source-local identifier (`"B11"`, `"neutral-100"`, `"642"`). Combined with `source` and `hex` for the dedupe key — re-importing the same `(source, code, hex)` upserts in place. Without a code, the key is `(source, hex, name)`. |
 | `name` | optional | Source's own label. If it differs from `masterName`, gets pushed to the entry's `altNames` automatically. |
 | `hex` | optional | Defaults to entry-level `hex`. Set when this source's hex differs from the master. |
 | `scaleKey` | optional | For design-system scales — `"tailwind:neutral"`, `"material:grey"`. Drives the Design Systems sibling lookup. |
@@ -469,7 +506,7 @@ Editorial fields land on the group via the editorial-merge phase. Re-importing l
 </Aside>
 
 - **`source` keys are lowercased on the way in.** Use `"as2700"` not `"AS2700"` — the backend treats them as the same key, but consistency in the file makes it easier to scan and diff.
-- **`(source, code, hex)` is the dedupe key.** Re-importing the same tuple upserts in place (rule 1). A different `code` for the same colour creates a new entry — clean up via the entry editor.
+- **`(source, code, hex)` is the dedupe key** (`(source, hex, name)` for a record with no code). Re-importing the same tuple upserts in place (rule 1). A different `code` for the same colour creates a new entry — clean up via the entry editor. Without a code, a respelled name or a changed `masterName` likewise arrives as a new name in the same group (see the [rule 1 note](#rule-1--exact-row-match)).
 - **`hex` defaults to entry-level `hex` if a source omits it.** Only set source-level `hex` when it genuinely differs (e.g. XKCD's slightly different rendering of a named colour).
 - **Don't put editorial fields inside `sources[]`.** `meaning`, `psychology*`, `origin`, `attributes`, `deprecatedNames` belong at the entry level — they end up on the **group**, not the source row.
 - **Same-hex collision across the file** (e.g. CSS `aqua` and `cyan` both at `#00ffff`) — emit them as separate entries; rule 2 will hex-match them into one group on the second one. Order them in the file with the preferred name first if you care which becomes the master pointer (it auto-points to the first-imported entry of a fresh group).
@@ -478,7 +515,7 @@ Editorial fields land on the group via the editorial-merge phase. Re-importing l
 
 ### Idempotency
 
-Every record runs through rule 1 (exact `(source, code, hex)` match) before anything else. That means:
+Every record runs through rule 1 (exact `(source, code, hex)` match, or `(source, hex, name)` without a code) before anything else. That means:
 
 - Re-running the same import is a no-op on existing rows — `name`, `altNames`, and `oklch` get refreshed; group memberships are untouched.
 - Editorial metadata merges via union — existing entries on the group survive, new entries are added.
