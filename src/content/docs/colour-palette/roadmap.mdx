@@ -262,6 +262,34 @@ No DAST probe was run, because no dev server was up. The fixes are batched under
     - groups whose primary entry moved to another group (and was demoted to `manual`).
   - **Also:** the `NOT IN` list holds every primary membership in the table. On a large thesaurus that can exceed Postgres' 32,767-parameter limit, so the delete fails outright.
   - **Fix:** collect the deleted entries' group ids first. Then delete only those groups that are left with zero primary members.
+  - **Found in the 2026-10-17 thesaurus review:**
+    - The sweep also leaves headline pointers aimed at the deleted names, and links from other sources into the swept groups.
+    - Today's UI already feeds it: deleting a group's last name in the name sheet leaves an empty group, notes and all, and the next source delete erases it.
+- **Importing a source without codes merges different names that share a colour.**
+  - **Where:** `thesaurus-ingest.ts:175-188`. Affects code-less sources such as CSS and XKCD.
+  - **What happens:** the "exact row" rule matches on source + hex only, and the name isn't checked, although the comment above it says these rows key on (source, hex, name). So importing CSS `cyan` overwrites `aqua`, because both are `#00ffff`. The same applies to every XKCD name that shares a hex with another.
+  - **Fix:** match code-less rows on `(sourceId, hex, nameNorm)`.
+
+**Thesaurus integrity (Moderate, from the 2026-10-17 thesaurus review)**
+
+- **Split fails with a 500 for a group's headline name.** `thesaurus-service.ts:499-518` creates the new group pointing at the name *before* clearing the old group's pointer, and both pointers are `@unique`.
+- **Moving a name through `POST /memberships {reason: 'primary'}` leaves stale headline pointers** on the old group.
+- **Merge can leave the target without a headline.** It also reads outside its transaction.
+- **One missing group blanks the Names card.** A link to a group that no longer exists makes `/lookup/by-hex` and `/nearest` return 404 for that hex.
+- **`POST /sources` resets a re-added source's design-system flag**, because of `.default(false)` in `thesaurus-types.ts:47`.
+- **Re-imports drift:**
+  - Editing a name's hex or code detaches it from future imports, so the next import adds a copy.
+  - A coded re-import whose hex changed also duplicates the name.
+- **Source delete and import can race.** Nothing serialises structural writes.
+- **Partly unused routes:**
+  - PATCH `/sources/:id` only ever sends the design-system flag, so there's no rename.
+  - PATCH `/entries/:id` never sends OKLCH, so stored OKLCH goes stale after a hex edit.
+- **Knowledge records have no single-record screens.** POST, PATCH and DELETE `/knowledge` have no frontend service or hook.
+- **The docs still describe the retired v1 thesaurus.**
+  - `usage.mdx:230-316` covers the v1 sources dedupe, `exactOnly`, `hueFamilyOverride` and a Zustand admin store.
+  - `thesaurus.mdx:268` says merge and split have screens; they don't.
+
+  This is part of why the names layer and the thesaurus feel like two separate thesauruses.
 
 **Security and compliance (Moderate)**
 
@@ -315,10 +343,11 @@ No DAST probe was run, because no dev server was up. The fixes are batched under
 **Dead code and duplicates (Moderate)**
 
 - **`colour-reference.ts` (1,403 lines) is an archive.** 20 of its 22 exports are dead. Only `projectTowardCusp` and `mindeMap` are used, by MixLab.
-- **Dead thesaurus code:**
-  - 14 of the 31 thesaurus hooks are dead, and 13 service methods are reachable only through them.
-  - 13 backend thesaurus endpoints have no UI caller.
+- **Thesaurus endpoints with no screen:**
+  - 14 of the 31 thesaurus hooks are unused, and 13 service methods are reachable only through them.
+  - 13 backend thesaurus endpoints have no UI caller. A search of every repo on the build machine found no other caller.
   - `POST /entries` and `POST /groups` don't check the ids they reference.
+  - **Kim's decision (2026-10-17): build screens for them rather than delete them** (Batch S).
 - **`palette-math.ts` is a second colour-analysis module.**
   - It has its own `analyseColour` (vs `analyzeColour`), its own `HUE_CATEGORIES`, and its own gamut and contrast maths.
   - All 22 of its exports are used only inside the file.
@@ -478,7 +507,17 @@ Fixes for the [2026-10-14 standards-alignment gaps](#standards-alignment-gaps-20
 
 These fix the [2026-10-17 cleanup and security gaps](#cleanup-and-security-gaps-2026-10-17-audit), plus that audit's minor findings. They are batched by area and ordered by severity. The letters continue from the 2026-10-14 batches. **Each deletion needs Kim's approval**, after a check for false positives: dynamic imports, side-effect imports and template-string references all defeat static "unused" detection.
 
-- **Batch K — Source-delete data loss (quick, patch).** Limit the orphan-group clean-up to the groups the deleted source's entries belonged to.
+- **Batch K — Thesaurus data-loss patch (moderate, patch).** The 2026-10-17 thesaurus review found it bigger than "scope the sweep".
+  - **Source delete,** in one transaction under an advisory lock:
+    - collect the source's names and their home groups;
+    - clear the headline pointers aimed at those names;
+    - delete the links, then the names;
+    - delete only those groups that are now empty;
+    - repoint the surviving headlines.
+  - Use subselects rather than a huge `IN` list, and raise the transaction timeout.
+  - **Delete preview:** add an impact preview (`GET /sources/:id/impact`) and a type-to-confirm delete dialog that shows the counts.
+  - **Import fix:** match code-less rows on `(sourceId, hex, nameNorm)`, so CSS keeps both `aqua` and `cyan`.
+  - **Before shipping:** take a read-only baseline of the host's thesaurus counts and a Neon branch backup.
 - **Batch L — Admin safeguards and audit trail (moderate, patch).**
   - **Step-up:** add `requireStepUp` after `requireAdmin` on source and group delete, ingest, knowledge import, and method-config save and reset. Check that the chunked Import reuses one grant across chunks.
   - **Audit:** log `{ audit: true, actorId }` on every admin write. This absorbs Batch B follow-up (b).
@@ -505,9 +544,32 @@ These fix the [2026-10-17 cleanup and security gaps](#cleanup-and-security-gaps-
   - **Lists:**
     - Add "load more" to the Library past 50.
     - Lift or page the 5,000 group-search cap, and fix `sort=updatedAt`.
-- **Batch N — Broken promises and small bugs (moderate, patch; two need a decision).**
-  - **Decide:** wire `MethodConfig.generators`, `schemes` and `colourTypes` into the Playground, or remove them along with the Advanced-tab copy.
-  - **Decide:** wire `colourBlindSafe` into Data-viz rejection sampling, or drop the "colour-vision-aware" claim.
+- **Batch N — Broken promises and small bugs (moderate–significant, minor).** **Kim decided on 2026-10-17: make both work.** The plans were reviewed adversarially, with measured numbers.
+  - **Method settings** (`generators`, `schemes`, `colourTypes`):
+    - **Mechanism:** a normaliser merges the admin's edits over the code defaults. It saves only what changed, so built-in wording keeps updating.
+    - **Choices tab:** a new tab in the Palette Methods admin with on/off switches, order, labels and starting counts.
+    - **Playground:** the pickers and Auto's structure roll read the active config, and the type labels reach every screen.
+    - **Limits:**
+      - Locked colours still bypass the generator choice; the admin page says so.
+      - The Functional starting count stays at 0 until functionals survive a roll.
+      - Custom scheme geometry comes later.
+    - **Also fixed:**
+      - Edited axis option names now reach the Playground pills.
+      - The dark-background slot for Cyberpunk, Lunarpunk and Goth survives accent defaults.
+  - **Colour-vision-aware Data-viz:**
+    - **Simulation:** the module's Machado-2009 simulation is kept but relabelled. culori's filters are not used: they apply in gamma space and snap severity, and they score the classic red/green pair at 0.123 instead of about 0.04.
+    - **Thresholds:**
+      - ΔEOK of 0.05 under simulation. That threshold passes every designed-safe palette measured and fails every known-bad one.
+      - Protan and deutan are enforced; tritan is reported only, behind an admin switch.
+      - Severity is fixed at 1.0.
+    - **Generation:**
+      - Best-of-8 re-rolls.
+      - A lightness repair capped at ±0.12, so Aesthetics fail honestly instead of being wrecked.
+      - Candidates are ranked on normal vision first.
+    - **Playground:** a "Colour vision" panel shows pass or fail per type and the weakest pair.
+    - **Measured pass rates (6 colours):** Data-viz alone 100%; + Vibrant 98%; + Bright 89%; + Muted 55%.
+    - Kim will refine the thresholds later.
+  - **Plans:** `.claude/plans/2026-10-17-method-settings-plan.md` and `.claude/plans/2026-10-17-colour-vision-plan.md` (local, gitignored). The review corrections in each take precedence.
   - Let black be the working colour: `hexToOklch` returns `null` on failure.
   - Drop the seven unread derived-store fields.
   - MixLab shows "Copied" even when the copy fails. Favourites mutations have no `onError`.
@@ -515,8 +577,9 @@ These fix the [2026-10-17 cleanup and security gaps](#cleanup-and-security-gaps-
   - **Thesaurus import file:** cap its size before calling `file.text()`.
 - **Batch O — Dead code (moderate, minor; each deletion needs approval).**
   - **`colour-reference.ts`:** move `projectTowardCusp` and `mindeMap` into colour-gamut, then delete the file and its `module.ts` mapping.
-  - **Thesaurus hooks:** delete the 14 dead hooks and their 13 service methods.
-    - **Decide** whether the 13 backend endpoints with no UI stay as an admin API or go. If they stay, add reference checks.
+  - **Thesaurus:** superseded by Batch S, following Kim's decision to build rather than delete.
+    - Batch S wires 6 of the unused hooks and retires 8.
+    - It also retires 7 duplicate routes and adds 4 new ones.
   - **`color-utils`:** retire the shim. It has 5 dead helpers; point its 5 importers at colour-convert.
   - **Unused code:**
     - 48 dead exports.
@@ -574,6 +637,49 @@ These fix the [2026-10-17 cleanup and security gaps](#cleanup-and-security-gaps-
   - **Not bugs, noted for context:**
     - **Data model ahead of the UI:** `subPalettes`, `referencePalettes`, `contextTemplates` and `structureNodeIds` aren't used by any UI yet. As a result, the Structure tab shows the same global palette on every node.
     - **Knowledge needs a seed:** a fresh install has no knowledge rows until an admin seeds them, so criteria-driven targets do nothing until then. A lifecycle seed would fix that.
+- **Batch S — Thesaurus admin build (significant, minor; after Batch K).**
+  - **Why:** Kim decided on 2026-10-17 that colour names and the thesaurus should both have usable screens.
+  - **The two layers:** it is one thesaurus in two layers.
+    - **Names** (`colour_name_entry`): one label per source per colour.
+    - **Groups** (`colour_name_group`): the names that mean the same colour, with a headline name, a headline colour and notes.
+
+    Colour Knowledge is a separate third library on the same admin page.
+  - **Chosen design:** integrity-first, picked by a three-design judge panel, with the best ideas from the others grafted in. Plan: `.claude/plans/2026-10-17-thesaurus-admin-plan.md` (local).
+  - **Rules first,** enforced in one new `thesaurus-integrity.ts`:
+    - one home group per name;
+    - no empty groups;
+    - the headline belongs to its own group;
+    - no dangling ids;
+    - nothing deleted silently;
+    - a proper import identity;
+    - one structural write at a time (advisory lock).
+  - **Write-path hardening:**
+    - **Split:** clear pointers before creating the new group; splitting a group's only name returns 409.
+    - **Move:** a new `POST /entries/:id/move`.
+    - **See-also links:** `POST /memberships` becomes see-also only, and `DELETE` heals stale pointers.
+    - **Merge:** reads inside its transaction and seeds the headline.
+    - **Add name:** `POST /entries` checks the ids it references.
+    - **Delete name:** deleting a group's last name returns 409 unless the group goes too.
+    - **PATCH:** collisions return 409, and OKLCH is recomputed from the hex.
+    - **Lookups:** they tolerate missing groups.
+  - **Endpoints:** 31 become 28.
+    - **Retired as duplicates:** GET `/sources/:id`, `/entries/by-hex/:hex`, `/entries/:id/scale-siblings`, `/groups`, `/groups/:id`, `/groups/:id/memberships`, and POST `/groups` (groups are now born from a name).
+    - **Added:** `/sources/:id/impact`, `/entries/:id/move`, `/health` and `/health/repair`.
+  - **Screens:**
+    - **Tabs:** Names · Groups · Sources · Import · Data check, then Knowledge.
+    - **Names tab:** a server-paged `DataTable` of every colour name.
+    - **Dialogs:** Add name, Move, Split, Merge (with a choice of headline), see-also links, Rename source, and a Delete-source preview.
+    - **Import:** a "Needs review" list for ambiguous rows.
+    - **Data check tab:** counts every rule breach, with View and a previewable Fix.
+  - **Testing:**
+    - DB-backed invariant tests. First confirm `conformance:check` accepts a mapped test file.
+    - A 20-minute walkthrough for Kim, with Data check reading 0 after every step.
+  - **Docs:** rewrite `usage.mdx:230-316` (it still describes v1), and fix `thesaurus.mdx`, `integration.mdx` and `colour-knowledge.mdx`.
+  - **Open decisions for Kim** (recommended defaults in brackets):
+    1. Can a group be left with no names? [no]
+    2. Must every group always have a headline? [yes]
+    3. How should code-less imports recognise names? [source + colour + name]
+    4. Should Knowledge get single-record screens in this build? [no, a small separate build straight after]
 
 ### Short-term (next version — production blockers)
 
