@@ -234,6 +234,109 @@ Audited module **v2.44.0** against the current LLM rules and registry reference 
   - The `module.ts` comments and `features` list are stale.
   - The `data/` directory is empty.
 
+### Cleanup and security gaps (2026-10-17 audit)
+
+<Aside type="caution" title="Found by the 2026-10-17 cleanup and security audit">
+Audited module **v2.50.0**: the templates, plus the code they generate on the e2e host (starter **v2.14.1**).
+
+Automated checks:
+- `npm audit --omit=dev` reports 0 vulnerabilities.
+- `type-check`, `check:templates`, `conformance:check` and `parity:check` pass.
+
+Verified safe:
+- Every per-user read and write is scoped to its owner. User A gets a 404 for user B's ids.
+- `requireAdmin` guards all 26 admin-global writes, and device tokens are refused on admin routes.
+- The only raw SQL is three parameterised `$queryRaw` tagged templates.
+- There is no mass assignment, no HTML or CSS injection sink, and no secret in the bundle.
+- Erasure, export and usage cover exactly the three per-user tables.
+
+No DAST probe was run, because no dev server was up. The fixes are batched under [Planned Improvements → Cleanup and security (2026-10-17 audit)](#cleanup-and-security-2026-10-17-audit).
+</Aside>
+
+**Loses data (Critical)**
+
+- **Deleting a thesaurus source deletes unrelated groups.**
+  - **Where:** `thesaurus-service.ts:144-164`.
+  - **What happens:** it deletes every group in the whole thesaurus that has no primary member, not just the groups that source left empty. Two kinds of group lose their meaning, attributes, origin and deprecated names:
+    - groups created empty through `POST /groups`;
+    - groups whose primary entry moved to another group (and was demoted to `manual`).
+  - **Also:** the `NOT IN` list holds every primary membership in the table. On a large thesaurus that can exceed Postgres' 32,767-parameter limit, so the delete fails outright.
+  - **Fix:** collect the deleted entries' group ids first. Then delete only those groups that are left with zero primary members.
+
+**Security and compliance (Moderate)**
+
+- **Destructive admin routes don't ask for step-up.**
+  - **Routes:** source and group delete, ingest, knowledge import, and method-config save and reset all use `requireAdmin` only.
+  - **Host practice:** the host's comparable routes add `requireStepUp` (`admin.routes.ts`, `builder.routes.ts`, `email.routes.ts`).
+- **Admin writes leave no audit trail.**
+  - Only erasure logs `audit: true`.
+  - No actor is logged for:
+    - method-config save and reset;
+    - knowledge create, update, delete, seed and import;
+    - every thesaurus write, including the source-delete cascade, merge, split and ingest.
+  - Knowledge `update` logs nothing at all.
+  - This extends Batch B follow-up (b).
+- **URL params and query strings aren't validated.**
+  - `GET /palettes?limit=abc` produces NaN and a Prisma 500 (`palette.ts:480` → `:185`).
+  - A fractional `limit` gives a 500 on the legacy and thesaurus lists.
+  - The `:hex` routes pass any CSS colour string to culori.
+  - `?q` has no length cap.
+  - Each 500 also lands in the admin System console.
+  - None of this is injectable, because Prisma binds every value.
+- **Per-user data has no size or row caps.**
+  - Palette `metadata` and `functionals`, favourites `oklch` and `generatedPalette` are open-ended JSON. Only the host's 10 MB body limit bounds them.
+  - There is no per-user row cap.
+  - `GET /favourites` has no `take`.
+- **Database errors surface as 500s.**
+  - These all return a generic 500:
+    - knowledge PATCH on an unknown id;
+    - a duplicate knowledge key, although the docs say duplicates are "rejected";
+    - `remove()`, which throws a plain `Error`;
+    - thesaurus unique-key collisions.
+  - DELETE on an unknown id returns 204 for favourites and knowledge, but 404 everywhere else.
+  - Editing a knowledge record's `kind`, `colourAnchor` or `brandName` doesn't recompute its `key`. The next import or seed then overwrites or duplicates the record.
+
+**Silent limits and broken promises (Moderate)**
+
+- **The Library stops at 50 palettes.** `palette-library-page.ts` sends no `limit` or `offset`, and the API caps at 50, so older palettes are invisible.
+- **Admin group search drops groups past 5,000** (`take: 5000`, `thesaurus-derived.ts:573`). Also, `sort=updatedAt` actually sorts by cuid.
+- **Three Palette Methods settings are saved but never read:** `MethodConfig.generators`, `schemes` and `colourTypes`.
+  - The Playground reads the `GENERATOR_OPTIONS` and `HARMONY_OPTIONS` constants instead, and nothing reads `colourTypes`.
+  - Yet the Advanced tab calls itself "the only place to edit" them.
+  - This is the same failure class as the Batch D tunables bug.
+- **"Colour-vision-aware" Data-viz isn't implemented.** The option sets `rejection.cvdSafe` and the readout says "(colour-vision-aware)". But no generator reads the flag, and `colourBlindSafe` is never called.
+- **Black can't be the working colour.** `hexToOklch` returns `{0,0,0}` when parsing fails, and `working-colour-store.ts` treats `l === 0 && c === 0` as invalid. So `#000000` is rejected.
+- **The derived colour store computes seven fields nobody reads.** They are recomputed on every colour change, and the heavy pass is about 1.5M gamut checks. The fields:
+  - `cusp`, `maxChromaHere`
+  - `painterPalette`, `tintedNeutralsPair`
+  - `tonalMasters`, `tonalScales`
+  - `complementStrip`
+
+**Dead code and duplicates (Moderate)**
+
+- **`colour-reference.ts` (1,403 lines) is an archive.** 20 of its 22 exports are dead. Only `projectTowardCusp` and `mindeMap` are used, by MixLab.
+- **Dead thesaurus code:**
+  - 14 of the 31 thesaurus hooks are dead, and 13 service methods are reachable only through them.
+  - 13 backend thesaurus endpoints have no UI caller.
+  - `POST /entries` and `POST /groups` don't check the ids they reference.
+- **`palette-math.ts` is a second colour-analysis module.**
+  - It has its own `analyseColour` (vs `analyzeColour`), its own `HUE_CATEGORIES`, and its own gamut and contrast maths.
+  - All 22 of its exports are used only inside the file.
+- **The Data-vis schemes are implemented twice, with different algorithms.** The `colour-schemes.ts` exports are never called, because the page builds its own. So the public `colourSchemes.*` output differs from what the tab shows.
+- **Validation code is duplicated.** `handleValidationError` has six identical copies. Hex is validated three different ways; favourites accepts any 4–9 characters, e.g. `#hello`.
+
+**Pipeline (Moderate)**
+
+- **No CI.** The quality gates (`build`, `type-check`, `check:templates`, `conformance:check`, `parity:check`, `npm audit`) run only when someone remembers. The builder module's `.github/workflows/ci.yml` is the model. Drop its `check:ui` step, which colour doesn't have.
+
+**Still open from earlier audits (re-confirmed)**
+
+- Ingest returns raw exception text (Batch E a).
+- Erasure deletes an admin's `isSystem` palettes (Batch B a). This is unreachable today, because the API strips `isSystem`.
+- Export has no paging (Batch B d).
+- `migrateLegacy`, seed and import loop without a transaction (Batch B c). Two concurrent migrate-legacy calls can also create duplicates.
+- There is no `palette` version-chain unique (folded into the deferred rename).
+
 ## Active Research
 
 ### Perceptual step spacing for gradients
@@ -272,7 +375,7 @@ Fixes for the [2026-10-14 standards-alignment gaps](#standards-alignment-gaps-20
   - (b) Admin-scoped hooks (`knowledge.*`, `methodConfig.*`) carry no `actorId` for audit. Add an optional actor parameter from the `requireAdmin` routes.
   - (c) `migrateLegacy`, knowledge `seed` and `importMany` loop without a transaction. A mid-loop failure leaves the already-written rows unannounced.
   - (d) The export handler has no row cap or paging (structure pages at 500 and caps at 50k).
-  - (e) `thesaurusMembershipService.set` invalidates its cache **before** its transaction.
+  - (e) ✅ _Verified fixed in the 2026-10-17 audit._ `thesaurusMembershipService.set` invalidated its cache **before** its transaction. It now invalidates after the commit.
 - ✅ _Shipped v2.46.0._ **Batch C — Lazy loading.**
   - Lazy routes in a keyed error boundary and `Suspense`.
   - Lazy admin pages with `preload` (needs starter v2.13.1+) and a lazy settings page.
@@ -331,6 +434,10 @@ Fixes for the [2026-10-14 standards-alignment gaps](#standards-alignment-gaps-20
   - Swap red error text for `text-destructive` (a quick win).
   - Move the duplicated constants (readable-text rule, achromatic threshold, WCAG/APCA thresholds, API base URL) into `config/palette-config.ts`.
   - Decide whether `<Heading>`/`<Text>` adoption joins the accepted typography deviation, and lift the sub-9px text sizes.
+  - **Started, uncommitted:**
+    - `utils.ts` has the shared API base, the WCAG/APCA thresholds and the achromatic thresholds.
+    - `colour-mix-page.ts` uses them.
+  - Two design questions are still open: the status colours and the typography.
 - ✅ _Shipped v2.49.0._ **Batch H — Housekeeping.** Done:
   - the hidden sidebar-section id is now `colour` (URLs kept) and the orders moved into 26–50
   - `methodConfig.*` renamed to `method-config.*` (`update` removes the old files, with a backup)
@@ -366,9 +473,111 @@ Fixes for the [2026-10-14 standards-alignment gaps](#standards-alignment-gaps-20
   - `contract:*` scripts omitted, since `sync-contract.cjs` is scaffold-only
 
   It brings `npm run conformance:check`, release scripts that rebuild `dist/`, `reconfigure`/`rename`, installed-module discovery for lifecycle hooks, and idempotent schema drops. Host `npx colour update --force` reported the schema in sync with no drift. The first `conformance:check` found 22 violations: 21 C18, plus **one new C9, now the top item in Batch B**.
+
+### Cleanup and security (2026-10-17 audit)
+
+These fix the [2026-10-17 cleanup and security gaps](#cleanup-and-security-gaps-2026-10-17-audit), plus that audit's minor findings. They are batched by area and ordered by severity. The letters continue from the 2026-10-14 batches. **Each deletion needs Kim's approval**, after a check for false positives: dynamic imports, side-effect imports and template-string references all defeat static "unused" detection.
+
+- **Batch K — Source-delete data loss (quick, patch).** Limit the orphan-group clean-up to the groups the deleted source's entries belonged to.
+- **Batch L — Admin safeguards and audit trail (moderate, patch).**
+  - **Step-up:** add `requireStepUp` after `requireAdmin` on source and group delete, ingest, knowledge import, and method-config save and reset. Check that the chunked Import reuses one grant across chunks.
+  - **Audit:** log `{ audit: true, actorId }` on every admin write. This absorbs Batch B follow-up (b).
+  - **Rate limits:** add `createUserRateLimiter` on ingest, import and seed (about 10 per minute) and on `nearest/*` (about 120 per minute).
+  - **Caching and list caps:**
+    - Share the in-flight cache load, so an admin write doesn't trigger a reload stampede.
+    - Add `take` caps on `findByHex`, `listForEntry`/`listForGroup` and `getScaleSiblings`.
+  - **Errors:**
+    - Knowledge PATCH returns 404 for an unknown id and recomputes `key` on identity edits.
+    - Map Prisma P2002 to 409.
+    - Throw `NotFoundError` for every missing row.
+- **Batch M — Input validation and limits (moderate, patch).**
+  - **Shared validation:**
+    - Use `validateParams` and `validateQuery` on every route.
+    - Add one shared `http.helpers.ts` for the validation error, pagination, the hex schema and `toJson`.
+  - **Field schemas:**
+    - Strict hex for favourites, and `oklch` as `{l,c,h}`.
+    - Normalise `brandHex` to `#rrggbb`.
+    - Make `colourAnchor` an enum. On the client, add an `Object.hasOwn` guard: an anchor named `constructor` currently yields a function as a hue centre.
+  - **Caps:**
+    - Cap JSON field sizes and per-user row counts.
+    - Add `take` to the favourites list.
+  - **Publish race:** use conditional writes (`updateMany` with `userId` and `status: 'draft'`), so a PATCH can't race a publish.
+  - **Lists:**
+    - Add "load more" to the Library past 50.
+    - Lift or page the 5,000 group-search cap, and fix `sort=updatedAt`.
+- **Batch N — Broken promises and small bugs (moderate, patch; two need a decision).**
+  - **Decide:** wire `MethodConfig.generators`, `schemes` and `colourTypes` into the Playground, or remove them along with the Advanced-tab copy.
+  - **Decide:** wire `colourBlindSafe` into Data-viz rejection sampling, or drop the "colour-vision-aware" claim.
+  - Let black be the working colour: `hexToOklch` returns `null` on failure.
+  - Drop the seven unread derived-store fields.
+  - MixLab shows "Copied" even when the copy fails. Favourites mutations have no `onError`.
+  - **Adobe import regex:** bound it and cap pasted input. `\.\S+-hex` backtracks quadratically: about 9 s per pass at 100k characters.
+  - **Thesaurus import file:** cap its size before calling `file.text()`.
+- **Batch O — Dead code (moderate, minor; each deletion needs approval).**
+  - **`colour-reference.ts`:** move `projectTowardCusp` and `mindeMap` into colour-gamut, then delete the file and its `module.ts` mapping.
+  - **Thesaurus hooks:** delete the 14 dead hooks and their 13 service methods.
+    - **Decide** whether the 13 backend endpoints with no UI stay as an admin API or go. If they stay, add reference checks.
+  - **`color-utils`:** retire the shim. It has 5 dead helpers; point its 5 importers at colour-convert.
+  - **Unused code:**
+    - 48 dead exports.
+    - 15 unused store members. `isGenerating` is written but never read.
+    - Dead backend functions: `getByKey`, `findByNameNorm`, `primaryGroupForEntry` and `ingestRecord`. `ingestRecord` would also skip the cache invalidation and the action hook.
+    - Unused constants: `PASTEL_DARK_LIGHTNESS_TARGET`, `SURFACE_CHROMA_MIN/MAX`, `CHART_COLOURS_MAX`, `WARM_HUE_MIN`, `relativeToCusp`, `harmonyTemplate`, `magentaLower` and others.
+    - The redundant `ExportCapableRegistry` guard.
+  - **Decide** on the barrel's namespace exports that nothing uses: `paletteMath`, `colourAccessibility`, and most of `colourModify`, `colourAnalyse` and `colourSchemes`. They are public API, so removing them is a clean pre-launch break.
+- **Batch P — Duplicate consolidation (significant, minor).** This pairs naturally with Batch G's constants work.
+  - Rebuild `palette-math.ts` on colour-analyse and colour-gamut, or remove it.
+  - Keep one Data-vis scheme implementation.
+  - **Colour maths:**
+    - One `hueDistance`, `wrapHue`, `lerpHue` and `clamp`.
+    - One ΔEOK.
+    - culori `formatHex` for rgb→hex.
+    - One HSL path and one OKLCH type.
+  - **Thesaurus:** one entry-view mapping and one nearest scan in `thesaurus-derived.ts`, and one source upsert.
+- **Batch Q — Pipeline and repo hygiene (quick, patch).**
+  - **CI:** add `.github/workflows/ci.yml`, modelled on builder's.
+  - **Dependencies:**
+    - Pin dependency ranges (e.g. `culori@^4.0.2`), if the scaffold accepts versioned specs.
+    - Run `npm audit fix` for the dev-only esbuild advisory (pulled in by tsup).
+  - **Package and repo files:**
+    - Add `.env.*`, `*.tgz`, `*.tsbuildinfo` and `coverage/` to `.gitignore`.
+    - Add a LICENSE: package.json says MIT, but there is no licence file.
+    - Add the `repository`, `homepage` and `bugs` fields.
+    - Refresh the `module.ts` and package.json description.
+  - Move or delete the root `palette-methods-admin-guide.md` (v2.39.0 research, superseded).
+  - **Docs drift:**
+    - `thesaurus.mdx` still lists the removed `psychology*` group fields.
+    - Template comments still point at `thesaurus-v2.mdx`.
+  - **Decide** what to do with the host's orphan tables, `colour_semantics` and `colour_palette_preset`. They aren't in `modelNames`, so `update` never dropped them, and the cultural rows may still be backfillable. Decide the same for the host-only `data/thesaurus.json`.
+- **Batch R — Consistency polish (moderate, minor).**
+  - **Status codes:** `POST /memberships` returns 200 on create, and `POST /sources` returns 201 on update.
+  - **Handlers:** the thesaurus handlers are untyped.
+  - **Logging gaps:**
+    - Source upsert writes no log.
+    - Favourites logs "removed" even on a no-op.
+    - Ingest completion is logged twice.
+  - **Action hooks:**
+    - `ingest.completed` fires even when nothing changed.
+    - Hook naming mixes `colour.palette.*` and `workspacePalette.*`.
+  - **Favourites:** no service registration, and no service/hook pair.
+  - **Zustand:** 23 whole-store subscriptions; every swatch subscribes to the whole page store.
+  - **Error handling:**
+    - The registration `try` blocks wrap `register()` as well as the import, which hides real failures.
+    - `colour-ryb.ts` has a redundant `try`/`catch`.
+    - `?? 0` after `wcagContrast` is redundant.
+  - **Clipboard:** 10 call sites use four error-handling styles, and two MixLab copy targets are clickable `<div>`s.
+  - **Comments:**
+    - 29 "Phase N / req N / Batch X" provenance comments.
+    - "Anchor blend (coming soon)", which shipped in v2.27.0.
+    - Comments that name removed endpoints.
+    - About 90 lines of commented-out scaffold examples in `module.ts` that reference constants which don't exist.
+  - **Not bugs, noted for context:**
+    - **Data model ahead of the UI:** `subPalettes`, `referencePalettes`, `contextTemplates` and `structureNodeIds` aren't used by any UI yet. As a result, the Structure tab shows the same global palette on every node.
+    - **Knowledge needs a seed:** a fresh install has no knowledge rows until an admin seeds them, so criteria-driven targets do nothing until then. A lifecycle seed would fix that.
+
 ### Short-term (next version — production blockers)
 
-- **Fire `colour-palette.generated` and `colour-palette.activated` actions.** The backend already fires `colour.palette.activated`, but through plain `doAction` (see Batch B). It must use `actionRegistry.doActionAll(...)`. `doAction` fails conformance check C18. Still to do: a frontend `generated` hook in the store's `generate` path. Bump the minor version and document it under Integration → Action Hooks Fired.
+- **Fire `colour-palette.generated` and `colour-palette.activated` actions.** The backend already fires `colour.palette.activated` through `actionRegistry.doActionAll(...)` (moved off plain `doAction` in Batch B). The legacy active-palette path that fires it (`GET /active`, `PATCH /:id/activate`) has no UI caller yet. Still to do: a frontend `generated` hook in the store's `generate` path. Bump the minor version and document it under Integration → Action Hooks Fired.
 - **Wire up the `theme.changed` listener** so the preview re-renders when the active theme changes.
 
 ### Short-term (high-impact improvements)
