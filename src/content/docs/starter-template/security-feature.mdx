@@ -19,7 +19,7 @@ v1.28.0 shipped the **shell** (tier config + the `securityRegistry`); subsequent
 
 ## Principles
 
-- **Delegate; don't build.** Auth, sessions, MFA, encryption-at-rest, key storage, isolation, edge/WAF, and crypto are owned by **expert providers**. If a provider offers it, we use the provider — we never hand-roll it.
+- **Delegate; don't build.** Auth, sessions, MFA (once the provider offers it), encryption-at-rest, key storage, isolation, edge/WAF, and crypto are owned by **expert providers**. If a provider offers it, we use the provider — we never hand-roll it.
 - **The starter is correct wiring, done once.** A template's value is that the integration is written once, reviewed, and inherited by every app — the opposite of "my system doing security".
 - **Honest about the residue.** Two things can't be outsourced: **declaring** your app's data/access rules (so the provider can enforce them) and **wiring** the providers correctly. The first is configuration; the second is exactly what the starter centralises.
 - **Tiers are additive configuration, not forks.** `standard ⊂ hardened ⊂ strict` — a higher tier only ever *adds* controls. One `securityProfile` setting toggles the expensive ones; no per-tier branches.
@@ -31,7 +31,7 @@ The providers and libraries security is delegated to:
 
 | Layer | Provider / library | Manages |
 |------|--------------------|---------|
-| Identity, sessions, MFA, OAuth, reset | **Neon Auth** (managed Better Auth) | The auth lifecycle |
+| Identity, sessions, OAuth, reset (MFA once Neon ships it; its roadmap says *coming soon*) | **Neon Auth** (managed Better Auth) | The auth lifecycle |
 | Cross-user isolation | **Neon RLS** / **database-per-tenant** | Row- or instance-level isolation |
 | Encryption at rest + key storage | **Neon** (AES-256, KMS-backed) | Disk encryption + key custody |
 | Field-level encryption | **Node `crypto` (AES-256-GCM)** + managed KMS | App-layer encryption; key never sent to the DB |
@@ -42,11 +42,15 @@ The providers and libraries security is delegated to:
 
 For each concern: the provider owns the mechanism, the starter does the thin wiring, and the app **declares** its surface via the `securityRegistry`.
 
+<Aside type="caution" title="Neon Auth's data lives in your database">
+Neon Auth stores its users, sessions and OAuth configuration in your database, under the `neon_auth` schema, and a Neon branch copies them along with the app data. The template's code never queries `neon_auth`, and field encryption covers app columns only. So keep `DATABASE_URL` server-side, and treat a leaked connection string, or SQL injection anywhere in the app or a module, as reaching the identity store too, not only app data. By default the connection string from Neon's Connect dialog uses the project's owner role (`neondb_owner`).
+</Aside>
+
 **The named bespoke allow-list** — the *only* app-side security code, because no provider covers it:
 
 1. **Field encryption** — a thin `encryptField`/`decryptField` over Node's standard **AES-256-GCM** (`crypto`), with the key from env/KMS and **never sent to the database** (app-layer, *not* `pgcrypto`, so Neon only ever holds ciphertext).
 2. **The deletion cascade wiring** — a small orchestrator that calls each provider's delete API (Neon Auth identity, R2, Stripe, …) in order; no provider deletes across *all* your stores.
-3. **A thin `owned()` helper** as defence-in-depth behind Neon RLS.
+3. **A thin `owned()` helper** as defence-in-depth behind Neon RLS. Since v2.14.2 it, and `withTenantContext()`, throw on an empty or missing `tenantId` before any query runs, so isolation fails closed (a 500) instead of matching every tenant's rows.
 
 Anything not on this list is provider- or library-backed, never hand-built.
 
@@ -70,7 +74,7 @@ securityConfig.auditMode;        // 'activity' | 'compliance'
 | `keyProvider` | env | kms² | kms² |
 | `sessionStepUp` | false | true | true |
 
-¹ At hardened, MFA is *available* and enforced for admins — admin enforcement is handled in the auth layer, not this all-users boolean. ² The **AWS KMS** adapter ships (v1.33.0) and **auto-wires** from `SECURITY_KMS_*` env — `npm run security:setup-kms` writes the vars and the feature registers `createAwsKmsKeyProvider` with no `app.ts` edit. Since v1.64.0, if `kms` is selected but cannot be wired (incomplete env, missing AWS SDK — probed at startup), the feature registers a **fail-closed `kms-failed` sentinel**: every key operation throws, at **every** tier — there is deliberately no env-key fallback, which would write new ciphertext under a different key root than the KMS-rooted ciphertext already stored — and the posture guardrail reports the provider not ready (error at `strict`). Fix the `SECURITY_KMS_*` env / re-run `npm run security:setup-kms`. Switching back with `SECURITY_KEY_PROVIDER=env` (and unsetting `SECURITY_KMS_PER_TENANT`) is safe **only if the deployment has never encrypted anything under KMS**.
+¹ Neon's Managed Better Auth doesn't offer MFA yet (its [roadmap](https://neon.com/docs/auth/roadmap) says *coming soon*), so no tier can enforce it today, for admins or anyone else. `mfaRequired` records the tier's intent: whenever it is on (at `strict`, or with `SECURITY_MFA_REQUIRED=true`), the [posture check](#cloudflare-edge--the-startup-posture-guardrail) warns that the provider can't back it. At `hardened` the extra check is step-up (`sessionStepUp`): an emailed code before sensitive actions. ² The **AWS KMS** adapter ships (v1.33.0) and **auto-wires** from `SECURITY_KMS_*` env — `npm run security:setup-kms` writes the vars and the feature registers `createAwsKmsKeyProvider` with no `app.ts` edit. Since v1.64.0, if `kms` is selected but cannot be wired (incomplete env, missing AWS SDK — probed at startup), the feature registers a **fail-closed `kms-failed` sentinel**: every key operation throws, at **every** tier — there is deliberately no env-key fallback, which would write new ciphertext under a different key root than the KMS-rooted ciphertext already stored — and the posture guardrail reports the provider not ready (error at `strict`). Fix the `SECURITY_KMS_*` env / re-run `npm run security:setup-kms`. Switching back with `SECURITY_KEY_PROVIDER=env` (and unsetting `SECURITY_KMS_PER_TENANT`) is safe **only if the deployment has never encrypted anything under KMS**.
 
 See [Configuration](/starter-template/configuration/#security-tier) for every env var.
 
@@ -213,26 +217,46 @@ Handlers must be **idempotent** and must throw — or return `{ action: 'failed'
 
 ### The Neon Auth identity (closing the gap)
 
-Historically `deleteUser` removed app rows but left the **Neon Auth login identity** behind. Deleting the identity is a provider action, so the feature ships a **seam**, not a hand-rolled auth store — exactly like the [key provider](#field-encryption). Neon Auth is now powered by **Better Auth**, whose supported server-side deletion is the Neon Auth server SDK (`@neondatabase/auth`, admin `removeUser`), so the recommended path is to implement the deleter against that SDK:
+Historically `deleteUser` removed app rows but left the **Neon Auth login identity** behind. Deleting the identity is a provider action, so the feature ships a **seam**, not a hand-rolled auth store — exactly like the [key provider](#field-encryption). For Neon Auth (Managed Better Auth), the starter ships a preset (v2.14.2), `createNeonAuthIdentityDeleter`. It calls the Neon management API's branch-level "delete auth user" endpoint with a Neon API key. It is **opt-in and never auto-wired**, and the starter adds no env vars for it: wire it at bootstrap, in app-owned code, reading names of your choosing from `process.env`.
 
 ```typescript
-// bootstrap, e.g. backend/src/app.ts
-import { setAuthIdentityDeleter } from './features/security/index.js';
+// In one of your app's own backend features, e.g.
+// features/<your-feature>/security.registration.ts (side-effect import from its
+// index.ts). Not config/env.ts or app.ts: both are template-owned, so
+// template:update can overwrite them, and env.ts drops keys it doesn't know. The env var names are yours to choose.
+import { setAuthIdentityDeleter, createNeonAuthIdentityDeleter } from '../security/index.js';
 
-setAuthIdentityDeleter({
-  name: 'neon-auth',
-  async deleteIdentity(subject) {
-    const userId = subject.userId || subject.tenantId;
-    if (!userId) return { deleted: false, detail: 'no user id' };
-    await serverAuth.api.removeUser({ body: { userId } }); // your Neon Auth server SDK
-    return { deleted: true };
-  },
-});
+setAuthIdentityDeleter(createNeonAuthIdentityDeleter({
+  projectId: process.env.NEON_PROJECT_ID ?? '',
+  branchId: process.env.NEON_AUTH_BRANCH_ID ?? '',     // the branch behind NEON_AUTH_URL
+  apiKey: process.env.NEON_AUTH_ADMIN_API_KEY ?? '',   // a project-scoped Neon API key
+}));
 ```
 
-If your provider exposes a plain REST admin endpoint instead, `createRestAuthIdentityDeleter({ buildUrl, headers })` is a thin provider-agnostic helper — you supply the URL and headers (verify them against your provider).
+What it does:
 
-The **default** deleter is `unconfigured`: it does **not** fake success — it logs a WARN and the report carries `authIdentity.status: 'unconfigured'`, so the gap is visible rather than silent. App data is still erased; the identity simply remains until you wire a deleter (or remove it from the Neon dashboard).
+- It sends `DELETE https://console.neon.tech/api/v2/projects/{projectId}/branches/{branchId}/auth/users/{userId}`, with each segment URL-encoded and `authorization: Bearer <apiKey>`. The user id is the subject's `userId` (or `tenantId`).
+- **204** (any 2xx) counts as deleted. **404** also counts as deleted ("identity already absent"), and logs a WARN naming the project and branch, because a wrong `projectId` or `branchId` answers 404 too.
+- Any other status throws `Auth-identity deletion failed: <status> <body, at most 500 characters>`, so the cascade records `authIdentity.status: 'failed'` and the retry tries again. Each call times out after 10 seconds (`NEON_AUTH_IDENTITY_DELETE_TIMEOUT_MS`).
+- It refuses to construct if `projectId`, `branchId` or `apiKey` is blank, so a missing env var fails loudly at boot instead of building a URL with `undefined` in it.
+- It reports as `'neon-api'` in deletion reports and on the admin Security page. Optional settings: `apiBaseUrl` (default `NEON_API_BASE_URL`), `timeoutMs` and `fetchImpl` (for tests).
+
+Before you rely on it:
+
+- **Use a project-scoped API key.** It has Editor access to that one project only, and only an organisation admin can create one. Keep it server-side (never a `VITE_` variable), and give it its own env name rather than reusing a CI `NEON_API_KEY`.
+- **Use the right branch per environment.** Neon Auth users live per branch, and a child branch copies them. `branchId` must be the branch behind this deployment's `NEON_AUTH_URL`, so a preview deployment needs its own.
+- **Use the branch-level endpoint.** The older project-level path is deprecated. The branch-level one is marked **beta** in Neon's API reference, and its description still mentions `neon_auth.users_sync`, so verify the wiring once on a throwaway branch: delete a test user, then confirm they can no longer sign in.
+- **Know what it doesn't do.** JWTs already issued stay valid until they expire (up to 15 minutes), and copies of the user remain in branches created earlier and in restores.
+
+The manual fallback is the Neon Console, on this deployment's branch, or `neon neon-auth user delete <user-id> --project-id <project-id> --branch <branch-id>`. Name the branch: without `--branch` the CLI takes the branch from its context file (which may be another branch), or asks for one when the project has more than one.
+
+<Aside type="note" title="Why not the SDK's admin removeUser">
+Earlier versions of this page suggested Neon Auth's server SDK (`removeUser`). It can't work from this backend. `@neondatabase/auth/server` forwards the caller's Neon Auth session cookies, and this API only receives a Bearer JWT. Better Auth's `removeUser` needs an admin session and refuses to remove the caller, so self-service deletion can't use it, and the deletion retry job has no request at all. It also returns `{ data, error }` rather than throwing, so a naive wrapper would record a refused call as a deleted identity.
+</Aside>
+
+For another provider with a plain REST admin endpoint, `createRestAuthIdentityDeleter({ buildUrl, headers, name?, timeoutMs? })` is the thin provider-agnostic helper the Neon preset is built on. You supply the URL and headers (verify them against your provider).
+
+The **default** deleter is `unconfigured`: it does **not** fake success — it logs a WARN and the report carries `authIdentity.status: 'unconfigured'`, so the gap is visible rather than silent. App data is still erased; the identity simply remains until you wire a deleter, or remove it by hand as above.
 
 <Aside type="note" title="Both deletion paths run the cascade">
 Self-service deletion (`user.service.deleteUser`) and admin deletion (`admin.service.deleteUser`) both route through `deleteAccount`. The admin path keeps its atomic last-admin guard — the row is deleted inside the Serializable transaction, and the idempotent `user.account` handler then no-ops. The legacy `user.deleted` action hook still fires (after the cascade) for back-compat; modules migrating cleanup into a deletion handler should drop their `user.deleted` subscriber in the same step to avoid double cleanup.

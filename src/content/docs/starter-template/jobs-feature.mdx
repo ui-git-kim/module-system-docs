@@ -8,7 +8,7 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 The starter ships background jobs as a **foundation feature** (`backend/src/features/jobs/`, backend only — a sibling to `auth`, `user`, `admin` and [`email`](/starter-template/email-feature/), **not a module**). It is a **seam, not a job system**: a handler registry, one `enqueueJob()` entry point, an honest in-process default, and a durable adapter that is one env key away.
 
 <Aside type="tip" title="Philosophy">
-Durability, retries and scheduling are delegated to a real queue (pg-boss — Postgres-backed, so the database the app already has *is* the queue; no new infrastructure). The foundation owns the *mechanism* — register a handler, enqueue a message, drain on shutdown — while job *content* stays with the feature or module that registered the handler. Same pattern as the email and key-provider seams.
+Durability, retries and scheduling are delegated to a real queue (pg-boss — Postgres-backed, so the database the app already has *is* the queue; no new infrastructure, though on Neon it keeps the compute awake — see [below](#pg-boss-keeps-a-neon-compute-awake)). The foundation owns the *mechanism* — register a handler, enqueue a message, drain on shutdown — while job *content* stays with the feature or module that registered the handler. Same pattern as the email and key-provider seams.
 </Aside>
 
 ## How it works
@@ -46,11 +46,30 @@ Job names follow `{feature}.{job}`. Payloads must be JSON-serialisable (durable 
 
 <Steps>
 1. `cd backend && npm install pg-boss`
-2. Set `JOBS_RUNNER=pg-boss` in `backend/.env` (the commented stub is already there). It uses `DIRECT_DATABASE_URL` (falling back to `DATABASE_URL`) and creates its own `pgboss` schema.
+2. Set `JOBS_RUNNER=pg-boss` in `backend/.env` (the commented stub is already there). It uses `DIRECT_DATABASE_URL`, falling back to `DATABASE_URL_UNPOOLED` and then `DATABASE_URL` (the same order as the Prisma CLI, v2.14.2), and creates its own `pgboss` schema.
 3. Restart — the adapter auto-wires at bootstrap, connects at `startJobRunner()`, and subscribes one worker per registered handler. Queued jobs now survive restarts, `retryLimit` works, and graceful shutdown persists unfinished work.
 </Steps>
 
+Since v2.14.2 the auto-wired runner also:
+
+- **Warns on a pooled URL.** If the URL it ends up with is a Neon `-pooler` host, it logs a warning at boot: pg-boss creates its schema with DDL, which belongs on a direct connection, not the transaction-mode pooler. Set `DIRECT_DATABASE_URL` (or `DATABASE_URL_UNPOOLED`) to the same host without `-pooler`.
+- **Gives up on a stalled connection with the app.** Its pool gets `DB_CONNECT_TIMEOUT_MS` as `connectionTimeoutMillis` (see [Connection limits and timeouts](/starter-template/database/#connection-limits-and-timeouts)).
+- **Honours `channel_binding`.** pg-boss runs on node-postgres, which ignores that URL parameter, so the runner sets `enableChannelBinding` when the URL asks for it.
+
+`createPgBossJobRunner()` takes the two pool settings as optional `connectionTimeoutMillis` and `enableChannelBinding` options, for an app that wires the runner itself.
+
 A declared-but-broken config stays **visible**: startup logs an error, `getJobRunnerStatus()` reports `configured: true, ready: false`, and jobs run on the inline fallback in the meantime. BullMQ (Redis-backed) or any other queue can be wired the same way — implement the `JobRunner` interface (two required members — `name` and `enqueue` — plus optional `start`/`drain`) and call `setJobRunner(...)` at bootstrap.
+
+### pg-boss keeps a Neon compute awake
+
+<Aside type="caution" title="Plan for paid compute before you turn it on">
+pg-boss polls the database. Each worker polls every 2 seconds, and pg-boss's own supervise, monitor and queue-cache loops run every 60 seconds, so while the backend runs, a Neon compute never sees the 5 idle minutes it needs to scale to zero.
+
+- **Free plan:** 100 CU-hours a project a month, about 400 hours of a 0.25 CU compute. An always-on compute uses that up in about 16–17 days, and Neon then suspends it, taking the app and sign-in down with it, until the next billing period or an upgrade.
+- **Paid plans:** an always-on 0.25 CU compute costs roughly US$19 a month on Launch, at its $0.106 per CU-hour (Neon's [plans](https://neon.com/docs/introduction/plans)).
+
+Run pg-boss on a paid plan, or stay on the inline runner. Raising pg-boss's polling interval alone doesn't help, because the 60-second loops still wake the compute. The template leaves pg-boss's defaults alone (they set job latency and retry timing), and its start-up log line now says the compute won't scale to zero.
+</Aside>
 
 ## The `app.shutdown` seam
 

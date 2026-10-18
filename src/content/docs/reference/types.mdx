@@ -196,31 +196,30 @@ Since v2.13.0 the stored preferences are also capped as a whole: an update that 
 
 ### Session Data
 
-Returned by the `useSession()` hook.
+Returned by the `useSession()` hook. Since v2.14.2 the two types are `Pick`s of the session the Neon Auth SDK infers (`frontend/src/features/auth/hooks/useSession.ts`), so they follow the SDK.
 
 ```typescript
+type InferredSession = typeof authClient.$Infer.Session;
+
+type SessionUser = Pick<
+  InferredSession['user'],
+  'id' | 'name' | 'email' | 'emailVerified' | 'image' | 'createdAt' | 'updatedAt'
+>;
+
+type Session = Pick<InferredSession['session'], 'id' | 'token' | 'userId' | 'expiresAt'>;
+
 type SessionData = {
   user: SessionUser;
   session: Session;
 } | null;
 
-interface SessionUser {
-  id: string;
-  name: string;
-  email: string;
-  emailVerified: boolean;
-  image?: string | null;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-interface Session {
-  id: string;
-  token: string;
-  userId: string;
-  expiresAt: Date;
-}
+// With SDK 0.6 (better-auth 1.7) these resolve to:
+//   SessionUser: { id: string; name: string; email: string; emailVerified: boolean;
+//                  image?: string | null; createdAt: Date; updatedAt: Date }
+//   Session:     { id: string; token: string; userId: string; expiresAt: Date }
 ```
+
+Neon's plugin fields are left out on purpose. The SDK's `user.role` is Neon's admin-plugin role, **not** the app's role: read that from `useUserProfile`. `session.token` holds the Neon JWT used for API calls (the SDK swaps it in from the `set-auth-jwt` response header), not the opaque better-auth session token, so compare sessions by `id`, never by `token`.
 
 ### Express Request Extension
 
@@ -236,10 +235,53 @@ declare global {
         role?: UserRole;    // Populated by requireAdmin/requireRole/attachRole
         tenantId?: string;  // Isolation key for data scoping (RLS + owned()); set by requireAuth, equals id in solo apps
         authMethod?: 'jwt' | 'device'; // Web session or device token; requireWebSession / requireStepUp refuse 'device'
+        emailVerified?: boolean; // v2.14.2: the JWT's emailVerified claim, only when the token carries a boolean one
       };
     }
   }
 }
+```
+
+`emailVerified` (v2.14.2) is a snapshot from when Neon minted the token, up to 15 minutes old. It is absent for device tokens and for a JWT without the claim, so treat anything but `true` as unverified. Neon leaves email verification off by default, and nothing in the starter gates on it.
+
+Since v2.14.2, `requireAuth` attaches a JWT user only when the token's `iss` and `aud` match `NEON_AUTH_URL` (or the `NEON_AUTH_ISSUER` / `NEON_AUTH_AUDIENCE` overrides) and it names a signed-in user: non-empty `sub` and `email`, not anonymous. `owned()` and `withTenantContext()` throw on an empty or missing `tenantId`, so a route without `requireAuth` fails closed. See [JWT Verification (requireAuth)](/starter-template/auth-feature/#jwt-verification-requireauth).
+
+### Neon JWT verification (backend)
+
+Exported from `backend/src/middleware/auth.middleware.ts` in v2.14.2.
+
+```typescript
+/** The signed-in user a verified Neon Auth access token names. */
+interface NeonJwtIdentity {
+  id: string;              // The `sub` claim
+  email: string;           // The `email` claim
+  emailVerified?: boolean; // Only when the token carries a boolean claim
+}
+
+/** Where the expected claims come from (the backend env, in production). */
+interface NeonJwtClaimSettings {
+  authUrl: string;   // NEON_AUTH_URL
+  issuer?: string;   // NEON_AUTH_ISSUER: unset derives it from authUrl
+  audience?: string; // NEON_AUTH_AUDIENCE: unset derives it from authUrl
+}
+
+// iss and aud pinned to authUrl's origin or the full authUrl (or the overrides),
+// requiredClaims ['sub'], clockTolerance JWT_CLOCK_TOLERANCE_SECONDS.
+buildJwtVerifyOptions(settings: NeonJwtClaimSettings): JWTVerifyOptions
+
+// An override's comma-separated values, the defaults when unset or blank,
+// or undefined (no check) for 'off'.
+resolveExpectedClaim(override: string | undefined, defaults: readonly string[]): string[] | undefined
+
+// null unless sub and email are non-empty strings and the token isn't anonymous.
+identityFromNeonClaims(payload: JWTPayload): NeonJwtIdentity | null
+
+// Signature, then claims, then identity; null when refused (the reason is logged).
+// The test seam: pass a local key set (createLocalJWKSet) and your own options.
+verifyNeonJwt(token: string, keySet: JWTVerifyGetKey, options: JWTVerifyOptions): Promise<NeonJwtIdentity | null>
+
+CLAIM_CHECK_OFF               // 'off'
+JWT_CLOCK_TOLERANCE_SECONDS   // 10
 ```
 
 ---
@@ -488,6 +530,44 @@ interface StepUpGrant {
 
 The frontend declares the same two shapes in `features/auth/services/step-up.service.ts`.
 
+### Auth-identity deletion
+
+The last step of the [deletion cascade](/starter-template/security-feature/#deletion-cascade): removing the user's login identity at the auth provider. The default deleter is `unconfigured`, which warns and reports that the identity remains. Wire one at bootstrap with `setAuthIdentityDeleter(...)`. See [The Neon Auth identity](/starter-template/security-feature/#the-neon-auth-identity-closing-the-gap).
+
+```typescript
+interface DeletionSubject {
+  tenantId: string;  // Isolation key
+  userId?: string;   // Neon Auth user id; the deleters target userId, else tenantId
+  email?: string;
+}
+
+interface AuthIdentityDeleter {
+  readonly name: string;   // Reported as the provider in the deletion report
+  deleteIdentity(subject: DeletionSubject): Promise<{ deleted: boolean; detail?: string }>;
+}
+
+interface RestAuthIdentityDeleterOptions {   // createRestAuthIdentityDeleter(opts)
+  buildUrl: (userId: string) => string;
+  headers?: Record<string, string>;
+  method?: 'DELETE' | 'POST';          // Default 'DELETE'
+  treatNotFoundAsDeleted?: boolean;    // Default true
+  name?: string;                       // v2.14.2: default 'rest'
+  timeoutMs?: number;                  // v2.14.2: abort after this many ms; default no timeout
+  fetchImpl?: typeof fetch;            // For tests
+}
+
+interface NeonAuthIdentityDeleterOptions {   // createNeonAuthIdentityDeleter(opts), v2.14.2
+  projectId: string;     // The Neon project id
+  branchId: string;      // The branch behind THIS deployment's NEON_AUTH_URL
+  apiKey: string;        // A Neon API key, ideally project-scoped. Server-side only
+  apiBaseUrl?: string;   // Default NEON_API_BASE_URL ('https://console.neon.tech/api/v2')
+  timeoutMs?: number;    // Default NEON_AUTH_IDENTITY_DELETE_TIMEOUT_MS (10000)
+  fetchImpl?: typeof fetch;
+}
+```
+
+Both factories return an `AuthIdentityDeleter`. A 2xx counts as deleted, and so does a 404 unless `treatNotFoundAsDeleted` is `false`. Any other status throws `Auth-identity deletion failed: <status> <body, at most 500 characters>`, so the cascade records the step as `failed` and retries. `createNeonAuthIdentityDeleter` calls `DELETE {apiBaseUrl}/projects/{projectId}/branches/{branchId}/auth/users/{userId}` with the key as a Bearer token, reports as `neon-api`, logs a WARN on every 404 (a wrong project or branch also answers 404), and throws at construction when `projectId`, `branchId` or `apiKey` is blank. It is never auto-wired, and the starter defines no env vars for it.
+
 ### Data export
 
 The personal-data export handler contract. See [Personal-data export](/starter-template/security-feature/#personal-data-export).
@@ -622,14 +702,19 @@ Backend environment validated with Zod on startup:
 const envSchema = z.object({
   // Database
   DATABASE_URL: z.string().min(1),
-  DIRECT_DATABASE_URL: z.string().optional(),
+  DIRECT_DATABASE_URL: z.string().optional(),     // Prisma CLI + pg-boss; falls back to DATABASE_URL_UNPOOLED, then DATABASE_URL
+  DATABASE_URL_UNPOOLED: z.string().optional(),   // v2.14.2: Neon's own name for the direct URL; read only when DIRECT_DATABASE_URL is unset
   DATABASE_ADAPTER: z.enum(['neon', 'pg']).default('neon'),
   DEBUG_PRISMA: z.string().default('false').transform((val) => val === 'true'),  // -> boolean
-  DB_QUERY_TIMEOUT: z.coerce.number().default(10000),
+  DB_QUERY_TIMEOUT: z.coerce.number().default(10000),  // interactive-transaction budget for withTransaction(), not a per-query timeout
+  DB_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(0).default(10_000),  // v2.14.2: connect + pool-checkout wait; 0 = wait forever
+  DB_POOL_MAX: z.coerce.number().int().min(1).default(10),                // v2.14.2: connections per process
   DB_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().min(0).default(60_000),  // idle connection kept open (v2.13.1)
 
   // Auth
-  NEON_AUTH_URL: z.string().url(),
+  NEON_AUTH_URL: z.string().url().refine(isTrustedAuthUrl),  // v2.14.2: https only (http for localhost, 127.0.0.1, [::1])
+  NEON_AUTH_ISSUER: z.string().optional(),    // v2.14.2: override; unset pins iss to NEON_AUTH_URL's origin or full URL; 'off' skips
+  NEON_AUTH_AUDIENCE: z.string().optional(),  // v2.14.2: override for aud, same rules
 
   // Server
   PORT: z.coerce.number().default(3100),
@@ -653,7 +738,7 @@ const envSchema = z.object({
   SECURITY_KEY_PROVIDER: z.enum(['env', 'kms']).optional(),
   SECURITY_KMS_PER_TENANT: z.enum(['true', 'false']).optional().transform(/* -> boolean | undefined */),  // per-tenant KMS data keys + crypto-shred (v1.64.0)
   SECURITY_AUDIT_SINK: z.enum(['memory', 'database']).optional(),
-  SECURITY_AUDIT_RETENTION_DAYS: z.coerce.number().optional(),
+  SECURITY_AUDIT_RETENTION_DAYS: z.coerce.number().int().min(0).default(30),
   SECURITY_DATA_RESIDENCY: z.string().optional(),
   SECURITY_JURISDICTION: z.string().optional(),
   SECURITY_EDGE: z.enum(['cloudflare', 'none']).optional(),  // declared CDN/WAF edge
@@ -665,6 +750,8 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 });
 ```
+
+This lists the core keys. The full schema, including the Sentry, email, jobs and modules keys, is in `backend/src/config/env.ts`.
 
 ---
 

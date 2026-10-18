@@ -23,7 +23,7 @@ Anonymisation masks a **branch** — a separate copy. The parent / production br
 - **Developer environments** — hand engineers a branch shaped like production but scrubbed, so no one holds live PII locally.
 - **Staging / preview branches** — realistic data for a preview deploy without exposing real users.
 - **A restored branch before a developer touches it** — [Backup & Restore](/getting-started/backup-restore/) restores *real* data into a branch; anonymise that branch before handing it over for debugging.
-- **CI / analytics** — production-shaped fixtures for a throwaway job (auto-delete the branch when done). Note the starter's own [database isolation test](/starter-template/testing/) provisions its **own synthetic** table and copies no production data, so it needs no anonymisation — this only becomes relevant if a future job runs against production-shaped data.
+- **CI / analytics** — production-shaped fixtures for a throwaway job (auto-delete the branch when done). Note the starter's own [database isolation test](/starter-template/testing/) provisions its **own synthetic** table, but the branch CI creates for it is a **full copy of your default branch**, data included, for as long as the job runs. Switching that job to a `branch_type: schema-only` branch (an option of `create-branch-action` v6) would leave the data out; see [Testing & CI](/starter-template/testing/#enabling-the-neon-branch-isolation-job).
 
 ## The red line
 
@@ -41,7 +41,7 @@ Anonymisation is **not** a production access control:
 
 2. **Apply masking rules** to the sensitive columns — via **Console → Data Masking**, the REST `/anonymize` endpoint, or SQL `SECURITY LABEL FOR anon ...`. Neon rewrites those columns once, in place, on the branch.
 
-3. **Point the non-production environment** at the branch's connection strings (both the pooled `-pooler` and the direct URL).
+3. **Point the non-production environment** at the branch's connection strings (both the pooled `-pooler` and the direct URL), and at the branch's own Neon Auth **Base URL** (`NEON_AUTH_URL` and `VITE_NEON_AUTH_URL`): every branch has its own, and since v2.14.2 the backend refuses tokens whose issuer isn't its `NEON_AUTH_URL` (see [Auth URL Matching](/starter-template/configuration/#auth-url-matching)). OAuth redirect URIs are per branch too.
 
 4. **(CI) Auto-delete** the branch when the job finishes, so scrubbed copies don't accumulate.
 
@@ -51,9 +51,16 @@ Anonymisation is **not** a production access control:
 
 Two rules keep the branch both safe **and** usable by this template's isolation model:
 
-- **Mask the plaintext PII the app stores in the clear** — `User` email / name, `Space` fields, notification content, audit-log payloads. These are the columns a scrubbed branch needs to neutralise.
+- **Mask the plaintext PII the app stores in the clear** — `User` email / name, `Space` fields, notification content, audit-log payloads. These are the columns a scrubbed branch needs to neutralise. Neon Auth's own copy of each user lives in `neon_auth`, outside the app's tables (see the caution below).
 - **Skip already-encrypted columns.** Fields protected by the app-layer field encryption (`encryptField` / per-tenant KMS) are already opaque ciphertext in Neon — masking them adds nothing and can break decryption if you need it on the branch.
 - **Preserve the isolation keys and referential integrity.** Do **not** mask `tenantId` / `userId`, and keep foreign-key relationships intact — the template's [Neon RLS + `owned()`](/starter-template/database/) isolation and the app's own queries must still behave on the branch. Mask the *content*, not the *keys*.
+
+<Aside type="caution" title="The branch carries Neon Auth too">
+Masking app columns doesn't scrub sign-in data. Neon Auth stores its data in the branch's `neon_auth` schema, and a new branch gets a copy of all of it ([Branching authentication](https://neon.com/docs/auth/branching-authentication)): real users' emails and names, password hashes and OAuth tokens, sessions, the auth configuration and the **JWT signing keys**. On the branch's own Auth URL, anyone who knows a real user's password can sign in as that user.
+
+- **Neon's masking docs don't cover it.** Neon's [Data anonymization](https://neon.com/docs/workflows/data-anonymization) page doesn't mention `neon_auth`, so don't assume it can be masked. Until you have confirmed it, treat a branch created from production as holding production sign-in data, and give its access the same care as production's.
+- **The shared keys are why the backend pins the issuer.** A branch signs tokens with the same copied keys as production, and its users keep their production ids, so a token minted on a branch would pass production's signature check. Since v2.14.2 the backend refuses it, because the token's `iss` / `aud` name the branch's Auth URL, not production's. Keep `NEON_AUTH_ISSUER` / `NEON_AUTH_AUDIENCE` unset (or set to your production origin), never `off`. See [Auth URL Matching](/starter-template/configuration/#auth-url-matching).
+</Aside>
 
 <Aside type="tip" title="Delegate, don't build">
 This is a Neon Console / API capability — there is nothing to add to the template. Define the masking rules once against your project and reuse them each time you branch. Keep the rules in your infrastructure notes alongside the [Neon setup](/getting-started/neon-setup/).

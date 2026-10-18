@@ -11,7 +11,11 @@ The template ships a minimum test suite ([Vitest](https://vitest.dev)) and a Git
 
 | Test | File | Needs a DB? |
 |------|------|-------------|
-| **`owned()` scoping** — the isolation key can't be overridden by a client-supplied `tenantId` | `backend/src/lib/owned.test.ts` | No |
+| **`owned()` scoping** — the isolation key can't be overridden by a client-supplied `tenantId`; since v2.14.2 an empty or missing `tenantId` throws instead of matching every tenant | `backend/src/lib/owned.test.ts` | No |
+| **JWT verification** (v2.14.2) — `iss` / `aud` pinned to `NEON_AUTH_URL` by default (a token from another branch is refused), the `NEON_AUTH_ISSUER` / `NEON_AUTH_AUDIENCE` overrides and `off`, the 10-second clock leeway, tokens with no user refused; `NEON_AUTH_URL` must be https | `backend/src/middleware/auth-jwt.test.ts`, `backend/src/config/env.test.ts` | No |
+| **Database connection** (v2.14.2) — the direct-URL fallback and `-pooler` check (CLI and runtime copies agree), `channel_binding`, the connect-timeout warning, pool-error logging that never includes the connection string, both adapters' wiring | `backend/src/lib/database-connection.test.ts`, `backend/src/lib/prisma.test.ts`, `backend/src/__tests__/prisma-config.test.ts`, `backend/src/lib/logger.test.ts` | No |
+| **Drift-safe migrate text** (v2.14.2) — `CREATE EXTENSION` ordering, the one-line error summary, the retry check (skips when `scripts/` isn't beside `backend/`) | `backend/src/__tests__/prisma-migrate-text.test.ts` | No |
+| **Install tooling** (v2.14.2) — line-hold version logic and channel filter, update plans, retired-package plans. Runs with `node --test`, no install needed | `scripts/line-holds.test.mjs`, `scripts/retired-deps.test.mjs` | No |
 | **Cross-user isolation** — user A can't read/update/delete user B's rows through any path (Neon RLS) | `backend/src/__tests__/isolation.test.ts` | **Yes** |
 | **Registry smoke** — features register their security manifest + deletion handlers | `backend/src/__tests__/registries.test.ts` | No |
 | **Email seam** — provider adapter auto-wires from env; registrations land; unwired sends fall back to the console log | `backend/src/features/email/email.test.ts` | No |
@@ -49,7 +53,7 @@ The **cross-user isolation** test is DB-backed and **skips unless `TEST_USE_DB=1
 
 - **backend** — `npm install` → `prisma generate` → typecheck → unit tests.
 - **frontend** — `npm install` → shadcn baseline (bare template only) → **test** → typecheck + build. A cloned app builds against its own shadcn `components/ui/*`. The bare template ships none (they are generated per app), so there CI first generates the [shadcn baseline](/starter-template/scripts/#shadcn-baseline) with a non-interactive `shadcn init`. The tests run after it (since v2.14.0), because component render tests import `components/ui` too. A template change that breaks the type-check or build is caught in the template, not in every app after `template:update`. The build uses placeholder `VITE_API_URL` / `VITE_NEON_AUTH_URL` values unless you set repository variables with those names (CI builds are never deployed). Lint runs only where an eslint config exists (the template ships none).
-- **audit** — an allowlist-aware `npm audit` gate across backend + frontend. **Warn-only** unless enabled (see below).
+- **audit** — an allowlist-aware `npm audit` gate across backend + frontend. **Warn-only** unless enabled (see below). Since v2.14.2 it first runs the offline install-tooling self-check (`node --test scripts/line-holds.test.mjs scripts/retired-deps.test.mjs`).
 - **isolation** — the DB-backed test against a **throwaway Neon branch**. **Opt-in** (see below).
 
 ### When CI runs
@@ -70,15 +74,23 @@ The **cross-user isolation** test is DB-backed and **skips unless `TEST_USE_DB=1
 
 CI then creates a fresh Neon branch per run, points the isolation test at it (`TEST_USE_DB=1`), and **deletes the branch afterwards** (even on failure). Without the variable set, the job is skipped and the rest of the pipeline still runs.
 
+Since v2.14.2 the job uses `neondatabase/create-branch-action@v6` (v5 was a composite action that installed `neonctl` on every run). v6 renamed the `username` input to `role` (the job passes `role: neondb_owner`) and `parent` to `parent_branch`; the job only reads the `db_url` output, which is unchanged. `delete-branch-action` stays on v3. If your project's role or database differs from Neon's defaults, edit `role` and `database` in `.github/workflows/ci.yml`.
+
+<Aside type="caution" title="The CI branch is a full copy of production">
+The branch is created from your default branch with its data, so each run holds a copy of production data, `neon_auth` included (users, password hashes, OAuth tokens and sessions), for as long as the job runs. The isolation test itself uses only its own synthetic table. v6 can make a `branch_type: schema-only` branch (schema, no data) and set an `expires_at` backstop (RFC 3339), and it offers `masking_rules`; none is turned on, because the job isn't run against a live project in the template. Consider `branch_type: schema-only` for your app, after checking the test still passes on it.
+</Aside>
+
 <Aside type="tip" title="Why a real branch, not a mock">
 Isolation is enforced by **Postgres RLS**, not app code — so the test only means something against a real database. A throwaway Neon branch gives production parity (the real adapter + policies) and costs nothing to spin up and tear down.
 </Aside>
 
 ### The dependency-audit gate
 
-The **audit** job runs `npm audit` across `backend` and `frontend` through `scripts/audit-gate.mjs`. A plain `npm audit` gate is unusable here — some advisories can't be fixed in this repo (Prisma 7's `deepmerge-ts` chain, whose only npm fix is a Prisma downgrade), so it would fail forever and get ignored. Instead the gate reads **`.audit-allowlist.json`** and splits high/critical advisories into **known** (allowlisted) vs **NEW**, reporting only new risk.
+The **audit** job runs `npm audit` across `backend` and `frontend` through `scripts/audit-gate.mjs`. A plain `npm audit` gate is unusable while an accepted advisory exists that can't be fixed in this repo (as Prisma 7's `deepmerge-ts` chain was until Prisma 7.10.1), because it would fail forever and get ignored. Instead the gate reads **`.audit-allowlist.json`** and splits high/critical advisories into **known** (allowlisted) vs **NEW**, reporting only new risk.
 
-It is **warn-only by default** — it never fails CI unless you set the repository variable **`AUDIT_GATE_ENFORCE`** = `true`. The allowlist holds only the Prisma `deepmerge-ts` chain. `GHSA-g38m-r43w-p2q7`, the better-auth advisory on Neon's managed auth server, left it in v2.14.1, once Neon's docs showed that server on better-auth 1.7.6 (see [Dependency vulnerabilities](/starter-template/roadmap/#dependency-vulnerabilities)). Curate it as advisories are triaged, then flip `AUDIT_GATE_ENFORCE` on once it's clean. Run it locally with `node scripts/audit-gate.mjs`.
+It is **warn-only by default** — it never fails CI unless you set the repository variable **`AUDIT_GATE_ENFORCE`** = `true`. Since v2.14.2 the allowlist is **empty**: Prisma 7.10.1 cleared the `deepmerge-ts` chain, and `GHSA-g38m-r43w-p2q7`, the better-auth advisory on Neon's managed auth server, left it in v2.14.1, once Neon's [About Managed Better Auth](https://neon.com/docs/auth/about) page showed that server on better-auth 1.7.6 (see [Dependency vulnerabilities](/starter-template/roadmap/#dependency-vulnerabilities)). Both audits report 0 high/critical, so `AUDIT_GATE_ENFORCE` can be switched on. Run it locally with `node scripts/audit-gate.mjs`.
+
+The gate only sees the packages in your lockfiles, not the better-auth Neon runs for you. better-auth `GHSA-965c-763c-88jm` (critical, a Magic Link account takeover fixed in 1.7.7) affects Neon's 1.7.6 when Magic Link is enabled, which it isn't by default, and it isn't in GitHub's global advisory database yet. Don't enable Magic Link in the Neon Console until Neon runs 1.7.7 or later. See [Audit gate](/starter-template/scripts/#audit-gate).
 
 The gate **fails closed** (v2.13.0): an audit that could not run (no lockfile, a registry or network error) is reported as a failed audit, never as clean. With `AUDIT_GATE_ENFORCE` on, that fails the job.
 

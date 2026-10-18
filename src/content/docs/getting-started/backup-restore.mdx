@@ -13,8 +13,9 @@ Neon keeps a **history window** of every change. Within that window you can bran
 
 ## Before an incident
 
-- **Know your retention window.** History retention is configurable and **capped by plan** — roughly **1 day on Free up to 30 days** on higher tiers. Set it to match your recovery objective in the Neon console (Project → Settings → Storage / History retention). A longer window costs more storage; pick per tier.
-- **Recovery objective.** With PITR your effective RPO is ~zero (any point in the window) and RTO is minutes (restore is instant). Decide the window that covers "how long before we'd notice a bad write".
+- **Know your history window.** Neon calls it the *history window*. It is set per project and capped by plan: **6 hours on Free** (the default and the maximum, capped at 1 GB of change history), and on paid plans **1 day by default**, up to **7 days on Launch** and **30 days on Scale**. Set it in the Neon Console under **Settings → Postgres → History window**. A longer window costs more: history storage is billed at $0.20/GB-month on paid plans. See Neon's [History window](https://neon.com/docs/postgres/backup-restore/history-window).
+- **Recovery objective.** With PITR your effective RPO is ~zero (any point in the window) and RTO is minutes (restore is instant). Decide the window that covers "how long before we'd notice a bad write". On Free, a bad write noticed the next morning is already outside the window.
+- **Auth restores with the data.** Neon Auth keeps its users, sessions and configuration in the branch's `neon_auth` schema, so a restore rolls sign-in back too. Read the auth caution under [Restore procedure](#restore-procedure-non-destructive-restore-into-a-branch) before you need it.
 
 ## Restore procedure (non-destructive: restore into a branch)
 
@@ -26,15 +27,26 @@ The safe pattern is to restore **into a new branch off the root**, verify it, an
 
 2. **Create a branch at that time.** In the Neon console: **Branches → Create branch → Include data up to → Time**, branching from your root/parent branch. (Or via the Neon API / CLI with the timestamp or LSN.) The branch is an isolated, writable copy of the database as it was at that instant.
 
-3. **Get the branch connection strings** — both the **pooled** (`-pooler`, for `DATABASE_URL`) and **direct** (for `DIRECT_DATABASE_URL`) URLs.
+3. **Get the branch connection strings** — both the **pooled** (`-pooler`, for `DATABASE_URL`) and **direct** (for `DIRECT_DATABASE_URL`) URLs. The branch also has its own Neon Auth **Base URL**, which you need only if you repoint the app (below).
 
 4. **Verify** (see below) against the branch before touching production.
 
 5. **Cut over**, one of:
-   - **Repoint the app** — set `DATABASE_URL` / `DIRECT_DATABASE_URL` to the restored branch and redeploy. Fastest; the branch becomes the live database.
-   - **Reset the root** — use Neon's **Restore** to reset the main branch to the restored point. Neon preserves the pre-restore state as an automatic backup branch, so this is reversible.
+   - **Reset the root** (recommended for production) — use Neon's **Restore** to reset the main branch to the restored point. The connection details don't change, so the app needs no new settings. Neon preserves the pre-restore state in an automatic backup branch (named `<branch>_old_<timestamp>`), so this is reversible. Instant restore works only on root branches.
+   - **Repoint the app** — set `DATABASE_URL` / `DIRECT_DATABASE_URL` to the restored branch and redeploy. The branch becomes the live database, but **sign-in stays on the old branch** unless you move it too (see the caution below).
 
 </Steps>
+
+<Aside type="caution" title="Auth data restores with the database">
+Neon Auth stores its users, sessions, password hashes and configuration in the branch's `neon_auth` schema, and Neon's [Instant restore](https://neon.com/docs/postgres/backup-restore/branch-restore) replaces that schema with everything else; there is no way to exclude it. The backup branch still holds the earlier auth state.
+
+- **Reset the root rolls sign-in back to the restore point.** Accounts created after it disappear, and password changes and session revocations made after it are undone. After a security incident, a restore to before the incident can bring back an attacker's sessions and a password the user had already changed: revoke sessions and ask affected users to reset their passwords again afterwards.
+- **Repointing leaves auth behind.** The restored branch has its own Neon Auth Base URL. If you change only `DATABASE_URL` / `DIRECT_DATABASE_URL`, the app keeps signing users in against the **old** branch's Neon Auth, new sign-ups land there, and deleting the "bad" old branch deletes your production sign-in. Either keep auth on the old branch and never delete it, or move auth as well:
+  1. Set `NEON_AUTH_URL` (backend) and `VITE_NEON_AUTH_URL` (frontend) to the restored branch's Base URL, then **rebuild the frontend**, because the Vite build bakes the URL in. The backend checks tokens' issuer against `NEON_AUTH_URL`, so the two must move together (see [Auth URL Matching](/starter-template/configuration/#auth-url-matching)).
+  2. Register the new branch's `<Base URL>/callback/<provider>` redirect URI with your OAuth provider (Google), since each branch has its own.
+  3. Check the branch's trusted domains in its Neon Auth configuration.
+  4. Expect every user to be signed out: sessions don't carry across Auth URLs.
+</Aside>
 
 <Aside type="tip" title="Handing a restored branch to a developer? Anonymise it first">
 A restored branch contains **real production data**. If you're giving it to a developer for debugging rather than cutting over, scrub it first — see [Anonymised Dev & Preview Branches](/getting-started/anonymized-branches/) — so no one handles live PII off-production.
@@ -51,16 +63,18 @@ Before and after cut-over, confirm the restore is good:
 
 ## Retention per tier
 
-| Tier | Typical history window | Notes |
-|------|------------------------|-------|
-| Free | ~1 day | Enough to recover from a same-day mistake. |
-| Paid (lower) | up to ~7 days | Covers a working week. |
-| Paid (higher) | up to **30 days** | Set explicitly; longer = more storage. |
+| Plan | History window (default → max) | Notes |
+|------|--------------------------------|-------|
+| Free | 6 hours → 6 hours (capped at 1 GB of change history) | Covers only the last few hours. Upgrade if you might not notice a bad write the same day. |
+| Launch | 1 day → up to 7 days | Raise it from the 1-day default deliberately. |
+| Scale | 1 day → up to **30 days** | Raise it deliberately; a longer window means more history storage. |
 
-Check your project's actual limit in the Neon console — plans and limits evolve. Set history retention deliberately per app tier rather than accepting the default.
+Check your project's actual window in the Neon Console, since plans and limits change (figures from Neon's [plans](https://neon.com/docs/introduction/plans) page, October 2026). On a paid plan, set the window to match your recovery objective instead of keeping the 1-day default. On Free, 6 hours is the most you can get.
 
 <Aside type="caution" title="PITR vs. the right to erasure">
 A point-in-time restore can **resurrect data you legally erased.** If you restore to a time *before* an account deletion (the [deletion cascade](/starter-template/security-feature/)), the restored branch will contain that account's data again. After any restore, **re-run erasure** for accounts deleted between the restore point and now. Compliance-mode audit logs are hash-chained and stored separately, so the erasure record survives.
+
+The same goes for sign-in identities: a restore brings back the Neon Auth users in `neon_auth` that were deleted after the restore point, so delete those identities again too (see [The Neon Auth identity](/starter-template/security-feature/#the-neon-auth-identity-closing-the-gap)).
 </Aside>
 
 <Aside type="tip" title="Drill it">

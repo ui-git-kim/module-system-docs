@@ -7,10 +7,10 @@ sidebar:
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The starter template uses [Neon Auth](https://neon.tech/docs/guides/neon-auth) for authentication, providing secure JWT-based auth with multiple sign-in methods.
+The starter template uses [Neon Auth](https://neon.com/docs/auth/overview) for authentication, providing secure JWT-based auth with multiple sign-in methods. Neon's docs now call the service **Managed Better Auth**: it runs Better Auth on Neon's servers, and stores its users, sessions and OAuth configuration in your database under the `neon_auth` schema.
 
 <Aside type="caution">
-  **Beta Notice:** Neon Auth is currently in beta. The API may change, and some features may be experimental. Monitor [Neon's documentation](https://neon.tech/docs/guides/neon-auth) for updates.
+  **Status:** Neon lists Managed Better Auth as generally available ([Neon Auth roadmap](https://neon.com/docs/auth/roadmap)). The client SDK, `@neondatabase/auth` 0.6.x, is still a 0.x beta, and a minor release can break, which is why `install-all.mjs` holds it to the 0.6 line. Some features are not available yet, MFA among them (see [Session & token security](#session--token-security-hardening)).
 </Aside>
 
 ---
@@ -23,8 +23,8 @@ The authentication system has two halves — the **frontend** handles sign-in UI
 ┌─────────────────────────────────────────────────────────────────┐
 │  FRONTEND                                                       │
 │                                                                 │
-│  1. User signs in via Neon Auth UI (email + password /         │
-│     Google OAuth)                                               │
+│  1. User signs in on the starter's auth pages (email +          │
+│     password / Google OAuth)                                    │
 │  2. Neon Auth issues a JWT token and stores it in the session   │
 │  3. api.ts interceptor attaches token to every API request:     │
 │     Authorization: Bearer <token>                               │
@@ -33,7 +33,8 @@ The authentication system has two halves — the **frontend** handles sign-in UI
 │  BACKEND                                                        │
 │                                                                 │
 │  4. requireAuth middleware extracts the Bearer token             │
-│  5. Token is verified against Neon Auth's JWKS endpoint         │
+│  5. Token is verified against Neon Auth's JWKS endpoint, with   │
+│     its issuer and audience pinned to NEON_AUTH_URL             │
 │  6. req.user = { id, email, tenantId } is attached to the       │
 │     request (tenantId defaults to the user id in solo apps)     │
 │  7. Route handler runs with authenticated user context          │
@@ -51,8 +52,10 @@ The template enables these methods by default:
 | **Email + password** | Email and password with forgot password |
 | **Google OAuth** | Sign in with Google account |
 
+Email verification is **off by default** in Neon. When you require it, sign-up and sign-in show a verification step that takes Neon's 6-digit code or its link (see [Email verification](#email-verification)).
+
 <Aside type="tip">
-  Configure additional OAuth providers (GitHub, Discord, etc.) in your Neon console.
+  Neon supports Google, GitHub and Vercel sign-in. Google works with Neon's shared development credentials. GitHub and Vercel always need your own OAuth app, with `{NEON_AUTH_URL}/callback/{provider}` as its redirect URI ([Neon's OAuth guide](https://neon.com/docs/auth/guides/setup-oauth)). The starter's pages show a Google button only, so another provider also needs a button that calls `authClient.signIn.social({ provider, callbackURL, errorCallbackURL })`.
 </Aside>
 
 ---
@@ -66,13 +69,19 @@ frontend/src/features/auth/
 ├── lib/
 │   ├── client.ts                 # Neon Auth client instance
 │   ├── getAuthToken.ts           # Token retrieval for API calls
-│   └── sign-out.ts               # signOutAndClear()
+│   ├── sign-out.ts               # signOutAndClear()
+│   ├── auth-errors.ts            # Recognise the SDK's thrown errors (v2.14.2)
+│   ├── email-verification.ts     # Email sign-up / sign-in + verification calls (v2.14.2)
+│   ├── oauth-errors.ts           # ?error= codes → fixed messages (v2.14.2)
+│   └── password-policy.ts        # 8–128 character rule (v2.14.2)
 ├── hooks/
-│   └── useSession.ts             # Session hook + TypeScript types
+│   ├── useSession.ts             # Session hook + TypeScript types
+│   └── useOAuthCallbackError.ts  # Reads a failed OAuth return's ?error= once (v2.14.2)
 ├── components/
 │   ├── AuthProtectedRoute.tsx    # Route guard component
 │   ├── AuthBackground.tsx        # Decorative auth-page background
-│   └── StepUpHost.tsx            # "Confirm it's you" code dialog (v2.13.0)
+│   ├── StepUpHost.tsx            # "Confirm it's you" code dialog (v2.13.0)
+│   └── VerifyEmailStep.tsx       # "Verify your email" step: code or link (v2.14.2)
 ├── services/
 │   ├── devices.service.ts        # Device-token API (Linked devices)
 │   └── step-up.service.ts        # Step-up start/verify API (v2.13.0)
@@ -109,8 +118,8 @@ The auth client is initialised in `lib/client.ts`:
 
 ```typescript
 // frontend/src/features/auth/lib/client.ts
-import { createAuthClient } from '@neondatabase/neon-js/auth';
-import { BetterAuthReactAdapter } from '@neondatabase/neon-js/auth/react/adapters';
+import { createAuthClient } from '@neondatabase/auth';
+import { BetterAuthReactAdapter } from '@neondatabase/auth/react/adapters';
 
 export const authClient = createAuthClient(
   import.meta.env.VITE_NEON_AUTH_URL,
@@ -123,7 +132,14 @@ export const authClient = createAuthClient(
 export const auth = authClient;
 ```
 
-**SDK version (v2.14.1).** The template is on `@neondatabase/neon-js` `^0.8.0-beta`, which brings better-auth 1.7 to the client. [`install-all.mjs`](/starter-template/scripts/#foundation-install-list) keeps it on the 0.8 line (the newest published 0.8.x, betas included), because a 0.x beta can break in any minor. `BetterAuthReactAdapter` comes from the `/auth/react/adapters` entry, as in Neon's README. `/auth/react` also re-exports Neon's prebuilt auth UI (`@neondatabase/auth-ui`; those re-exports are deprecated since SDK 0.8), which the dev server would otherwise pre-bundle. One 0.8 change reaches template code: `unlinkAccount()` selects the account by its row id (`id` from `listAccounts()`) and no longer takes `providerId`. So Disconnect on the Security page calls `auth.unlinkAccount({ accountId: account.id })`. See the [v2.14.1 changelog](/starter-template/changelog/#v2141).
+**SDK version (v2.14.1).** v2.14.1 moved the client to better-auth 1.7 (Neon's SDK 0.8 release). One change in it reaches template code: `unlinkAccount()` selects the account by its row id (`id` from `listAccounts()`) and no longer takes `providerId`. So Disconnect on the Security page calls `auth.unlinkAccount({ accountId: account.id })`. See the [v2.14.1 changelog](/starter-template/changelog/#v2141).
+
+**SDK package (v2.14.2).** The frontend now depends on `@neondatabase/auth` `^0.6.0-beta` directly, not on the `@neondatabase/neon-js` `^0.8.0-beta` wrapper that Neon's React quick start installs. The wrapper's `/auth` entries only re-export this package, so the functions are the same and the built bundle is unchanged. The wrapper also brings a Data API client and a CLI the template doesn't use (21 extra lockfile packages, `pg` among them). Neon releases the two together: auth 0.6 ships with neon-js 0.8.
+
+- [`install-all.mjs`](/starter-template/scripts/#foundation-install-list) keeps `@neondatabase/auth` on the 0.6 line: the newest 0.6.x release or `-beta`. Alpha, canary and rc builds never install. A 0.x beta can break in any minor, so moving to another line is a deliberate change.
+- `BetterAuthReactAdapter` comes from the `/react/adapters` entry, as Neon documents. `/react` also re-exports Neon's prebuilt auth UI (`@neondatabase/auth-ui`; those re-exports are deprecated since SDK 0.8), which the dev server would otherwise pre-bundle.
+- **Existing apps:** `template:update` brings the new imports in `client.ts`. `install-all.mjs` then uninstalls `@neondatabase/neon-js` from `frontend/` and prunes, unless code or an npm script under `frontend/` (or in the root `package.json`) still uses it. In that case it keeps the package and names the files.
+- **Apps that use the Data API** (`createClient` from neon-js) install it themselves: `cd frontend && npm install @neondatabase/neon-js`. It brings its own exact-pinned copy of `@neondatabase/auth`.
 
 ### App Provider Setup
 
@@ -257,12 +273,14 @@ type SessionUser = {
 };
 
 type Session = {
-  id: string;        // Session ID
-  token: string;     // JWT token for API authentication
+  id: string;        // Session ID (the session row's id)
+  token: string;     // The Neon JWT used for API calls, not the session token
   userId: string;    // User ID this session belongs to
   expiresAt: Date;   // Session expiration time
 };
 ```
+
+Since v2.14.2, `SessionUser` and `Session` are `Pick`s of the SDK's own `typeof authClient.$Infer.Session`, so they track the SDK. Neon's plugin fields are left out on purpose: the `role` on Neon's user is its admin-plugin role, **not** the app role (read that from `useUserProfile`). The SDK swaps the Neon JWT into `session.token` (from the `set-auth-jwt` response header) and re-mints it about every 15 minutes, so compare sessions by `id`, never by `token`.
 
 ### Getting Token for API Calls
 
@@ -388,54 +406,100 @@ export const billingService = {
 
 ### JWT Verification (requireAuth)
 
-The `requireAuth` middleware verifies JWT tokens using JWKS (JSON Web Key Set) from the Neon Auth endpoint:
+The `requireAuth` middleware verifies JWT tokens using JWKS (JSON Web Key Set) from the Neon Auth endpoint. Simplified:
 
 ```typescript
-// backend/src/middleware/auth.middleware.ts
-import { createRemoteJWKSet, jwtVerify, type JWTVerifyOptions } from 'jose';
+// backend/src/middleware/auth.middleware.ts (simplified)
+import { createRemoteJWKSet } from 'jose';
 import { env } from '../config/env.js';
 
-// JWKS client — automatically caches and refreshes public keys
-const baseUrl = env.NEON_AUTH_URL.endsWith('/')
-  ? env.NEON_AUTH_URL.slice(0, -1)
-  : env.NEON_AUTH_URL;
-const jwksUrl = new URL(`${baseUrl}/.well-known/jwks.json`);
-const JWKS = createRemoteJWKSet(jwksUrl);
+// JWKS client: caches Neon's public keys (startJwksRefresh() keeps them warm)
+const baseUrl = env.NEON_AUTH_URL.replace(/\/$/, '');
+const JWKS = createRemoteJWKSet(new URL(`${baseUrl}/.well-known/jwks.json`));
 
-// Optional issuer/audience checks — jose validates `iss`/`aud` ONLY when these
-// options are supplied. Both are unset by default, so existing deployments are
-// unaffected (the signature is always bound to this instance's JWKS).
-const jwtVerifyOptions: JWTVerifyOptions = {};
-if (env.NEON_AUTH_ISSUER) jwtVerifyOptions.issuer = env.NEON_AUTH_ISSUER;
-if (env.NEON_AUTH_AUDIENCE) jwtVerifyOptions.audience = env.NEON_AUTH_AUDIENCE;
+// iss and aud pinned to this deployment's Neon Auth, a sub required, 10 s leeway:
+// { issuer: [origin, baseUrl], audience: [origin, baseUrl],
+//   requiredClaims: ['sub'], clockTolerance: 10 }
+const jwtVerifyOptions = buildJwtVerifyOptions({
+  authUrl: env.NEON_AUTH_URL,
+  issuer: env.NEON_AUTH_ISSUER,     // optional override
+  audience: env.NEON_AUTH_AUDIENCE, // optional override
+});
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
-  try {
-    const authHeader = req.headers.authorization;
-
-    if (!authHeader?.startsWith('Bearer ')) {
-      res.status(401).json({ error: 'Missing authorization header' });
-      return;
-    }
-
-    const token = authHeader.slice(7);
-    const { payload } = await jwtVerify(token, JWKS, jwtVerifyOptions);
-
-    // Attach user data to the request object. tenantId is the isolation key
-    // for data scoping (RLS + owned()); in solo apps it equals the user id.
-    const userId = payload.sub as string;
-    req.user = {
-      id: userId,                      // 'sub' claim = user ID
-      email: payload.email as string,  // 'email' claim = user email
-      tenantId: userId,                // solo default: tenant === user
-    };
-
-    next();
-  } catch (err) {
-    res.status(401).json({ error: 'Invalid token' });
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Missing authorization header' });
+    return;
   }
+  const token = authHeader.slice(7);
+  // (A dvc_ device token takes its own path here; see Device Tokens below.)
+
+  // The signature, exp/nbf, iss, aud and sub, then that the token names a
+  // signed-in user: a non-empty sub and email, and not an anonymous token.
+  const identity = await verifyNeonJwt(token, JWKS, jwtVerifyOptions);
+  if (!identity) {
+    res.status(401).json({ error: 'Invalid token' });
+    return;
+  }
+
+  // tenantId is the isolation key for data scoping (RLS + owned());
+  // in solo apps it equals the user id.
+  req.user = {
+    id: identity.id,          // 'sub' claim = user ID
+    email: identity.email,    // 'email' claim = user email
+    tenantId: identity.id,    // solo default: tenant === user
+    authMethod: 'jwt',
+    // Only when the token carries a boolean emailVerified claim
+    ...(identity.emailVerified !== undefined ? { emailVerified: identity.emailVerified } : {}),
+  };
+  next();
 }
 ```
+
+**What a Neon token must carry (v2.14.2).** Before v2.14.2, `requireAuth` checked the signature and expiry, and the issuer and audience checks were opt-in. Now a Neon Auth JWT must pass all of these, or the request gets **401** `{"error":"Invalid token"}`:
+
+- **Signature**, against `${NEON_AUTH_URL}/.well-known/jwks.json` (one trailing slash removed). There is no algorithm pin: jose already limits verification to the algorithms the key set's keys can verify. Neon signs with EdDSA (Ed25519), and its access tokens expire after 15 minutes.
+- **Expiry** (`exp` / `nbf`), with a **10-second** clock tolerance (`JWT_CLOCK_TOLERANCE_SECONDS`). The Neon SDK keeps sending its cached token until 10 seconds before `exp` by the browser's clock, so a browser whose clock runs behind the server's would otherwise get a burst of 401s at the end of each token. The leeway extends a token's life by at most 10 seconds.
+- **Issuer and audience**, pinned to this deployment's Neon Auth (see [Issuer and audience checks](#issuer-and-audience-checks)).
+- **A signed-in user**: a non-empty `sub` and `email`, and not an anonymous token (`role: 'anonymous'` or `isAnonymous: true`). A signed token with no `sub` used to attach `id: undefined`. Other roles, Neon's admin-plugin roles included, still sign in.
+
+`verifyNeonJwt(token, keySet, options)` and `buildJwtVerifyOptions({ authUrl, issuer?, audience? })` are exported from `auth.middleware.ts`. Tests pass a local key set (`createLocalJWKSet`), so the real verification runs offline.
+
+**`req.user.emailVerified` (v2.14.2)** is set only when the token carries a boolean `emailVerified` claim. It is a snapshot from when Neon minted the token (up to 15 minutes old), and it is absent for device tokens. Neon leaves email verification off by default, so treat anything but `true` as unverified. Nothing in the starter gates on it.
+
+**`NEON_AUTH_URL` must use https (v2.14.2).** Its JWKS is the only key that verifies sign-ins, so over plain http anyone on the network path could swap in their own keys. The backend refuses to boot unless `NEON_AUTH_URL` uses `https://`. Plain `http://` is allowed only when the hostname is exactly `localhost`, `127.0.0.1` or `[::1]`. The backend also logs a boot WARN when the URL ends in `/.well-known/jwks.json`, which means Neon's `jwks_url` was pasted instead of its base URL.
+
+#### Issuer and audience checks
+
+Neon copies an auth branch's JWKS signing keys, and its users with their ids, into every child branch. So a token minted on a preview, dev or CI branch is signed by the same key as production's, and the signature alone can't tell them apart. The `iss` and `aud` claims can: Neon stamps both with the origin of the branch's own Auth URL ([Neon's JWT guide](https://neon.com/docs/auth/guides/plugins/jwt)). Pinning them is what makes Neon's "tokens issued in one branch are not valid in another" true for this backend. By default each claim must be one of:
+
+- `new URL(NEON_AUTH_URL).origin`, such as `https://ep-xxx.neonauth.region.aws.neon.tech` (what Neon documents);
+- the full `NEON_AUTH_URL` without its trailing slash (accepted too, in case a token carries better-auth's base URL).
+
+The audience pin also refuses better-auth's session-cache JWT (aud `better-auth:session-cache`), which the same keys sign but which isn't an access token.
+
+`NEON_AUTH_ISSUER` and `NEON_AUTH_AUDIENCE` are **overrides** of that default, normally left unset:
+
+| Value | Effect |
+|-------|--------|
+| Unset or blank | The derived defaults above |
+| A comma-separated list | Replaces the defaults. Each value is trimmed, and jose matches exactly, so don't add a trailing slash |
+| `off` (any case) | Skips that one check, and the backend logs a boot WARN. Not recommended: tokens from other branches of the project may then be accepted |
+
+**When every sign-in returns 401.** A refused claim on a validly signed token is logged at **WARN** (pino module `auth`), at most once a minute per claim; repeats go to debug. The entry has `claim`, `reason`, `tokenIssuer`, `tokenAudience`, `expectedIssuer`, `expectedAudience` and `envVar` (the variable to set). The token and the email are never logged. A bad signature, an expired token or an unknown key is logged at debug only. The usual causes of a refused claim:
+
+- The backend's `NEON_AUTH_URL` differs from the frontend's `VITE_NEON_AUTH_URL`, for example a preview frontend calling the production backend. Point both at the same branch.
+- `NEON_AUTH_URL` points at a reverse proxy in front of Neon Auth. Tokens still carry Neon's own origin, so set `NEON_AUTH_ISSUER` / `NEON_AUTH_AUDIENCE` to the `tokenIssuer` / `tokenAudience` the WARN reports.
+- The token really came from another branch, and the check is doing its job.
+
+**Check one real token before you deploy v2.14.2.** The default follows Neon's documented claims (iss = aud = the Auth URL origin); it was not checked against a live Neon token before release. Sign in to a dev app, copy the value after `Bearer ` from a request's `Authorization` header in the browser's Network tab, and decode its middle segment:
+
+```bash
+node -e "console.log(JSON.parse(Buffer.from(process.argv[1].split('.')[1], 'base64url')))" '<the token>'
+```
+
+`iss` and `aud` should each equal your Neon Auth URL's origin or the full `NEON_AUTH_URL`. If they don't, set the overrides to the values you see.
 
 After `requireAuth` runs, every route handler has access to `req.user`:
 
@@ -472,6 +536,7 @@ declare global {
         role?: UserRole;   // Populated by requireAdmin/requireRole/attachRole
         tenantId?: string; // Isolation key for data scoping (RLS + owned()); equals id in solo apps, set by requireAuth
         authMethod?: 'jwt' | 'device'; // How the request authenticated — a device token is pinned to role 'user'
+        emailVerified?: boolean; // The JWT's emailVerified claim, when present (v2.14.2); absent for device tokens
       };
     }
   }
@@ -481,6 +546,8 @@ type UserRole = 'user' | 'admin' | 'managed';
 ```
 
 `requireAuth` sets `tenantId` to the user id by default — in a solo app the tenant is the user, so isolation/data-scoping code (RLS + `owned()`) can key on `tenantId` everywhere from day one. When a multi-user membership model lands, `tenantId` is resolved from the user's tenant instead.
+
+**`owned()` and `withTenantContext()` fail closed (v2.14.2).** Both helpers (`backend/src/lib/owned.ts`) now throw `a tenantId is required — refusing to build an unscoped query` for an empty or non-string `tenantId`, before any query or transaction runs. Prisma drops an `undefined` filter, so `owned(undefined)` used to match every tenant's rows. Code that calls `owned()` on a route without `requireAuth` now fails with a **500** instead of reading across tenants. See [User-data isolation](/starter-template/database/#user-data-isolation-neon-rls).
 
 ### Role-Based Middleware
 
@@ -1167,8 +1234,8 @@ export function AuthPage() {
 ```
 
 Routes:
-- `/auth/sign-in` — Email + password + Google OAuth
-- `/auth/sign-up` — Name + email + password + Google OAuth
+- `/auth/sign-in` — Email + password + Google OAuth; shows a failed Google sign-in's message, and the verification step for an unverified email
+- `/auth/sign-up` — Name + email + password + Google OAuth; then the verification step when Neon requires one
 - `/auth/forgot-password` — Request password-reset email
 - `/auth/reset-password` — Submit new password with token from URL
 
@@ -1213,21 +1280,23 @@ Auth pages render outside the authenticated shell, so they can't access the full
 
 ### Calling the SDK
 
-Every form calls `authClient` methods directly — no wrapper, no provider:
+The pages call `authClient` directly, with no provider. Since v2.14.2, email sign-up and sign-in go through small wrappers in `lib/email-verification.ts`, so the verification decisions can be unit-tested:
 
 ```tsx
 import { authClient } from '../lib/client';
+import { signInWithEmail, signUpWithEmail } from '../lib/email-verification';
 
-// Sign in with email + password
-const result = await authClient.signIn.email({ email, password });
+// Sign in with email + password: resolves 'signed-in' or 'verify-email'
+const outcome = await signInWithEmail({ email, password });
 
-// Sign up with email + password
-const result = await authClient.signUp.email({ name, email, password });
+// Sign up: resolves 'signed-in' or 'verify-email' (sends callbackURL `${origin}/`)
+const outcome = await signUpWithEmail({ name, email, password });
 
-// Google OAuth (full-page redirect)
+// Google OAuth (full-page redirect). A failed callback returns to errorCallbackURL.
 await authClient.signIn.social({
   provider: 'google',
   callbackURL: `${window.location.origin}/`,
+  errorCallbackURL: `${window.location.origin}/auth/sign-in`,
 });
 
 // Forgot password — sends a reset email
@@ -1240,9 +1309,64 @@ await authClient.requestPasswordReset({
 await authClient.resetPassword({ newPassword, token });
 ```
 
+On the sign-in page the Google button's `callbackURL` is the deep link the user was headed for (`${origin}${from}`); on sign-up it is `${origin}/`.
+
+**Failed calls throw (v2.14.2).** Neon's adapter rejects every non-2xx Better Auth call: it throws an `AuthError` for a 500, 501 or 503 and an `AuthApiError` for any other status (4xx, and 502 or 504 too), both exported from `@neondatabase/auth` and both carrying `.status`, `.code` and `.message`. So wrap SDK calls in `try/catch`. Neon's `throw: false` setting doesn't make them resolve `{ error }`.
+
+- `.code` is Neon's normalised code, and it loses detail: an unmapped 403 becomes `feature_not_supported`, and any plain 401 becomes `invalid_credentials`. Where a status is shared (422 is also a validation error), match the code instead.
+- The types still allow a resolved `{ data, error }`. `throwIfResolvedError(result.error, fallback)` from `@/features/auth` throws one as an Error that keeps `.code` and `.status`, so it reaches the same `catch`.
+- `lib/auth-errors.ts` holds the checks the pages use: `isEmailNotVerifiedError` (`email_not_confirmed`), `isRateLimitedError` (status 429, `over_request_rate_limit` or `over_email_send_rate_limit`), `isInvalidResetTokenError` (`bad_jwt`) and `isInvalidCallbackURLError`.
+- The forgot-password page now always shows a fixed message, "Could not send reset email. Please try again." (or a wait message when rate-limited), and logs the detail to the console as `[ForgotPassword]`. A common cause is a 403 "Invalid redirectURL" when the app's origin isn't in Neon Auth's trusted domains. Better Auth answers 200 for an unknown address, so the page reveals nothing about which emails have accounts.
+- The reset page treats a token the server refuses as the "Link expired or invalid" state, with its "Request a new link" button. An expired emailed link already arrives as `?error=INVALID_TOKEN` with no token.
+
 <Aside type="caution">
-**Forgot / reset password flows are unverified end-to-end.** `ForgotPasswordPage.tsx` and `ResetPasswordPage.tsx` call `requestPasswordReset()` and `resetPassword()`, which the SDK types directly (they type-check on SDK 0.8). Neon's server is no longer behind: its [auth overview](https://neon.com/docs/auth/overview) says Managed Better Auth runs better-auth 1.7.6 (checked 14 October 2026). But the flow has not been run end-to-end against a live Neon Auth project. Verify in your running app before shipping to production — see the [roadmap entry](/starter-template/roadmap/#finalise-the-forgot-password--reset-password-flow) for the full pre-production checklist.
+**Forgot / reset password flows are unverified end-to-end.** `ForgotPasswordPage.tsx` and `ResetPasswordPage.tsx` call `requestPasswordReset()` and `resetPassword()`, which the SDK types directly. Neon's server is no longer behind: Neon's [About Managed Better Auth](https://neon.com/docs/auth/about) page says it runs better-auth 1.7.6 (checked 17 October 2026; the sentence moved there from the auth overview). But the flow has not been run end-to-end against a live Neon Auth project. Neon's password-reset guide still calls `resetPasswordForEmail` "not fully supported yet"; that is the Supabase adapter's wrapper around the same `requestPasswordReset`, which the template calls directly. Verify in your running app before shipping to production: the app's origin is in trusted domains, the email arrives, the link lands on `/auth/reset-password?token=…`, the new password signs in, and a stale link (they expire after 15 minutes) shows the invalid-link state. See the [roadmap entry](/starter-template/roadmap/#finalise-the-forgot-password--reset-password-flow).
 </Aside>
+
+### Email verification
+
+Neon can require a verified email before anyone signs in. It is **off by default**; turn it on in the Neon Console's Better Auth settings (**Sign-up with Email** and **Verify at Sign-up**, then choose the method). Neon then emails either a **6-digit code** or a **link**:
+
+- **Codes** work with Neon's shared email provider or your own.
+- **Links** need a custom email provider.
+- Both expire after 15 minutes.
+
+Since v2.14.2 the auth pages handle both, through one shared step, `VerifyEmailStep` (exported from `@/features/auth` with `VerifyEmailStepProps`):
+
+- **After sign-up.** The page decides from the session token. Better Auth returns `token: null` when it didn't sign the user in (verification required), and the card then switches to the verification step. It no longer looks at `user.emailVerified`, which is false for every new email sign-up, signed in or not. An address that already has an account gets Better Auth's deliberately identical reply, so the step's copy doesn't say whether an account exists. Sign-up passes `callbackURL: ${origin}/`, so a verification link returns to the app instead of Neon's auth host.
+- **At sign-in.** An unverified user's sign-in is refused (the SDK throws `email_not_confirmed`, status 422), and the sign-in page opens the same step. That only happens after a correct password, so it reveals nothing to anyone without it. A user who left the sign-up screen can still finish this way.
+- **The step.** A code field (digits only, up to 6; `inputMode="numeric"`, `autoComplete="one-time-code"`, and no `maxLength`, so a pasted `123 456` still works) calls `authClient.emailOtp.verifyEmail({ email, otp })`. **Send a new code** calls `authClient.sendVerificationEmail({ email, callbackURL })`, which sends whichever kind, code or link, the project is set to, with a 30-second cooldown. The copy covers both kinds. Errors use fixed copy, and the detail goes to the console as `[VerifyEmail]`.
+- **After verifying.** If Neon signed the user in (the verify response carries a session token), they go into the app: `/` after sign-up, or the deep link after sign-in. Otherwise they return to sign-in with "Your email is verified. Please sign in." and the email filled in. The step never relies on a session the browser already holds, which could belong to another account.
+
+The emailOTP client plugin is part of Neon's supported client plugins, so `authClient` needs no extra configuration.
+
+**Trusted domains matter here too.** Better Auth refuses a `callbackURL` outside Neon Auth's trusted domains (403 "Invalid callbackURL"). On that refusal, sign-up and **Send a new code** retry once without it, and log `[Auth] Neon Auth refused <origin> as a callbackURL …` to the console. The sign-up then works, but its links open on Neon's auth host rather than the app. Add the origin under the Neon Console's Auth → Configuration → Domains.
+
+**Two limits.** Sign-in deliberately sends no `callbackURL` (Better Auth's client would then do a full-page redirect on every successful sign-in). So if Neon's "send verification email on sign-in" setting is on, the links it sends at sign-in return to `/` on Neon's auth host; links from **Send a new code** return to the app. And under *optional* verification, a signed-in but unverified user has no screen to enter a code later; `VerifyEmailStep` is exported so an app can add one.
+
+### OAuth sign-in errors
+
+Since v2.14.2, `signIn.social` on the sign-in and sign-up pages passes `errorCallbackURL: ${origin}/auth/sign-in`, and Connect on **Settings → Security** (`linkSocial`) passes `${origin}/settings/security`. A failed Google sign-in now comes back to the app with `?error=<code>` instead of stranding the user on Neon's own error page. These URLs are on the same origin as `callbackURL`, so they pass the same trusted-domain check.
+
+`useOAuthCallbackError(context)` (`'sign-in'` or `'connect'`, exported from `@/features/auth`) reads `?error=` once, maps it to fixed copy, and removes `error` and `error_description` from the URL. Known codes:
+
+| Code | Message |
+|------|---------|
+| `access_denied` | Sign-in was cancelled. |
+| `account_not_linked` | An account with this email already exists. Sign in with your email and password instead (verify your email if you're asked to). |
+| `state_mismatch`, `state_security_mismatch` | Sign-in expired or was started in another tab. Please try again. |
+| `signup_disabled`, `email_not_found`, `email_not_verified` | A specific explanation for each |
+| `account_already_linked_to_different_user`, `email_does_not_match`, `unable_to_link_account` | Connecting an account from Settings → Security |
+
+Any other code gets a generic "Sign-in didn't complete. Please try again." (or the Connect equivalent). The raw `error` value and `error_description` are never shown, because anyone can craft the URL. Failures before the server can read the OAuth state (a missing state cookie, for example) still land on Neon's own error page.
+
+**Why `account_not_linked` happens.** Since better-auth 1.6.11, signing in with Google links to an existing email/password account only when that account's email is verified. Neon leaves verification off by default, so an email/password user who then tries **Continue with Google** with the same address is refused. Once their email is verified, it works.
+
+### Passwords and Remember me
+
+`lib/password-policy.ts` (v2.14.2, exported from `@/features/auth`) holds the length limits: `PASSWORD_MIN_LENGTH = 8` (Better Auth's default minimum; Neon's docs don't state one), `PASSWORD_MAX_LENGTH = 128` (stated in Neon's [user-management guide](https://neon.com/docs/auth/guides/user-management)) and `getPasswordLengthError(password)`, which returns "Password must be at least 8 characters." or "Password must be 128 characters or fewer.". The sign-up and reset pages check it before submitting, because Neon's SDK reports a too-long password only as "Password does not meet security requirements". Lengths are counted with `String.length`, as the server counts them. Never enforce the maximum with the HTML `maxLength` attribute, which silently truncates a pasted password. The Security page's Change password dialog checks the 8-character minimum only.
+
+**Remember me** is still hidden (`SHOW_REMEMBER_ME = false` in `SignInPage.tsx`). `rememberMe` is stock Better Auth, and Neon's server accepts it: `false` gives a browser-session cookie and a session of at most 24 hours that is never refreshed. The flag now waits only on a live check on a Neon project: unticked, the session should survive a reload and end when the browser closes; ticked, it should persist. Showing it after that is a product decision.
 
 ### Conditional rendering on auth state
 
@@ -1307,26 +1431,30 @@ async function handleSignOut() {
 ### Frontend
 
 ```env
-VITE_NEON_AUTH_URL=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
+VITE_NEON_AUTH_URL=https://ep-xxx.neonauth.region.aws.neon.tech/neondb/auth
 ```
 
 ### Backend
 
 ```env
-NEON_AUTH_URL=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
+# Must use https:// (http:// only for localhost, 127.0.0.1 or [::1])
+NEON_AUTH_URL=https://ep-xxx.neonauth.region.aws.neon.tech/neondb/auth
 
-# Optional JWT claim hardening — both OFF unless set. When set, requireAuth
-# rejects tokens whose `iss` / `aud` claim doesn't match (RFC 8725 §3.8).
-# Defence-in-depth against audience confusion when one Neon Auth instance
-# issues tokens for multiple relying parties; the signature is always bound
-# to this instance's JWKS regardless.
-# NEON_AUTH_ISSUER=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
-# NEON_AUTH_AUDIENCE=your-app-audience
+# Optional overrides of the issuer / audience check, which is ON by default
+# (each claim must be NEON_AUTH_URL's origin or the full NEON_AUTH_URL).
+# Leave both unset unless the requireAuth WARN log shows your tokens carry
+# another value, e.g. when NEON_AUTH_URL is a reverse proxy. A value is a
+# comma-separated list of exact matches (origin only, no path, no trailing
+# slash); 'off' skips that check (not recommended).
+# NEON_AUTH_ISSUER=https://ep-xxx.neonauth.region.aws.neon.tech
+# NEON_AUTH_AUDIENCE=https://ep-xxx.neonauth.region.aws.neon.tech
 ```
 
 <Aside type="caution">
-  Both URLs must match **exactly**, including the `/neondb/auth` path. A mismatch causes token verification failures.
+  `VITE_NEON_AUTH_URL` and `NEON_AUTH_URL` must match **exactly**, including the `/neondb/auth` path. A mismatch now fails the issuer and audience checks, so every request gets a 401. `NEON_AUTH_ISSUER` / `NEON_AUTH_AUDIENCE`, when set, are origins with no path. Before v2.14.2 the commented example on this page set the issuer to the full `/neondb/auth` URL and the audience to an app-specific value. Neon documents that its tokens carry the origin, which the old issuer line refuses (not yet checked against a live token; see [Issuer and audience checks](#issuer-and-audience-checks)). The old app-specific audience refuses real tokens either way: if you uncommented the old lines, delete them.
 </Aside>
+
+Each Neon branch has its own Auth URL. Set both URLs per environment, to the branch that environment uses; a preview frontend calling the production backend now gets 401s.
 
 ---
 
@@ -1335,10 +1463,11 @@ NEON_AUTH_URL=https://your-project.neonauth.region.aws.neon.tech/neondb/auth
 ### 401 Unauthorised Errors
 
 1. Check `NEON_AUTH_URL` matches exactly in both `.env` files
-2. Ensure URL includes the full path (`/neondb/auth`)
+2. Ensure URL includes the full path (`/neondb/auth`). It is Neon's base URL, not its `jwks_url` (the backend warns at boot if the path ends in `/.well-known/jwks.json`)
 3. Verify the JWKS endpoint is accessible: `curl <NEON_AUTH_URL>/.well-known/jwks.json`
 4. Check the token is being sent (Network tab → Request Headers → Authorization)
 5. Check the token hasn't expired
+6. Read the backend log for a WARN from module `auth`. A refused issuer or audience names the token's value (`tokenIssuer` / `tokenAudience`), the expected values and the env var to set; see [Issuer and audience checks](#issuer-and-audience-checks). A WARN saying the token names no signed-in user means it has no `sub` or `email`, or is an anonymous token
 
 ### Token Not Refreshing
 
@@ -1349,22 +1478,26 @@ Neon Auth handles token refresh automatically. If issues occur:
 
 ### OAuth Not Working
 
-1. Configure the OAuth provider in the Neon Console
-2. Add the correct redirect URLs
-3. Enable the provider in the Neon Console (Settings → Auth) — OAuth provider configuration is entirely Neon-side, not in template code
-4. Note: Neon Auth shared development keys don't support OAuth account linking — you need custom OAuth credentials for that
+1. Configure the OAuth provider in the Neon Console. Google works with Neon's shared development credentials; GitHub and Vercel need your own OAuth app
+2. Add the correct redirect URLs: register `{NEON_AUTH_URL}/callback/{provider}` with the provider (no trailing slash before `/callback`), and add your app's origin to Neon Auth's trusted domains, which `callbackURL` and `errorCallbackURL` must pass
+3. Enable the provider in the Neon Console (the Better Auth page; some Neon guides still say Settings → Auth) — OAuth provider configuration is entirely Neon-side, not in template code
+4. If sign-in comes back with a message instead of signing in, the provider or Neon refused it; the message comes from the `?error=` code (see [OAuth sign-in errors](#oauth-sign-in-errors)). `account_not_linked` means an unverified email/password account already uses that address
+5. Account linking: Neon doesn't document whether its shared development keys can link a provider to an existing account. The starter keeps Connect on Settings → Security off unless `VITE_ENABLE_OAUTH_LINKING` is `'true'`; test linking on a dev branch with your own OAuth credentials before turning it on
 
 ### Session Lost on Page Refresh
 
 1. Check that `authClient` is initialised before rendering
 2. Verify session storage isn't being cleared
 3. Check for CORS issues with the auth endpoint
+4. If it happens in Safari (macOS or iOS), see [Safari and blocked third-party cookies](#safari-and-blocked-third-party-cookies): the session lives in a cookie on Neon's auth host, which the browser treats as third-party
 
 ---
 
 ## Session & token security (hardening)
 
 Authentication is **delegated to Neon Auth** — the starter does not build its own session system. The token model is Neon's: the client SDK caches a short-lived JWT and `api.ts` forwards it as `Authorization: Bearer <token>`; the backend verifies it via JWKS.
+
+Why Bearer + JWKS: the starter is a split deployment. The SPA calls the API at `VITE_API_URL`, and Neon Auth runs on Neon's own host. Neon's cookie sessions don't yet support frontend and backend as separate deployments (its roadmap lists "Standalone frontend + backend" as coming soon), and Neon's JWT guide recommends JWTs for services that can't read the browser's cookie jar, verified against the JWKS, which is what `requireAuth` does.
 
 <Aside type="caution" title="The exposure, and the right (non-DIY) fix">
 The JWT is **readable by JavaScript** (`authClient.getSession()` returns it), so its one real risk is **XSS exfiltration**. The correct fix is **not** a hand-built cookie/session vault — it is to remove the thing that steals tokens (XSS) and to lean on the provider's own protections.
@@ -1374,8 +1507,8 @@ The provider-delegated hardening, in order of impact:
 
 1. **Prevent XSS — the root cause.** Set a strict **Content-Security-Policy on the frontend HTML at the edge / hosting layer (Cloudflare)** — this is the CSP that matters, because the SPA document is what executes scripts. Keep React's auto-escaping (never `dangerouslySetInnerHTML` on untrusted input). Cloudflare WAF + bot management reduce the surface that delivers XSS. *(The backend API also sets a locked-down `default-src 'none'` CSP via helmet, but that only hardens the JSON API — it is not the XSS defence for the app.)*
 2. **Rely on Neon Auth's short-lived + auto-refreshing tokens.** The theft window is minutes; never extend token lifetime. Token refresh is the provider's job — don't reimplement it.
-3. **Use Neon Auth's own cookie/session mode where the deployment topology allows it** (e.g. same-origin app + API, or Neon's server SDK) — *Neon's* httpOnly cookie handling, not a cookie system you build.
-4. **MFA via Neon Auth, by tier.** MFA is available at `standard`, enforced for admins at `hardened`, mandatory at `strict`. It is configured on the Neon side and surfaced by `securityProfile` — see the [Security feature](/starter-template/security-feature/).
+3. **Neon Auth's cookie mode needs a same-site proxy, which the starter doesn't ship.** The auth host is on `*.neon.tech` whether or not the app and API share an origin, so cookie mode means serving `/api/auth/*` from your own domain through a proxy. Neon ships one for Next.js; for Express it would have to be built on Neon's server toolkit, `@neondatabase/auth/server` (beta, framework-agnostic: `createAuthServer`, `handleAuthProxyRequest`). It is a [roadmap item](/starter-template/roadmap/#neon-follow-ups-v2142), not a supported setup today. What it would gain is a first-party cookie (see [Safari](#safari-and-blocked-third-party-cookies)). It would not hide the JWT from JavaScript, so XSS prevention (item 1) stays the real defence.
+4. **MFA: not yet available from the provider.** Neon's [Auth roadmap](https://neon.com/docs/auth/roadmap) lists MFA as *coming soon*, and the SDK registers no two-factor client. The starter does not enforce MFA at any tier, for admins or anyone else. `securityProfile.mfaRequired` (on at `strict`, or with `SECURITY_MFA_REQUIRED=true`) is a declaration only, and while it is on, the startup posture check warns `auth.mfa-capability`. The Security page shows 2-step verification as *coming soon*. Until Neon ships MFA, the extra check you have is step-up before sensitive actions at `hardened+` (item 5), which is not sign-in MFA. A deployment that needs MFA now has to move to self-hosted Better Auth. Don't wire `TwoFactorCard` / `TwoFactorForm` from `@neondatabase/auth-ui`: they call `authClient.twoFactor.*`, which the Neon client doesn't have. See the [Security feature](/starter-template/security-feature/).
 5. **Step-up for sensitive actions at `hardened+` (built into the starter).** The Neon Auth token can't say how recently the person signed in, so since v2.13.0 the starter asks for a code emailed to the signed-in address before the most sensitive actions (see [Step-up](#step-up-the-confirm-its-you-dialog)). It needs a working email provider in production.
 
 <Aside type="note" title="What the starter deliberately does NOT do">
@@ -1388,8 +1521,22 @@ No bespoke session table, no app-issued auth cookies, no hand-rolled CSRF, no cu
 - [ ] Cloudflare **WAF + bot management** enabled (hardened+)
 - [ ] No `dangerouslySetInnerHTML` on untrusted content anywhere
 - [ ] Neon Auth token lifetime left at the provider default (short); refresh untouched
-- [ ] MFA configured per tier in the Neon Console
-- [ ] Considered Neon Auth cookie mode if the deployment is same-origin
+- [ ] MFA: tracked on Neon's Auth roadmap (not yet available). If your tier declares `mfaRequired`, accept the `auth.mfa-capability` posture warning in writing, or plan for self-hosted Better Auth
+- [ ] Frontend + API as separate deployments: stay on Bearer + JWKS (Neon cookie mode needs a same-site proxy; see item 3)
+- [ ] Sign-in tested in Safari on macOS and iOS (see below)
+
+### Safari and blocked third-party cookies
+
+The SPA talks to Neon's auth host directly, and Neon keeps the session in a cookie on that host (`*.neon.tech`). That is a different site from your app, so the browser treats it as a **third-party cookie**. Neon's JWT guide warns that cross-domain setups have limits, "notably Safari ITP blocking third-party cookies". After a reload, the SDK has to ask Neon's auth host for the session, which needs that cookie. If Safari drops it, users would look signed out after signing in, or after every reload. The backend is not affected: it only sees the Bearer JWT.
+
+<Aside type="caution" title="Known limitation, not yet verified">
+This has **not been checked in a real Safari** against a live Neon project. Before launch, test on a deployed app in Safari on macOS and on iOS, with default settings: sign in with email and password, reload, wait past the 15-minute token life and use the app, sign out, and sign in with Google. If a step fails there but works in Chrome and Firefox, this limitation is the likely cause, and the fix is a same-site proxy (below).
+</Aside>
+
+The workarounds Neon points to (from [Better Auth's cookie guide](https://www.better-auth.com/docs/concepts/cookies#safari-itp-and-cross-domain-setups)):
+
+- **A reverse proxy**, so auth requests go to your own domain and the cookie is first-party. For this starter that means a same-site proxy for Neon Auth, built on Neon's server toolkit `@neondatabase/auth/server` (beta). That is a [roadmap item](/starter-template/roadmap/#neon-follow-ups-v2142), not something the starter ships. If you build one and point `NEON_AUTH_URL` at it, the tokens still carry Neon's origin, so set `NEON_AUTH_ISSUER` / `NEON_AUTH_AUDIENCE` to it (see [Issuer and audience checks](#issuer-and-audience-checks)).
+- **A shared parent domain** (`app.example.com` and `auth.example.com`, with Better Auth's cross-subdomain cookies). It needs the auth server on a subdomain of your domain, and Neon's auth host is on `*.neon.tech`, so it doesn't apply as the starter is set up.
 
 ---
 
@@ -1425,22 +1572,28 @@ Transport and app-layer (most are shipped — verify the deployment-side items):
 - [x] **Error sanitisation** — generic messages in production (shipped v1.27.0)
 - [x] **API security headers / CSP** — helmet with a locked-down CSP (shipped v1.29.0)
 - [ ] **Frontend CSP at the edge** — the XSS-relevant CSP (Cloudflare/hosting) — see [Session & token security](#session--token-security-hardening)
-- [ ] **Auth URL Match** — Verify `VITE_NEON_AUTH_URL` and `NEON_AUTH_URL` are identical
+- [ ] **Auth URL Match** — Verify `VITE_NEON_AUTH_URL` and `NEON_AUTH_URL` are identical, use `https://`, and point at the branch this environment uses (the issuer and audience checks refuse tokens from any other)
 - [ ] **Dependency Audit** — Run `npm audit` regularly
 
 ### Neon Auth Production Checklist
 
-The Neon Console ships with development defaults that are **not** appropriate for production. Review each item in your Neon project's **Settings → Auth** page before go-live — these aren't code changes in the template, they're configuration on the Neon side.
+The Neon Console ships with development defaults that are **not** appropriate for production. Review each item on your Neon project's **Settings → Better Auth** page (some Neon guides still say Settings → Auth) before go-live — these aren't code changes in the template, they're configuration on the Neon side. Neon Auth is configured **per branch**: each branch has its own Auth URL and settings, so configure the branch your production deployment's `NEON_AUTH_URL` points at.
 
-- [ ] **Trusted domains** — Add every production domain (and any preview domains you care about) to the Neon Auth trusted domains list. Without this, OAuth redirects and email verification links fail with an "invalid redirect" error. See [Configure domains](https://neon.com/docs/auth/guides/configure-domains).
-- [ ] **Custom SMTP / email provider** — The shared development SMTP is fine for email **codes** but not for email **verification links**. Any app that uses magic-link sign-in or password-reset-by-link must configure a custom email provider (SendGrid, Resend, Postmark, AWS SES, etc.) before production.
-- [ ] **Custom OAuth credentials** — Replace Neon's shared development Google/GitHub OAuth keys with your own OAuth apps. The shared keys are rate-limited, branded as "Neon", and do not support OAuth account linking.
-- [ ] **Email verification enabled** — Email verification is **off by default**. Turn it on in the Neon Console so unverified accounts can't access protected routes.
-- [ ] **Disable "Allow Localhost"** — The "Allow Localhost" toggle in Settings → Auth widens redirect validation for local development. Turn it off in production to prevent open-redirect-style abuse.
-- [ ] **Production checklist reference** — Walk through [Neon's published production checklist](https://neon.com/docs/auth/production-checklist) every time you cut a new production environment; Neon adds items as the platform evolves (passkey, organisation features, etc.).
+- [ ] **Trusted domains** — Add every production domain (and any preview domains you care about) to the Neon Auth trusted domains list (Auth → Configuration → Domains; a wildcard such as `https://*.my-app-preview.vercel.app` covers preview hosts). Localhost on any port is allowed without an entry. Without this, OAuth sign-in fails, its `errorCallbackURL` can't bring the user back, verification links open on Neon's auth host instead of the app, and password-reset requests fail with a 403. See [Configure domains](https://neon.com/docs/auth/guides/configure-domains).
+- [ ] **Custom SMTP / email provider** — Neon's shared sender (`auth@mail.myneon.app`) is rate-limited and meant for development. It sends verification **codes** and password-reset emails, but not verification **links**. Set up your own provider (Resend, Postmark, AWS SES, SendGrid, etc.) before production for deliverability and limits; you also need it to send verification links. Neon strongly recommends one for magic links too. Custom SMTP changes the sender, not the content; Neon's dashboard email templates aren't available yet, so full control of the content means Neon's `send.otp` / `send.magic_link` webhooks.
+- [ ] **Application name** — Set it under Project Info on the same page. It appears in verification and password-reset emails, defaults to the Neon project name, and is set per branch.
+- [ ] **Custom OAuth credentials** — Replace Neon's shared Google credentials with your own Google OAuth app; with the shared ones, Google shows users Neon's name and logo. GitHub and Vercel have no shared credentials, so they always need your own app. Register `{NEON_AUTH_URL}/callback/{provider}` as the redirect URI.
+- [ ] **Email verification** — **Off by default**; Neon recommends turning it on (Sign-up with Email → Verify at Sign-up). Since v2.14.2 the auth pages handle both methods: **codes** work on the shared provider, **links** need the custom provider above. See [Email verification](#email-verification). Test each mode you use on a branch first.
+- [ ] **Disable "Allow Localhost"** — The "Allow Localhost" toggle widens redirect validation for local development and is on by default. Turn it off in production to prevent open-redirect-style abuse.
+- [ ] **Leave Magic Link off** — It is off by default (Settings → Better Auth → Enable Magic Link), and the starter has no magic-link sign-in. Neon's server runs better-auth 1.7.6, inside the range of better-auth advisory [GHSA-965c-763c-88jm](https://github.com/better-auth/better-auth/security/advisories/GHSA-965c-763c-88jm) (critical, fixed in 1.7.7): with Magic Link and a social provider such as Google both on, someone who knows a user's email address could sign in as them. Don't turn Magic Link on until Neon's [About](https://neon.com/docs/auth/about) page reports better-auth 1.7.7 or later, or Neon confirms a fix. Turning off new sign-ups does **not** mitigate it. The advisory's configuration workarounds (`storeStateStrategy: 'cookie'`, a hashed `storeToken`) are server options Neon doesn't expose; its remaining workaround, keeping Magic Link off (or social and Generic OAuth sign-in off), is this item. The advisory isn't in GitHub's global advisory database yet, so `npm audit` can't report it.
+- [ ] **MFA** — Not available on Neon yet (roadmap: coming soon). See [Session & token security](#session--token-security-hardening), item 4.
+- [ ] **One real token decoded** — Confirm its `iss` and `aud` match what `requireAuth` expects (see [Issuer and audience checks](#issuer-and-audience-checks)), and that the backend's `NEON_AUTH_URL` is the same `https://` URL as the frontend's `VITE_NEON_AUTH_URL`.
+- [ ] **Account deletion removes the login** — Wire `createNeonAuthIdentityDeleter` at bootstrap, or the Neon Auth identity outlives an account deletion. See [The Neon Auth identity](/starter-template/security-feature/#the-neon-auth-identity-closing-the-gap).
+- [ ] **Closing sign-up (optional, single-owner apps only)** — Neon's email-and-password `disable_sign_up` setting blocks email/password sign-ups only. Google sign-in can still create accounts, and Neon's API has no per-provider sign-up switch, so you would also have to remove the Google provider. Never do this on an app that takes customer sign-ups. Test it on a branch.
+- [ ] **Production checklist reference** — Walk through [Neon's published production checklist](https://neon.com/docs/auth/production-checklist) every time you cut a new production environment; Neon adds items as the platform evolves.
 
 <Aside type="note">
-Neon Auth is still marked **beta** on Neon's side. Watch the changelog on [https://neon.com/docs/auth/overview](https://neon.com/docs/auth/overview) for new features worth wiring into the custom auth pages or surfacing via `authClient` — passkey and 2FA are likely candidates based on the underlying Better Auth foundation.
+Neon lists Managed Better Auth as generally available. Watch [About Managed Better Auth](https://neon.com/docs/auth/about) (the server's Better Auth version), the [Auth roadmap](https://neon.com/docs/auth/roadmap) (MFA is still *coming soon*; passkeys aren't listed) and [Neon's changelog](https://neon.com/docs/changelog) for new features worth wiring into the custom auth pages or surfacing via `authClient`.
 </Aside>
 
 ---
@@ -1454,6 +1607,8 @@ Neon Auth is still marked **beta** on Neon's side. Watch the changelog on [https
 | Sign the user out | `signOutAndClear()` from `@/features/auth` — ends the session and clears the query cache |
 | Get user ID in backend route handler | `req.user!.id` (after `requireAuth`) |
 | Get user email in backend route handler | `req.user!.email` (after `requireAuth`) |
+| Check whether the email is verified | `req.user!.emailVerified === true` (a snapshot from the token; absent for device tokens) |
+| Scope a query to the caller's data | `owned(req.user!.tenantId!, where)` from `lib/owned.js` (throws without a tenantId) |
 | Register authenticated backend routes | `routeRegistry.register({ ..., requiresAuth: true })` |
 | Add admin-only routes | `routeRegistry.register({ ..., middleware: [requireAdmin] })` |
 | Add role-specific routes | `routeRegistry.register({ ..., middleware: [requireRole('editor')] })` |

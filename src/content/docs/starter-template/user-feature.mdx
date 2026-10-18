@@ -40,7 +40,7 @@ The template distinguishes between three types of configuration:
 
 **User Settings Pages** are account management:
 - Personal Information (profile details)
-- Security (password, 2FA, sessions)
+- Security (email, sign-in methods, password, sessions; 2FA is a *coming soon* placeholder)
 - Data & Privacy (export, deletion)
 - Billing (subscription management)
 - Integrations (connected services)
@@ -70,9 +70,12 @@ frontend/src/features/user/
 │   ├── useUserProfile.tsx          # Profile context and hook
 │   └── useStorageUsage.ts          # Storage usage query + refresh (v2.14.0)
 ├── lib/
+│   ├── auth-call-errors.ts         # Neon Auth failures + "Sign in again" (fresh-session 403) (v2.14.2)
+│   ├── change-password.ts          # Change password, then sign out other devices (v2.14.2)
 │   ├── debounced-save.ts           # Save once the user pauses (avatar colour)
 │   ├── format-bytes.ts             # Byte sizes for the Storage section (v2.14.0)
 │   ├── preferences-mutation.ts     # Profile query key + ordered profile/preference saves
+│   ├── session-rows.ts             # Active sessions rows (current = row id), row sign-out, device names (v2.14.2)
 │   ├── storage-usage-view.ts       # What the Storage section shows (v2.14.0)
 │   └── timezones.ts                # Time-zone list, built once per session
 ├── services/
@@ -80,7 +83,7 @@ frontend/src/features/user/
 ├── pages/
 │   ├── DynamicSettingsPage.tsx     # Settings router
 │   ├── PersonalInformationPage.tsx # Profile settings
-│   ├── SecurityPage.tsx            # Password, 2FA
+│   ├── SecurityPage.tsx            # Email (read-only), sign-in methods, password, 2FA (coming soon), sessions
 │   ├── PreferencesPage.tsx         # Theme, notifications
 │   ├── IntegrationsPage.tsx        # Third-party services
 │   ├── BillingPage.tsx             # Subscription (placeholder, development builds only)
@@ -365,7 +368,7 @@ interface StorageUsageResponse {
 | Page | Path | Purpose | Order |
 |------|------|---------|-------|
 | Personal Information | `/settings/personal-info` | Profile, avatar, display name; [Storage](#storage-usage) at the end | 10 |
-| Security | `/settings/security` | Password, 2FA, sessions | 20 |
+| Security | `/settings/security` | Email (read-only), sign-in methods, password, sessions; 2FA placeholder | 20 |
 | Preferences | `/settings/preferences` | Theme, notifications | 30 |
 | Integrations | `/settings/integrations` | Third-party services | 40 |
 | Billing | `/settings/billing` | Subscription (placeholder, development builds only) | 50 |
@@ -374,6 +377,28 @@ interface StorageUsageResponse {
 The Billing placeholder shows a made-up plan with nothing behind it, so since v2.13.0 it is registered in development builds only. Production shows a Billing page only when a billing module registers one (`id: 'billing'`, `isReplacement: true`).
 
 Custom pages slot into the sidebar by their registered `order` — e.g. the `order: 60` page in the example below lands between Billing (50) and Data & Privacy (90).
+
+### The Security page
+
+`SecurityPage.tsx` (`/settings/security`) calls Neon Auth directly, through `auth` from `@/features/auth`. The v2.14.2 changes:
+
+- **Email is read-only.** The row shows the address, a disabled **Change email** button and "Changing your email address isn't currently available." Neon's [user-management guide](https://neon.com/docs/auth/guides/user-management) says email address changes are not currently supported, and Neon's API has no setting to turn on Better Auth's change-email, so the dialog that could only fail is gone. So are the hints that told OAuth users to disconnect Google or set a password to change their email. The row no longer waits on the sign-in methods to load.
+- **This browser's session is matched by row id.** The page compares `useSession().data.session.id` with each listed session's `id`, no longer `session.token`. The SDK puts the Neon JWT in `session.token`, while the sessions list returns opaque tokens, so the two never matched (on SDK 0.5 and 0.6 as well). Now:
+  - the **Current** badge shows on this browser's row;
+  - **Sign out all other sessions** shows only when another device has a session, and always when the list fails to load;
+  - **Sign out** on the current row signs this browser out (`signOutAndClear()`) and goes to `/`. Revoking the row used to leave the cached JWT working for up to 15 minutes. Other rows still call `auth.revokeSession({ token })` with that row's opaque token;
+  - an iPhone or iPad is no longer listed as macOS.
+- **"Sign in again" when the session isn't fresh.** Better Auth refuses listing sessions and disconnecting a sign-in method with **403** "Session is not fresh" once the sign-in is older than the server's `freshAge`. Better Auth's default is 24 hours; Neon doesn't document its value. Freshness counts from when the session was created, which a refresh never moves, so reloading the page doesn't help. The SDK reports the refusal with the code `feature_not_supported`, so `isSessionNotFresh(err)` (`lib/auth-call-errors.ts`) matches status 403 and the message instead.
+  - The page then shows "For your security, sign in again to manage sessions and sign-in methods." with a **Sign in again** button: in the Active sessions section, and inside the Disconnect and **Switch to email & password** dialogs, whose confirm buttons are then disabled.
+  - The button signs out and opens `/auth/sign-in`, which returns to Settings → Security once the user signs in.
+  - Signing out other sessions, revoking one session and changing the password don't need a fresh sign-in, so **Sign out all other sessions** stays available when the list is refused.
+  - Other failures to load the list read "Couldn't load your active sessions. Try again later." The page no longer suggests a refresh.
+- **A password change can sign out other devices.** The Change password dialog has a **Sign out of other devices** checkbox, ticked by default ("Signs out every other browser and device within 15 minutes."). It runs two calls, `auth.changePassword({ currentPassword, newPassword })` and then `auth.revokeOtherSessions()`, rather than `changePassword`'s `revokeOtherSessions` flag. On Neon's better-auth 1.7.6 that flag also deletes this browser's session, and it isn't atomic, so a failed sign-out would report a changed password as a failure (Better Auth fixed this in 1.7.8). If only the second call fails, the dialog says the password did change and points to **Sign out all other sessions**. Other devices keep API access until their issued JWT expires, up to 15 minutes, because the backend checks JWTs against the JWKS only.
+- **Failed calls throw.** A non-2xx Neon Auth call rejects with `AuthError` for a 500, 501 or 503 and `AuthApiError` for any other status (4xx, and 502 or 504 too), and `throwIfAuthError()` also turns a resolved `{ error }` into a throw. So a failed load shows an error, never "no sessions", and a failed action never looks like success.
+
+App owners have nothing to set. To see Neon's actual `freshAge` on a live project, open Settings → Security with a sign-in more than 24 hours old. If Neon uses Better Auth's 24-hour default, the Active sessions section shows the **Sign in again** prompt.
+
+The helpers live in `lib/` (not exported from the feature barrel): `session-rows.ts` (`isCurrentSession`, `toSessionRows`, `countOtherSessions`, `signOutSessionRow`, `parseDevice`), `auth-call-errors.ts` (`throwIfAuthError`, `isSessionNotFresh`, `disconnectFailure` and the Sign in again text and target) and `change-password.ts` (`changePasswordAndSignOutOthers`, `SIGN_OUT_OTHER_DEVICES_DEFAULT`).
 
 ### Adding Settings Pages
 

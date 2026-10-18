@@ -77,6 +77,10 @@ const schemaPath = existsSync(new URL('./prisma/schema', import.meta.url))
   ? 'prisma/schema'
   : 'prisma/schema.prisma';
 
+// The CLI's database URL, direct first (resolveCliDatabaseUrl is defined in
+// this file; see below). Warns on stderr when it lands on a -pooler host.
+const cliDatabase = resolveCliDatabaseUrl(process.env);
+
 export default defineConfig({
   // Schema location (auto-detected above: multi-file dir vs single file)
   schema: schemaPath,
@@ -102,11 +106,20 @@ export default defineConfig({
   },
 
   datasource: {
-    // Direct URL for migrations (non-pooled)
-    url: process.env.DIRECT_DATABASE_URL || process.env.DATABASE_URL,
+    // The first non-blank of DIRECT_DATABASE_URL, DATABASE_URL_UNPOOLED,
+    // DATABASE_URL
+    url: cliDatabase.url,
   },
 });
 ```
+
+**Which URL the CLI uses (v2.14.2).** `resolveCliDatabaseUrl()` takes the first non-blank of `DIRECT_DATABASE_URL`, then `DATABASE_URL_UNPOOLED` (Neon's own name for the direct URL, as set by Neon's Vercel integration), then `DATABASE_URL`. It never rewrites the URL. When the chosen URL is a Neon `-pooler` host and the command is `migrate`, `db` (push / pull / execute / seed) or `studio`, it writes one line to stderr:
+
+```text
+prisma.config: DIRECT_DATABASE_URL is not set, so the Prisma CLI is using DATABASE_URL, a Neon -pooler host. Prisma Migrate needs a direct URL (its advisory lock fails through the pooler): set DIRECT_DATABASE_URL (or DATABASE_URL_UNPOOLED) to the same URL without "-pooler".
+```
+
+If one of the direct names holds the `-pooler` URL, the line names that variable instead. `generate` and `validate` stay quiet. The line goes to stderr, never stdout, because `npm run db:migrate` writes `migrate diff --script` output straight into `migration.sql`. The file stays self-contained (no import from `src/`), so the CLI still works from a deploy that ships only `prisma/` and this file; its URL helpers have twins in `src/lib/database-connection.ts` that the pg-boss runner uses, and a test checks the two agree.
 
 ---
 
@@ -115,32 +128,32 @@ export default defineConfig({
 Neon requires different connection strategies for different operations:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                       Neon Database                          │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│   ┌─────────────────┐         ┌─────────────────┐          │
-│   │  Pooled URL     │         │  Direct URL     │          │
-│   │  (DATABASE_URL) │         │ (DIRECT_URL)    │          │
-│   │                 │         │                 │          │
-│   │  -pooler in     │         │  No -pooler     │          │
-│   │  hostname       │         │                 │          │
-│   └────────┬────────┘         └────────┬────────┘          │
-│            │                           │                    │
-│            ▼                           ▼                    │
-│   ┌─────────────────┐         ┌─────────────────┐          │
-│   │  Runtime        │         │  Migrations     │          │
-│   │  (lib/prisma.ts)│         │  (CLI)          │          │
-│   │                 │         │                 │          │
-│   │  WebSocket via  │         │  TCP via        │          │
-│   │  PrismaNeon     │         │  prisma.config  │          │
-│   └─────────────────┘         └─────────────────┘          │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                          Neon Database                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌─────────────────────────┐     ┌─────────────────────────┐   │
+│   │  Pooled URL             │     │  Direct URL             │   │
+│   │  DATABASE_URL           │     │  DIRECT_DATABASE_URL    │   │
+│   │                         │     │  (or Neon's             │   │
+│   │                         │     │  DATABASE_URL_UNPOOLED) │   │
+│   │  -pooler in hostname    │     │  no -pooler             │   │
+│   └────────────┬────────────┘     └────────────┬────────────┘   │
+│                │                               │                │
+│                ▼                               ▼                │
+│   ┌─────────────────────────┐     ┌─────────────────────────┐   │
+│   │  Runtime                │     │  Prisma CLI             │   │
+│   │  (lib/prisma.ts)        │     │  (prisma.config.ts)     │   │
+│   │                         │     │  + pg-boss job runner   │   │
+│   │  neon: WebSocket :443   │     │                         │   │
+│   │  pg:   TCP              │     │  TCP                    │   │
+│   └─────────────────────────┘     └─────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 <Aside type="tip">
-  The pooled URL (with `-pooler` in hostname) is used for runtime queries. The direct URL is used for migrations. See [Neon Database Setup](/getting-started/neon-setup/) for full environment variable configuration.
+  The pooled URL (with `-pooler` in hostname) is used for runtime queries. The direct URL is used for migrations and by the pg-boss job runner, which both follow the same fallback (`DIRECT_DATABASE_URL`, then `DATABASE_URL_UNPOOLED`, then `DATABASE_URL`) and warn when they end up on a `-pooler` host. See [Neon Database Setup](/getting-started/neon-setup/) for full environment variable configuration.
 </Aside>
 
 ---
@@ -150,35 +163,63 @@ Neon requires different connection strategies for different operations:
 The `lib/prisma.ts` file creates the Prisma client with the appropriate adapter:
 
 ```typescript
-// backend/src/lib/prisma.ts
+// backend/src/lib/prisma.ts (simplified)
+import { createRequire } from 'node:module';
 import { PrismaClient, Prisma } from '../generated/prisma/client.js';
 import { PrismaNeon } from '@prisma/adapter-neon';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { neonConfig } from '@neondatabase/serverless';
-import ws from 'ws';
 import { env } from '../config/env.js';
+import {
+  neonWebSocketConstructor,
+  urlRequestsChannelBinding,
+  withConnectTimeoutTap,
+} from './database-connection.js';
 
 // Cache the client across hot reloads (see singleton note below)
 declare global {
   var prisma: PrismaClient | undefined;
 }
 
-// Pool options shared by both adapters (v2.13.1)
+// Pool options shared by both adapters
 export function databasePoolConfig() {
   return {
     connectionString: env.DATABASE_URL,
-    idleTimeoutMillis: env.DB_POOL_IDLE_TIMEOUT_MS, // default 60 s
+    idleTimeoutMillis: env.DB_POOL_IDLE_TIMEOUT_MS,     // default 60 s (v2.13.1)
+    connectionTimeoutMillis: env.DB_CONNECT_TIMEOUT_MS, // default 10 s (v2.14.2)
+    max: env.DB_POOL_MAX,                               // default 10 (v2.14.2)
+  };
+}
+
+// The 'pg' adapter also honours channel_binding and names its connections
+export function pgPoolConfig() {
+  return {
+    ...databasePoolConfig(),
+    enableChannelBinding: urlRequestsChannelBinding(env.DATABASE_URL),
+    fallback_application_name: DB_FALLBACK_APPLICATION_NAME, // 'app-backend'
   };
 }
 
 // Select the adapter based on the DATABASE_ADAPTER env var
-function createAdapter() {
+export function createDatabaseAdapter() {
   if (env.DATABASE_ADAPTER === 'neon') {
-    // Configure WebSockets for Node.js (not needed in edge runtimes)
-    neonConfig.webSocketConstructor = ws;
-    return new PrismaNeon(databasePoolConfig());
+    // Node.js 22+ has a global WebSocket, which the Neon driver uses by
+    // itself. Only an older runtime gets the `ws` package, loaded lazily.
+    const legacyWebSocket = neonWebSocketConstructor(
+      typeof globalThis.WebSocket === 'function',
+      () => createRequire(import.meta.url)('ws'),
+      process.version,
+    );
+    if (legacyWebSocket) {
+      neonConfig.webSocketConstructor = legacyWebSocket as typeof neonConfig.webSocketConstructor;
+    }
+    return withConnectTimeoutTap(new PrismaNeon(databasePoolConfig(), databaseAdapterOptions), (err) =>
+      warnDatabaseConnectTimeout(err),
+    );
   }
-  return new PrismaPg(databasePoolConfig());
+  return withConnectTimeoutTap(new PrismaPg(pgPoolConfig(), databaseAdapterOptions), (err) =>
+    warnDatabaseConnectTimeout(err),
+  );
 }
 
 // Log level derived from NODE_ENV / DEBUG_PRISMA
@@ -190,16 +231,67 @@ function getLogConfig(): Prisma.LogLevel[] {
 // Reuse the cached client in non-production to survive hot reloads
 export const prisma =
   globalThis.prisma ??
-  new PrismaClient({ adapter: createAdapter(), log: getLogConfig() });
+  new PrismaClient({ adapter: createDatabaseAdapter(), log: getLogConfig() });
 
 if (env.NODE_ENV !== 'production') {
   globalThis.prisma = prisma;
 }
 ```
 
-The client is a **global singleton**: `globalThis.prisma ?? new PrismaClient(...)` reuses a cached instance in non-production so repeated dev hot reloads don't each open a new client and exhaust the connection pool. It is constructed with a `log` config derived from `DEBUG_PRISMA` / `NODE_ENV`, and adapter selection lives in a `createAdapter()` helper reading `env.DATABASE_ADAPTER`.
+The client is a **global singleton**: `globalThis.prisma ?? new PrismaClient(...)` reuses a cached instance in non-production so repeated dev hot reloads don't each open a new client and exhaust the connection pool. It is constructed with a `log` config derived from `DEBUG_PRISMA` / `NODE_ENV`. Adapter selection lives in `createDatabaseAdapter()` (renamed from `createAdapter()` and exported in v2.14.2, marked `@internal`, so the tests can check its wiring), reading `env.DATABASE_ADAPTER`. `databaseAdapterOptions` and `warnDatabaseConnectTimeout()` are described below.
 
-Since v2.13.1, an idle database connection stays open for 60 seconds (pg-pool's own default is 10), so the first query after a short pause reuses a warm connection instead of reconnecting. Change it with the optional `DB_POOL_IDLE_TIMEOUT_MS`. The pool keeps no minimum, so it still empties when the app is idle and Neon can scale the compute to zero.
+Since v2.13.1, an idle database connection stays open for 60 seconds (pg-pool's own default is 10), so the first query after a short pause reuses a warm connection instead of reconnecting. Change it with the optional `DB_POOL_IDLE_TIMEOUT_MS`. Open idle connections don't stop Neon scaling the compute to zero (only queries and open transactions count as activity), and the template runs no keep-alive query that would. Neon closes idle connections when the compute suspends, and the pool then drops them and opens a new one for the next query.
+
+### Connection limits and timeouts
+
+Since v2.14.2 two optional settings bound the pool, for both adapters:
+
+| Variable | Default | What it does |
+|----------|---------|--------------|
+| `DB_CONNECT_TIMEOUT_MS` | `10000` | How long to wait for a connection: opening a new one (TCP, TLS, WebSocket and auth, including a Neon compute waking from scale-to-zero, which normally takes a few hundred milliseconds) **and** waiting for a free pooled one when all `DB_POOL_MAX` are busy. `0` waits forever. pg-boss uses the same value |
+| `DB_POOL_MAX` | `10` | Maximum open connections in this process's pool (the driver's own default) |
+
+Prisma 7's driver adapters ignore the old `connect_timeout`, `pool_timeout` and `connection_limit` URL parameters at runtime (the Prisma CLI still reads them). Before v2.14.2, a stalled connection or a full pool therefore waited forever.
+
+<Aside type="caution" title="New failure mode in v2.14.2">
+A burst of requests that keeps all `DB_POOL_MAX` connections busy for more than 10 seconds now **fails** instead of queueing forever. The query rejects with `timeout exceeded when trying to connect` (pool full) or `Connection terminated due to connection timeout` (connect stalled), and `lib/prisma.ts` logs one warning at most once a minute, with the error message, `connectTimeoutMs`, `poolMax` and `adapter`:
+
+```text
+Timed out waiting for a database connection. If the database is reachable but slow to accept connections (e.g. waking from scale-to-zero), raise DB_CONNECT_TIMEOUT_MS (0 = wait forever); if every pooled connection was busy, raise DB_POOL_MAX.
+```
+
+Raise `DB_POOL_MAX` if requests queue under load (each connection goes to Neon's pooler, which accepts far more), or set `DB_CONNECT_TIMEOUT_MS=0` to restore the old behaviour.
+</Aside>
+
+`DB_QUERY_TIMEOUT` is a different setting: the interactive-transaction budget (`maxWait` and `timeout`) that `withTransaction()` passes to Prisma. It doesn't bound plain queries.
+
+### Pool errors and connection names
+
+Since v2.14.2 both adapters get error callbacks (`databaseAdapterOptions`), so a dropped connection reaches the log instead of only Prisma's debug channel. Typical causes are Neon closing connections when a compute suspends or restarts, and network drops. The warnings carry the error's `code` and message **only**:
+
+- `An idle database connection failed and was dropped from the pool; the next query opens a new one`
+- `A database connection failed during an interactive transaction`
+
+Logging the error object would have written the connection string, password included, to the logs: pg-pool attaches the client to an idle-connection error, and the Neon driver's client keeps its raw config. The logger also redacts `err.client` now (`LOG_REDACT_PATHS` is exported from `lib/logger.ts`).
+
+The `pg` adapter names its connections `app-backend` (sent as `fallback_application_name`), so `pg_stat_activity` and Neon's monitoring can tell the app's pool from migrations and from pg-boss, which reports `pgboss`. A `?application_name=` in `DATABASE_URL`, or the `PGAPPNAME` env var, overrides it. The `neon` adapter keeps the driver id that `@neondatabase/serverless` sends.
+
+### TLS and channel binding
+
+Neon's connection strings end in `?sslmode=require&channel_binding=require`, and create-app's placeholders now do too. Keep Neon's string as it is.
+
+- **`pg` adapter and pg-boss (v2.14.2).** node-postgres ignores the `channel_binding` URL parameter, so a Neon URL used to drop to plain SCRAM silently. Both now turn on `enableChannelBinding` when the URL says `channel_binding=require` or `prefer`. pg treats it as "prefer": it uses SCRAM-SHA-256-PLUS when the server offers it over TLS, and plain SCRAM otherwise, so `require` isn't enforced. No parameter, or `channel_binding=disable`, leaves it off.
+- **`neon` adapter.** Unchanged: that driver tunnels Postgres through a TLS WebSocket.
+- **`sslmode`.** Don't change `DIRECT_DATABASE_URL` to `sslmode=verify-full`: the Prisma CLI treats modes it doesn't know as `prefer`. On `DATABASE_ADAPTER=pg`, `sslmode=require` makes pg print a `SECURITY WARNING` that it treats the mode as `verify-full`. Switching `DATABASE_URL` alone to `sslmode=verify-full` silences it, but only when a separate direct URL (`DIRECT_DATABASE_URL` or `DATABASE_URL_UNPOOLED`) is set, because the CLI otherwise falls back to `DATABASE_URL`. With `JOBS_RUNNER=pg-boss`, the warning still prints once if pg-boss's direct URL stays on `sslmode=require`, because pg-boss also runs on node-postgres.
+
+### Choosing an adapter
+
+Both adapters work with Neon's `-pooler` URL:
+
+- **`neon`** (`@prisma/adapter-neon`, the default): Postgres over a WebSocket on port 443, so it works where a host blocks outbound port 5432. Since v2.14.2 it uses the WebSocket built into Node.js 22+ (the `engines` floor), so the `ws` package and the `neonConfig.webSocketConstructor = ws` line are no longer needed. On an older Node.js the template loads `ws` itself if it is installed, and otherwise stops with: `DATABASE_ADAPTER=neon needs a WebSocket client. Node.js 22+ has one built in, but this is Node.js <version>: upgrade Node.js, install the ws package in backend/, or set DATABASE_ADAPTER=pg.` Nothing imports `ws` on Node.js 22+, but the template's `backend/package.json` and install-all still list `ws` and `@types/ws`, so new and existing apps both have the package installed, which is harmless.
+- **`pg`** (`@prisma/adapter-pg`, plain TCP): what Neon's [Choosing your connection method](https://neon.com/docs/connect/choose-connection) recommends for a long-running Node server such as this backend (VPS, container, Railway, Render), and the adapter for any non-Neon PostgreSQL.
+
+The backend is one long-lived Express process with one shared pool; it doesn't target edge runtimes. create-app still writes `DATABASE_ADAPTER=neon`.
 
 ### Using Prisma in Features
 
@@ -435,6 +527,12 @@ app.get('/api/health/db', async (req, res) => {
 // }
 ```
 
+The template's own `GET /api/health/db` route wraps that object as `{ status, timestamp, database }` and answers **503** when the database is unreachable. `GET /api/health` answers without touching the database.
+
+<Aside type="caution" title="Health probes and scale-to-zero">
+`checkDatabaseHealth()` runs `SELECT 1`, which counts as activity on Neon: it wakes a suspended compute, and a monitor calling `/api/health/db` every 5 minutes or more often keeps the compute from ever scaling to zero. Point frequent uptime and liveness probes at `/api/health`, and keep `/api/health/db` for deploy-time readiness checks or checks spaced further apart.
+</Aside>
+
 ---
 
 ## Transactions
@@ -480,9 +578,13 @@ const [user, log] = await batchTransaction([
 
 ### "Migration failed"
 
-1. Ensure `DIRECT_DATABASE_URL` is set (non-pooled URL)
+1. Ensure `DIRECT_DATABASE_URL` (or Neon's `DATABASE_URL_UNPOOLED`) is set to the non-pooled URL. A `prisma.config:` line in the output means the CLI is on a `-pooler` host (see [CLI Configuration](#cli-configuration))
 2. Check migration status: `npx prisma migrate status`
 3. Reset if needed (development only): `npx prisma migrate reset`
+
+### "Timed out waiting for a database connection"
+
+A query failed with `timeout exceeded when trying to connect` or `Connection terminated due to connection timeout` after `DB_CONNECT_TIMEOUT_MS` (10 seconds by default). If every pooled connection was busy, raise `DB_POOL_MAX`. If the database is reachable but slow to accept connections, raise `DB_CONNECT_TIMEOUT_MS`, or set it to `0` to wait forever. See [Connection limits and timeouts](#connection-limits-and-timeouts).
 
 ---
 
@@ -497,6 +599,8 @@ const [user, log] = await batchTransaction([
   - src/
     - lib/
       - prisma.ts (Runtime client)
+      - database-connection.ts (Direct-URL fallback, -pooler check, channel binding, connect-timeout tap, Neon WebSocket choice; v2.14.2)
+      - owned.ts (owned() and withTenantContext())
     - generated/
       - prisma/ (Generated client)
 </FileTree>
@@ -505,7 +609,7 @@ const [user, log] = await batchTransaction([
 
 ## User-data isolation (Neon RLS)
 
-Cross-user isolation is **delegated to the database** — Neon's [Row-Level Security](https://neon.com/docs/guides/neon-rls) is the wall, with the `owned()` helper as application-layer defence-in-depth. Both layers scope on the **isolation key `tenantId`**.
+Cross-user isolation is **delegated to the database** — Postgres [Row-Level Security](https://neon.com/postgresql/administration/row-level-security) on Neon is the wall (see also Neon's [Row-Level Security with Neon](https://neon.com/docs/guides/row-level-security)), with the `owned()` helper as application-layer defence-in-depth. Both layers scope on the **isolation key `tenantId`**.
 
 <Aside type="note" title="Two ids on every owned model">
 Owned models carry **`tenantId`** (the isolation key — what RLS scopes on) and **`userId`** (the actor — who created the row). In **solo apps `tenantId === userId`** (the deployment's own database is the wall); the column is present from the start so growing to multi-user is a *data* change, not a schema rewrite. `req.user.tenantId` is set at auth time (= the user id in solo mode). The starter ships no owned *resource* models yet — `User` is the actor/identity and `AppSettings` is a global singleton — so these policies apply to the owned models your modules add.
@@ -550,6 +654,8 @@ const docs = await prisma.document.findMany({ where: owned(req.user!.tenantId!) 
 
 Both layers active together are the backstop: a forgotten `WHERE` can't leak (RLS catches it); a misapplied RLS context can't leak (`owned()` scopes it).
 
+**Both helpers fail closed (v2.14.2).** `owned()` and `withTenantContext()` throw when the `tenantId` is empty or not a string, before any query or transaction runs, so the request fails with a 500 (`owned(): a tenantId is required — refusing to build an unscoped query`, or the same message from `withTenantContext()`). Before, Prisma dropped the `undefined` filter, so `owned(undefined)` matched every tenant's rows. Code that calls `owned()` on a route without `requireAuth` now fails loudly instead of reading across tenants.
+
 <Aside type="caution">
 Cross-tenant reads (admin reports, the last-admin count) must run **outside** `withTenantContext()` (or under a role exempt from the policy), or they will see zero rows.
 </Aside>
@@ -560,11 +666,29 @@ For strict/multi-tenant apps, **database-per-tenant** (a Neon **project** per te
 
 ---
 
+## Neon Auth data in your database
+
+Neon Auth stores its data in your database, in the `neon_auth` schema of the branch: users, sessions, hashed passwords and OAuth tokens. The template never queries it (the System page leaves its indexes out of the unused-index list). Three things follow:
+
+- **`DATABASE_URL` reaches the identity store.** The connection string from Neon's **Connect** dialog uses the project's default role (`neondb_owner`), the same role the app connects as, and Neon describes the `neon_auth` data as queryable with SQL. Treat a leaked `DATABASE_URL`, or SQL injection anywhere in the app or a module, as exposing sign-in data too, not just app data.
+- **A branch carries it.** Every branch created from production holds a copy of `neon_auth` along with the Neon Auth signing keys. See [Anonymised Dev & Preview Branches](/getting-started/anonymized-branches/).
+- **A restore rolls it back.** Neon's instant restore replaces `neon_auth` with the rest of the branch. See [Backup & Restore](/getting-started/backup-restore/).
+
+---
+
 ## Alternative: the Neon Data API
 
 The starter uses **Prisma + Express** for all database access: the frontend never talks to the database directly, and every authenticated query goes through a route handler that has already verified the JWT. This is the recommended architecture for this template and for any module that ships inside it — it keeps business logic, validation, and cross-module composition in one place (the service registry) and matches the rest of the starter's patterns.
 
-Neon also publishes a **[Data API](https://neon.com/docs/data-api/get-started)** — a PostgREST-based REST endpoint in front of your database that accepts a Neon Auth JWT and enforces [row-level security](https://neon.com/docs/data-api/rls) policies at the database level. With the Data API you can query Postgres directly from the frontend:
+Neon also publishes a **[Data API](https://neon.com/docs/data-api/get-started)** — a PostgREST-based REST endpoint in front of your database that accepts a Neon Auth JWT and enforces row-level security policies at the database level (see Neon's [Access control & security](https://neon.com/docs/data-api/access-control)). With the Data API you can query Postgres directly from the frontend.
+
+The Data API client comes from the `@neondatabase/neon-js` package, which the template no longer installs: since v2.14.2 the frontend depends on `@neondatabase/auth` directly. Install it yourself first:
+
+```bash
+cd frontend && npm install @neondatabase/neon-js
+```
+
+It brings its own exact-pinned copy of `@neondatabase/auth`, so once the template's line hold moves past that version, npm nests a second copy of the auth SDK under it. `npm run install:all` and `template:update` keep `@neondatabase/neon-js` in an app whose code imports it (see [Retired packages](/starter-template/scripts/#retired-packages)).
 
 ```typescript
 import { createClient } from '@neondatabase/neon-js';

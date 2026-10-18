@@ -26,6 +26,7 @@ The starter template includes shell scripts for creating new apps and keeping th
 | `npm run install:all` | Install the foundation packages in root, frontend and backend, then `prisma generate` (runs the template-owned `scripts/install-all.mjs`) | [Foundation install list](#foundation-install-list) |
 | `node scripts/shadcn-baseline.mjs` | List, check or install the template's baseline shadcn components (the one list in `scripts/shadcn-baseline.json`) | [shadcn baseline](#shadcn-baseline) |
 | `node scripts/audit-gate.mjs` | Allowlist-aware `npm audit` gate for CI — splits known (allowlisted) vs new advisories; warn-only unless `AUDIT_GATE_ENFORCE=true` | [Audit gate](#audit-gate) |
+| `node --test scripts/line-holds.test.mjs scripts/retired-deps.test.mjs` | Offline self-check of the line holds and the retired-package plans, with Node's built-in test runner (v2.14.2; CI's audit job runs it) | [Foundation install list](#foundation-install-list) |
 
 ---
 
@@ -61,9 +62,9 @@ Creates a new app from the template, preserving git history for future updates.
 1. **Prompts for configuration:**
    - App name
    - Output directory
-   - Neon database credentials (paste from Neon dashboard)
-   - Neon Auth URL
-   - Backend port
+   - Neon database credentials (paste from the Neon Console's **Connect** dialog)
+   - Neon Auth URL (the **Base URL** on the Auth page's Configuration tab)
+   - Backend port (digits only, 1–65535; anything else falls back to the default with a warning)
 
 2. **Clones the template:**
    - Preserves full git history (enables updates)
@@ -96,11 +97,11 @@ Creates a new app from the template, preserving git history for future updates.
 
 ### Database Configuration
 
-The template uses **Neon PostgreSQL**. During setup, paste the connection snippet from your Neon dashboard:
+The template uses **Neon PostgreSQL**. During setup, paste the connection snippet from the Neon Console (your project → **Connect**, with **Connection pooling** on), then press Enter twice:
 
 ```
-DATABASE_URL="postgresql://user:pass@ep-xxx-pooler.../neondb?..."
-# DATABASE_URL_UNPOOLED="postgresql://user:pass@ep-xxx.../neondb?..."
+DATABASE_URL="postgresql://user:pass@ep-xxx-pooler.../neondb?sslmode=require..."
+DATABASE_URL_UNPOOLED="postgresql://user:pass@ep-xxx.../neondb?sslmode=require..."
 ```
 
 The script parses both URLs automatically:
@@ -108,7 +109,15 @@ The script parses both URLs automatically:
 | Variable | Description |
 |----------|-------------|
 | `DATABASE_URL` | Pooled connection (has `-pooler` in hostname) |
-| `DIRECT_DATABASE_URL` | Direct connection for migrations |
+| `DIRECT_DATABASE_URL` | Direct connection for migrations (from the pasted `DATABASE_URL_UNPOOLED`) |
+
+Since v2.14.2 the paste reader and parser are more forgiving, with the same rules in `create-app.ps1` and `create-app.sh`:
+
+- **Blank lines inside the paste are fine.** One empty line no longer ends the paste; two in a row (or the end of input) do. An empty first line still skips the step. Before, the rest of a two-block snippet answered the next prompts.
+- **Any of Neon's shapes parse.** `DATABASE_URL=` and `DATABASE_URL_UNPOOLED=` lines, with the value in double quotes, single quotes or bare, and with or without a leading `#` (Neon's older Prisma snippet commented the second line out). Otherwise any `postgres://` or `postgresql://` string on a line counts, such as a bare connection string or a `psql '...'` command: one with `-pooler` in it is the pooled URL, any other is the direct one. Only `postgres(ql)://` values are taken.
+- **One URL is enough.** A lone pooled URL gives the direct one by removing `-pooler`; a lone direct URL gives the pooled one by adding `-pooler` after the endpoint id (`@ep-xxx.<region>` becomes `@ep-xxx-pooler.<region>`).
+
+If nothing parses, the script says `Could not parse a database URL from what you pasted` and leaves the `.env` lines commented for you to fill in. See [Create Script Walkthrough → Database URLs](/starter-template/create-script/#step-3-database-urls) for the full prompt.
 
 ### Output Structure
 
@@ -207,10 +216,10 @@ If the update touches any `componentsJson` contributions (module-starter changes
    - Checks for new schema models
    - Auto-adds missing models (e.g., AppSettings, AuthDeviceRetiredToken)
    - Adds new template fields and indexes to models you already have (`scripts/sync-schema-fields.mjs`)
-   - Adds any missing foundation dependency to your `package.json` files (`scripts/sync-deps.mjs`; for example `cn` in v2.13.1)
-   - Runs the template-owned `scripts/install-all.mjs`, preserving `npm link` symlinks (snapshot + restore)
+   - Adds any missing foundation dependency to your `package.json` files (`scripts/sync-deps.mjs`; for example `cn` in v2.13.1 and `@neondatabase/auth` in v2.14.2)
+   - Runs the template-owned `scripts/install-all.mjs`, preserving `npm link` symlinks (snapshot + restore). Since v2.14.2 it also removes packages the template has [retired](#retired-packages), such as `@neondatabase/neon-js`, unless your app uses them
    - Reconciles foundation npm scripts into your `package.json` (so new `deps:*` aliases reach older apps)
-   - Reconciles foundation env keys into your `.env` files (appends missing keys, such as the security knobs and, since v2.13.1, the rate limits and `DB_POOL_IDLE_TIMEOUT_MS`; never overwrites)
+   - Reconciles foundation env keys into your `.env` files (appends missing keys, such as the security knobs; since v2.13.1 the rate limits and `DB_POOL_IDLE_TIMEOUT_MS`; since v2.14.2 `DB_CONNECT_TIMEOUT_MS`, `DB_POOL_MAX` and `DATABASE_URL_UNPOOLED`, all commented; never overwrites)
    - Installs any missing baseline shadcn components
    - Commits the schema, the generated migration and any newly installed shadcn components together, in one commit
    - Warns about stale compiled files beside their TypeScript sources: a `vite.config.js` / `.mjs` / `.cjs` and, since v2.14.0, old `tsc -b` output in `frontend/src/` (`config/env.schema.js` / `.d.ts`, `lib/neon-auth-zod.plugin.js` / `.d.ts`). It prints a removal command per file (`git rm` when tracked) and deletes nothing. The same check runs on the "already up to date" path. See [Updating → Source changes ignored](/starter-template/updating/#source-changes-ignored-by-the-dev-server-or-tests)
@@ -441,6 +450,24 @@ If the block already has a `previewFeatures` / `extensions` list, the value is *
 
 Arguments are strict, because the consumer is automated: an unknown flag, or `--schema` with no path, is a hard error rather than a silent fallback to the default schema. Both `--schema <path>` and `--schema=<path>` are accepted.
 
+### Lakebase Search extensions
+
+<Badge text="v2.4.2" variant="tip" /> `--lakebase` (or a truthy `ENSURE_PGVECTOR_LAKEBASE` env var) **also** merges Neon's Lakebase Search pair into the datasource list:
+
+```prisma
+datasource db {
+  provider = "postgresql"
+  extensions = [pgvector(map: "vector"), lakebase_vector, lakebase_text]
+}
+```
+
+`--no-lakebase` forces the pair off and overrides the env var, so an automated caller can keep its own opt-out authoritative. pgvector itself is always declared.
+
+The flag is **opt-in** because every declared extension becomes a `CREATE EXTENSION IF NOT EXISTS "<name>"`, without `CASCADE`, in the next migration, and that fails anywhere the extension isn't available. The Lakebase Search extensions exist only on Neon Postgres 16 and later ([Get started with Lakebase Search](https://neon.com/docs/ai/lakebase-search-get-started)): not on Neon Postgres 14 or 15 projects, non-Neon Postgres or a local shadow database. So the documented consumer, a database-aware module lifecycle hook, sets the flag only after confirming both are installed (`SELECT ... FROM pg_extension`).
+
+- **Order (v2.14.2).** Prisma emits the statements in alphabetical order (`lakebase_text`, `lakebase_vector`, `vector`), but `lakebase_vector` depends on pgvector. When one generated migration adds both, `npm run db:migrate` moves `CREATE EXTENSION "vector"` above `lakebase_vector` and logs `Moved CREATE EXTENSION "vector" ahead of "lakebase_vector" (it depends on pgvector)`.
+- **`lakebase_tokenizer` is not declared.** Neon's third Lakebase Search extension is optional, and neither of the pair depends on it.
+
 ### Direct usage
 
 <Tabs>
@@ -448,17 +475,19 @@ Arguments are strict, because the consumer is automated: an unknown flag, or `--
     ```powershell
     node scripts\ensure-pgvector.mjs
     node scripts\ensure-pgvector.mjs --schema backend\prisma\schema
+    node scripts\ensure-pgvector.mjs --lakebase
     ```
 
-    `.\scripts\ensure-pgvector.ps1` is a thin shim that calls the Node script.
+    `.\scripts\ensure-pgvector.ps1` is a thin shim that calls the Node script. Since v2.14.2 it takes `-Schema`, `-Lakebase` and `-NoLakebase`, and passes Unix-style flags (`--lakebase`, `--no-lakebase`, `--schema <path>`, `--help`) through unchanged, so the Node script validates them.
   </TabItem>
   <TabItem label="macOS/Linux">
     ```bash
     node scripts/ensure-pgvector.mjs
     node scripts/ensure-pgvector.mjs --schema backend/prisma/schema
+    node scripts/ensure-pgvector.mjs --lakebase
     ```
 
-    `./scripts/ensure-pgvector.sh` is a thin shim that calls the Node script.
+    `./scripts/ensure-pgvector.sh` is a thin shim that calls the Node script. Since v2.14.2 it accepts `--schema <path>`, `--schema=<path>`, `--lakebase`, `--no-lakebase` and `--help`, and stops with a usage line on anything else.
   </TabItem>
 </Tabs>
 
@@ -498,7 +527,7 @@ Most packages install at `@latest`. A few are held on purpose until the template
 | `@tanstack/react-table` | `^9.2.4` | The [`DataTable`](/starter-template/data-table/) is built on the v9 API |
 | `recharts` | `^3` | The shadcn chart primitive's major |
 | `cn` | `^0.2.6` | shadcn's class merger, behind `cn()` in `@/lib/utils` (v2.13.1). A 0.x package can break in any minor, so it stays on the 0.2 line |
-| `@neondatabase/neon-js` | newest `0.8.x` (line hold) | The Neon Auth SDK (v2.14.1). A 0.x beta can break in any minor: `@latest` moved from 0.7 to 0.8 on 12 October 2026 and changed what `unlinkAccount()` takes, which broke `npm run build` in new apps until the template caught up. Neon ships fixes as patch betas (0.8.1-beta, …), which no caret range matches. So this entry is a **line hold**, `{ name, line: '0.8', fallback: '0.8.0-beta' }`. The script looks up the newest published `0.8.x` (betas included) with `npm view` and installs it, or the fallback with a warning if the registry can't be read. The line moves with the template |
+| `@neondatabase/auth` | newest `0.6.x` (line hold) | The Neon Auth SDK. Since v2.14.2 the template depends on it directly instead of the `@neondatabase/neon-js` wrapper (v2.14.1 held neon-js on `0.8.x`), whose `/auth` entries only re-export this package; Neon releases the two in lockstep, two minors apart (auth 0.6 = neon-js 0.8). A 0.x beta can break in any minor: `@latest` moved from 0.7 to 0.8 on 12 October 2026 (neon-js; auth 0.5 to 0.6) and changed what `unlinkAccount()` takes, which broke `npm run build` in new apps until the template caught up. Neon ships fixes as patch betas, which no caret range matches. So this entry is a **line hold** (see below). The line moves with the template |
 
 `clsx` and `tailwind-merge` are still installed, though the template no longer imports them: some modules (builder, style) use them directly.
 
@@ -509,6 +538,35 @@ Flags, for running it directly (`node scripts/install-all.mjs`):
 - `--no-generate` — skip the final `prisma generate`.
 - `--silent` — hide npm's progress and warnings (`--loglevel=error`). npm's own error still prints, so a failure is never unexplained.
 - `--keep-going` — run every step even after a failure, then exit 1 and name each failed step. By default it stops at the first failure.
+
+### Line holds
+
+A line hold keeps a 0.x package on the newest release of one `MAJOR.MINOR` line. npm can't do this with a range: a prerelease satisfies a range only on its own `MAJOR.MINOR.PATCH`, so `^0.6.0-beta` never matches `0.6.1-beta`. Since v2.14.2 the holds live in one side-effect-free file, `scripts/line-holds.mjs`, shared by `install-all.mjs` and `update-deps.mjs`, so every install path lands the same version. It holds one entry today:
+
+```js
+{ dir: 'frontend', name: '@neondatabase/auth', line: '0.6', fallback: '0.6.0-beta' }
+```
+
+- **Channel filter (v2.14.2).** A hold accepts releases plus prereleases on the channel of its `fallback` (its first prerelease identifier, here `beta`): `0.6.1`, `0.6.1-beta` and `0.6.1-beta.2` qualify; alpha, canary and rc builds never install. A newer version the filter skips is logged (`line hold: skipping <name> <version> (not a release or -beta).`), so a renamed channel shows up instead of silently freezing the hold.
+- **install-all** looks up the published versions with `npm view`, always logs what it picked (`line hold: @neondatabase/auth on 0.6.x -> <version>`), and installs it. If the registry can't be read, or nothing on the line passes the filter, it installs the `fallback` with a warning. The install rewrites the range in `frontend/package.json` to `^<version>`.
+- **deps:update / deps:lockfile** honour the hold too (see [Dependency Updates](#dependency-updates)). Unlike install-all they never use the fallback and never move a package backwards.
+
+To move the line deliberately, edit `line` and `fallback` in `LINE_HOLDS`, move the template's `frontend/package.json` range and the `sync-deps.mjs` entry with it, run `npm run deps:lockfile`, then build and test in a sandbox. `node --test scripts/line-holds.test.mjs` checks the version logic offline and that both ranges sit on the hold's line; CI's audit job runs it.
+
+### Retired packages
+
+<Badge text="v2.14.2" variant="tip" /> `package.json` files are yours, and neither `sync-deps.mjs` (presence-only) nor `npm install` ever removes a dependency, so a package the template stops using would stay listed in older apps forever. `scripts/retired-deps.mjs` lists those packages, and `install-all.mjs` cleans them up once that folder's installs have succeeded. One entry today: `@neondatabase/neon-js` in `frontend/`, replaced by `@neondatabase/auth`. Left behind, neon-js 0.8.0-beta pins `@neondatabase/auth` 0.6.0-beta exactly, so once the hold installs a newer 0.6.x, npm would nest a second copy of the auth SDK under it.
+
+An app counts as **using** the package if a file under `frontend/` imports it as a module specifier (scanning `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.mts`, `.cts`, `.css`, `.scss` and `.html`; skipping `node_modules`, `dist`, `build`, `coverage`, `out`, hidden folders and symlinks), or if an npm script in `frontend/package.json` or the root `package.json` runs its CLI (`neon-js gen-types`, `npx neon-js`, …). A mention in backticks (as in a code comment) doesn't count, but a quoted specifier counts even inside a comment. Then:
+
+| Your app | What install-all does |
+|----------|-----------------------|
+| Still lists it, doesn't use it | Runs `npm uninstall "@neondatabase/neon-js" && npm prune` in `frontend/` after the installs |
+| Still lists it and uses it (for example the Data API's `createClient`) | Keeps it, with a warning: `install-all: keeping @neondatabase/neon-js in frontend: the template now uses @neondatabase/auth, but <files> use(s) it.` |
+| A clean `template:update` merge already dropped it from `package.json`, but the lock or `node_modules` still has it | Runs `npm prune` once after the installs |
+| Dropped by the merge, but the app uses it | Re-adds it at the version your lock had, in the same `npm install` as the frontend's foundation packages, with a warning naming the files |
+
+A failed clean-up step only warns and prints the command to run later (`cd frontend && npm uninstall "@neondatabase/neon-js" && npm prune`). The step is skipped when an install in that folder failed (only possible with `--keep-going`), so an app is never left with neither SDK. The scan can't see code outside `frontend/` that resolves the package without declaring it, such as an `npm link`ed module with an undeclared dependency; such an app needs `cd frontend && npm install @neondatabase/neon-js`. `node --test scripts/retired-deps.test.mjs` checks the plans offline.
 
 ---
 
@@ -534,12 +592,14 @@ npm run deps:relink         # Re-create npm-link symlinks from the last snapshot
 
 | Mode | Respects semver? | Tool | Needs `node_modules`? | Changes lockfiles? |
 |------|------------------|------|:--:|:--:|
-| `deps:check` | n/a (read-only) | `npm outdated` + `npx npm-check-updates` | No | No |
-| `deps:update` | Yes — won't cross majors | `npm update` | Yes (skips packages without it) | Yes |
-| `deps:update:latest` | **No** — jumps to latest | `npx npm-check-updates -u` + `npm install` | Yes | Yes |
-| `deps:lockfile` | Yes | `npm update --package-lock-only` + `npm install --package-lock-only`, checked with `npm ci --dry-run` | **No** | Yes |
+| `deps:check` | n/a (read-only) | `npm outdated` + `npx npm-check-updates`, plus where each line hold stands | No | No |
+| `deps:update` | Yes — won't cross majors | `npm update`, then the line holds | Yes (skips packages without it) | Yes |
+| `deps:update:latest` | **No** — jumps to latest, except line-held packages | `npx npm-check-updates -u --reject <held>` + `npm install`, then the line holds | Yes | Yes |
+| `deps:lockfile` | Yes | `npm update --package-lock-only` + `npm install --package-lock-only`, then the line holds, checked with `npm ci --dry-run` | **No** | Yes |
 
 `deps:check` is informational — it prints what's pending and always exits 0 (it's a preview, not a CI drift gate).
+
+**Line holds (v2.14.2).** `npm update` alone can never move the Neon Auth SDK to a later patch beta (see [Line holds](#line-holds)), so every mode that writes now applies the hold from `scripts/line-holds.mjs` as its last install step. It runs `npm install [--package-lock-only] "@neondatabase/auth@<newest 0.6.x>"`, which also rewrites the range in `frontend/package.json` to `^<version>`, as install-all already did, and prints `Build and test before committing.` (In the template repo it also reminds you to raise the hold's `fallback`.) It only moves forward: a lock already ahead of the line is left alone with a message, it never uses the fallback, and when the registry can't be read it warns (`Re-run online to apply the hold.`) and installs nothing. It acts only where the `package.json` lists the package. `deps:update:latest` passes `--reject "@neondatabase/auth"` to npm-check-updates, so ncu can't jump the SDK to another line; it can still move the install list's other holds (Prisma `^7` and the rest), as before. `deps:check` prints `-- line hold: @neondatabase/auth on 0.6.x --` with the locked version and the newest on the line.
 
 The other modes **fail loudly** (v2.13.0): every npm step's exit code is checked, and a failed step is listed in a red summary and the script exits 1. The script never prints "Done" over a failed install. If `deps:update:latest` fails, `npm-check-updates` may already have rewritten `package.json` with majors that were not installed, so check `git diff` before committing.
 
@@ -580,9 +640,9 @@ All three `package.json` files (root, `frontend/`, `backend/`) are **user-owned*
 
 `ensure-pgvector` is reconciled for a specific reason: modules **probe for it**. A vector-using module checks `scripts["ensure-pgvector"]` in the app's root `package.json` to decide whether the app can declare pgvector, so the key's presence is itself the capability signal.
 
-**Env keys** have the same problem: `.env` is user-owned, so new foundation knobs the template introduces (e.g. `SECURITY_PROFILE`, `SECURITY_ENCRYPTION_KEY`, the `SECURITY_KMS_*` key-custody settings) never reach existing apps. `template:update` also runs `scripts/sync-env.mjs`, which **appends** any missing foundation key to `frontend/.env` / `backend/.env` — the security tier active (matching the code default), secrets as commented placeholders to fill if needed. It only ever appends; existing values are never touched, and `.env` stays git-ignored (nothing is committed). You don't hand-add these per app. Since v2.13.1 it also appends the API rate limits (`RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `RATE_LIMIT_USER_MAX`) and `DB_POOL_IDLE_TIMEOUT_MS`, all commented with their defaults shown.
+**Env keys** have the same problem: `.env` is user-owned, so new foundation knobs the template introduces (e.g. `SECURITY_PROFILE`, `SECURITY_ENCRYPTION_KEY`, the `SECURITY_KMS_*` key-custody settings) never reach existing apps. `template:update` also runs `scripts/sync-env.mjs`, which **appends** any missing foundation key to `frontend/.env` / `backend/.env` — the security tier active (matching the code default), secrets as commented placeholders to fill if needed. It only ever appends; existing values are never touched, and `.env` stays git-ignored (nothing is committed). You don't hand-add these per app. Since v2.13.1 it also appends the API rate limits (`RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX`, `RATE_LIMIT_USER_MAX`) and `DB_POOL_IDLE_TIMEOUT_MS`, and since v2.14.2 `DB_CONNECT_TIMEOUT_MS` with `DB_POOL_MAX` (one block) and `DATABASE_URL_UNPOOLED`, all commented with their defaults shown. Reworded comments on keys you already have (v2.14.2 rewords the `JOBS_RUNNER` and `DB_POOL_IDLE_TIMEOUT_MS` ones) only reach new apps, because the script never rewrites a line that is already there. `NEON_AUTH_ISSUER` / `NEON_AUTH_AUDIENCE` are not appended: they are optional overrides of a working default (see [Configuration](/starter-template/configuration/#backend)).
 
-**Dependencies** follow the same rule: `scripts/sync-deps.mjs` adds any foundation dependency your `package.json` files lack, before the install runs. It never changes a version you already have. Since v2.13.1 its frontend list includes `cn` (`^0.2.6`), which the new `frontend/src/lib/utils.ts` needs. See [Post-merge reconciliation](/starter-template/updating/#post-merge-reconciliation) for the full list.
+**Dependencies** follow the same rule: `scripts/sync-deps.mjs` adds any foundation dependency your `package.json` files lack, before the install runs. It never changes a version you already have. Since v2.13.1 its frontend list includes `cn` (`^0.2.6`), which the new `frontend/src/lib/utils.ts` needs, and since v2.14.2 `@neondatabase/auth` (`^0.6.0-beta`), which the force-synced `features/auth/lib/client.ts` imports: recording it means the code never imports an undeclared package even if the install fails. It is presence-only, so it doesn't fight the line hold. v2.14.2 also drops the backend `mysql2` override from its list. See [Post-merge reconciliation](/starter-template/updating/#post-merge-reconciliation) for the full list.
 
 <Aside type="tip">
   If `template:update` stops on a merge conflict, the post-merge reconcilers don't run. After resolving the conflict and committing, run `npm run template:update -- -Continue` (`./update-template.sh --continue` on macOS/Linux) to finish them all. See [Resuming after a conflict](/starter-template/updating/#resuming-after-a-conflict--continue).
@@ -602,7 +662,7 @@ All three `package.json` files (root, `frontend/`, `backend/`) are **user-owned*
 
 ## Audit gate
 
-<Badge text="v2.3.0" variant="tip" /> `scripts/audit-gate.mjs` is a CI-oriented, allowlist-aware wrapper over `npm audit`. A plain `npm audit` gate is unusable on this stack — some advisories can't be fixed in this repo (Prisma 7's `deepmerge-ts` chain, whose only npm fix is a Prisma downgrade), so it would fail forever and get ignored. The gate splits high/critical advisories into **known** (on `.audit-allowlist.json`) vs **NEW**, and surfaces only new risk.
+<Badge text="v2.3.0" variant="tip" /> `scripts/audit-gate.mjs` is a CI-oriented, allowlist-aware wrapper over `npm audit`. A plain `npm audit` gate is unusable while an accepted advisory exists that can't be fixed in this repo (as Prisma 7's `deepmerge-ts` chain was until Prisma 7.10.1, when its only npm fix was a Prisma downgrade): it would fail forever and get ignored. The gate splits high/critical advisories into **known** (on `.audit-allowlist.json`) vs **NEW**, and surfaces only new risk.
 
 ```bash
 node scripts/audit-gate.mjs                 # audits backend + frontend (default)
@@ -611,7 +671,8 @@ node scripts/audit-gate.mjs --enforce       # fail on a NEW advisory (see below)
 ```
 
 - **Warn-only by default.** It reports and warns but never fails unless `--enforce` (or the CI variable `AUDIT_GATE_ENFORCE=true`) is set — so a mis-tuned allowlist can't break CI on first propagation. Validate the allowlist in a cloned app, then enforce.
-- **The allowlist** (`.audit-allowlist.json` at the repo root) matches by affected package name (`modules`) or GHSA id (`ghsa`). Since v2.14.1 it holds one accepted item: the Prisma `deepmerge-ts` chain. Nothing Neon-related is on it. v2.13.0 removed the client-side Neon/better-auth chain, which audits clean (now `@neondatabase/neon-js` ^0.8.0-beta, better-auth 1.7.6). v2.14.1 removed `GHSA-g38m-r43w-p2q7`, kept by id until Neon's docs showed its managed auth server on better-auth 1.7.6 (it ran 1.4.18). A new advisory in the Neon chain now shows as NEW. Curate the list as advisories are triaged.
+- **The allowlist** (`.audit-allowlist.json` at the repo root) matches by affected package name (`modules`) or GHSA id (`ghsa`). **Since v2.14.2 it is empty** (`"modules": []`, `"ghsa": []`), so every high/critical advisory is NEW. Prisma 7.10.1 closed the last accepted item, the `deepmerge-ts` chain (`GHSA-ggr8-5vv4-36mx`), by moving `@prisma/config` to deepmerge-ts 8.0.2. v2.13.0 removed the client-side Neon/better-auth chain, which audits clean (now `@neondatabase/auth` ^0.6.0-beta, better-auth 1.7.6). v2.14.1 removed `GHSA-g38m-r43w-p2q7`, kept by id until Neon's [About Managed Better Auth](https://neon.com/docs/auth/about) page showed its managed auth server on better-auth 1.7.6 (it ran 1.4.18). With both audits at 0 high/critical, `AUDIT_GATE_ENFORCE=true` can be switched on. Curate the list as advisories are triaged.
+- **It can't see Neon's server.** `npm audit` checks the packages in your lockfiles, not the better-auth that Neon runs for you. better-auth `GHSA-965c-763c-88jm` (critical: an OAuth state can be used as a Magic Link to sign in as another user; fixed in 1.7.7) affects Neon's 1.7.6 when Magic Link is turned on alongside a social provider, and it isn't in GitHub's global advisory database yet, so `npm audit` can't report it anyway. Magic Link is off by default: don't enable it in the Neon Console until Neon runs better-auth 1.7.7 or later.
 - **Fails closed** (v2.13.0). An audit that could not run (no lockfile, a registry or network error) is a **failed** audit, never a clean one. It is always reported, and under `--enforce` it exits 2.
 - **Runs in CI** as the `audit` job in `.github/workflows/ci.yml` — see [Testing & CI](/starter-template/testing/#the-dependency-audit-gate). There is no `npm run` alias; invoke it via `node` directly.
 
@@ -769,7 +830,7 @@ Both scripts follow the same structure and can be customized.
 - update-template.ps1 (Windows PowerShell)
 - update-template.sh (macOS/Linux Bash)
 - update-template.bat (Windows batch wrapper for update-template.ps1)
-- .audit-allowlist.json (advisories the audit gate knowingly accepts — the Prisma deepmerge-ts chain)
+- .audit-allowlist.json (advisories the audit gate knowingly accepts — empty since v2.14.2)
 - scripts/
   - bump-version.sh (Template version bumping)
   - bump-version.ps1 (Template version bumping)
@@ -781,12 +842,18 @@ Both scripts follow the same structure and can be customized.
   - ensure-pgvector.ps1 (Shim → ensure-pgvector.mjs)
   - enable-vectors.ps1 (pgvector declaration + demo Embedding model + migrate — wraps ensure-pgvector.mjs)
   - prisma-migrate-safe.mjs (Drift-safe Prisma migrate primitive — wired by backend db:migrate)
+  - lib/
+    - migrate-text.mjs (prisma-migrate-safe's pure text helpers: error summary, retry check, CREATE EXTENSION order; v2.14.2)
   - check-vite-shadow.mjs (predev/prebuild/pretest guard — deletes gitignored compiled copies shadowing vite.config.ts and, since v2.14.0, src/config/env.schema.ts and src/lib/neon-auth-zod.plugin.ts)
   - update-deps.mjs (Dependency updates — cross-platform Node, canonical)
   - update-deps.sh (Shim → update-deps.mjs)
   - update-deps.ps1 (Shim → update-deps.mjs)
   - link-modules.mjs (Snapshot/restore npm-link symlinks)
   - install-all.mjs (The foundation install list — what `npm run install:all`, create-app and template:update run)
+  - line-holds.mjs (Line holds shared by install-all and update-deps — the Neon Auth SDK on 0.6.x; v2.14.2)
+  - line-holds.test.mjs (Offline self-check: `node --test`)
+  - retired-deps.mjs (Packages the template dropped and how install-all retires them — @neondatabase/neon-js; v2.14.2)
+  - retired-deps.test.mjs (Offline self-check: `node --test`)
   - shadcn-baseline.json (The one list of baseline shadcn components)
   - shadcn-baseline.mjs (List / check / install the baseline — used by create-app, template:update and CI)
   - sync-schema-fields.mjs (Add template model fields/indexes an app's Prisma schema is missing)
