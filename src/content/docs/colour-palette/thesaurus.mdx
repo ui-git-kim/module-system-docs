@@ -267,24 +267,82 @@ const siblings = entry.scaleKey
 
 ## Auth Model
 
-- **Reads** — public within the app; no role gate. The thesaurus is reference data.
-- **Writes** — admin role only, enforced at the route layer via the existing admin gate used by the thesaurus admin page.
-- **Workspace scope** — none. All four tables are module-global. There is no `workspaceId` column anywhere.
+Since v2.51.0, curation is **admin-only**:
 
-## Merge, Split, Rename
+- **Admin-only:**
+  - every write;
+  - every read that only the admin screens use: `GET /sources`, `/entries` (the Names list), `/entries/:id`, `/entries/:id/memberships`, `/groups/search`, `/groups/:id/view`, `/sources/:id/impact` and `/health`.
+- **Open to any signed-in user:** the reads the colour tools need. These are `/entries/search` (toolbar), `/lookup/by-hex/:hex`, `/design-systems/scales/:hex`, `/nearest/:hex` and `POST /nearest/names`.
+- **Validation:** every id, hex and query string is validated, so a malformed value is a 400 (or, for paging, its default), never a 500.
+  - The by-hex reads accept `#rgb`, `#rrggbb`, `#rgba` and `#rrggbbaa`. They drop the alpha, because stored names carry none.
+  - Writes accept `#rgb` or `#rrggbb`.
+- **Workspace scope:** none. All four tables are module-global, and there is no `workspaceId` column anywhere.
 
-Editorial operations on groups. Their endpoints exist, but **merge and split have no admin screen yet**; that's roadmap Batch S.
+## The Rules (v2.51.0+)
 
-- **Merge** `groupA` → `groupB`: update every `colour_name_entry_group` row with `groupId = groupA` to `groupId = groupB`, de-duping on `(entryId, groupId)` by keeping the stronger reason (`primary` over others). Union the editorial string arrays. Delete `groupA`.
-- **Split** (v2.50.1+): moves a name out of its home group into a new group, where it becomes the headline name and colour.
-  - Every headline pointer aimed at the name is released first, because both pointers are unique.
-  - The old group's headline passes to its oldest remaining name.
-  - Splitting a group's **only** name is refused with a 409; there's nothing to split it from.
-  - A split that waits more than 20 seconds behind another structural write gets a "busy" 409 rather than a server error.
+Every write that changes which names live in which group runs through `thesaurus-integrity.service.ts`, which enforces:
+
+1. **Every name has exactly one home group.**
+2. **No group is left without names.** Deleting or moving a group's last name is a 409 with `code: "last_name_in_group"`. `DELETE /entries/:id?alsoDeleteGroup=true` deletes the name and its group together. Merging keeps the group's notes.
+3. **A group's headline name and colour are its own home names, and it always has both.** A headline can be changed but never cleared. When a group loses its headline name, its oldest remaining name takes over.
+4. **No link points at a missing name or group.**
+5. **Nothing is deleted without the admin being told:** previews, last-name warnings, and a Data check for anything else.
+6. **Structural writes run one at a time.** They share a transaction-scoped advisory lock. A write that waits more than 20 seconds gets a 409 with `code: "thesaurus_busy"`.
+
+A duplicate is a 409 with `code: "thesaurus_duplicate"`. That covers the same source, code and hex, or, without a code, the same source, hex and name. Duplicates are refused on add and edit, as on import.
+
+## Editing Groups and Names
+
+- **Add a name:** `POST /entries` either adds the name to `groupId` or starts a new group with it as the headline.
+  - The source (and group, if given) must exist.
+  - OKLCH is computed from the hex when it isn't given.
+  - The design-system flag defaults to the source's.
+  - The answer is `{ entry, groupId, newGroup }`.
+- **Edit a name:** `PATCH /entries/:id`. A change to its identity that would duplicate another name is a 409, and a new hex recomputes the stored OKLCH.
+- **Move a name:** `POST /entries/:id/move { groupId, keepSeeAlso? }` makes another group its home. With `keepSeeAlso`, the old group keeps a see-also link to it. Moving a group's only name is refused; merge the groups instead.
+- **Split:** `POST /groups/split { entryId }` moves a name out into a new group of its own, as headline name and colour.
+  - Every pointer aimed at the name is released first, because both pointers are unique.
+  - The old group's headline passes to its oldest name.
+  - A group's only name is refused.
+  - The answer is `{ newGroup, oldGroup }` (both views).
   - Before v2.50.1, splitting a headline name failed with a 500.
-- **Rename** the group's master name or master hex: repoint `masterNameEntryId` / `masterHexEntryId` to a different entry that is already a primary member of this group. The service validates membership before accepting.
+- **Merge:** `POST /groups/merge { sourceGroupIds, targetGroupId, headline? }` folds 1–50 groups into the target. It runs as set-based SQL in one transaction:
+  - names and links move across;
+  - a name linked to several of the groups keeps one link, its home if it has one;
+  - notes combine without duplicates;
+  - the merged-in groups are deleted.
 
-All three run inside one transaction each.
+  `headline` optionally picks the result's headline name and/or colour from its home names. A field you leave out is kept. The answer is the merged group's view.
+- **Headline:** `PATCH /groups/:id { masterNameEntryId?, masterHexEntryId? }`. The value must be one of the group's home names.
+- **See-also links:** `POST /memberships { entryId, groupId }` lists a name under another group as well as its home. It answers 201 when created, 200 when the link already existed. `DELETE /memberships?entryId&groupId` removes one. A home link can't be added or removed this way; move or split the name instead.
+
+Every write logs `{ audit: true, actorId }` naming the admin.
+
+The admin UI has the headline crowns, see-also rows that open their home group, the name sheet's group list, and the last-name delete flow. Screens for Add name, Move, Split and Merge come with the Names tab in Batch S2.
+
+## Data Check (v2.51.0+)
+
+`GET /health` (admin-only) counts every breach of the rules, with up to 50 examples each:
+
+- names with no home group;
+- names with two or more home groups;
+- headlines pointing outside their group;
+- groups without a headline;
+- links to deleted groups or names;
+- names whose source is missing;
+- empty groups (for review only);
+- two report-only rows: possible duplicates (import name clashes, and groups sharing a headline colour) and one source code at several colours.
+
+`POST /health/repair { dryRun?, checks?, emptyGroupIds? }` applies the safe repairs in dependency order. `dryRun` defaults to true. Any structural repair is always followed by the headline repairs. In detail:
+
+- **Dangling links** are removed.
+- **Several homes:** a name keeps one live home, preferring the group where it is the only name. Its other homes become see-also links.
+- **No home:** a name gets a new group of its own.
+- **Missing source:** a deleted source's names move to a "Recovered" source of their own, which can't clash.
+- **Headlines** are repaired or filled in.
+- **Empty groups** are deleted only when listed in `emptyGroupIds`.
+
+The admin **Data check** tab shows the counts, View (the examples, each opening its name or group), Fix per row, and "Fix all safe problems". On the e2e host on 2026-10-18 there were 0 rule problems; the report rows showed 23 possible duplicates and 95 codes at several colours.
 
 ### Deleting a source (v2.50.1+)
 
@@ -544,12 +602,19 @@ v1 persisted to `localStorage` via `zustand/persist`. The migration path is:
 
 ## Status & Remaining Work
 
-The four-table model, ingest rules, and import pipeline are in place. A few refinements remain (none blocking):
+These are in place:
 
-- **FTS vs prefix match** for the toolbar — decide between full-text search and prefix match once the seed size is known. Prefix match + btree is sufficient for now.
-- **Admin import-report UI** — a table row per ingested record with its outcome, and click-through resolution for ambiguous rows.
-- **Source editor** — the Sources admin panel maps cleanly onto `colour_name_source`; decide whether adding/editing sources manually (outside import) is a supported flow.
-- **API shape** — REST endpoints under `/api/v1/colour/thesaurus/...` match the rest of the module; no GraphQL.
+- the four-table model;
+- the ingest rules and import pipeline;
+- the rules engine and Data check (v2.51.0);
+- source add, rename and delete (with a preview).
+
+Still to come:
+
+- **Batch S2:** the Names tab, the Add name / Move / Split / Merge / see-also dialogs, and the Import tab's "Needs review" list of ambiguous rows.
+- **Refining pass:** a coded re-import whose hex changed updates in place; one rule for the design-system flag; FTS vs prefix match for the toolbar.
+
+REST endpoints under `/api/v1/colour/thesaurus/...` match the rest of the module.
 
 ## See Also
 
