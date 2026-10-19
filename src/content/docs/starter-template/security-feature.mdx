@@ -146,6 +146,7 @@ Third-party webhooks (Stripe, GitHub, ...) authenticate with an **HMAC over the 
 - **`verifyTimestampedWebhookSignature({ payload, header, secret, toleranceSeconds? })`** — the Stripe-style `t=...,v1=...` scheme: HMAC-SHA256 over `` `${t}.${rawBody}` `` with a **replay window** (default 300&nbsp;s), rotation candidates accepted, constant-time comparison.
 - **`verifyWebhookSignature({ payload, signature, secret, prefix? })`** — the plain scheme (header = HMAC of body, e.g. GitHub's `X-Hub-Signature-256` with `prefix: 'sha256='`).
 - **`computeHmac` / `timingSafeEqualStrings`** — the underlying keyed-MAC primitives for anything bespoke.
+- **`verifyNeonAuthWebhookSignature`** (v2.15.0) — Neon Auth's asymmetric Ed25519 scheme, with no shared secret. See [Neon Auth webhooks](#neon-auth-webhooks-ed25519) below.
 
 ```ts
 import { verifyTimestampedWebhookSignature } from '../security/index.js';
@@ -161,9 +162,59 @@ if (!result.valid) {
 }
 ```
 
+**The timestamped header.** It reads `t=<epoch seconds>,v1=<hex>[,v1=<hex>...]`, and the signed payload is `<t>.` followed by the raw body bytes. Stripe keys the HMAC with the whole `whsec_...` string, prefix included, with no base64 decoding, and so does the helper. Any one of several `v1` signatures may match, in any order (key rotation). `v0` signatures are ignored, so a header with only `v0` is `malformed-header`. Hex compares case-insensitively and spaces around each part are trimmed, but the keys are case-sensitive (`T=` or `V1=` is malformed). If the header carries several `t` values, the last one is used. An empty body (`''`) is a valid payload.
+
+**The plain scheme.** `prefix` is stripped when present, and a bare signature is still accepted when a prefix is configured. Hex is case-insensitive, base64 is case-sensitive, surrounding whitespace is trimmed, and `algorithm: 'sha1'` covers GitHub's legacy `X-Hub-Signature`.
+
+**The result.** Neither function throws on a hostile signature (the wrong length, not hex, multibyte): it returns `{ valid: false, reason: 'signature-mismatch' }`. `reason` is for your logs only; answer the caller with a bare 400. The timestamped check reports the first problem it finds, in this order: `missing-secret` (a blank or whitespace-only secret, which fails closed), `invalid-tolerance`, `missing-payload` (`payload` undefined), `missing-signature` (no header, or `''`), `malformed-header`, `timestamp-out-of-tolerance`, then `signature-mismatch`. The first two are endpoint misconfigurations: every delivery is refused until the config is fixed.
+
+**The replay window.** A request verifies only when `|now - t| <= toleranceSeconds`, checked before any signature compare, so a captured request can't be replayed once the window closes. Far-future timestamps are rejected too, which is stricter than Stripe's own library (it rejects only old ones). Leave `toleranceSeconds` out for the 300&nbsp;s default. A literal `0` turns the window off, the same opt-out as Stripe's SDK, and isn't recommended.
+
+Since v2.14.4, any other tolerance that isn't a finite number `>= 0` fails closed: every request is rejected as `invalid-tolerance`. That covers `NaN`, negatives, `Infinity`, `null` and any string, `'300'` included. Before, all of those except `'300'` silently turned the window off, so a request captured a year earlier still verified; `'300'` was coerced into a working 300&nbsp;s window and is now refused. A `NaN` clock (`now`, the test override, from an invalid `Date`) fails closed as `timestamp-out-of-tolerance`, except while the window is off, when the clock is ignored. Finite values behave as before. `webhooks.ts` is template-owned, so apps get the fix through `template:update`; an app that passed such a value used to accept every webhook, stale ones included, and now rejects them all with `invalid-tolerance`. The behaviour is pinned by `webhooks.test.ts`, including a Stripe-format known-answer vector (see [Testing & CI](/starter-template/testing/#whats-covered)).
+
+<Aside type="tip" title="Reading the tolerance from an env var">
+Validate it in `env.ts` instead of passing `Number(process.env.X)`. `Number('')` is `0`, so a variable that is set but empty would turn the replay window off, and an unset one gives `NaN`, which now rejects every delivery. A schema such as `z.coerce.number().int().min(1).default(300)` makes an empty value a startup error instead.
+</Aside>
+
 <Aside type="caution" title="Webhooks need the CORS carve-out in production">
 Webhook deliveries are server-to-server and carry **no `Origin` header**, which production CORS rejects by default. Register the webhook route with `allowNoOrigin: true` (route registry) so signed deliveries reach the handler — the HMAC, not the Origin, authenticates the caller. See [Route Registry](/starter-template/registries/#route-registry).
 </Aside>
+
+### Neon Auth webhooks (Ed25519)
+
+Neon Auth signs its webhooks differently: with an asymmetric **Ed25519** key instead of a shared secret, so there is no secret to store. Since v2.15.0 the security feature verifies them with `verifyNeonAuthWebhookSignature`, and the [Neon Auth webhooks](/starter-template/auth-feature/#neon-auth-webhooks) receiver (`POST /api/v1/webhooks/neon-auth`) uses it.
+
+```ts
+import { verifyNeonAuthWebhookSignature } from '../security/index.js';
+
+const result = await verifyNeonAuthWebhookSignature({
+  payload: rawBody,                          // the exact bytes received
+  signature: req.get('x-neon-signature'),    // '<header>..<signature>'
+  kid: req.get('x-neon-signature-kid'),
+  timestamp: req.get('x-neon-timestamp'),    // Unix milliseconds, as received
+  keySet,                                    // Neon Auth's key set (jose)
+});
+// { valid: true, timestampMs, kid } or { valid: false, retryable, reason }
+```
+
+- **The signed bytes.** `X-Neon-Signature` is a detached JWS: a protected header, an empty middle part, and the signature. Neon signs `base64url(timestamp + '.' + base64url(rawBody))`, so the helper rebuilds exactly that from the timestamp header **as received** and the raw bytes, and checks it with jose's `compactVerify`. Only Ed25519 is accepted (the `EdDSA` and `Ed25519` algorithm names). A delivery signed with any other algorithm, even with a key that is in the set (ES256, RS256), is refused.
+- **The key.** It is looked up by `X-Neon-Signature-Kid`, falling back to the protected header's `kid`, in the same cached Neon Auth key set that `requireAuth` uses for sign-in tokens (`<NEON_AUTH_URL>/.well-known/jwks.json`). Looking the key up is limited to 1.5 seconds (`NEON_WEBHOOK_KEY_TIMEOUT_MS`).
+- **The timestamp window.** The timestamp must be within 5 minutes of the server clock, either way (`NEON_WEBHOOK_TOLERANCE_MS`, 300000). This is checked before any cryptography, and because the timestamp is part of what is signed, it can't be changed. A tolerance that isn't a positive finite number fails closed (`invalid-tolerance`).
+- **The result.** It never throws. `reason` is one of `missing-payload`, `missing-signature`, `malformed-signature`, `malformed-timestamp`, `timestamp-out-of-tolerance`, `invalid-tolerance`, `unknown-key`, `signature-mismatch` or `key-set-unavailable`, for logs and status only. Only `key-set-unavailable` is `retryable` (answer 503 so Neon tries again); `unknown-key` is left to the caller's key-rotation rule; anything else is final (401).
+
+**Key rotation.** A delivery signed with a key id the cached set doesn't have may mean Neon has just rotated its keys, so the receiver reloads the key set before refusing it. The reload is shared by every request waiting on it and starts at most once every 2 seconds, so random key ids can't force a fetch per request. The delivery is refused for good (401) only when a reload that **started after it arrived**, timed by the server's own clock, has **succeeded** and still lacks the key id. A reload that fails gives 503, so Neon retries. A request with a foreign key id can therefore wait up to 2 seconds for its 401.
+
+**The receiver's other checks.** The signature proves a delivery came from Neon, not that it is meant for this deployment, so the receiver adds:
+
+- **A branch pin.** Neon copies a branch's signing keys into its child branches, so a preview branch's deliveries verify too. The signed body names its endpoint (`context.endpoint_id`), which must equal the `ep-…` label of `NEON_AUTH_URL`'s host (falling back to `NEON_AUTH_ISSUER`, then `NEON_AUTH_AUDIENCE`). Another branch gets 403; when no `ep-…` label can be found, every delivery gets 424 and the admin status says how to fix it.
+- **Trusting only signed fields.** Dispatch and deduplication use the body's `event_type` and `event_id`; the `X-Neon-Event-*` headers aren't signed and are ignored.
+- **Deduplication.** Each `event_type:event_id` is remembered for 10 minutes, longer than the 5-minute window. A Neon retry joins the work already running (the same email send, the same sign-up decision), and a captured copy of a delivery that already succeeded, replayed inside the window, gets the stored answer and sends nothing. Per process: another instance can send a second email.
+- **Its own body reader.** The route sets `ownBodyParser`, so neither JSON parser touches it. It reads the raw bytes itself, up to 64 KiB, and answers every reader error (400, 413, 415) without passing it to the error handler. gzip, deflate and br bodies are decoded, and the decoded bytes are what Neon signed.
+- **Rate limiting that other Neon projects can't use up.** Neon delivers every project's webhooks from a few shared addresses, and any Neon project can point its webhook at your URL. Their deliveries fail the signature check, but a limit counted per address alone would let them push your real codes and resets into 429s (Neon retries a 429 at once, so all three attempts would fail). So the route sets `skipGlobalRateLimit` and brings its own limiter, keyed by address **and** key-id class: `k:<kid>` for this project's key ids (those in the last fetched key set, or that have verified a delivery), `other` for everything else. Each bucket allows the larger of `RATE_LIMIT_MAX` and 3000 per `RATE_LIMIT_WINDOW_MS`. A failed signature costs one bounded body read and one Ed25519 check, so there is no separate limit on failures.
+- **Redaction.** Codes, links, names, IP addresses, user agents, sign-up metadata and allowlist entries are never logged. A refused sign-up logs only its code, who decided and the email's domain. Signature failures go to `debug`, with one `warn` per reason per minute. `LOG_REDACT_PATHS` gains `otp_code`, `link_url`, `event_data` and `rawBody` (each also as `*.`) and the `x-neon-signature` header, as a backstop. Provider error text is masked by `sanitiseEmailDetail()` (`features/email/email.redact.ts`: links, addresses and runs of digits) before it is logged or shown in the status.
+- **Untrusted input, made safe.** `signup_metadata` comes from the person signing up, so it is rebuilt without `__proto__`, `constructor` or `prototype` keys (and with null-prototype objects) before any hook sees it. An over-long user agent or name is cut to length rather than refusing the delivery. The public address used for the logo in emails is learnt only from an admin's https request, never from the webhook's unsigned `Host` header.
+
+For tests, `backend/src/test/neon-signing.ts` (test-only) creates an Ed25519 key, a local key set and signed deliveries (`createNeonSigningKey`, `localKeySet`, `signNeonDelivery`). Neon's own published Node verifier accepts what it signs.
 
 ## Deletion cascade
 
@@ -309,6 +360,9 @@ Guarded out of the box:
 | Change a user's role (admin) | `PATCH /api/v1/admin/users/:userId/role` |
 | Edit the security `.env` knobs (admin) | `PUT /api/v1/admin/security/env` |
 | Change the email settings (admin, once a provider is live) | `PUT /api/v1/admin/email/config` |
+| Change or reset the wording of a Neon Auth email (admin, once a provider is live; v2.15.0) | `PUT` / `DELETE /api/v1/admin/auth-emails/:type` |
+| Switch an optional Neon Auth email on or off (admin, once a provider is live; v2.15.0) | `PUT /api/v1/admin/auth-emails/:type/enabled` |
+| Change the sign-up rule (admin, once a provider is live; v2.15.0) | `PUT /api/v1/admin/signup-policy` |
 
 **How it works:**
 
@@ -324,7 +378,7 @@ Guarded out of the box:
 - Codes and grants are stored hashed and bound to the user. Wrong or expired codes all get the same answer.
 - Device tokens can never step up and are always refused on guarded routes.
 
-**The email settings are guarded too, once email works.** The email provider decides where codes are delivered. So once a provider is live, saving the admin email settings (`PUT /api/v1/admin/email/config`) needs a code sent through the **current** provider. Otherwise a hijacked admin session could point email at its own server and read the codes. With no provider ready the save stays open, so a new deploy can still set email up.
+**The email settings are guarded too, once email works.** The email provider decides where codes are delivered. So once a provider is live, saving the admin email settings (`PUT /api/v1/admin/email/config`) needs a code sent through the **current** provider. Otherwise a hijacked admin session could point email at its own server and read the codes. With no provider ready the save stays open, so a new deploy can still set email up. Since v2.15.0 the same guard (`requireStepUpOnceEmailWorks`, now in `features/email/step-up-gate.ts`) covers the Neon Auth email wording, the optional email switches and the sign-up rule: without it, a hijacked admin session could add a phishing line to the reset email, turn on sign-in codes for any address, or open sign-ups. Step-up codes are now sent as `sensitive` emails, so they skip the `email.outbound` filter and `email.sent` carries only the recipient and subject.
 
 **Stored in server memory, on purpose.** Like the rate limiters, codes and grants live in the process. A restart, or a request that lands on a second instance, simply asks for a fresh code. Nothing is ever accepted that the server didn't issue.
 

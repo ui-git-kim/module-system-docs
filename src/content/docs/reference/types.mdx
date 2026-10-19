@@ -323,8 +323,12 @@ interface PublicRouteConfig {
   handler: RequestHandler;
   description?: string;
   allowNoOrigin?: boolean;
+  ownBodyParser?: boolean;        // v2.15.0: the handler chain reads the body itself
+  skipGlobalRateLimit?: boolean;  // v2.15.0: the handler chain brings its own rate limiter
 }
 ```
+
+`ownBodyParser` and `skipGlobalRateLimit` (v2.15.0, both default `false`) are for webhook receivers, and both apply to the exact `path` only. With `ownBodyParser`, neither the global pre-auth JSON parser nor the route's own mount reads the body, so the handler chain owns parsing, the size limit and the answer to a malformed body. With `skipGlobalRateLimit`, the global per-IP `/api/` limiter skips the path; set it only when the handler chain has its own limiter, for a sender that delivers from a few shared addresses. The Neon Auth webhook receiver sets both. See [Request bodies](/starter-template/registries/#request-bodies).
 
 ---
 
@@ -530,6 +534,45 @@ interface StepUpGrant {
 
 The frontend declares the same two shapes in `features/auth/services/step-up.service.ts`.
 
+### Neon Auth webhook verification
+
+Added in v2.15.0, in `features/security/webhooks.ts`. It checks a Neon Auth webhook delivery: an Ed25519 detached JWS over the raw body and the timestamp, as Neon documents it.
+
+```typescript
+interface VerifyNeonAuthWebhookOptions {
+  payload: Buffer | undefined;    // The exact request bytes
+  signature: string | undefined;  // X-Neon-Signature: a detached compact JWS, '<header>..<signature>'
+  kid: string | undefined;        // X-Neon-Signature-Kid (the protected header's kid is the fallback)
+  timestamp: string | undefined;  // X-Neon-Timestamp: Unix milliseconds, exactly as received
+  keySet: CompactVerifyGetKey;    // jose key resolver: the shared Neon Auth key set, or createLocalJWKSet() in tests
+  now?: number;                   // Clock override (epoch ms) for tests. Default Date.now()
+  toleranceMs?: number;           // Replay window: a finite number > 0. Default NEON_WEBHOOK_TOLERANCE_MS
+  keyTimeoutMs?: number;          // Bound on resolving the key. Default NEON_WEBHOOK_KEY_TIMEOUT_MS
+}
+
+type NeonWebhookFailureReason =
+  | 'missing-payload'
+  | 'missing-signature'
+  | 'malformed-signature'
+  | 'malformed-timestamp'
+  | 'timestamp-out-of-tolerance'
+  | 'invalid-tolerance'
+  | 'unknown-key'
+  | 'signature-mismatch'
+  | 'key-set-unavailable';
+
+type NeonWebhookVerification =
+  | { valid: true; timestampMs: number; kid: string | undefined }
+  | { valid: false; retryable: boolean; reason: NeonWebhookFailureReason };
+
+verifyNeonAuthWebhookSignature(opts: VerifyNeonAuthWebhookOptions): Promise<NeonWebhookVerification>
+
+NEON_WEBHOOK_TOLERANCE_MS     // 300000 (5 minutes, either side of the server's clock)
+NEON_WEBHOOK_KEY_TIMEOUT_MS   // 1500
+```
+
+It never throws. Only Ed25519 is accepted (`alg` `EdDSA` or `Ed25519`), and the timestamp window is checked before any crypto. `retryable` is true only for `'key-set-unavailable'` (a slow or failing key set: answer 503 so Neon retries). `'unknown-key'` is left to the caller's key-rotation rule, and every other reason is final (answer 401). Send the reason to logs and status, never back to the caller. `backend/src/test/neon-signing.ts` (`createNeonSigningKey`, `localKeySet`, `signNeonDelivery`) signs test deliveries the same way.
+
 ### Auth-identity deletion
 
 The last step of the [deletion cascade](/starter-template/security-feature/#deletion-cascade): removing the user's login identity at the auth provider. The default deleter is `unconfigured`, which warns and reports that the identity remains. Wire one at bootstrap with `setAuthIdentityDeleter(...)`. See [The Neon Auth identity](/starter-template/security-feature/#the-neon-auth-identity-closing-the-gap).
@@ -666,6 +709,189 @@ The frontend declares `ModuleUsageItem`, `ModuleStorageUsage` and `StorageUsageR
 
 ---
 
+## Email Send Options
+
+Exported from the backend email barrel (`features/email/index.js`). Added in v2.15.0. See [Email](/starter-template/email-feature/).
+
+```typescript
+/** sendEmail(message, options?): without options it behaves as before. */
+interface SendEmailOptions {
+  sensitive?: boolean;   // The message carries a secret (a code or link): skip the email.outbound filter,
+                         // fire email.sent with { to, subject, sensitive: true } only, never use the
+                         // console provider (the result is sent: false), and sanitise a failure's log text
+  timeoutMs?: number;    // Positive integer: give up with { sent: false, timedOut: true } and abort the provider's signal
+  signal?: AbortSignal;  // Abort the send from outside
+}
+
+/** What sendEmail hands an adapter alongside the message, when options were given. */
+interface EmailSendContext {
+  signal?: AbortSignal;  // Aborted on timeout or by the caller; pass it to an SDK that takes one
+}
+
+interface EmailProvider {
+  readonly name: string;
+  send(message: EmailMessage, context?: EmailSendContext): Promise<EmailResult>;  // context: v2.15.0
+}
+
+// EmailResult gains:
+//   timedOut?: boolean;  // sendEmail's timeoutMs ran out before the provider answered
+```
+
+The SES adapter passes the signal on as `abortSignal`. The frontend's `EmailResult` (`@/features/email`) gains the same `timedOut`.
+
+---
+
+## Auth Webhook Types
+
+Exported from the backend auth-webhooks barrel (`features/auth-webhooks/index.js`), except where a section says a type is internal. Added in v2.15.0, with the Neon Auth webhook receiver; see the [v2.15.0 changelog](/starter-template/changelog/#v2150) and [Neon Auth webhooks](/starter-template/auth-feature/#neon-auth-webhooks).
+
+### Auth emails
+
+```typescript
+const NEON_AUTH_WEBHOOK_PATH = '/api/v1/webhooks/neon-auth';
+
+const AUTH_EMAIL_TYPES = [
+  'verification-code',    // send.otp, otp_type 'email-verification'
+  'sign-in-code',         // send.otp, 'sign-in' (optional)
+  'password-reset-code',  // send.otp, 'forget-password' (optional)
+  'verification-link',    // send.magic_link, link_type 'email-verification'
+  'password-reset-link',  // send.magic_link, 'forget-password'
+  'magic-link',           // send.magic_link, 'sign-in' (optional)
+] as const;
+
+type AuthEmailType = (typeof AUTH_EMAIL_TYPES)[number];
+
+/** A rendered email: what renderAuthEmail() returns (with html), and the authEmail.outbound filter's value. */
+interface AuthEmailContent {
+  subject: string;
+  text: string;
+  html?: string;
+}
+
+/** The authEmail.outbound filter's context. */
+interface AuthEmailContentContext {
+  type: AuthEmailType;
+  kind: 'code' | 'link';
+  eventId: string | null;             // Neon's event id; null for an admin preview or test send
+  recipient: string;
+  appName: string;
+  preview: boolean;                   // true for the admin preview and test send (a sample code or link)
+  variables: Record<string, string>;  // Includes code or link, and expiresInMinutes ('' when unknown). Never log or store them
+}
+```
+
+The three optional types are off until an admin turns on their **Send** switch in Admin → Email or an `auth.emailTypeEnabled` filter returns `true`.
+
+### Sign-up decision
+
+```typescript
+type SignupMode = 'open' | 'closed' | 'allowlist';
+
+/** The decision, and the auth.signupDecision filter's value. */
+interface SignupDecision {
+  allowed: boolean;
+  code?: string;      // /^[A-Z][A-Z0-9_]{0,63}$/, e.g. SIGNUP_CLOSED. Dropped when allowed
+  message?: string;   // Shown to the person signing up (at most 500 characters, one line). Dropped when allowed
+  decidedBy: string;  // 'policy', or the id of the filter that decided
+}
+
+/** The auth.signupDecision filter's context. */
+interface SignupDecisionContext {
+  eventId: string;
+  email: string | null;
+  emailDomain: string | null;
+  emailVerified: boolean | null;
+  authProvider: string;                      // 'credential' | 'google' | 'github' | 'vercel' | … as Neon reports it
+  name: string | null;
+  signupMetadata?: Record<string, unknown>;  // Sanitised: null-prototype objects, no __proto__ / constructor / prototype keys
+  ipAddress?: string;
+  userAgent?: string;
+  policy: { mode: SignupMode; matched: 'address' | 'domain' | null };
+  dryRun: boolean;                           // The admin "Check an address" tool and the email pre-check: no side effects
+}
+
+// The admin's stored rule: { mode, allowlist: string[], refusalMessage: string | null }.
+getSignupPolicy(opts?: { timeoutMs?: number }): Promise<{ mode: SignupMode; allowlist: string[]; refusalMessage: string | null }>
+
+// The rule, then the auth.signupDecision filters. Rejects when the rule can't be read (and this
+// process has no earlier copy), when a filter throws, or when the 14-second cap (hardCapMs) runs out;
+// policyOverride decides against an unsaved draft rule (and skips the read).
+evaluateSignupDecision(
+  ctx: Omit<SignupDecisionContext, 'policy' | 'dryRun'>,
+  opts?: { dryRun?: boolean; hardCapMs?: number; policyOverride?: { mode: SignupMode; allowlist: string[]; refusalMessage: string | null } },
+): Promise<SignupDecision & { matched: 'address' | 'domain' | null }>
+```
+
+Allowlist entries are stored normalised, as `name@example.com` or `@example.com` (domains in punycode). The rule's refusal codes are `SIGNUP_CLOSED` and `SIGNUP_NOT_ALLOWED`. A filter that returns no boolean `allowed` refuses with `SIGNUP_CHECK_FAILED`, and a filter's own `code` that doesn't match the pattern becomes `SIGNUP_NOT_ALLOWED`. When the promise rejects, the receiver answers Neon with a 503.
+
+### AuthWebhookStatusView
+
+Returned by `getAuthWebhookStatus()` and `GET /api/v1/admin/auth-webhooks/status` (admin only). Most of it is kept in memory and starts again when the server restarts.
+
+Only `AuthWebhookStatusView` is exported from the barrel. `HandledEventType` (`neon-webhook.types.ts`), `StatusWarning` (`neon-webhook.status-view.ts`) and `EventStatus` (`neon-webhook.status.ts`) are internal and shown for reference; reach them through the view, for example `AuthWebhookStatusView['warnings'][number]`.
+
+```typescript
+type HandledEventType = 'send.otp' | 'send.magic_link' | 'user.before_create' | 'user.created';
+
+interface StatusWarning {
+  id: string;                                                    // e.g. 'auth-email-no-provider', 'wrong-endpoint'
+  severity: 'critical' | 'warning' | 'info';
+  message: string;
+  time?: { kind: 'failed-at' | 'next-retry-at'; at: string };    // ISO; shown in the browser's own locale
+}
+
+interface EventStatus {
+  lastReceivedAt: string | null;
+  lastSuccessAt: string | null;
+  lastFailureAt: string | null;
+  lastFailure: { code: string; httpStatus: number; detail: string | null; emailType?: AuthEmailType } | null;
+  lastOutcome: 'success' | 'failure' | 'refused' | null;        // 'refused': user.before_create said no
+  byEmailType: Partial<Record<AuthEmailType, { lastSuccessAt: string | null; lastFailureAt: string | null; lastSentAt: string | null }>>;
+}
+
+interface AuthWebhookStatusView {
+  receiverPath: string;                                          // '/api/v1/webhooks/neon-auth'
+  endpoint: { expected: string | null; source: 'NEON_AUTH_URL' | 'NEON_AUTH_ISSUER' | 'NEON_AUTH_AUDIENCE' | null };
+  emailProvider: { provider: string; ready: boolean; wiring: 'env' | 'none' | 'pending' | 'wired' | 'failed'; nextRetryAt: string | null };
+  events: Record<HandledEventType, EventStatus>;
+  ignored: Array<{ eventType: string; lastReceivedAt: string }>;
+  unverified: { lastAt: string | null; lastReason: string | null; sinceBoot: number };
+  wrongEndpoint: { lastAt: string | null; endpointId: string | null };
+  signups: { lastRefusedAt: string | null; lastRefusalCode: string | null; refusedSinceBoot: number };
+  limits: { recipientLimitedSinceBoot: number; globalLimitedSinceBoot: number; globalCapHitAt: string | null };
+  logo: { apiOriginKnown: boolean };
+  sinceBoot: { startedAt: string; received: number; succeeded: number; failed: number; queued: number; queuedFailed: number };
+  warnings: StatusWarning[];
+}
+```
+
+`expected` is `null` when the deployment can't tell which Neon endpoint it belongs to, and then every delivery is refused.
+
+### AuthUserCreatedContext
+
+The `auth.userCreated` action's payload (`CoreHookContexts['auth.userCreated']`), fired after Neon's `user.created` delivery has been answered.
+
+```typescript
+type AuthUserCreatedContext = {
+  userId: string;                            // Neon's user id: becomes User.id (and tenantId) once they use the app
+  email: string | null;
+  name: string | null;
+  emailVerified: boolean | null;
+  authProvider: string;                      // 'credential' | 'google' | 'github' | 'vercel' | …
+  signupMetadata?: Record<string, unknown>;  // Sanitised, as above
+  createdAt?: string;
+  eventId: string;                           // Neon's event id
+};
+```
+
+It may arrive before the app's own User row exists, and a retry on another server can fire it again, so handlers must be idempotent on `userId`.
+
+### Frontend mirrors
+
+`@/features/email` exports the types `AuthEmailType`, `AuthEmailTemplateView` (one email type's current and default wording, its placeholders, the last send since restart, whether it is queued, and its `enabled: { optional, admin, effective, turnedOnBy }`) and `AuthWebhookStatusView`. Their source is `features/email/services/auth-email-admin.service.ts`, which also holds the client; the sign-up rule's types (`SignupMode`, `SignupPolicyView`, `SignupPolicyInput`, `SignupCheckResult`) are in `features/admin/services/signup-policy.service.ts`. Import those files directly, from lazily loaded code.
+
+---
+
 ## Database Types
 
 ### TransactionClient
@@ -785,6 +1011,49 @@ interface RegisteredFilter<T = unknown, C = unknown> {
   callback: FilterCallback<T, C>;
   order: number;
 }
+```
+
+### Core filter catalogue (backend)
+
+Since v2.15.0, `backend/src/config/hooks.catalog.ts` names the filters the template applies, beside the action names in `CoreHooks`, with the value and context each one carries.
+
+```typescript
+const CoreFilters = {
+  emailOutbound: 'email.outbound',              // email.service sendEmail (skipped for sensitive messages)
+  authEmailOutbound: 'authEmail.outbound',      // a rendered Neon Auth email, after the built-in or admin wording
+  authSignupDecision: 'auth.signupDecision',    // a new sign-up's decision, after the admin's rule
+  authEmailTypeEnabled: 'auth.emailTypeEnabled', // an optional auth email type on or off, after the admin switch
+} as const;
+
+type CoreFilterName = (typeof CoreFilters)[keyof typeof CoreFilters];
+
+interface CoreFilterValues {
+  'email.outbound': unknown;  // EmailMessage
+  'authEmail.outbound': { subject: string; text: string; html?: string };
+  'auth.signupDecision': { allowed: boolean; message?: string; code?: string; decidedBy: string };
+  'auth.emailTypeEnabled': boolean;
+}
+
+interface CoreFilterContexts {
+  'email.outbound': undefined;
+  'authEmail.outbound': AuthEmailContentContext;
+  'auth.signupDecision': SignupDecisionContext;
+  'auth.emailTypeEnabled': { type: 'sign-in-code' | 'password-reset-code' | 'magic-link'; adminEnabled: boolean };
+}
+```
+
+The catalogue spells the two auth contexts out with plain `string` where the feature uses its unions; otherwise they have the same fields as [`AuthEmailContentContext` and `SignupDecisionContext`](#auth-webhook-types). `auth.signupDecision` and `auth.emailTypeEnabled` follow a new `{domain}.{decision}` naming pattern: the value is the decision.
+
+```typescript
+import { CoreFilters, type CoreFilterContexts } from '../../config/hooks.catalog.js';
+import { filterRegistry } from '../../config/filter.registry.js';
+
+// A module that adds sign-in with a code turns that email type on.
+filterRegistry.register<boolean, CoreFilterContexts['auth.emailTypeEnabled']>(
+  CoreFilters.authEmailTypeEnabled,
+  'my-module',
+  (enabled, ctx) => (ctx.type === 'sign-in-code' ? true : enabled),
+);
 ```
 
 ### Action Types

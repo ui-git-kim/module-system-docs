@@ -20,8 +20,8 @@ The admin panel is accessible at `/admin` and is only visible to users with the 
 
 - **Overview** — the `/admin` landing page: live user/database/module/error stats, a merged "needs attention" list (service findings + module issues), and the most recent console entries (rebuilt from a placeholder in v1.56.0)
 - **Users & Access** — **Users**: view, modify roles (server-side paged since v1.55.0), and delete users
-- **Appearance** — **Branding** (app name, logo — formerly "App Settings"), **Navigation** (the side/top navigation layout, nav items, sections, user menu, and the dashboard-in-nav toggle), **Toolbar** (show/hide header toolbar items), **Widgets** (dashboard-widget visibility, added v1.56.0)
-- **Platform** — **Security** (live posture + env-backed knobs, v1.37.0), **Modules** (registered modules, dependencies, migrations, v1.50.0; enable/disable since v2.4.1, and each change is recorded in the audit trail with the admin who made it since v2.13.0), **Email** (provider status + test delivery, v1.58.0), **System** (database health + service status), **Console** (errors, activity, audit history — split from System in v1.59.0)
+- **Appearance** — **Branding** (app name, logo — formerly "App Settings"; its page header still reads **App Settings**, and since v2.15.0 it also holds [New sign-ups](#new-sign-ups)), **Navigation** (the side/top navigation layout, nav items, sections, user menu, and the dashboard-in-nav toggle), **Toolbar** (show/hide header toolbar items), **Widgets** (dashboard-widget visibility, added v1.56.0)
+- **Platform** — **Security** (live posture + env-backed knobs, v1.37.0), **Modules** (registered modules, dependencies, migrations, v1.50.0; enable/disable since v2.4.1, and each change is recorded in the audit trail with the admin who made it since v2.13.0), **Email** (provider status + test delivery, v1.58.0; the Neon Auth webhook status and the auth emails since v2.15.0, see [Email](#email)), **System** (database health + service status), **Console** (errors, activity, audit history — split from System in v1.59.0)
 - **Extensions** — everything modules register without a `section`
 
 <Aside type="tip">
@@ -63,6 +63,8 @@ This design allows:
 - **All users** can see the app logo and name in the navigation (sidebar or top bar)
 - **Only admins** can change branding and configuration
 
+The [sign-up rule](#new-sign-ups) (v2.15.0) is stored on the same `AppSettings` row but is **not** part of this response, or of the `admin.settingsUpdated` hook: its list holds other people's email addresses. It has its own admin-only API, `/api/v1/admin/signup-policy`.
+
 ### File Structure
 
 ```
@@ -80,6 +82,7 @@ frontend/src/features/admin/
 │   ├── AdminPanels.tsx             # AdminDetailTabs + AdminSheet (on the barrel)
 │   ├── AdminComponents.tsx         # Sortable list/item (@dnd-kit; import directly, not from the barrel)
 │   ├── RoleProtectedRoute.tsx      # Client-side role guard for admin routes
+│   ├── SignupPolicySection.tsx     # App Settings → New sign-ups (v2.15.0)
 │   └── system-blocks.tsx           # Shared severity/audit rows (System + Console)
 ├── pages/
 │   ├── AdminDashboardPage.tsx      # Overview stats
@@ -100,11 +103,15 @@ frontend/src/features/admin/
 │   ├── useAdminUsers.ts            # User management
 │   ├── useAdminToolbarActions.ts   # Register toolbar items from admin pages
 │   ├── useModulesAdmin.ts          # Modules page data + enablement toggle
+│   ├── useSignupPolicy.ts          # Sign-up rule: read, save, check an address (v2.15.0)
 │   └── useSystemAdmin.ts           # System (diagnostics) page data
+├── lib/
+│   └── signup-policy.ts            # Sign-up rule draft, payload and wording helpers (v2.15.0)
 └── services/
     ├── admin.service.ts            # API client
     ├── security-admin.service.ts   # Security page API client
     ├── modules-admin.service.ts    # Modules page API client
+    ├── signup-policy.service.ts    # Sign-up rule API client (v2.15.0)
     └── system-admin.service.ts     # System page API client
 
 backend/src/features/admin/
@@ -130,6 +137,8 @@ backend/src/features/admin/
 └── service.registration.ts         # Service registry
 ```
 
+The sign-up rule's backend and its admin API live in `backend/src/features/auth-webhooks/` (see [Neon Auth webhooks](/starter-template/auth-feature/#neon-auth-webhooks)).
+
 ---
 
 ## App Settings (the Branding page)
@@ -151,6 +160,31 @@ The Branding page sends the logo only when it changed: a new upload, or removing
 The **Enable Marketing Pages** toggle was removed from this page in v2.13.0, because nothing read it. The `enableMarketingPages` column stays in `AppSettings` for the planned Landing Layout, which will own its setting.
 
 The **Show Dashboard in Nav** toggle moved to the **Navigation** admin page in v1.56.0 (it always persisted via the same `AppSettings` record — only its home changed).
+
+### New sign-ups
+
+Since v2.15.0 the page has a **New sign-ups** section below Branding: who can create an account. Existing accounts can always sign in. The rule is enforced only while Neon Auth sends `user.before_create` to the app (see [Neon Auth webhooks](/starter-template/auth-feature/#the-sign-up-rule)); until then it is only stored.
+
+| Control | What it does |
+|---------|--------------|
+| **Who can sign up** | **Open: anyone can create an account** (the default), **Closed: no new accounts**, or **Only these emails or domains** |
+| **Allowed emails and domains** (list mode only) | One entry per line: an address (`alex@example.com`) or a whole domain (`@example.com`). Subdomains need a line of their own, and `alex+news@example.com` doesn't match `alex@example.com`. A count shows "N of 500", and a line the server can't read is reported as "Line N: … isn't an address or @domain". An empty list shows "The list is empty, so nobody new can sign up: the same as Closed." A note says to turn on email verification in Neon, or someone could sign up with a listed address that isn't theirs |
+| **Message for refused sign-ups** | Optional, one line, up to 500 characters; leave it empty for the built-in message, shown as the placeholder. It replaces the built-in message when the rule refuses an **email** sign-up. Google and GitHub sign-ups see a standard message instead |
+| **Check an address** | A dry run of the rule, unsaved changes included, plus any modules that also decide, for one address. It shows, for example, "Allowed (matches @example.com)" or "Refused: SIGNUP_NOT_ALLOWED (decided by: policy)", and "They would see: …". Nothing is saved or sent. An international domain is shown as typed, not in its stored punycode form |
+
+Below the controls, the section says whether the rule is working:
+
+- **Not enforced yet**, when the rule isn't Open and Neon has never checked a sign-up with the app, or hasn't for 30 days: subscribe `user.before_create` in Neon to this app's webhook URL (Admin → Email shows it). Until then the rule doesn't stop anyone signing up.
+- Otherwise, "Neon last checked a sign-up with this app" and the time.
+- "Modules can also decide: …" names the modules with an `auth.signupDecision` filter.
+
+**Saving.** The page's **Save Changes** button saves the rule too, but only when it changed, and separately from the other settings: if one save fails, the other still goes through. The rule's errors show in its own section ("The sign-up rule wasn't saved: …", with messages under the fields), and the success message appears only when both saved. Once an email provider works, saving the rule may ask for a [step-up code](/starter-template/security-feature/#step-up-re-verification-sensitive-actions). Each save is recorded in the audit trail through `auth.signupPolicyUpdated` (`{ actorId, mode, allowlistCount, messageChanged }`, never the entries).
+
+<Aside type="caution" title="The custom message may not reach the sign-up page">
+Neon's SDK replaces the message of some error codes with its own "Internal server error". If Neon reports a refused sign-up that way, the person sees the sign-up page's generic "We couldn't create your account. New sign-ups may be limited; contact the person who runs this app." instead of your message. This hasn't been checked against a live Neon project yet; see [The sign-up rule](/starter-template/auth-feature/#the-sign-up-rule).
+</Aside>
+
+On an existing app the three columns arrive with the v2.15.0 migration, which `template:update` applies; in production run `prisma migrate deploy` before the new backend starts. Until then the rule reads as Open.
 
 ### Using App Settings in Your Components
 
@@ -326,6 +360,17 @@ The **System** page shows database health and service status; the **Console** pa
 - **Failure:** the API's error message (or "The exact count failed.") appears beside the button.
 
 The button never shows with the in-memory sink, or when the figure is already exact.
+
+---
+
+## Email
+
+The **Email** page (Platform section) belongs to the [email feature](/starter-template/email-feature/#the-admin-email-page). Its cards, top to bottom:
+
+- **Configuration** (or **Configured via environment** when `EMAIL_PROVIDER` is set): configure SMTP, Microsoft 365, Google, Resend, SendGrid or SES, or see the read-only environment config. Choosing **None** while Neon has sent auth emails through the app in the last 30 days shows a warning (v2.15.0).
+- **Status** and **Test delivery**: the provider's readiness, and a test email to your own address.
+- **Neon Auth webhooks** (v2.15.0): the webhook URL to give Neon, the Neon endpoint the backend accepts, a row per Neon event with **Working**, **Failing** or **Not received**, warnings, and a setup checklist. See [Neon Auth webhooks](/starter-template/auth-feature/#neon-auth-webhooks).
+- **Auth emails** (v2.15.0): the six emails the app sends for Neon Auth, each with an editor, a preview, a test send and a reset, plus **Send** switches for the three optional ones. See [Neon Auth emails](/starter-template/email-feature/#neon-auth-emails).
 
 ---
 
@@ -545,8 +590,11 @@ The `/settings` endpoint returns **everything** the frontend needs to render the
 | `/api/v1/admin/users/:userId` | DELETE | Delete user (step-up) |
 | `/api/v1/admin/security/overview` | GET | Security posture, config, key/edge status, secret status, module manifests |
 | `/api/v1/admin/security/env` | PUT | Edit the non-secret, env-backed security knobs (allow-listed; restart required; step-up) |
+| `/api/v1/admin/signup-policy` | GET | The sign-up rule (v2.15.0): `{ mode, allowlist, refusalMessage, defaults, limits, enforcement }`, where `enforcement` is when Neon last sent `user.before_create` and which modules also decide |
+| `/api/v1/admin/signup-policy` | PUT | Save it: `{ mode, allowlist, refusalMessage }` (step-up once email works). `allowlist` is the lines as typed; bad lines come back as `400` `details.allowlist` with their line numbers |
+| `/api/v1/admin/signup-policy/check` | POST | `{ email, draft? }` → `{ allowed, code?, message?, matched, decidedBy }`. A dry run of the rule (or the unsaved draft) and the modules' filters |
 
-Routes marked **step-up** also use `requireStepUp` (v2.13.0). At the hardened and strict tiers they answer **403** `code: 'step_up_required'` until the admin enters an emailed code; the frontend's API client handles this for you. The admin email settings (`PUT /api/v1/admin/email/config`) are guarded the same way once a provider is live. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
+Routes marked **step-up** also use `requireStepUp` (v2.13.0). At the hardened and strict tiers they answer **403** `code: 'step_up_required'` until the admin enters an emailed code; the frontend's API client handles this for you. The admin email settings (`PUT /api/v1/admin/email/config`) are guarded the same way once a provider is live, and so, since v2.15.0, are the sign-up rule and the Neon Auth email endpoints (listed on the [Email Feature](/starter-template/email-feature/#admin-api) page). See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
 
 <Aside type="note">
 The two `/admin/security/*` endpoints are **admin-only for reads too** (not public-read like `/settings`) — the posture reveals where the app's security is weak, so it must not be exposed to non-admins. See the [Security](#security) section.
@@ -582,6 +630,9 @@ model AppSettings {
   styleOverrides       Json     @default("{}")  // Style registry enable/disable
   dashboardOverrides   Json     @default("{}")  // Admin-hidden dashboard widgets (v1.27.0)
   appTheme             Json?                     // Module-owned theme blob (v1.25.0)
+  signupMode           String   @default("open") // "open" | "closed" | "allowlist" (v2.15.0)
+  signupAllowlist      String[] @default([])     // "name@example.com" or "@example.com" (v2.15.0)
+  signupRefusalMessage String?                   // null = the built-in message (v2.15.0)
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 }
@@ -605,6 +656,8 @@ type StyleOverrides = Record<string, boolean>;
 ```
 
 The table uses a singleton pattern — there's only ever one row with `id = "default"`. The service auto-creates this row on first access.
+
+The three `signup*` columns (v2.15.0) belong to the auth-webhooks feature, which reads and writes them with its own narrow queries. The admin service drops them from its settings response.
 
 ---
 
@@ -763,6 +816,12 @@ Instead: one well-known `appTheme` slot, reserved for whichever style module the
 
 1. Check that the AppSettings migration has run
 2. Run: `cd backend && npm run db:migrate`
+
+### Sign-up Rule Not Enforced
+
+1. App Settings shows **Not enforced yet**: Neon isn't sending `user.before_create` to the app. Subscribe it on the branch this deployment's `NEON_AUTH_URL` points at (see [Neon Auth webhooks](/starter-template/auth-feature/#setting-it-up))
+2. Check the **Neon Auth webhooks** card on Admin → Email for warnings, such as deliveries refused from another branch
+3. The rule never affects existing accounts, only new sign-ups
 
 ---
 

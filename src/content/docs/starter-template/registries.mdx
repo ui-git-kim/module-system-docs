@@ -950,6 +950,43 @@ interface RouteConfig {
 }
 ```
 
+**Public route configuration** (`registerPublic`):
+
+```typescript
+interface PublicRouteConfig {
+  path: string;              // The full path, e.g. '/api/health' or '/api/v1/webhooks/neon-auth'
+  method: 'get' | 'post' | 'put' | 'patch' | 'delete';
+  handler: RequestHandler;   // One handler; chain several with composeMiddleware()
+                             // (middleware/rate-limit.middleware.js)
+  description?: string;
+  allowNoOrigin?: boolean;   // v1.54.0 — as on RouteConfig
+  ownBodyParser?: boolean;   // v2.15.0 — the handler chain reads the body itself:
+                             // neither the global pre-auth JSON parser nor this
+                             // route's mount touches this exact path, so the
+                             // route owns parsing, its size limit and its
+                             // answer to a malformed body. Default: false.
+  skipGlobalRateLimit?: boolean; // v2.15.0 — the global per-IP /api/ limiter
+                             // skips this exact path. ONLY for a route whose
+                             // handler chain brings its own limiter, for a
+                             // sender that delivers from a few shared
+                             // addresses. Default: false.
+}
+```
+
+The Neon Auth webhook receiver (`features/auth-webhooks`, v2.15.0) sets all three flags:
+
+```typescript
+routeRegistry.registerPublic({
+  path: NEON_AUTH_WEBHOOK_PATH,   // '/api/v1/webhooks/neon-auth'
+  method: 'post',
+  handler: composeMiddleware(neonWebhookLimiter, readNeonWebhookBody, neonAuthWebhookHandler),
+  allowNoOrigin: true,
+  ownBodyParser: true,
+  skipGlobalRateLimit: true,
+  description: 'Neon Auth webhooks (send.otp, send.magic_link, user.before_create, user.created) — signed by Neon',
+});
+```
+
 **Methods:**
 | Method | Description |
 |--------|-------------|
@@ -959,7 +996,8 @@ interface RouteConfig {
 | `getByFeature(feature)` | Get routes by feature name |
 | `getByVersion(version)` | Get routes by API version |
 | `allowsNoOrigin(path)` | v1.54.0 — whether a request path opted into no-Origin access (consulted by the production origin gate) |
-| `usesOwnBodyParser(path)` | v2.13.1 — whether a request path's body is parsed by its route after auth (so the global pre-auth parser skips it) |
+| `usesOwnBodyParser(path)` | v2.13.1 — whether the global pre-auth parser skips a request path, because its route parses the body after auth or, since v2.15.0, because an exact-path `registerPublic` route set `ownBodyParser` |
+| `skipsGlobalRateLimit(path)` | v2.15.0 — whether the global per-IP `/api/` limiter skips a request path (an exact-path `registerPublic` route that set `skipGlobalRateLimit`) |
 | `generateDocs()` | Generate route documentation (includes `bodyLimit`) |
 
 `requiresAuth` (the default) already applies `requireAuth` when the routes are mounted, so don't list it again in `middleware` — it would be redundant. Since v2.14.0, `requireAuth` verifies a request once: when a request falls through nested mounts (`/api/v1/admin`, then `/api/v1/admin/security`), the later mounts reuse the identity verified at the first, as long as the `Authorization` header is the same. A device token therefore costs one database lookup per request. Per-route middleware such as `requireAdmin` still runs at each mount. Since v2.13.1, `requireAuth` is followed by a per-user rate limit (`RATE_LIMIT_USER_MAX`, default 600 per window); see [Configuration → Rate limits](/starter-template/configuration/#rate-limits).
@@ -981,7 +1019,8 @@ Reading a JSON body costs the server work, so since v2.13.1 a large body is neve
 |-------|----------------------------|-------|
 | Public routes (`register({ requiresAuth: false })`) and unregistered paths | By the global parser, before auth | 1.5 MB (`DEFAULT_JSON_BODY_LIMIT`) |
 | Routes that require auth (the default) | Right after `requireAuth`, before the route's own `middleware` | 10 MB (`AUTHENTICATED_JSON_BODY_LIMIT`) |
-| `registerPublic` routes (webhooks) | By their own parser, before auth, even under an authed prefix such as `/api/v1/billing/webhook`. The raw body is kept for signature checks | 1.5 MB |
+| `registerPublic` routes (webhooks) | Before auth: by the global parser, or by the route's own mount when it sits under an authed prefix such as `/api/v1/billing/webhook`. The raw body is kept for signature checks. Either way, a malformed body (any parse error but 413) goes to the error handler before the route runs | 1.5 MB |
+| `registerPublic` routes with `ownBodyParser` (v2.15.0) | By the route's own handler chain, which also answers a malformed body itself. The Neon Auth receiver reads the raw bytes with `express.raw` | The route's own (64 KiB for the Neon Auth receiver) |
 | Routes that set `bodyLimit` | After `requireAuth` (when the route requires it) **and** the route's `middleware` (put `requireAdmin` there to read bodies for admins only) | The route's `bodyLimit` |
 
 A route reads only the bodies of requests it is the **most specific** mount for. So a nested route with its own `bodyLimit` (`/ai/attachments`) always gets its limit, even under an outer route (`/ai`). A body over the limit gets a plain **413** `{ error: 'Request body too large' }`, with no error log or audit row. The limits live in `backend/src/middleware/body-parser.middleware.ts`.
@@ -1295,6 +1334,8 @@ const response = await filterRegistry.applyAll(
 | Backend: `api.{feature}.{action}.response` | `api.user.profile.response` |
 | Backend: `api.{feature}.{action}.request` | `api.user.update.request` |
 | Backend: `service.{feature}.{method}` | `service.user.getProfile` |
+| Backend: `{entity}.{direction}` (message pipelines) | `email.outbound`, `authEmail.outbound` |
+| Backend: `{domain}.{decision}` (v2.15.0; the value is the decision) | `auth.signupDecision`, `auth.emailTypeEnabled` |
 
 **Methods:**
 

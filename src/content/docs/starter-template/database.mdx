@@ -164,14 +164,12 @@ The `lib/prisma.ts` file creates the Prisma client with the appropriate adapter:
 
 ```typescript
 // backend/src/lib/prisma.ts (simplified)
-import { createRequire } from 'node:module';
 import { PrismaClient, Prisma } from '../generated/prisma/client.js';
 import { PrismaNeon } from '@prisma/adapter-neon';
 import { PrismaPg } from '@prisma/adapter-pg';
-import { neonConfig } from '@neondatabase/serverless';
 import { env } from '../config/env.js';
 import {
-  neonWebSocketConstructor,
+  assertNeonWebSocket,
   urlRequestsChannelBinding,
   withConnectTimeoutTap,
 } from './database-connection.js';
@@ -203,16 +201,9 @@ export function pgPoolConfig() {
 // Select the adapter based on the DATABASE_ADAPTER env var
 export function createDatabaseAdapter() {
   if (env.DATABASE_ADAPTER === 'neon') {
-    // Node.js 22+ has a global WebSocket, which the Neon driver uses by
-    // itself. Only an older runtime gets the `ws` package, loaded lazily.
-    const legacyWebSocket = neonWebSocketConstructor(
-      typeof globalThis.WebSocket === 'function',
-      () => createRequire(import.meta.url)('ws'),
-      process.version,
-    );
-    if (legacyWebSocket) {
-      neonConfig.webSocketConstructor = legacyWebSocket as typeof neonConfig.webSocketConstructor;
-    }
+    // The Neon driver uses the WebSocket built into Node.js 22+ by itself.
+    // A runtime without one stops here with a clear error (v2.14.4).
+    assertNeonWebSocket(typeof globalThis.WebSocket === 'function', process.version);
     return withConnectTimeoutTap(new PrismaNeon(databasePoolConfig(), databaseAdapterOptions), (err) =>
       warnDatabaseConnectTimeout(err),
     );
@@ -288,7 +279,7 @@ Neon's connection strings end in `?sslmode=require&channel_binding=require`, and
 
 Both adapters work with Neon's `-pooler` URL:
 
-- **`neon`** (`@prisma/adapter-neon`, the default): Postgres over a WebSocket on port 443, so it works where a host blocks outbound port 5432. Since v2.14.2 it uses the WebSocket built into Node.js 22+ (the `engines` floor), so the `ws` package and the `neonConfig.webSocketConstructor = ws` line are no longer needed. On an older Node.js the template loads `ws` itself if it is installed, and otherwise stops with: `DATABASE_ADAPTER=neon needs a WebSocket client. Node.js 22+ has one built in, but this is Node.js <version>: upgrade Node.js, install the ws package in backend/, or set DATABASE_ADAPTER=pg.` Nothing imports `ws` on Node.js 22+, but the template's `backend/package.json` and install-all still list `ws` and `@types/ws`, so new and existing apps both have the package installed, which is harmless.
+- **`neon`** (`@prisma/adapter-neon`, the default): Postgres over a WebSocket on port 443, so it works where a host blocks outbound port 5432. Since v2.14.2 it uses the WebSocket built into Node.js 22+ (the `engines` floor), so the `ws` package and the `neonConfig.webSocketConstructor = ws` line are no longer needed. Since v2.14.4 the `ws` fallback is gone too: `lib/prisma.ts` no longer loads `ws` on any runtime or imports `neonConfig`, and `backend/package.json` and install-all no longer list `ws` or `@types/ws`. On a runtime without a global WebSocket (a Node.js older than 22 that ignored `engines`), `assertNeonWebSocket()` stops startup with: `DATABASE_ADAPTER=neon needs the WebSocket built into Node.js 22+, but this is Node.js <version>: upgrade Node.js (the backend requires 22.22.0 or later) or set DATABASE_ADAPTER=pg.` Installing `ws` no longer helps. Existing apps have `ws` and `@types/ws` removed by install-all unless their own backend code uses `ws` (see [`ws` retired](/starter-template/updating/#ws-retired-v2144)). Template code no longer imports `@neondatabase/serverless` itself; it stays a dependency, held to `^1` so your code shares the adapter's copy (see [Foundation install list](/starter-template/scripts/#foundation-install-list)).
 - **`pg`** (`@prisma/adapter-pg`, plain TCP): what Neon's [Choosing your connection method](https://neon.com/docs/connect/choose-connection) recommends for a long-running Node server such as this backend (VPS, container, Railway, Render), and the adapter for any non-Neon PostgreSQL.
 
 The backend is one long-lived Express process with one shared pool; it doesn't target edge runtimes. create-app still writes `DATABASE_ADAPTER=neon`.
@@ -599,7 +590,7 @@ A query failed with `timeout exceeded when trying to connect` or `Connection ter
   - src/
     - lib/
       - prisma.ts (Runtime client)
-      - database-connection.ts (Direct-URL fallback, -pooler check, channel binding, connect-timeout tap, Neon WebSocket choice; v2.14.2)
+      - database-connection.ts (Direct-URL fallback, -pooler check, channel binding, connect-timeout tap; v2.14.2. The Neon WebSocket check, assertNeonWebSocket; v2.14.4)
       - owned.ts (owned() and withTenantContext())
     - generated/
       - prisma/ (Generated client)

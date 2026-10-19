@@ -73,7 +73,9 @@ frontend/src/features/auth/
 │   ├── auth-errors.ts            # Recognise the SDK's thrown errors (v2.14.2)
 │   ├── email-verification.ts     # Email sign-up / sign-in + verification calls (v2.14.2)
 │   ├── oauth-errors.ts           # ?error= codes → fixed messages (v2.14.2)
-│   └── password-policy.ts        # 8–128 character rule (v2.14.2)
+│   ├── password-policy.ts        # 8–128 character rule (v2.14.2)
+│   ├── refresh-session.ts        # Re-read the session past the SDK's cache (v2.14.4)
+│   └── verify-email-dialog.ts    # VerifyEmailDialog's open/close decisions (v2.14.4)
 ├── hooks/
 │   ├── useSession.ts             # Session hook + TypeScript types
 │   └── useOAuthCallbackError.ts  # Reads a failed OAuth return's ?error= once (v2.14.2)
@@ -81,7 +83,8 @@ frontend/src/features/auth/
 │   ├── AuthProtectedRoute.tsx    # Route guard component
 │   ├── AuthBackground.tsx        # Decorative auth-page background
 │   ├── StepUpHost.tsx            # "Confirm it's you" code dialog (v2.13.0)
-│   └── VerifyEmailStep.tsx       # "Verify your email" step: code or link (v2.14.2)
+│   ├── VerifyEmailStep.tsx       # "Verify your email" step: code or link (v2.14.2)
+│   └── VerifyEmailDialog.tsx     # "Verify email" button + dialog for a signed-in user (v2.14.4)
 ├── services/
 │   ├── devices.service.ts        # Device-token API (Linked devices)
 │   └── step-up.service.ts        # Step-up start/verify API (v2.13.0)
@@ -468,7 +471,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
 
 **`req.user.emailVerified` (v2.14.2)** is set only when the token carries a boolean `emailVerified` claim. It is a snapshot from when Neon minted the token (up to 15 minutes old), and it is absent for device tokens. Neon leaves email verification off by default, so treat anything but `true` as unverified. Nothing in the starter gates on it.
 
-**`NEON_AUTH_URL` must use https (v2.14.2).** Its JWKS is the only key that verifies sign-ins, so over plain http anyone on the network path could swap in their own keys. The backend refuses to boot unless `NEON_AUTH_URL` uses `https://`. Plain `http://` is allowed only when the hostname is exactly `localhost`, `127.0.0.1` or `[::1]`. The backend also logs a boot WARN when the URL ends in `/.well-known/jwks.json`, which means Neon's `jwks_url` was pasted instead of its base URL.
+**`NEON_AUTH_URL` must use https (v2.14.2).** Its JWKS is the only key that verifies sign-ins, so over plain http anyone on the network path could swap in their own keys. The backend refuses to boot unless `NEON_AUTH_URL` uses `https://`. Plain `http://` is allowed only when the hostname is exactly `localhost`, `127.0.0.1` or `[::1]`. Since v2.14.4 the frontend applies the same rule to `VITE_NEON_AUTH_URL`, the address the browser sends passwords to: a set value that fails it stops `vite dev` and every `vite build`, whatever the mode (see [Configuration](/starter-template/configuration/#environment-files)). The backend also logs a boot WARN when the URL ends in `/.well-known/jwks.json`, which means Neon's `jwks_url` was pasted instead of its base URL.
 
 #### Issuer and audience checks
 
@@ -938,6 +941,14 @@ routeRegistry.registerPublic({
 });
 ```
 
+Flags for webhook receivers, each applying to the route's exact path:
+
+- `allowNoOrigin: true` lets server-to-server requests, which carry no `Origin` header, through production CORS. Use it only when the route authenticates the caller another way, such as a signature.
+- `ownBodyParser: true` (v2.15.0): neither JSON body parser touches the path, so the route's own handler chain reads, limits and answers errors for the body itself (for example with `express.raw`, to verify the exact bytes).
+- `skipGlobalRateLimit: true` (v2.15.0): the global per-address `/api/` limiter skips the path. Only for a route that brings its own limiter, for a sender that delivers from a few shared addresses. `createIpRateLimiter({ windowMs, max, keySuffix })` builds one: `keySuffix(req)` splits each address's allowance into separate buckets.
+
+The [Neon Auth webhook](#neon-auth-webhooks) receiver uses all three.
+
 ### Auto-Generated API Docs
 
 All registered routes appear at `/api/docs`:
@@ -1315,7 +1326,7 @@ On the sign-in page the Google button's `callbackURL` is the deep link the user 
 
 - `.code` is Neon's normalised code, and it loses detail: an unmapped 403 becomes `feature_not_supported`, and any plain 401 becomes `invalid_credentials`. Where a status is shared (422 is also a validation error), match the code instead.
 - The types still allow a resolved `{ data, error }`. `throwIfResolvedError(result.error, fallback)` from `@/features/auth` throws one as an Error that keeps `.code` and `.status`, so it reaches the same `catch`.
-- `lib/auth-errors.ts` holds the checks the pages use: `isEmailNotVerifiedError` (`email_not_confirmed`), `isRateLimitedError` (status 429, `over_request_rate_limit` or `over_email_send_rate_limit`), `isInvalidResetTokenError` (`bad_jwt`) and `isInvalidCallbackURLError`.
+- `lib/auth-errors.ts` holds the checks the pages use: `isEmailNotVerifiedError` (`email_not_confirmed`), `isRateLimitedError` (status 429, `over_request_rate_limit` or `over_email_send_rate_limit`), `isInvalidResetTokenError` (`bad_jwt`) and `isInvalidCallbackURLError`. Since v2.14.4 also `isVerificationEmailDisabledError` (Better Auth's `VERIFICATION_EMAIL_NOT_ENABLED`, or its message "Verification email isn't enabled") and `isEmailAlreadyVerifiedError` (`EMAIL_ALREADY_VERIFIED`, or "Email is already verified"). Neon's SDK has no mapping for either code and reports both as `validation_failed`, so they are matched by Better Auth's fixed message too. Since v2.15.0 also `isGenericCreateUserError`: better-auth's `FAILED_TO_CREATE_USER` or "Failed to create user", or the SDK's remapped form of it (`internal_error` with "Internal server error"). The sign-up page then shows `CREATE_USER_FAILED_MESSAGE` instead of the bare error (see [The sign-up rule](#the-sign-up-rule)).
 - The forgot-password page now always shows a fixed message, "Could not send reset email. Please try again." (or a wait message when rate-limited), and logs the detail to the console as `[ForgotPassword]`. A common cause is a 403 "Invalid redirectURL" when the app's origin isn't in Neon Auth's trusted domains. Better Auth answers 200 for an unknown address, so the page reveals nothing about which emails have accounts.
 - The reset page treats a token the server refuses as the "Link expired or invalid" state, with its "Request a new link" button. An expired emailed link already arrives as `?error=INVALID_TOKEN` with no token.
 
@@ -1331,18 +1342,55 @@ Neon can require a verified email before anyone signs in. It is **off by default
 - **Links** need a custom email provider.
 - Both expire after 15 minutes.
 
+Since v2.15.0 the app can send these codes and links itself, through its own email provider and with wording admins can edit, once Neon's `send.otp` and `send.magic_link` webhooks are subscribed (see [Neon Auth webhooks](#neon-auth-webhooks)). Neon still decides when a verification email is sent; the app only delivers it.
+
 Since v2.14.2 the auth pages handle both, through one shared step, `VerifyEmailStep` (exported from `@/features/auth` with `VerifyEmailStepProps`):
 
 - **After sign-up.** The page decides from the session token. Better Auth returns `token: null` when it didn't sign the user in (verification required), and the card then switches to the verification step. It no longer looks at `user.emailVerified`, which is false for every new email sign-up, signed in or not. An address that already has an account gets Better Auth's deliberately identical reply, so the step's copy doesn't say whether an account exists. Sign-up passes `callbackURL: ${origin}/`, so a verification link returns to the app instead of Neon's auth host.
 - **At sign-in.** An unverified user's sign-in is refused (the SDK throws `email_not_confirmed`, status 422), and the sign-in page opens the same step. That only happens after a correct password, so it reveals nothing to anyone without it. A user who left the sign-up screen can still finish this way.
-- **The step.** A code field (digits only, up to 6; `inputMode="numeric"`, `autoComplete="one-time-code"`, and no `maxLength`, so a pasted `123 456` still works) calls `authClient.emailOtp.verifyEmail({ email, otp })`. **Send a new code** calls `authClient.sendVerificationEmail({ email, callbackURL })`, which sends whichever kind, code or link, the project is set to, with a 30-second cooldown. The copy covers both kinds. Errors use fixed copy, and the detail goes to the console as `[VerifyEmail]`.
+- **The step.** A code field (digits only, up to 6; `inputMode="numeric"`, `autoComplete="one-time-code"`, and no `maxLength`, so a pasted `123 456` still works) calls `authClient.emailOtp.verifyEmail({ email, otp })`. **Send a new code** calls `authClient.sendVerificationEmail({ email, callbackURL })`, which sends whichever kind, code or link, the project is set to, with a 30-second cooldown. Since v2.14.4 each successful send is remembered per address (trimmed, lower-case) for the browser tab, so sign-in's first resend waits out a send this tab made moments ago instead of starting at 0; sign-up still starts at the full 30 seconds. The copy covers both kinds. Errors use fixed copy, and the detail goes to the console as `[VerifyEmail]`.
 - **After verifying.** If Neon signed the user in (the verify response carries a session token), they go into the app: `/` after sign-up, or the deep link after sign-in. Otherwise they return to sign-in with "Your email is verified. Please sign in." and the email filled in. The step never relies on a session the browser already holds, which could belong to another account.
 
 The emailOTP client plugin is part of Neon's supported client plugins, so `authClient` needs no extra configuration.
 
 **Trusted domains matter here too.** Better Auth refuses a `callbackURL` outside Neon Auth's trusted domains (403 "Invalid callbackURL"). On that refusal, sign-up and **Send a new code** retry once without it, and log `[Auth] Neon Auth refused <origin> as a callbackURL …` to the console. The sign-up then works, but its links open on Neon's auth host rather than the app. Add the origin under the Neon Console's Auth → Configuration → Domains.
 
-**Two limits.** Sign-in deliberately sends no `callbackURL` (Better Auth's client would then do a full-page redirect on every successful sign-in). So if Neon's "send verification email on sign-in" setting is on, the links it sends at sign-in return to `/` on Neon's auth host; links from **Send a new code** return to the app. And under *optional* verification, a signed-in but unverified user has no screen to enter a code later; `VerifyEmailStep` is exported so an app can add one.
+**Two limits.** Sign-in deliberately sends no `callbackURL` (Better Auth's client would then do a full-page redirect on every successful sign-in). So if Neon's "send verification email on sign-in" setting is on, the links it sends at sign-in return to `/` on Neon's auth host; links from **Send a new code** return to the app. And under *optional* verification, a signed-in but unverified user had no screen to enter a code later. Since v2.14.4 they do: **Settings → Personal Information** (next section).
+
+#### Verifying later from Settings
+
+Since v2.14.4 a signed-in user whose email isn't verified can verify it from the **Email** row of **Settings → Personal Information**, which shows a **Not verified** badge and a **Verify email** button (see [Verifying the email later](/starter-template/user-feature/#verifying-the-email-later)). The button is `VerifyEmailDialog`, exported from `@/features/auth` with `VerifyEmailDialogProps`:
+
+```tsx
+import { VerifyEmailDialog } from '@/features/auth';
+
+<VerifyEmailDialog
+  email={user.email}                  // the signed-in user's address
+  onVerified={(email) => markVerified(email)}
+/>
+```
+
+| Prop | What it does |
+|------|--------------|
+| `email` | The signed-in user's address, the one to verify. Required |
+| `onVerified?: (email: string) => void` | Called with the address once the code is accepted, or when a send is refused because the address is already verified, before the refreshed session arrives. The dialog closes itself |
+| `children?: ReactElement` | A custom trigger, which must pass its props and ref on (a shadcn `Button` does). Defaults to an outline "Verify email" button |
+
+- **It sends from the click.** Opening the dialog emails a code or link straight away, from the click itself (never from an effect), unless this tab sent one to the address in the last 30 seconds. It shows "Sending a verification email to …" with a spinner, then `VerifyEmailStep` with `reason="settings"`. A failed send shows the reason with **Try again** and **Cancel**.
+- **Reopening doesn't send again.** After a send, opening the dialog again only shows the step, so the emailed code stays valid. The step's own **Send a new code** sends a fresh one.
+- **The session is refreshed.** Neon's SDK keeps the session in memory until its JWT expires (about 15 minutes), and Better Auth's own refetch after verifying reads that copy, so `useSession()`'s `emailVerified` wouldn't flip without a reload. After the code is accepted, `refreshSession()` (`lib/refresh-session.ts`, internal) fetches the session past that cache, which also renews the cached JWT the backend reads, and tells every `useSession()` to re-read. Closing the dialog after a send, and a failed first send, refresh too, which picks up an address verified by the emailed link in another tab.
+- **"Already verified" counts as verified.** A signed-in send for an address that is already verified is refused by Better Auth (`EMAIL_ALREADY_VERIFIED`); the dialog, and the step's **Send a new code** from Settings, treat that as success.
+- **Move focus if you unmount it.** A caller that stops rendering the dialog once the address is verified must move focus itself, because Radix returns focus to a trigger that is gone. The Email row does.
+
+`VerifyEmailStep` gained a `reason` value and one prop for this. `reason` is now `'sign-up' | 'sign-in' | 'settings'`: `'settings'` adds "Codes and links expire after 15 minutes, so send a new one if yours has." and its back button reads **Cancel** instead of **Back to sign in**. The new prop is `container?: 'card' | 'dialog'` (default `'card'`): `'dialog'` renders a plain `DialogHeader` with `DialogTitle` and `DialogDescription`, aligned like any other dialog, with no mail icon and no `brand`, and must sit inside a `Dialog`. The card layout is unchanged.
+
+`refreshSession()` relies on `X-Force-Fetch`, a header internal to Neon's SDK (its Supabase-style adapter sends it for `getSession({ forceFetch: true })` and strips it before the request leaves), plus `disableCookieCache`. It is not documented public API: `refresh-session.test.ts` runs it against the installed SDK and fails if the SDK stops honouring or stripping the header.
+
+**With Neon Auth webhooks (v2.15.0).** The dialog keeps calling `authClient.sendVerificationEmail`. When `send.otp` (codes) or `send.magic_link` (links) is subscribed, Neon creates the code or link and the app emails it, with the **Verification code** or **Verification link** wording from Admin → Email (see [Neon Auth webhooks](#neon-auth-webhooks)). Neon still decides whether to send at all, so a project that can't send verification emails still gets "This app isn't set up to send verification emails." Verification emails are sent before Neon gets its answer, so a failed send should still reach the dialog as an error (better-auth's code says it does; not yet checked on Neon).
+
+<Aside type="caution" title="Not yet tried against a live Neon project">
+On Neon's default settings (verification off), every email/password user sees **Not verified** and **Verify email**. Whether Neon then sends a code, or refuses with `VERIFICATION_EMAIL_NOT_ENABLED` (shown as "This app isn't set up to send verification emails."), hasn't been checked live, and neither has the full flow: the code arriving, the badge flipping without a reload, the emailed link from another tab, and the screen-reader announcement and focus move. Check the modes you use on a branch first.
+</Aside>
 
 ### OAuth sign-in errors
 
@@ -1356,6 +1404,7 @@ Since v2.14.2, `signIn.social` on the sign-in and sign-up pages passes `errorCal
 | `account_not_linked` | An account with this email already exists. Sign in with your email and password instead (verify your email if you're asked to). |
 | `state_mismatch`, `state_security_mismatch` | Sign-in expired or was started in another tab. Please try again. |
 | `signup_disabled`, `email_not_found`, `email_not_verified` | A specific explanation for each |
+| `SIGNUP_CLOSED`, `SIGNUP_NOT_ALLOWED` (either case; v2.15.0) | The app's [sign-up rule](#the-sign-up-rule) refused a first OAuth sign-up: "New sign-ups are closed at the moment." or "That account can't be used to sign up here." The admin's custom message can't be passed this way |
 | `account_already_linked_to_different_user`, `email_does_not_match`, `unable_to_link_account` | Connecting an account from Settings → Security |
 
 Any other code gets a generic "Sign-in didn't complete. Please try again." (or the Connect equivalent). The raw `error` value and `error_description` are never shown, because anyone can craft the URL. Failures before the server can read the OAuth state (a missing state cookie, for example) still land on Neon's own error page.
@@ -1426,11 +1475,250 @@ async function handleSignOut() {
 
 ---
 
+## Neon Auth webhooks
+
+Since v2.15.0, Neon Auth can hand three jobs to the app's backend. It does this through webhooks: HTTP calls Neon makes to your server when something happens.
+
+- **Sending the auth emails.** Verification codes, verification links and password-reset links go out through the app's own email provider (the one on **Admin → Email**), with built-in wording that admins can edit for each kind of email. Neon stops sending those emails itself.
+- **Checking new sign-ups.** Before Neon creates an account, it asks the app. The app answers with the rule set on **App Settings → New sign-ups** (open, closed, or only listed emails and domains), and modules can change the answer.
+- **Announcing new accounts.** After Neon creates an account, the app fires the `auth.userCreated` action hook for modules.
+
+Nothing changes until you configure Neon. The receiver, `POST /api/v1/webhooks/neon-auth`, is always mounted, needs no env var and has no switch in the app: the events you subscribe in Neon decide what it does. The code lives in `backend/src/features/auth-webhooks/` (imported once from `app.ts`), and the admin screens are in the email and admin features.
+
+<Aside type="caution" title="Your backend and email provider join the sign-up and reset path">
+Once `send.otp` or `send.magic_link` is subscribed, Neon has no fallback. If the backend is down, slow or blocked, or the email provider fails, nobody gets a verification code or a reset link. With `user.before_create` subscribed, nobody can sign up while the backend can't be reached. Existing users can still sign in with their password. Set up a working email provider **first**, and know how to [back out](#backing-out).
+</Aside>
+
+<Aside type="caution" title="Not yet run against a live Neon project">
+The receiver follows Neon's documented contract, and its tests use deliveries that Neon's own published verifier accepts. It has not been run against a live Neon project yet. Try it on a dev branch first; [Live checks still owed](#live-checks-still-owed) lists what to watch for.
+</Aside>
+
+### What each event does
+
+| Event | Subscribe it when | What changes |
+|-------|-------------------|--------------|
+| `send.otp` | You want the app to send Neon's codes | Neon stops emailing codes and asks the app instead, for every kind: **verification codes** (sent), **sign-in codes** and **password reset codes** (refused unless an admin or a module turns them on) |
+| `send.magic_link` | You want the app to send Neon's links | Neon stops emailing links and asks the app instead: **verification links** and **password reset links** (sent; the Forgot password page uses links) and **magic links** (refused unless turned on) |
+| `user.before_create` | You use the sign-up rule, or a module decides sign-ups | Neon asks the app before it creates each new account, for email sign-ups and first OAuth sign-ups. The app's answer is final, and if Neon can't reach the app, the sign-up is refused |
+| `user.created` | A module listens to `auth.userCreated` | The app answers at once, then fires `auth.userCreated`. Neon doesn't wait on this event, so it can't break sign-up |
+
+Neon's other events (`phone_number.verified`, `organization.invitation.created`, `organization.invitation.accepted`) are answered `200 { ignored: true }`, and the status card suggests unsubscribing them.
+
+A subscription covers every kind of email for its event. Subscribing `send.otp` therefore also hands the app sign-in codes, which it refuses by default because the starter has no sign-in-by-code screen, and Neon does not send them instead. If your app uses one of those Neon features, turn its email on (**Admin → Email → Auth emails → Send**) before you subscribe. SMS isn't supported: Neon's Phone Number plugin needs `send.otp` to deliver its codes, the app refuses SMS requests (`422 sms_not_supported`), and phone sign-in then fails.
+
+### Before you start
+
+- **Run the v2.15.0 migration.** It adds five columns, all defaulted or nullable: `signupMode`, `signupAllowlist` and `signupRefusalMessage` on `AppSettings`, and `authEmailSettings` and `authWebhookStatus` on `EmailConfig`. On an existing app, `npm run template:update` adds them to the schema, then writes and applies a `template_update_v2_15_0` migration to the database in `backend/.env` (if that step fails, the update prints the commands to run). In production, run `prisma migrate deploy` before the v2.15.0 backend starts. Until it has run, the sign-up rule reads as Open and the backend logs a warning naming `prisma migrate deploy`.
+- **A working email provider.** SMTP, Resend, SendGrid or SES, set up on **Admin → Email** or with the `EMAIL_*` env vars (see [Email Feature](/starter-template/email-feature/)).
+- **A public HTTPS address for the backend.** Neon refuses `localhost`, so local development needs a tunnel (see [Branches and local development](#branches-and-local-development)).
+
+### Setting it up
+
+<Steps>
+
+1. **Set up email first.** On **Admin → Email**, configure a real provider and use **Test delivery** to send yourself a test email. Set SPF, DKIM and DMARC for the From domain: auth emails that land in spam lock people out.
+
+2. **Review the auth emails.** The **Auth emails** card on the same page lists the six emails. Preview each one, change the wording if you like, and use **Send me a test**. Leave sign-in codes, password reset codes and magic links switched off unless your app uses them, and if you don't use those features, turn them off in Neon too (keep Magic Link off: see the [production checklist](#neon-auth-production-checklist)). Opening the page over https also lets the emails show an uploaded logo.
+
+3. **Check the webhook URL.** The **Neon Auth webhooks** card shows the URL to give Neon, with a **Copy** button: `https://<api-host>/api/v1/webhooks/neon-auth`. The host comes from `VITE_API_URL`, or from the page's own address when that is a relative path. Give Neon exactly this path, with no trailing slash. For deliveries to get through:
+   - it must be `https://` with a hostname: Neon refuses an IP address, `localhost` or a private address;
+   - it must be the final address: Neon doesn't follow redirects, so nothing in front of the backend may redirect it (http to https, the bare domain to www, an added trailing slash);
+   - no bot check or WAF challenge may sit on that path (with Cloudflare, add a skip rule for it; Bot Fight Mode blocks it);
+   - the backend must answer within about 4 seconds, so not a host that sleeps or scales to zero with longer cold starts.
+
+   The card also names the Neon endpoint the backend accepts deliveries from (`ep-…`, read from `NEON_AUTH_URL`). It must be the branch you configure in the next step.
+
+4. **Subscribe in Neon.** In the Neon Console, on the branch this deployment's `NEON_AUTH_URL` points at, open **Auth → Configuration → Webhooks**. Turn webhooks on, paste the URL, choose the events ([above](#what-each-event-does)), leave the timeout at **5 seconds** (the default; don't go lower), and save.
+
+5. **Check it works.** Request a password reset for your own account at `/auth/forgot-password`. The email should come from your provider with your wording, and the card should show `send.magic_link` as **Working**. If email verification is on, sign up a test address. If you use the sign-up rule, set it, try **Check an address**, then make a sign-up the rule refuses.
+
+6. **Sort out your other branches** (next section).
+
+</Steps>
+
+The same settings can be made per branch from the Neon CLI or the Neon API. Neon's CLI reference shows one event per `--enabled-events`; check `neon neon-auth config webhook update --help` for how it takes several, or use the Console or the API:
+
+```bash
+# Neon CLI
+neon neon-auth config webhook update --enabled \
+  --url https://api.example.com/api/v1/webhooks/neon-auth \
+  --enabled-events send.magic_link --timeout 5 \
+  --branch <branch> --project-id <project-id>
+
+# Neon API
+curl -X PUT "https://console.neon.tech/api/v2/projects/{project_id}/branches/{branch_id}/auth/webhooks" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $NEON_API_KEY" \
+  -d '{
+    "enabled": true,
+    "webhook_url": "https://api.example.com/api/v1/webhooks/neon-auth",
+    "enabled_events": ["send.otp", "send.magic_link", "user.before_create"],
+    "timeout_seconds": 5
+  }'
+```
+
+A `GET` on the same API path, or `neon neon-auth config webhook get`, shows what is set.
+
+### Branches and local development
+
+- **Webhook settings belong to a branch.** Neon copies a branch's auth configuration and signing keys into every child branch made from it. Whether that copy includes the webhook settings hasn't been checked yet (live check 4), so assume that a preview or dev branch created after you configured production calls production's URL. Production refuses those deliveries (`403 wrong_endpoint`: the signed body names the branch's own endpoint), so that branch's codes, resets and sign-ups fail. For each such branch, either point its webhook at a backend whose `NEON_AUTH_URL` is that branch, or turn its webhooks off so Neon sends its own emails there. A branch that already existed keeps its own settings until you change them.
+- **Local development needs a tunnel.** Neon refuses `localhost` and private addresses, so give it a tunnel's HTTPS hostname (ngrok, cloudflared), on a **dev branch only**, with the local backend's `NEON_AUTH_URL` set to that branch. For email, use a real provider or a local SMTP catcher such as Mailpit through the SMTP provider. Unlike step-up codes in development, auth codes and links are never written to the log. Or leave `send.otp` and `send.magic_link` unsubscribed on the dev branch, so Neon keeps sending.
+
+### The sign-up rule
+
+Admins set the rule on **App Settings → New sign-ups** (`/admin/settings`, listed as **Branding** in the admin sidebar; see [New sign-ups](/starter-template/admin-feature/#new-sign-ups)). It is enforced only while `user.before_create` is subscribed. While the rule isn't Open and Neon has never checked a sign-up with the app, or hasn't for 30 days, App Settings shows **Not enforced yet** and the status card warns.
+
+- **Open** (the default): anyone can create an account.
+- **Closed**: nobody new can.
+- **Only these emails or domains**: one entry per line, `alex@example.com` for one address or `@example.com` for a whole domain. Matching is exact: a subdomain needs its own line, `alex+news@example.com` doesn't match `alex@example.com`, and dots aren't ignored. Entries are trimmed and lower-cased, and an international domain is stored in its punycode form (`@bücher.de` becomes `@xn--bcher-kva.de`). Up to 500 entries of up to 254 characters each. An empty list refuses everyone, like Closed.
+
+The rule judges the address Neon sends. With email verification off (Neon's default), anyone can sign up with an address on the list without owning it, so turn on **Verify at Sign-up** in Neon when you use a list.
+
+**Who decides.** The admin rule goes first, then any `auth.signupDecision` filters, which can change the answer either way: an invite module could admit invitees while sign-ups are closed, for example. App Settings names the modules that also decide. A filter that returns no boolean `allowed` makes the app refuse the sign-up with `SIGNUP_CHECK_FAILED`. A filter that throws makes the app answer 503; Neon retries, then refuses the sign-up. The whole decision is capped at 14 seconds. The rule is read with a 1-second limit, and if that read fails the app uses the last rule it read. A Neon retry of the same sign-up gets the same answer for 10 minutes.
+
+**What the person sees.**
+
+| Code | When | Built-in message |
+|------|------|------------------|
+| `SIGNUP_CLOSED` | The rule is Closed | "New sign-ups are closed at the moment. If you need an account, contact the person who runs this app." |
+| `SIGNUP_NOT_ALLOWED` | The address isn't on the list | "This email address can't be used to sign up. If you think it should, contact the person who runs this app." |
+| `SIGNUP_NOT_ALLOWED` (or the module's own code) | A module refused | The module's message, or "Sign-up isn't available for this account." |
+| `SIGNUP_CHECK_FAILED` | A module filter returned a broken decision | "Sign-up isn't available for this account." |
+
+An admin can replace the first two messages with their own (one line, up to 500 characters).
+
+- **Email sign-up** shows the message the app sent, when it reaches the page. If better-auth reports only its generic "Failed to create user", the page shows "We couldn't create your account. New sign-ups may be limited; contact the person who runs this app." (`isGenericCreateUserError` in `lib/auth-errors.ts`).
+- **A first Google (or other OAuth) sign-up** returns to the sign-in page with `?error=SIGNUP_CLOSED` or `?error=SIGNUP_NOT_ALLOWED`, shown as "New sign-ups are closed at the moment." or "That account can't be used to sign up here." (see [OAuth sign-in errors](#oauth-sign-in-errors)). The admin's own message can't travel this way.
+
+<Aside type="caution" title="Known limitation: the admin's message may never show">
+Neon's SDK replaces the message of some error codes with its own. It maps better-auth's `FAILED_TO_CREATE_USER` (and `FAILED_TO_CREATE_SESSION` and `FAILED_TO_UPDATE_USER`) to `internal_error` with "Internal server error". If Neon reports a refused sign-up that way, the admin's message can't reach the sign-up page, and the person sees the generic copy above. Because the page treats that exact pair as the generic error, a Neon outage during sign-up also shows "New sign-ups may be limited", which can mislead. How Neon reports a refusal hasn't been checked yet (live check 5). With **Verify at Sign-up** on, better-auth may also turn a refusal into its usual "check your email" reply, so a refused person would wait for an email that never comes (live check 6).
+</Aside>
+
+**What the rule never does.** It never affects existing accounts, so an admin can't lock themselves out by closing sign-ups. It doesn't change who becomes admin: that is still the first person to use the app after signing up (see [User Profile Auto-Creation](#user-profile-auto-creation)). The rule starts Open on a fresh deploy, so sign up yourself first, then set it. Neon's own disable-sign-up setting is an alternative to Closed that doesn't depend on your backend, but it blocks email-and-password sign-ups only (see the [production checklist](#neon-auth-production-checklist)). The app's rule also covers first OAuth sign-ups, is recorded in the audit trail, and can be extended by modules.
+
+**Sign-in codes and magic links for new addresses.** Signing in with a code or a magic link creates the account. So when you turn either on and Neon asks for one for an address with no account (the delivery carries no user id), the app first runs the rule as a dry run, and sends nothing if the rule would refuse that address (`422 signup_not_allowed`). This relies on Neon including the user only for existing accounts, which hasn't been checked yet (live check 9).
+
+### How the emails go out
+
+The six emails, their wording, placeholders, preview and switches are covered on the [Email Feature](/starter-template/email-feature/#neon-auth-emails) page. How they are sent:
+
+- **Verification emails are sent before Neon gets its answer**, so Neon learns when a send fails, and the Settings **Verify email** dialog should show an error (live check 7). The provider call is limited to 12 seconds.
+- **Password resets are acknowledged first.** As soon as a reset email is written, the app tells Neon it is on its way, then sends it from an in-memory queue. A failed send is tried again 10 seconds later, then 60 seconds after that, while the link is still valid. The Forgot password page then doesn't wait for your provider, which would otherwise let anyone time the page to tell which addresses have accounts. Neon never hears about a failed reset send (better-auth discards that error anyway), but the status card shows it. A restart can lose a queued send: shutdown waits up to 5 seconds for the queue, and the person can ask again.
+- **Limits.** Counted per 15 minutes, in each server process, with each kind of email counted separately. Sign-in codes and magic links: 3 per address from one requesting IP address, and 10 per address. The other emails: 10 and 30. App-wide: 100 sign-in codes and magic links together, and 500 auth emails in all. An email over a limit isn't sent (`422`). The app-wide limits protect your provider account from a flood, at the cost of refusing real people's emails until the 15 minutes pass, and the status card raises a critical warning when they are hit.
+- **The app name in the emails** is the **App Name** from App Settings. Neon's **Application Name** no longer appears in emails the app sends. An uploaded logo appears once an admin has opened **Admin → Email** over https: the app learns its public address from that visit, never from Neon's request. A logo given as an https URL always works.
+- **Codes and links are never logged or stored.** Each email is sent with `sendEmail`'s `sensitive` option, so it skips the `email.outbound` filter and never reaches the console provider (see [Email Feature](/starter-template/email-feature/#sensitive-and-time-limited-sends)).
+- **Retries join the work already running.** Neon makes up to three attempts within 15 seconds. Each attempt waits at most 4 seconds here, and a retry of the same event joins the send or the sign-up decision already under way, so a slow provider still sends one email and a slow module filter runs once.
+
+### Risks
+
+- **It fails closed, by design.** If the backend is down, slower than about 4 seconds, asleep, or blocked by a WAF, verification codes and links and password resets fail, and with `user.before_create` nobody can sign up. Password sign-in for existing accounts keeps working. Watch `/api/health` with an uptime monitor.
+- **The email provider is on the sign-up and reset path.** A provider outage or a suspended provider account is an auth email outage, and Neon has no fallback while you are subscribed. Neon offers no test events, delivery log or redelivery, so the status card is your only view. Right after a restart, while a provider configured on the Email page is still loading, the app answers 503 for verification emails (and any sign-in codes or magic links you turned on) so that Neon retries. Password resets are acknowledged and queued instead, and the queue retries them itself.
+- **Anyone can ask for codes.** `NEON_AUTH_URL` is public (it ships in the frontend), and Neon sends sign-in codes, and magic links when that plugin is on, for any address. Once `send.otp` is subscribed, the app is asked to send them. It refuses unless an admin or a module turns them on, and the limits above bound what it sends when they are on. better-auth's own per-IP limits apply first, at Neon.
+- **The limits can refuse real people.** A flood can use up the app-wide limits. Someone with many addresses can use up one person's reset or verification allowance (30 per 15 minutes for each email) for as long as they keep going.
+- **Resets are acknowledged before they are sent** (above), so a failed reset send shows only on the status card.
+- **Another branch's deliveries are refused** (`403`), which breaks that branch's auth emails and sign-ups until its settings are fixed.
+- **Other Neon projects can point their webhook at your URL.** Their deliveries fail the signature check (`401`) and count against a separate rate-limit bucket, so they can't use up your real deliveries' allowance (see [Neon Auth webhooks](/starter-template/security-feature/#neon-auth-webhooks-ed25519) on the Security page).
+- **Several server instances.** The duplicate check, the email limits, the reset queue and the receiver's rate limit are all kept in each process. With several instances the limits multiply by the instance count, and a Neon retry that lands on another instance can send a second email (with the same code or link) or fire `auth.userCreated` a second time, so handlers must be idempotent. Changes to the rule and the wording reach the other instances within 30 seconds. A provider saved on one instance is wired on the others only where no provider is working yet, at their next auth email (up to 30 seconds later, as each instance trusts its last read of the provider name for that long). Instances that already have a working provider keep using it until they restart, so restart every instance after changing the provider. The status card shows the instance that served the page, plus the last outcomes saved by any of them.
+- **A server clock more than 5 minutes out** refuses every delivery (`401`). Keep NTP on.
+- **Modules handle secrets.** `authEmail.outbound` handlers see the codes and links, `auth.signupDecision` handlers can open sign-ups, and `auth.emailTypeEnabled` handlers can turn on the emails anyone can request. Install only modules you trust.
+
+### Backing out
+
+- **Turn webhooks off in Neon**, with the toggle on **Auth → Configuration → Webhooks** or a `PUT` of `{"enabled": false}` to the API path above. Neon goes back to sending its own emails, and sign-ups are no longer checked. This doesn't need your backend, so it is the fix for an outage you can't solve quickly.
+- **Or remove single events.** Without `send.otp` and `send.magic_link`, Neon sends those emails again. Without `user.before_create`, the sign-up rule stops being enforced at once; App Settings switches to **Not enforced yet** once 30 days pass without a check.
+- **Never set the app's email provider to None while `send.otp` or `send.magic_link` is subscribed.** Every auth email would be lost. The provider form warns when Neon has sent auth emails through the app in the last 30 days.
+- Nothing needs removing from the app. The receiver stays mounted and does nothing while Neon doesn't call it.
+
+### Troubleshooting by status warning
+
+The **Neon Auth webhooks** card on **Admin → Email** refreshes every minute and when the window regains focus. It shows a row per event (**Working**, **Failing** or **Not received**, with the time of the last success or failure; the sign-up check also shows how many sign-ups were refused since the restart), a since-restart summary, and these warnings:
+
+| Warning | Level | What it means | What to do |
+|---------|-------|---------------|------------|
+| `auth-email-no-provider` | Critical | Neon is asking the app to send auth emails (it did in the last 30 days, or the last one failed for this reason) and no provider is working, so every one is lost | Set up a provider on the page. When `EMAIL_PROVIDER` is set, fix the `EMAIL_*` settings in `backend/.env` or your host's settings and restart. Or turn off `send.otp` / `send.magic_link` in Neon |
+| `email-provider-wiring-failed` | Critical | The provider saved on the page couldn't be loaded at startup. The app retries after 5 s, 15 s and 60 s, then every 5 minutes, and the warning says when it tries next | Check the database and the encryption key (`SECURITY_ENCRYPTION_KEY` or KMS), or save the provider again |
+| `auth-email-global-cap` | Critical | The app-wide limit refused auth emails in the last hour, possibly real people's | Usually someone requesting codes or links for many addresses. Turn off sign-in codes and magic links if you don't use them, and check your provider's sending reputation |
+| `endpoint-unresolved` | Critical | `NEON_AUTH_URL` has no `ep-…` host, so the app can't tell which branch it belongs to and refuses every delivery (`424`) | Set `NEON_AUTH_ISSUER` to Neon's own origin (`https://ep-….neonauth…`), as a setup behind a same-site proxy already needs |
+| `auth-email-failing` | Warning | The last `send.otp` or `send.magic_link` delivery, or the last queued reset, failed. The warning gives its code, the provider's reason with addresses and codes masked, and when it failed | `no_provider`, `provider_unavailable`, `provider_failed` and `timed_out` point at the provider. `invalid_link`, `missing_recipient`, `unsupported_email_type` and `invalid_payload` point at what Neon sent |
+| `wrong-endpoint` | Warning | Deliveries from another Neon branch were refused (`403`) in the last 7 days | Point that branch's webhook at its own backend, or turn its webhooks off |
+| `unverified-only` | Warning | In the last day, requests reached the URL but failed the signature check, and no verified delivery arrived | Check that `NEON_AUTH_URL` is the branch the webhook is set on, and that the server clock is right. Another Neon project aimed at this URL causes these too, and a few from scanners are normal |
+| `signup-policy-not-enforced` | Warning | The sign-up rule isn't Open, but Neon hasn't sent `user.before_create` in the last 30 days | Subscribe `user.before_create` in Neon |
+| `sms-requested` | Warning | Neon asked for an SMS code, which the app can't send, so phone sign-in fails | Turn off phone number sign-in in Neon |
+| `template-invalid` | Warning | A saved email no longer passes the rules, so the built-in wording is used | Edit the email and save it again |
+| `email-type-disabled-requested` | Info | Neon asked for an email that is switched off, so nothing was sent | Turn the feature off in Neon, or turn the email on in the Auth emails card |
+| `logo-origin-unknown` | Info | The logo is an upload, and no admin has opened the page over https yet, so emails show the app name instead | Open **Admin → Email** over https once |
+| `ignored-events` | Info | Neon sends events the app doesn't use | Unsubscribe them in Neon |
+| `provider-not-ready-setup` | Info | No provider is ready and no delivery has arrived yet | Set up a provider before you subscribe `send.otp` or `send.magic_link` |
+
+Most of the detail is kept in memory, so after a restart the card shows only the last success and failure per event (saved to the database at most once a minute, or within 2 seconds when an event's state changes), and the "since restart" counts start again.
+
+**What the app tells Neon.** Useful when you read a tunnel's request log:
+
+| Answer | Meaning | Does Neon retry? |
+|--------|---------|------------------|
+| `200 {"ok":true}` | Sent (a password reset: queued) | No need |
+| `200 {"allowed":…}` | The sign-up decision | No need |
+| `400`, `413`, `415` | The body was missing or unreadable, over 64 KiB, or in an unsupported encoding | No |
+| `401 invalid_signature` | The signature, key id or timestamp didn't check out | No |
+| `403 wrong_endpoint` | The delivery came from another branch | No |
+| `422` | Verified but refused: `email_type_disabled`, `recipient_rate_limited`, `global_rate_limited`, `signup_not_allowed`, `invalid_link`, `missing_recipient`, `sms_not_supported`, `unsupported_email_type` or `invalid_payload` | No |
+| `424` | The app is misconfigured: `email_provider_not_configured` or `endpoint_unresolved` | No |
+| `429` | The receiver's own rate limit | Yes |
+| `503` | A temporary problem: `email_provider_unavailable`, `delivery_failed`, `settings_unavailable`, `decision_unavailable`, `temporarily_unavailable` (Neon's key set couldn't be fetched) or `internal` | Yes |
+
+### Where it lives
+
+```
+backend/src/features/auth-webhooks/
+├── index.ts                         # Exports + registrations (imported from app.ts)
+├── route.registration.ts            # The receiver + the three admin routers
+├── neon-webhook.receiver.ts         # Verify → parse → branch check → dispatch
+├── neon-webhook.body.ts             # Its own 64 KiB raw body reader
+├── neon-webhook.keys.ts             # Key set, known key ids, key-rotation reload
+├── neon-webhook.endpoint.ts         # Which Neon endpoint (branch) is accepted
+├── neon-webhook.rate-limit.ts       # The receiver's limiter + the auth email limits
+├── neon-webhook.dedupe.ts           # Retries join the running work
+├── neon-webhook.status.ts           # Delivery status (memory + a trimmed saved copy)
+├── neon-webhook.status-view.ts      # The admin status view and its warnings
+├── auth-email.service.ts            # Deliver one auth email; the reset queue; preview + test
+├── auth-email.render.ts / .defaults.ts / .store.ts / .types.ts
+├── signup-policy.service.ts / .types.ts
+├── auth-webhooks.admin.routes.ts    # /api/v1/admin/auth-emails, auth-webhooks, signup-policy
+├── security.registration.ts         # Audit events (owns no account data)
+└── shutdown.registration.ts         # Drain queued resets on shutdown (order 8)
+```
+
+The hooks are listed on the [Hooks](/starter-template/hooks/#neon-auth-webhook-hooks) page, the receiver's checks on the [Security](/starter-template/security-feature/#neon-auth-webhooks-ed25519) page, and the admin screens on [Email Feature](/starter-template/email-feature/#neon-auth-emails) and [Admin Feature](/starter-template/admin-feature/#new-sign-ups). For module tests, `backend/src/test/neon-signing.ts` (test-only) signs deliveries the way Neon does: `createNeonSigningKey`, `localKeySet` and `signNeonDelivery`.
+
+### Live checks still owed
+
+None of this has been run against a live Neon project. Before you rely on it, check these on a dev branch, with a tunnel's request inspector and the status card:
+
+1. **Neon's real headers:** where the key id travels, the algorithm name, the timestamp format, the content type, and that the body isn't compressed.
+2. **The signing key** is in `<NEON_AUTH_URL>/.well-known/jwks.json`, the same key set as the sign-in tokens.
+3. **The endpoint id:** `context.endpoint_id` is the `ep-…` label of `NEON_AUTH_URL`'s host.
+4. **Branches:** whether a branch created after you configure the webhook copies its URL (production should then show `wrong-endpoint`).
+5. **A refused sign-up:** what reaches the person, for email sign-up (status, code and message) and for OAuth (the `?error=` code).
+6. **A refusal with Verify at Sign-up on:** whether it becomes better-auth's "check your email" reply.
+7. **A failed send** (424, 503, a timeout): what the Settings **Verify email** dialog and the Forgot password page show.
+8. **Retries:** the same `event_id`; whether the timestamp and signature change; whether a second attempt waits for the first.
+9. **The user on code and link deliveries:** whether `send.otp` and `send.magic_link` carry the user (with its id) for an existing account and leave it out for a new address. The sign-in code and magic link pre-check relies on this.
+10. **Verification off:** whether Neon sends a verification code at all (the Settings dialog's case).
+11. **Verification links:** whether Neon allows the Verification link method while `send.magic_link` is subscribed and its own email provider is still the shared one.
+12. **The CLI:** its syntax for several `--enabled-events`.
+13. **Neon's sending addresses:** how many there are, and whether `X-Neon-Signature-Kid` is always sent (the rate limit is keyed on both).
+14. **A sign-up with Verify at Sign-up on while the app answers 424, then 503:** what the person sees, whether the account exists afterwards unverified, and whether it can still be verified (better-auth creates the account before it sends the email).
+15. **Forgot password timing:** whether the reply waits for the webhook, timed for an existing and an unknown address with a provider that takes about 2 seconds.
+
+---
+
 ## Environment Variables
 
 ### Frontend
 
 ```env
+# Must use https:// (http:// only for localhost, 127.0.0.1 or [::1]); since
+# v2.14.4 a set value that fails this stops vite dev and every vite build
 VITE_NEON_AUTH_URL=https://ep-xxx.neonauth.region.aws.neon.tech/neondb/auth
 ```
 
@@ -1551,6 +1839,8 @@ The backend uses `createRemoteJWKSet` from the `jose` library, which automatical
 
 Since v2.13.1, `startJwksRefresh()` (called once at boot from `app.ts`) fetches the keys when the server starts and again every 5 minutes in the background, inside the 10-minute cache window. So no signed-in request waits for a key download. If a background refresh fails, the old keys stay in use and the failure is logged. No additional caching configuration is needed.
 
+Since v2.15.0 the [Neon Auth webhook](#neon-auth-webhooks) receiver checks deliveries against this same cached key set. `auth.middleware.ts` exports it (`getNeonAuthKeySet()`, `NEON_AUTH_JWKS_URL`) and a tracked forced reload, `reloadNeonAuthKeySet()`, which the background refresh also goes through. `getLastSuccessfulKeySetReloadStartedAt()` and `getPendingKeySetReload()` tell the receiver's key-rotation rule when a reload last succeeded and whether one is running; only a successful reload counts as proof that the set is fresh.
+
 ### Rate Limiting
 
 **Shipped since v1.27.0** — a global per-IP `express-rate-limit` is applied to `/api` in `app.ts`, env-tunable via `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` (health checks are skipped). No setup required; tune the env vars per traffic profile. Mutation- or auth-heavy routes may warrant a stricter per-route limiter on top, and Cloudflare adds an edge rate-limit at `hardened+`.
@@ -1561,6 +1851,8 @@ Since v2.13.1 there are two layers, both counted per `RATE_LIMIT_WINDOW_MS` (15 
 - **Per user, after `requireAuth`** (`RATE_LIMIT_USER_MAX`, default **600**). The real budget for signed-in traffic, keyed on the user id (a device token counts against its owner). A request that fails auth doesn't use it up.
 
 An app that set `RATE_LIMIT_MAX=300` itself keeps 300; raise it or remove the line to get the new default. Both limits are kept in each server's memory, so with several instances each counts separately.
+
+The [Neon Auth webhook](#neon-auth-webhooks) receiver (v2.15.0) is skipped by the per-address limit and has its own. Neon sends every project's webhooks from a few shared addresses, so it counts per address **and** per signing key: deliveries signed with this project's keys and everything else are counted apart, at the larger of `RATE_LIMIT_MAX` and 3000 per window each.
 
 ### Security Checklist
 
@@ -1580,8 +1872,9 @@ Transport and app-layer (most are shipped — verify the deployment-side items):
 The Neon Console ships with development defaults that are **not** appropriate for production. Review each item on your Neon project's **Settings → Better Auth** page (some Neon guides still say Settings → Auth) before go-live — these aren't code changes in the template, they're configuration on the Neon side. Neon Auth is configured **per branch**: each branch has its own Auth URL and settings, so configure the branch your production deployment's `NEON_AUTH_URL` points at.
 
 - [ ] **Trusted domains** — Add every production domain (and any preview domains you care about) to the Neon Auth trusted domains list (Auth → Configuration → Domains; a wildcard such as `https://*.my-app-preview.vercel.app` covers preview hosts). Localhost on any port is allowed without an entry. Without this, OAuth sign-in fails, its `errorCallbackURL` can't bring the user back, verification links open on Neon's auth host instead of the app, and password-reset requests fail with a 403. See [Configure domains](https://neon.com/docs/auth/guides/configure-domains).
-- [ ] **Custom SMTP / email provider** — Neon's shared sender (`auth@mail.myneon.app`) is rate-limited and meant for development. It sends verification **codes** and password-reset emails, but not verification **links**. Set up your own provider (Resend, Postmark, AWS SES, SendGrid, etc.) before production for deliverability and limits; you also need it to send verification links. Neon strongly recommends one for magic links too. Custom SMTP changes the sender, not the content; Neon's dashboard email templates aren't available yet, so full control of the content means Neon's `send.otp` / `send.magic_link` webhooks.
-- [ ] **Application name** — Set it under Project Info on the same page. It appears in verification and password-reset emails, defaults to the Neon project name, and is set per branch.
+- [ ] **Custom SMTP / email provider** — Neon's shared sender (`auth@mail.myneon.app`) is rate-limited and meant for development. It sends verification **codes** and password-reset emails, but not verification **links**. Set up your own provider (Resend, Postmark, AWS SES, SendGrid, etc.) before production for deliverability and limits; you also need it to send verification links. Neon strongly recommends one for magic links too. Custom SMTP changes the sender, not the content; Neon's dashboard email templates aren't available yet. Since v2.15.0 the app can instead send these emails itself, through its own provider and with your own wording, once Neon's `send.otp` / `send.magic_link` webhooks are subscribed: see [Neon Auth webhooks](#neon-auth-webhooks). Whether Neon still asks for its own custom provider before it offers verification links in that case hasn't been checked yet (see [Live checks still owed](#live-checks-still-owed), item 11).
+- [ ] **Neon Auth webhooks (optional, v2.15.0)** — If the app sends Neon's emails or checks sign-ups: the provider on Admin → Email passes a test, the webhook is set on the production branch with `send.magic_link` showing **Working**, every preview and dev branch has its own backend or its webhooks off, `/api/health` is monitored, and you know how to [back out](#backing-out).
+- [ ] **Application name** — Set it under Project Info on the same page. It appears in verification and password-reset emails, defaults to the Neon project name, and is set per branch. Emails the app sends through [Neon Auth webhooks](#neon-auth-webhooks) use the App Name from App Settings instead.
 - [ ] **Custom OAuth credentials** — Replace Neon's shared Google credentials with your own Google OAuth app; with the shared ones, Google shows users Neon's name and logo. GitHub and Vercel have no shared credentials, so they always need your own app. Register `{NEON_AUTH_URL}/callback/{provider}` as the redirect URI.
 - [ ] **Email verification** — **Off by default**; Neon recommends turning it on (Sign-up with Email → Verify at Sign-up). Since v2.14.2 the auth pages handle both methods: **codes** work on the shared provider, **links** need the custom provider above. See [Email verification](#email-verification). Test each mode you use on a branch first.
 - [ ] **Disable "Allow Localhost"** — The "Allow Localhost" toggle widens redirect validation for local development and is on by default. Turn it off in production to prevent open-redirect-style abuse.
@@ -1589,7 +1882,7 @@ The Neon Console ships with development defaults that are **not** appropriate fo
 - [ ] **MFA** — Not available on Neon yet (roadmap: coming soon). See [Session & token security](#session--token-security-hardening), item 4.
 - [ ] **One real token decoded** — Confirm its `iss` and `aud` match what `requireAuth` expects (see [Issuer and audience checks](#issuer-and-audience-checks)), and that the backend's `NEON_AUTH_URL` is the same `https://` URL as the frontend's `VITE_NEON_AUTH_URL`.
 - [ ] **Account deletion removes the login** — Wire `createNeonAuthIdentityDeleter` at bootstrap, or the Neon Auth identity outlives an account deletion. See [The Neon Auth identity](/starter-template/security-feature/#the-neon-auth-identity-closing-the-gap).
-- [ ] **Closing sign-up (optional, single-owner apps only)** — Neon's email-and-password `disable_sign_up` setting blocks email/password sign-ups only. Google sign-in can still create accounts, and Neon's API has no per-provider sign-up switch, so you would also have to remove the Google provider. Never do this on an app that takes customer sign-ups. Test it on a branch.
+- [ ] **Closing sign-up (optional, single-owner apps only)** — Neon's email-and-password `disable_sign_up` setting blocks email/password sign-ups only. Google sign-in can still create accounts, and Neon's API has no per-provider sign-up switch, so you would also have to remove the Google provider. Never do this on an app that takes customer sign-ups. Test it on a branch. Since v2.15.0 the app's own [sign-up rule](#the-sign-up-rule) (App Settings → New sign-ups, enforced through Neon's `user.before_create` webhook) can close sign-ups, or limit them to listed addresses and domains, for Google sign-ups too, but it depends on your backend being reachable.
 - [ ] **Production checklist reference** — Walk through [Neon's published production checklist](https://neon.com/docs/auth/production-checklist) every time you cut a new production environment; Neon adds items as the platform evolves.
 
 <Aside type="note">
@@ -1616,6 +1909,8 @@ Neon lists Managed Better Auth as generally available. Watch [About Managed Bett
 | Check role in a handler | Use `attachRole` middleware, then check `req.user?.role` |
 | Refuse device tokens on an account-wide action | `requireWebSession` from `auth.middleware.js` |
 | Ask for an emailed code before a sensitive action | `requireStepUp` from `step-up.middleware.js` (after the auth/admin check) |
+| React to an account created at Neon Auth | `auth.userCreated` action (needs Neon's `user.created` webhook; idempotent on `userId`). See [Hooks](/starter-template/hooks/#neon-auth-webhook-hooks) |
+| Allow or refuse new sign-ups from a module | `auth.signupDecision` filter (needs Neon's `user.before_create` webhook) |
 | Access another feature's service | `serviceRegistry.get('user')` |
 | Validate request body | `validate(MyZodSchema)` middleware |
 

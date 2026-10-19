@@ -11,8 +11,8 @@ The starter ships email as a **foundation feature** (`backend/src/features/email
 Delivery is delegated to expert providers (Resend, SendGrid, AWS SES, or any SMTP host via Nodemailer). The foundation owns the *mechanism* — one correct wiring of "send this message" — while templates, rendering and per-feature email *content* stay with callers and modules. Same pattern as the [security feature's](/starter-template/security-feature/) key-provider and auth-identity seams.
 </Aside>
 
-<Aside type="note" title="Auth emails are not sent through this seam">
-Verification, password-reset and change-email messages are sent by **Neon Auth itself**; a custom SMTP provider for those is configured in the **Neon dashboard**, not here (see [Authentication](/starter-template/auth-feature/)). This seam serves everything else: notifications, billing receipts, module-sent mail, and the step-up codes (below).
+<Aside type="note" title="Auth emails: Neon's by default, this seam's with webhooks">
+By default, verification and password-reset emails are sent by **Neon Auth itself**, and a custom SMTP provider for those is configured in the **Neon dashboard**, not here (see [Authentication](/starter-template/auth-feature/)). Since v2.15.0 you can instead subscribe Neon's `send.otp` and `send.magic_link` webhooks: Neon then stops sending them, and the app sends them through this seam, with wording admins edit on this page (see [Neon Auth emails](#neon-auth-emails) and [Neon Auth webhooks](/starter-template/auth-feature/#neon-auth-webhooks)). The seam also serves everything else: notifications, billing receipts, module-sent mail, and the step-up codes (below).
 </Aside>
 
 <Aside type="caution" title="Production needs a provider for step-up codes (v2.13.0)">
@@ -21,10 +21,11 @@ The "Confirm it's you" codes for [step-up re-verification](/starter-template/sec
 
 ## How it works
 
-- **`sendEmail(message)`** is the one entry point. It resolves the active provider, applies the `email.outbound` filter, sends, fires the `email.sent` action, and **never throws** — failures normalise to `{ sent: false, detail }` so callers treat non-delivery as data.
-- **Unconfigured = visible, not silent.** With no provider wired, the **console provider** logs the envelope (body at `debug` level) and returns `sent: false` — it never fakes success. In development this doubles as a "what would have been sent" console.
+- **`sendEmail(message, options?)`** is the one entry point. It resolves the active provider, applies the `email.outbound` filter, sends, fires the `email.sent` action, and **never throws** — failures normalise to `{ sent: false, detail }` so callers treat non-delivery as data. Since v2.15.0 it takes optional per-call [options](#sensitive-and-time-limited-sends) for messages that carry a secret and for a time limit; without them it behaves exactly as before.
+- **Unconfigured = visible, not silent.** With no provider wired, the **console provider** logs the envelope (body at `debug` level) and returns `sent: false` — it never fakes success. In development this doubles as a "what would have been sent" console. A message sent as `sensitive` (a code or a link) never reaches it: the result is `sent: false` and only the masked recipient is logged.
 - **Adapters are optional dependencies.** Each SDK is imported dynamically via a variable specifier (the same idiom as the [AWS KMS key provider](/getting-started/aws-kms-setup/) and [Sentry](/getting-started/error-tracking/)), so the template — and any app not sending email — type-checks and builds without any mail SDK installed.
 - **Wiring is configuration, not code.** Set the `EMAIL_*` env keys and the feature auto-wires the matching adapter at startup; a bad or incomplete config logs an error and leaves the console default active — it never crashes bootstrap. Or configure the provider from the **admin Email page** (below) — stored in the database, secret encrypted at rest, applied without a restart. **Env always wins**: when `EMAIL_PROVIDER` is set, the admin config is read-only.
+- **The wiring state (v2.15.0).** `getEmailWiringState()` says where wiring stands: `env` (`EMAIL_PROVIDER` is set), `none` (nothing configured), `pending` (the provider saved on the admin page is still being loaded, for example right after boot), `wired`, or `failed`, with `lastError` and `nextRetryAt`. A failed load used to stay failed until a restart; it now retries after 5 s, 15 s and 60 s, then every 5 minutes. `ensureEmailWired({ deadlineMs })` wires a saved provider before a send that matters, also picking up one saved on another instance, and answers `'wired'`, `'none'` or `'unavailable'`. Every `EmailConfig` read selects only this feature's columns (`EMAIL_CONFIG_SELECT`), so columns other features keep on the same row can't stop the provider loading.
 
 ## Sending email
 
@@ -47,6 +48,26 @@ if (!result.sent) {
 `EmailMessage` is deliberately small: `to`, `subject`, `text`, optional `html` / `from` / `replyTo` / `attachments`. Single recipient — the product is solo, so fan-out is a caller loop, never seam surface. Attachment `content` follows the Nodemailer convention: a **string is UTF-8 text**, **binary content must be a `Buffer`** (adapters convert per provider).
 
 `EmailResult` reports `sent`, the `provider` name, the provider's `messageId` when available, and a human-readable `detail`.
+
+### Sensitive and time-limited sends
+
+Since v2.15.0, `sendEmail` takes a second, optional argument, `SendEmailOptions` (exported from the barrel with `EmailSendContext`):
+
+```typescript
+const result = await sendEmail(
+  { to, subject: 'Your sign-in code', text: `Your code is ${code}.` },
+  { sensitive: true, timeoutMs: 12_000 },
+);
+if (result.timedOut) log.warn('The provider took too long');
+```
+
+| Option | What it does |
+|--------|--------------|
+| `sensitive` | The message carries a secret, such as a code or a reset link. The `email.outbound` filter is skipped, so generic decorators never see or change it. `email.sent` fires with `message: { to, subject, sensitive: true }` and `sensitive: true`, with no body, HTML or attachments. With no real provider, the console provider is **not** called (its debug line would log the body): the result is `sent: false`. A failed send logs the provider's error text masked by `sanitiseEmailDetail()`, plus the error's fixed codes |
+| `timeoutMs` | Give up after this many milliseconds (a positive integer). The result is `{ sent: false, timedOut: true }` and the signal passed to the provider is aborted. The provider may still deliver late; that late outcome is ignored |
+| `signal` | Abort the send from outside, through the same signal |
+
+Step-up codes and the Neon Auth emails are sent as `sensitive`. Without options, `sendEmail` calls the provider exactly as before.
 
 ## Enabling a provider
 
@@ -93,6 +114,8 @@ Set `EMAIL_PROVIDER` + `EMAIL_FROM` (plus the provider's key) in `backend/.env`,
 
 A declared-but-broken config (key missing, SDK not installed) stays **visible**: startup logs an error, `getEmailProviderStatus()` reports `configured: true, ready: false`, and sends return `sent: false` with an actionable message naming the missing piece.
 
+**SMTP time limits (v2.15.0).** SMTP transports now give up after 10 seconds connecting, 10 seconds waiting for the server's greeting and 30 seconds of silence (`SMTP_TIMEOUTS`), where Nodemailer's defaults allowed minutes. With `SMTP_URL`, any of the three the URL doesn't already set is added as a query parameter (`connectionTimeout`, `greetingTimeout`, `socketTimeout`); the rest of the URL is left exactly as written, and a URL containing `#` is left alone. The SES adapter passes the send's abort signal to the AWS SDK.
+
 ## The admin Email page
 
 The **Email** page (admin sidebar → Platform) configures and tests the seam without touching its service-only sending design. A provider can be wired two ways — env (above) or this page — with **env always winning**.
@@ -130,7 +153,134 @@ Since v2.13.0, saving the config (`PUT .../email/config`) also:
 - **needs a step-up code once a provider is live.** The provider decides where step-up codes go, so a hijacked admin session must not be able to point email at its own server. The code is sent through the **current** provider. With no provider ready the save stays open, so a new deploy can still set email up. See [Step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions).
 - **is recorded in the audit trail** with the admin who saved it, through the `email.configUpdated` hook (below).
 
-Deliberately **not** included: an outbound log viewer (delivery state belongs to the provider) and template previews (module territory).
+Since v2.15.0 the step-up check is `requireStepUpOnceEmailWorks` in `features/email/step-up-gate.ts`, and it also guards the Neon Auth email wording, the optional email switches and the sign-up rule. Once Neon's `send.otp` or `send.magic_link` webhook is subscribed, the provider on this page also carries Neon's verification codes and password-reset links, so changing it changes where those go too: one more reason a save needs a code.
+
+**Choosing "None" while Neon uses the app (v2.15.0).** If Neon has sent auth emails through the app in the last 30 days, choosing **None — log to console** in the provider form shows a destructive warning: with no provider, every verification and password-reset email (and any sign-in code or magic link you turned on) is lost.
+
+Deliberately **not** included: an outbound log viewer (delivery state belongs to the provider) and template previews for other mail (module territory). The Neon Auth emails are the exception, with their own editor and preview (below).
+
+### Neon Auth webhooks card
+
+Since v2.15.0 two more cards follow **Test delivery**. The first, **Neon Auth webhooks**, is the only view you have of Neon's deliveries (Neon keeps no delivery log). It shows:
+
+- the backend's warnings, critical ones as destructive alerts; a failing delivery (`auth-email-failing`) also shows when it failed, and a provider that failed to load (`email-provider-wiring-failed`) when the next retry runs, in the browser's locale;
+- the webhook URL to give Neon (the API host from `VITE_API_URL` plus `/api/v1/webhooks/neon-auth`, or this page's origin when `VITE_API_URL` is relative), with a **Copy** button, and the Neon endpoint it accepts ("Accepts deliveries from Neon endpoint `ep-…` (from `NEON_AUTH_URL`)", or from `NEON_AUTH_ISSUER` / `NEON_AUTH_AUDIENCE`);
+- a row each for `send.otp`, `send.magic_link`, `user.before_create` and `user.created`: **Working**, **Failing** or **Not received**, **Refused N** on the sign-up check, and "last success / last failure / last received" with a relative time;
+- "Since restart: N received, N queued resets, N refused by limits";
+- a folded-away **Set up in Neon** checklist, linking to the full guide.
+
+It refreshes every 60 seconds and when the window regains focus. The warnings and setup steps are explained in [Neon Auth webhooks](/starter-template/auth-feature/#troubleshooting-by-status-warning).
+
+### Auth emails card
+
+The second card, **Auth emails**, lists the six emails the app sends once `send.otp` or `send.magic_link` is subscribed, grouped as **Codes** (verification code, sign-in code, password reset code) and **Links** (verification link, password reset link, magic link). Each row shows when Neon asks for that email, a **Default** or **Customised** badge, when it was last sent (kept in memory, so blank after a restart) and an **Edit** button. The three optional emails also have a **Send** switch, and a badge unless the switch alone has turned the email on: **Off**, **On (module)** with "Turned on by: …", or **Off (module)** with "Turned off by: …", naming the module filters. When a module rewrites these emails, the card says so ("A module also changes these emails: …"). See [Neon Auth emails](#neon-auth-emails).
+
+## Neon Auth emails
+
+Since v2.15.0, when Neon's `send.otp` / `send.magic_link` webhooks are subscribed, the auth-webhooks feature (`backend/src/features/auth-webhooks/`) writes each auth email and sends it through `sendEmail(…, { sensitive: true, timeoutMs: 12_000 })` with this page's provider. Setting up the webhooks, the risks and backing out are covered in [Neon Auth webhooks](/starter-template/auth-feature/#neon-auth-webhooks); this section covers the emails themselves.
+
+### The six emails
+
+| Email | Neon event (kind) | Sent by default | Delivery | When Neon asks for it |
+|-------|-------------------|-----------------|----------|-----------------------|
+| Verification code (`verification-code`) | `send.otp` (`email-verification`) | Yes | Sent, then Neon is answered | Sign-up with verification by code, resend, and Settings → **Verify email** |
+| Sign-in code (`sign-in-code`) | `send.otp` (`sign-in`) | No | Sent, then answered | Email code sign-in. The starter has no screen for it, and anyone can request one for any address |
+| Password reset code (`password-reset-code`) | `send.otp` (`forget-password`) | No | Queued | A reset by code. The starter resets passwords with a link instead |
+| Verification link (`verification-link`) | `send.magic_link` (`email-verification`) | Yes | Sent, then answered | Sign-up with verification by link, resend, and Settings → **Verify email** |
+| Password reset link (`password-reset-link`) | `send.magic_link` (`forget-password`) | Yes | Queued | The Forgot password page |
+| Magic link (`magic-link`) | `send.magic_link` (`sign-in`) | No | Sent, then answered | Neon's Magic Link plugin, which the starter doesn't use. Anyone can request one for any address |
+
+"Queued" emails are acknowledged to Neon before they are sent, so the Forgot password page doesn't wait for the provider; the app retries a failed send itself (see [How the emails go out](/starter-template/auth-feature/#how-the-emails-go-out)). Every email goes out from the provider's default From address (`EMAIL_FROM`, or the From address set on this page).
+
+### Wording and placeholders
+
+Each email starts with built-in wording (`auth-email.defaults.ts`) that uses your app name. An admin can replace it per email: **Edit** opens a sheet with three fields.
+
+- **Subject**: 1 to 200 characters, one line.
+- **Email text**: 1 to 5,000 characters of plain text, never HTML.
+- **Button label** (link emails only): up to 60 characters, one line, no placeholders. Left empty, the built-in label is used.
+
+All saved wording and switches together are limited to 64 KB.
+
+| Placeholder | Value | In the subject? |
+|-------------|-------|-----------------|
+| `{{appName}}` | The App Name from App Settings | Yes |
+| `{{expiresIn}}` | When the code or link expires, such as "in 15 minutes" | Yes |
+| `{{email}}` | The recipient's address | No |
+| `{{userName}}` | The account's name. The person signing up chooses it, so treat it as untrusted text; no built-in email uses it | No |
+| `{{code}}` | The one-time code. Code emails only, and **required** in their text | Never |
+| `{{link}}` | The sign-in, verification or reset link. Link emails only, and **required** in their text | Never |
+
+The rules are checked when you save, and each message appears under its field:
+
+- A code email's text must contain `{{code}}`, a link email's `{{link}}`, and neither may contain the other.
+- Codes and links never go in the subject, because a subject shows on lock screens ("Codes and links can't go in the subject: it shows on lock screens."). Only `{{appName}}` and `{{expiresIn}}` are allowed there.
+- Only names made of letters are read as placeholders, and one that isn't in the table above, such as `{{firstName}}`, is an error. Other text in double braces, such as `{{user_name}}`, `{{first-name}}` or `{{name2}}`, isn't a placeholder: it passes the check and appears in the email as typed. Spaces inside the braces are allowed (`{{ code }}`).
+
+`{{expiresIn}}` is worked out from the expiry time Neon sends. Without one, it falls back to the lifetime Neon documents: 15 minutes for verification codes, verification links and reset links, and "soon" for the others.
+
+**How the email is built.** The plain-text part gets each value as it is, with control characters removed, and the subject is kept to one line. The HTML part escapes your text **and** every value, so neither your wording nor a name chosen at sign-up can inject markup. In the HTML:
+
+- blank lines separate paragraphs, and a single line break stays a line break;
+- a paragraph that is exactly `{{code}}` shows the code large and easy to copy;
+- a paragraph that is exactly `{{link}}` becomes a button with your label, followed by the link to paste into a browser; a `{{link}}` inside a sentence becomes a plain link.
+
+The layout is a single column built from tables with inline styles, which mail clients render reliably, in neutral greys and the system font. It uses no brand colour, because the server can't read the app's theme; a module can restyle it with the `authEmail.outbound` filter. The header is your logo or, without one, the app name. An https logo URL is used as it is. An uploaded logo is linked from `/api/v1/branding/logo` on the API's public address, which the app learns the first time an admin opens this page over https (never from Neon's request, whose `Host` header isn't signed).
+
+A link from Neon must be `https://` (`http://` only for `localhost`, `127.0.0.1` or `[::1]`), or the email isn't sent (`422 invalid_link`).
+
+**Which wording wins.** The built-in wording, then the admin's saved version, then the `authEmail.outbound` filter. If a filter's result loses the code or the exact link, puts either in the subject, or the filter throws, the app sends the unfiltered email and logs a warning naming the filter. If a saved version no longer passes the rules (they were tightened, or the row was edited by hand), the built-in wording is used and the status card warns (`template-invalid`). A bad version or a broken module never stops auth email.
+
+### Preview, test and reset
+
+- **Preview.** The sheet shows the email rendered by the server 500 ms after your last change, using your real app name and logo, sample values (code `123456`, the link `https://auth.example.com/verify?token=SAMPLE`, "in 15 minutes", the name Alex) and any module filters (with `preview: true`). An **Email** tab shows it in a sandboxed frame, and a **Plain text** tab shows the text part. While the draft breaks a rule, the last good preview stays.
+- **Send me a test.** Sends the draft to the signed-in admin's own address only, with the subject starting `[Test] ` and a first line saying the code or link is a sample that won't work.
+- **Save** needs a step-up code once a provider works, and is recorded in the audit trail (`auth.emailTemplatesUpdated`, without the content).
+- **Reset to default** asks for confirmation. It deletes the saved version; with none saved, it only puts the built-in wording back in the draft.
+- The password reset emails explain that Neon is told the email is on its way before it is sent.
+
+### The optional emails and their switches
+
+Sign-in codes, password reset codes and magic links are **off by default**. The starter never asks for them, and anyone can ask Neon for a sign-in code or a magic link for any address, so sending them would let strangers have your provider mail any address from your domain, and complaints could get your provider account suspended. While one is off, Neon's request for it is refused (`422 email_type_disabled`): nothing is sent, the refusal is final, and the status card shows an info line ("Neon asked this app for … emails, which are turned off").
+
+- **The Send switch** on the Auth emails card turns one on. It needs a step-up code once a provider works and is recorded in the audit trail (`auth.emailTypeToggled`).
+- **A module can override the switch** with the `auth.emailTypeEnabled` filter, for example a module that adds a sign-in-by-code screen. The card then shows **On (module)** or **Off (module)** and names the filter.
+- **The other three are always sent** and have no switch. The API refuses to switch them off (400).
+- **Prefer turning the feature off in Neon too** when you don't use it (Neon's email code sign-in, Magic Link). The switch is the app's backstop.
+
+A switched-on sign-in code or magic link for an address with no account is still not sent when the [sign-up rule](/starter-template/auth-feature/#the-sign-up-rule) would refuse that address.
+
+### When the provider isn't ready
+
+Before writing an email, the app checks the provider, and answers Neon accordingly:
+
+| Situation | Answer to Neon |
+|-----------|----------------|
+| A provider is wired | Send |
+| No provider is configured anywhere (no `EMAIL_PROVIDER`, none saved on this page) | `424 email_provider_not_configured`. Final: Neon doesn't retry, and the person gets no email |
+| `EMAIL_PROVIDER` is set but its adapter couldn't load (a missing API key or `EMAIL_FROM`) | `424`, because only fixing the environment and restarting helps |
+| The provider saved on this page is still loading, or failed to load | One attempt to wire it within the 4-second answer window; still not ready → `503 email_provider_unavailable`, so Neon retries |
+| The same, for a password reset email | Acknowledged and queued; each queued attempt checks the provider again |
+
+The console provider never receives these emails, and unlike step-up codes in development, auth codes and links are never written to the log. For local development, use a real provider or an SMTP catcher such as Mailpit.
+
+The provider's name is read with a 1-second limit and remembered for 30 seconds; saving the provider clears that.
+
+### Admin API
+
+All admin-only (device tokens refused). Writes need a step-up code once a provider works. Field errors come back as `400 { error: 'Validation failed', details: { field: [messages] } }`, which `getApiValidationDetails()` from `@/lib/api` turns into per-field messages.
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/v1/admin/auth-emails` | GET | Every email: its current and built-in wording, whether it is customised, when it was last sent, its delivery mode, its switch state and placeholders, plus the module filter ids and the limits |
+| `/api/v1/admin/auth-emails/:type` | PUT | Save an email's wording (step-up) |
+| `/api/v1/admin/auth-emails/:type` | DELETE | Reset it to the built-in wording (step-up) |
+| `/api/v1/admin/auth-emails/:type/enabled` | PUT | `{ enabled }` for an optional email (step-up); 400 for the others, 404 for an unknown type |
+| `/api/v1/admin/auth-emails/preview` | POST | `{ type, content? }` → `{ subject, text, html }` with sample values |
+| `/api/v1/admin/auth-emails/test` | POST | `{ type, content? }` → sends a marked test to the signed-in admin only |
+| `/api/v1/admin/auth-webhooks/status` | GET | The webhook status: receiver path, accepted endpoint, provider and wiring state, per-event rows, counts and warnings |
+
+In the frontend, the email barrel exports only the types for these (`AuthEmailType`, `AuthEmailTemplateView`, `AuthWebhookStatusView`), because it is loaded on every page. Import the hooks and the client directly, in lazily loaded code: `@/features/email/hooks/useAuthEmailAdmin` and `@/features/email/services/auth-email-admin.service`.
 
 ## Custom adapters
 
@@ -149,13 +299,20 @@ const myProvider: EmailProvider = {
 setEmailProvider(myProvider);
 ```
 
+Since v2.15.0, `send` also receives an optional second argument, `EmailSendContext` (`{ signal? }`), when the caller set `timeoutMs` or `signal`. The signal is aborted when the send times out or is cancelled; pass it to your SDK if it accepts one (the SES adapter does), so a timed-out request stops. Adapters that ignore it keep working.
+
 ## Hooks
 
 | Hook | Kind | Fires |
 |------|------|-------|
-| `email.outbound` | filter | Before send — transform the outgoing `EmailMessage` (e.g. append a footer) |
-| `email.sent` | action | After a successful send, with `{ message, result }` — fire-and-forget, never delays the send path |
+| `email.outbound` | filter | Before send — transform the outgoing `EmailMessage` (e.g. append a footer). Skipped for `sensitive` messages (v2.15.0): step-up codes and the Neon Auth emails |
+| `email.sent` | action | After a successful send, with `{ message, result }` — fire-and-forget, never delays the send path. For a `sensitive` message, `message` is only `{ to, subject, sensitive: true }` and the payload also carries `sensitive: true` |
 | `email.configUpdated` | action | After an admin saves the email config (v2.13.0), with `{ actorId, provider, secretChanged, hostChanged }` — flags only, the secret never travels. Recorded in the durable audit trail |
+| `authEmail.outbound` | filter | Before a Neon Auth email is sent (v2.15.0), after the built-in or admin wording is rendered. Value `{ subject, text, html? }`; the context's `variables` include the code or link. The result is checked (see [Which wording wins](#wording-and-placeholders)) |
+| `auth.emailTypeEnabled` | filter | Whether an optional Neon Auth email (sign-in code, password reset code, magic link) is sent (v2.15.0). Value: a boolean, starting from the admin switch |
+| `auth.emailTemplatesUpdated` / `auth.emailTypeToggled` | action | After an admin saves or resets an email's wording, or flips a switch (v2.15.0). `{ actorId, type, action }` / `{ actorId, type, enabled }`, never the content. Recorded in the durable audit trail |
+
+A module that adds a footer to the app's own emails registers on `email.outbound`, for example:
 
 ```typescript
 import { filterRegistry } from '../../config/filter.registry.js';
@@ -166,15 +323,38 @@ filterRegistry.register<EmailMessage>('email.outbound', 'my-module.footer', (m) 
 }));
 ```
 
+That filter never sees step-up codes or the Neon Auth emails, because they are sent as `sensitive`. The Neon Auth hooks, with their full contexts, are on the [Hooks](/starter-template/hooks/#neon-auth-webhook-hooks) page. `authEmail.outbound` handlers see live codes and links: never log or store them. A module that adds a footer to the auth emails, for example, changes both parts, because most mail clients show the HTML part rather than the text:
+
+```typescript
+import { filterRegistry } from '../../config/filter.registry.js';
+import type { AuthEmailContent, AuthEmailContentContext } from '../auth-webhooks/index.js';
+
+// A pure change with no side effects, so it applies to the preview and test
+// send too (check ctx.preview only before a side effect).
+filterRegistry.register<AuthEmailContent, AuthEmailContentContext>(
+  'authEmail.outbound',
+  'my-module.auth-email-footer',
+  (email) => ({
+    ...email,
+    text: `${email.text}\n\n— Sent by My App`,
+    ...(email.html ? { html: email.html.replace('</body>', '<p>Sent by My App</p></body>') } : {}),
+  }),
+);
+```
+
+The result must still carry the code or the exact link in `text`, and neither in `subject`; otherwise the unfiltered email is sent (see [Which wording wins](#wording-and-placeholders)). Text you add to `html` from a variable, such as `ctx.appName`, must be HTML-escaped first.
+
 ## Enabling on an existing app
 
 Run `npm run template:update` — the merge brings the feature in, and `sync-env` appends the commented `EMAIL_*` stubs to your `backend/.env`. Fill them in and install the SDK per the tabs above.
 
+v2.15.0 adds two columns to `EmailConfig` (`authEmailSettings` for the Neon Auth wording and switches, `authWebhookStatus` for the trimmed delivery status) and three to `AppSettings` (the sign-up rule). `template:update` adds them to your schema and writes and applies the migration; in production, run `prisma migrate deploy` before the new backend starts. The email feature's own reads never select the new columns, so the provider keeps loading either way. No new env vars are needed.
+
 ## What the foundation deliberately does not do
 
-- **Templates / rendering** — callers pass `text` (+ optional `html`); template systems are module territory (the planned Email module).
+- **Templates / rendering** — callers pass `text` (+ optional `html`); template systems are module territory (the planned Email module). The one exception is the six [Neon Auth emails](#neon-auth-emails) (v2.15.0), whose templates belong to the auth-webhooks feature, not to this seam.
 - **Bulk / marketing send** — one message, one recipient; campaign tooling belongs with a provider.
-- **Queuing and retry** — `sendEmail` is a direct call. Durable retry arrives with the background-jobs seam (roadmap) or via your provider.
-- **Auth emails** — Neon Auth sends its own (see the note above).
+- **Queuing and retry** — `sendEmail` is a direct call. Durable retry arrives with the background-jobs seam (roadmap) or via your provider. The auth-webhooks feature keeps its own small in-memory retry queue for password-reset emails, on purpose not the jobs seam: a durable queue would store the live reset link in the database.
+- **Auth emails** — Neon Auth sends its own (see the note above), unless you subscribe its `send.otp` / `send.magic_link` webhooks.
 
-The seam's *sending* path is stateless (no per-message rows). Its only stored state is the optional app-wide `EmailConfig` singleton (admin-set provider config, secret encrypted at rest) — app config, not account data, so it carries no `tenantId` and needs no deletion handler. Its security manifest declares the `email.sent` and `email.configUpdated` audit events and the encrypted `EmailConfig.secretCiphertext` field.
+The seam's *sending* path is stateless (no per-message rows). Its only stored state is the optional app-wide `EmailConfig` singleton (admin-set provider config, secret encrypted at rest) — app config, not account data, so it carries no `tenantId` and needs no deletion handler. Its security manifest declares the `email.sent` and `email.configUpdated` audit events and the encrypted `EmailConfig.secretCiphertext` field. Since v2.15.0 the same row also holds the auth-webhooks feature's two columns, which only that feature reads and writes; codes and links are never stored.

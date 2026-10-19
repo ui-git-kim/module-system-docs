@@ -132,7 +132,8 @@ const result = await filterRegistry.applyAll('hook.name', value, context);
 | Frontend: `theme.cssVariables` | CSS variable injection |
 | Backend: `api.{feature}.{action}.response` | `api.user.profile.response` |
 | Backend: `api.{feature}.{action}.request` | `api.user.update.request` |
-| Backend: `{entity}.{direction}` (message pipelines) | `email.outbound` — transform an outgoing [email message](/starter-template/email-feature/#hooks) |
+| Backend: `{entity}.{direction}` (message pipelines) | `email.outbound` — transform an outgoing [email message](/starter-template/email-feature/#hooks); `authEmail.outbound` — a rendered Neon Auth email (v2.15.0) |
+| Backend: `{domain}.{decision}` (a decision modules may change; the value **is** the decision) | `auth.signupDecision`, `auth.emailTypeEnabled` (v2.15.0) |
 
 ---
 
@@ -252,6 +253,18 @@ import { CoreHooks, type CoreHookContexts } from '@/config/hooks.catalog';
 
 The string **values** are the contract (they never change outside the deprecation cycle); the constants are conveniences — plain string hook names keep working forever. Each entry's JSDoc names the dispatch semantics and the emitting call site.
 
+Since v2.15.0 the backend catalogue also lists the **filters** the template applies: `CoreFilters` (names), `CoreFilterValues` (the value each one transforms) and `CoreFilterContexts` (its context), for `email.outbound`, `authEmail.outbound`, `auth.signupDecision` and `auth.emailTypeEnabled`:
+
+```typescript
+import { CoreFilters, type CoreFilterValues, type CoreFilterContexts } from '../../config/hooks.catalog.js';
+
+filterRegistry.register<CoreFilterValues['auth.emailTypeEnabled'], CoreFilterContexts['auth.emailTypeEnabled']>(
+  CoreFilters.authEmailTypeEnabled,
+  'my-module.code-sign-in',
+  (enabled, ctx) => (ctx.type === 'sign-in-code' ? true : enabled),
+);
+```
+
 **Dev-mode dispatch tracing** (v1.57.0): every dispatch logs one debug line — hook, dispatcher, and per-pool listener counts — so "did my hook fire, and did anyone listen?" is answerable from `LOG_LEVEL=debug` (backend) or the browser console's verbose level (frontend). Silent in production.
 
 **Job lifecycle hooks** (v1.57.0): both job runners now dispatch `job.completed` and `job.failed` (`void doActionParallel`, context `{ jobName, jobId?, attempt, runner, tenantId?, error? }`). `job.failed` was declared in the jobs security manifest since v1.46 but never fired — subscribe to it for background-work failure alerts (e.g. from a notifications module).
@@ -289,9 +302,9 @@ The starter template fires these action hooks in the user and admin services. Al
 
 | Hook | Kind / Execution | Context |
 |------|------------------|---------|
-| `email.outbound` | filter, `applyAll` before send | the outgoing `EmailMessage` — see [Email feature](/starter-template/email-feature/#hooks) |
-| `email.sent` | action, `doActionParallel` after a successful send | `{ message, result }` |
-| `app.shutdown` | action, `await doActionAll` on SIGTERM/SIGINT (bounded by `SHUTDOWN_TIMEOUT`) | `{ signal, deadline }` — drain buffered work while the DB is still connected. `deadline` (v2.14.0) is the epoch-ms time when `SHUTDOWN_TIMEOUT` runs out. The foundation's own handlers are `http.close` (5), `jobs.drain` (10) and `audit.flush` (90, v2.14.0); see [Jobs feature](/starter-template/jobs-feature/#the-appshutdown-seam) |
+| `email.outbound` | filter, `applyAll` before send (skipped for `sensitive` messages since v2.15.0: step-up codes and Neon Auth emails) | the outgoing `EmailMessage` — see [Email feature](/starter-template/email-feature/#hooks) |
+| `email.sent` | action, `doActionParallel` after a successful send | `{ message, result, sensitive? }`. For a `sensitive` send (v2.15.0), `message` is only `{ to, subject, sensitive: true }` and `sensitive` is `true` |
+| `app.shutdown` | action, `await doActionAll` on SIGTERM/SIGINT (bounded by `SHUTDOWN_TIMEOUT`) | `{ signal, deadline }` — drain buffered work while the DB is still connected. `deadline` (v2.14.0) is the epoch-ms time when `SHUTDOWN_TIMEOUT` runs out. The foundation's own handlers are `http.close` (5), `auth-webhooks.drain` (8, v2.15.0: waits up to 5 s for queued password-reset emails, then saves the webhook status), `jobs.drain` (10) and `audit.flush` (90, v2.14.0); see [Jobs feature](/starter-template/jobs-feature/#the-appshutdown-seam) |
 | `notification.created` | action, `doActionParallel` after the in-app row is written | `{ id, tenantId, userId, category }` — see [Notifications feature](/starter-template/notifications-feature/) |
 | `error:unhandled` | action, `void doActionParallel` from the global error middleware | `{ statusCode, name, message, operational, method, path, ip, tenantId, stack }` — feeds the admin System console audit sink |
 | `job.completed` / `job.failed` | action, `void doActionParallel` from both job runners (v1.57.0) | `{ jobName, jobId?, attempt, runner, tenantId?, error? }` — `job.failed` closes the declared-but-never-fired gap in the jobs security manifest |
@@ -312,6 +325,55 @@ The starter template fires these action hooks in the user and admin services. Al
 <Aside type="note">
 The admin service fires the **same hook names** as the user service for shared operations (role updates, user deletion). Context fields like `updatedBy` and `deletedBy` distinguish the source.
 </Aside>
+
+### Neon Auth Webhook Hooks
+
+Added in v2.15.0 by the auth-webhooks feature (see [Neon Auth webhooks](/starter-template/auth-feature/#neon-auth-webhooks)). `auth.userCreated` fires only while Neon's `user.created` webhook is subscribed, and the filters run for real auth emails and sign-ups only while `send.otp`, `send.magic_link` or `user.before_create` is subscribed. The three admin hooks fire whenever an admin saves, whatever Neon is subscribed to. The filters also run from the admin pages without any webhook: `authEmail.outbound` for the preview and test send (`preview: true`), `auth.signupDecision` for **Check an address** (`dryRun: true`), and `auth.emailTypeEnabled` each time the **Auth emails** list loads or an email's wording or switch is saved. The types are exported from `features/auth-webhooks/index.ts` (`AuthUserCreatedContext`, `SignupDecision`, `SignupDecisionContext`, `AuthEmailContent`, `AuthEmailContentContext`).
+
+**Actions**
+
+| Hook | Execution | Context |
+|------|-----------|---------|
+| `auth.userCreated` | `void doActionParallel`, on `setImmediate` after the app has answered Neon's `user.created` | `{ userId, email, name, emailVerified, authProvider, signupMetadata?, createdAt?, eventId }`. `userId` is Neon's user id, which becomes `User.id` (and `tenantId`) once the person uses the app. `authProvider` is `'credential'`, `'google'`, `'github'`, `'vercel'` or whatever Neon reports. `signupMetadata` is sanitised: null-prototype objects, with no `__proto__`, `constructor` or `prototype` keys |
+| `auth.signupPolicyUpdated` | `await doActionAll`, when an admin saves the sign-up rule | `{ actorId?, mode, allowlistCount, messageChanged }`. Never the list entries |
+| `auth.emailTemplatesUpdated` | `await doActionAll`, when an admin saves or resets an auth email | `{ actorId?, type, action: 'updated' \| 'reset' }`. Never the content |
+| `auth.emailTypeToggled` | `await doActionAll`, when an admin flips an optional auth email | `{ actorId?, type, enabled }` |
+
+The three admin hooks are recorded in the durable audit trail. `auth.userCreated` is not the app's own `user.created`:
+
+- **`user.created`** fires when the app's `User` row is created, on the person's first authenticated request, and that request waits for it.
+- **`auth.userCreated`** fires when Neon has created the account, for every sign-up path, and nothing waits for it. It can arrive **before** the `User` row exists, and for people who never open the app. Don't assume the row exists, make handlers idempotent on `userId` (a retry that reaches another server instance can fire it twice), and hand slow work to [`enqueueJob()`](/starter-template/jobs-feature/).
+
+**Filters**
+
+| Filter | Value | Context | Runs |
+|--------|-------|---------|------|
+| `authEmail.outbound` | `{ subject, text, html? }` | `{ type, kind: 'code' \| 'link', eventId, recipient, appName, preview, variables }`. For the admin preview and test send, `eventId` is null and `preview` is true. `variables` holds `appName`, `expiresIn`, `expiresInMinutes` (`''` when unknown), `email`, `userName` and the `code` or `link` | After the built-in or admin wording is rendered. The result must keep the code or the exact link in `text` and out of `subject`; otherwise, or if the filter throws, the unfiltered email is sent |
+| `auth.signupDecision` | `{ allowed, message?, code?, decidedBy }` | `{ eventId, email, emailDomain, emailVerified, authProvider, name, signupMetadata?, ipAddress?, userAgent?, policy: { mode, matched }, dryRun }` | After the admin's sign-up rule, and may change it either way. A result without a boolean `allowed` refuses (`SIGNUP_CHECK_FAILED`). A throw makes the app answer 503, and Neon refuses the sign-up after its retries. `code` must match `/^[A-Z][A-Z0-9_]{0,63}$/` (otherwise `SIGNUP_NOT_ALLOWED`), and `message` is cut to one line of 500 characters |
+| `auth.emailTypeEnabled` | `boolean` | `{ type: 'sign-in-code' \| 'password-reset-code' \| 'magic-link', adminEnabled }` | For the three optional auth emails only, after the admin switch. A non-boolean result, or a throw, keeps the admin's setting |
+
+Guidance for module authors:
+
+- **`authEmail.outbound`** handlers see live codes and links. Never log or store them, and check `ctx.preview` before any side effect.
+- **`auth.signupDecision`**: decide quickly (well under 4 seconds, so Neon's first attempt gets the answer; the hard cap is 14 seconds), give the same answer for the same `eventId`, and return `allowed: false` for "no" rather than throwing. With `dryRun: true` (the admin's **Check an address**, and the check before a sign-in code or magic link goes to a new address), have no side effects. For an invite system, check the invite here and use it up in `auth.userCreated`.
+- **`auth.emailTypeEnabled`** turns on emails that anyone can request for any address. Turn on only the type your module adds a screen for.
+
+```typescript
+import { filterRegistry } from '../../config/filter.registry.js';
+import type { SignupDecision, SignupDecisionContext } from '../auth-webhooks/index.js';
+
+// Let invited addresses sign up even while sign-ups are closed.
+// (`invites` stands for your module's own service.)
+filterRegistry.registerAsync<SignupDecision, SignupDecisionContext>(
+  'auth.signupDecision',
+  'invites',
+  async (decision, ctx) => {
+    if (decision.allowed || !ctx.email) return decision;
+    const invited = await invites.hasOpenInvite(ctx.email); // a read only: ctx.dryRun may be true
+    return invited ? { allowed: true, decidedBy: 'invites' } : decision;
+  },
+);
+```
 
 ### Frontend Hooks
 

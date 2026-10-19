@@ -73,6 +73,7 @@ frontend/src/features/user/
 │   ├── auth-call-errors.ts         # Neon Auth failures + "Sign in again" (fresh-session 403) (v2.14.2)
 │   ├── change-password.ts          # Change password, then sign out other devices (v2.14.2)
 │   ├── debounced-save.ts           # Save once the user pauses (avatar colour)
+│   ├── email-status.ts             # Email row: verified / unverified / unknown, refocus after verifying (v2.14.4)
 │   ├── format-bytes.ts             # Byte sizes for the Storage section (v2.14.0)
 │   ├── preferences-mutation.ts     # Profile query key + ordered profile/preference saves
 │   ├── session-rows.ts             # Active sessions rows (current = row id), row sign-out, device names (v2.14.2)
@@ -91,6 +92,7 @@ frontend/src/features/user/
 └── components/
     ├── SettingsLayout.tsx          # Settings sidebar layout
     ├── AccountDeletionGate.tsx     # "Finish deleting your account" screen
+    ├── EmailRow.tsx                # Email row on Personal Information: verified badge or "Verify email" (v2.14.4)
     ├── StorageUsageSection.tsx     # Storage section on Personal Information (v2.14.0)
     ├── UserAvatar.tsx              # Avatar component
     └── settings/
@@ -367,7 +369,7 @@ interface StorageUsageResponse {
 
 | Page | Path | Purpose | Order |
 |------|------|---------|-------|
-| Personal Information | `/settings/personal-info` | Profile, avatar, display name; [Storage](#storage-usage) at the end | 10 |
+| Personal Information | `/settings/personal-info` | Profile, avatar, display name; the email, with a way to [verify it later](#verifying-the-email-later); [Storage](#storage-usage) at the end | 10 |
 | Security | `/settings/security` | Email (read-only), sign-in methods, password, sessions; 2FA placeholder | 20 |
 | Preferences | `/settings/preferences` | Theme, notifications | 30 |
 | Integrations | `/settings/integrations` | Third-party services | 40 |
@@ -377,6 +379,31 @@ interface StorageUsageResponse {
 The Billing placeholder shows a made-up plan with nothing behind it, so since v2.13.0 it is registered in development builds only. Production shows a Billing page only when a billing module registers one (`id: 'billing'`, `isReplacement: true`).
 
 Custom pages slot into the sidebar by their registered `order` — e.g. the `order: 60` page in the example below lands between Billing (50) and Data & Privacy (90).
+
+### Verifying the email later
+
+Since v2.14.4 the **Email** row on **Settings → Personal Information** shows whether the address is verified, and lets the user verify it there. The row lives in `components/EmailRow.tsx`:
+
+| Session user | What the row shows |
+|--------------|--------------------|
+| `emailVerified` is true | A **Verified** badge, as before |
+| `emailVerified` is false | An outline **Not verified** badge and a **Verify email** button, beside **Account settings** |
+| None yet | Neither badge |
+
+**Verify email** opens the auth feature's [`VerifyEmailDialog`](/starter-template/auth-feature/#verifying-later-from-settings). Opening it emails a code (or a link, whichever the Neon project sends), unless this tab sent one to that address in the last 30 seconds, and then shows the same code step as sign-up and sign-in. Once the code is accepted the dialog closes, the session is refreshed in the background, and the badge reads **Verified** straight away, even if the refreshed session is slow or never arrives. That is matched to the exact address (`getEmailStatus(user, verifiedHere)` in `lib/email-status.ts`), so another account signing in on the same tab doesn't inherit it.
+
+The badge sits in a polite live region (`role="status"`), so the change to **Verified** is announced. Verifying removes the **Verify email** button (and the dialog with it), so if focus has fallen to the page, the row moves it to **Account settings** (`shouldRefocusAfterVerify()`). It never moves focus on page load, or away from where the user put it.
+
+<Aside type="caution" title="Every email/password user may see it">
+Neon leaves email verification **off** by default, and then `emailVerified` stays false for every email/password sign-up, so on a default project every email/password user sees **Not verified** and **Verify email**. The flow is useful when verification is on and set to optional (with verification required, an unverified user can't sign in, so never reaches the row). If the server refuses the send because the project can't send verification emails (Better Auth's `VERIFICATION_EMAIL_NOT_ENABLED`), the dialog says "This app isn't set up to send verification emails." The row and dialog are template-owned and there is no opt-out yet. Neither the full flow nor Neon's reply with verification off has been tried against a live Neon project; check both on a branch before relying on them.
+</Aside>
+
+**Who sends the email (v2.15.0).** With [Neon Auth webhooks](/starter-template/auth-feature/#neon-auth-webhooks) subscribed, the code or link the dialog asks for is created by Neon but emailed by the app, through the provider on **Admin → Email** and with that page's **Verification code** wording (`send.otp`) or **Verification link** wording (`send.magic_link`, with the dialog's return address inside Neon's link). Without them, Neon emails it as before. The dialog itself is unchanged, and two things still depend on Neon:
+
+- **Neon decides whether to send.** The webhooks change only who delivers the email. If Neon refuses the send (verification emails not enabled), the dialog still says "This app isn't set up to send verification emails."
+- **Delivery failures.** The app sends verification emails before it answers Neon, so a failed send should reach the dialog as its usual "We couldn't send a new email. Wait a minute, then try again." This hasn't been checked on a live Neon project yet. Right after a backend restart, a provider that is still loading makes Neon retry rather than fail at once.
+
+The app's limits on verification emails (per address in 15 minutes: 10 requested from one IP address, 30 in all) sit well above what the dialog's 30-second wait between sends allows in normal use.
 
 ### The Security page
 
@@ -553,6 +580,24 @@ The old `SettingsToggleRow` and `SettingsDropdownRow` have been replaced with **
   badge="Coming soon"
 />
 ```
+
+#### Switch names
+
+Since v2.14.4 a `ToggleSwitch` can always have an accessible name, so a screen reader no longer announces a bare "switch":
+
+- **Inside a row, it is named for you.** The row blocks give their title and description ids, and a `ToggleSwitch` anywhere in their control slots gets `aria-labelledby` pointing at the title and `aria-describedby` pointing at the description (only when the row renders one). A screen reader then reads the row's title, "switch", its state and the description. So the composition examples above need no change. The slots are `Row`'s `children` and `action`, `Row3Col`'s `middle` and `action`, `RowStacked`'s `action` (not the stacked content below it) and `DisabledRow`'s `action`, where the name is the label alone, without the "Coming soon" badge.
+- **Outside a row, name it yourself.** `ToggleSwitch` now takes `aria-label` and `aria-labelledby`, and passes the other shadcn `Switch` props through (`aria-describedby`, `title`, `className`, `data-*` and the rest). The props it owns (`id`, `checked`, `onChange`, `disabled`, `size`) are applied last, so a passed-through prop can't override them.
+
+```tsx
+<ToggleSwitch aria-label="Show weekends" checked={showWeekends} onChange={setShowWeekends} />
+```
+
+- **A name you pass wins.** An `aria-label` or `aria-labelledby` replaces the row's title; the row's description still applies unless you pass `aria-describedby`. `aria-labelledby` also outranks a `<label>`, so inside a row slot a `<label htmlFor>` pointing at the switch's `id` is overridden by the row title. To use your own label there, give it an `id` and pass that as `aria-labelledby`.
+- **Several switches in one slot share the row's title**, popovers included, so name each one yourself.
+- **Only `ToggleSwitch` reads the row.** A plain shadcn `Switch`, a `Dropdown` or a `Select` in a row slot still needs its own `aria-label`.
+- **`ToggleGroup` is unchanged.** Its switches keep their own `<label>`, even when the group sits inside a row.
+
+Row titles and descriptions now carry `id` attributes in the DOM. Existing callers need no change. The mechanism is internal (`components/settings-blocks/components/RowLabelContext.tsx`) and not exported from the barrel.
 
 #### Toggle Group
 
