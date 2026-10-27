@@ -1,0 +1,177 @@
+---
+title: Usage
+description: How to use AI Chat after install — the chat page, streamed replies, personas, memories, branching, checkpoints, saved sections and the admin-visible degrades
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Once AI Chat is installed (`npx ai-chat init`), it adds a **Chat** item to the main navigation, a **Saved sections** page, an **AI Assistant** settings page for personas, a **Chat** preferences section, a **Recent chats** dashboard widget and an **AI Chat** admin page. This page walks through the user-facing features; [Configuration](/modules/ai-chat/configuration/) covers the admin surface.
+
+<Aside type="caution" title="One admin step first">
+Nothing seeds at boot. Until an admin presses **Ensure defaults** on the admin page's AI operations tab, the `ai-chat/*` operations do not exist in AI Core — replies fail loudly and the background pipelines degrade visibly (logged, nothing written). See [Configuration](/modules/ai-chat/configuration/#ai-operations-tab).
+</Aside>
+
+---
+
+## The Chat Page
+
+The chat page at `/ai-chat` is composed from the module's own [AI Elements](https://ui.shadcn.com/docs/ai-elements) — copy-in shadcn source emitted to `components/ai-elements/`, yours to restyle. It has three zones:
+
+- **Conversation rail** — your conversations, newest activity first, with *New conversation* and per-row archive. The selected conversation lives in the `?conversation=` search param, so branch jumps, refreshes and shared links land on the right thread.
+- **Thread** — persisted messages rendered through the Message element, with **Reasoning** (persisted extended thinking, collapsible), **Sources** (the context refs a reply's provenance says were supplied) and **Tool** (tool-call parts stored on the message) where present. Assistant replies carry per-message actions: copy, **save section** and **branch**.
+- **Composer** — the Prompt Input element. The draft is controlled, so a failed send never loses typed text.
+
+Below the thread the page surfaces a pending **checkpoint card** (confirm / correct / dismiss) and the pending **action-bank suggestions** for this conversation (act / park / dismiss), both only when present. Two per-user preferences from the settings Preferences section apply here: *Show reasoning* and *Show suggestions*.
+
+### Streamed replies and the fallback
+
+Sending a message streams the reply by default:
+
+<Steps>
+
+1. The page's `useChat` (from `@ai-sdk/react`) posts `{ text }` to `POST /api/v1/ai-chat/conversations/:id/reply/stream` — only the typed text crosses the wire; the server rebuilds its own context.
+
+2. The route gates on `supportsStreaming()` **before any write**. On an AI Core without `stream()` it answers **501** with the machine-readable code `ai-chat-streaming-unavailable`.
+
+3. On 501, the page silently resends the same text through the non-streamed pair (`POST /messages` then `POST /reply`) and stays on that path for the rest of the visit. Nothing was double-stored — the gate ran before the user message persisted.
+
+4. On a successful stream, text deltas render as they arrive. When the run settles, the server persists the assistant message (with reasoning and provenance) in the background and the page's queries refetch, replacing the streamed copy with the stored row.
+
+</Steps>
+
+A mid-stream failure restores the draft into the composer, shows the error as a toast and an inline alert, and persists nothing for the reply (the user message was already stored). A dropped connection cancels the run server-side; the partial text still finalises.
+
+<Aside type="note" title="Both paths are the same run">
+The streamed and non-streamed paths share one context-assembly half (`prepareReply`) and one persistence half (`finaliseStreamedReply`), so a streamed reply is the identical AI Core run — same spending gates, guardrails, ledger entry and provenance record — as a non-streamed one.
+</Aside>
+
+### What goes into a reply
+
+The server assembles only the module's **own** domain context, inside a token-aware window:
+
+| Context | Source | Limit |
+|---------|--------|-------|
+| Recent messages | `ai_chat_message` | 30 messages / ~6,000 tokens |
+| Conversation focus | purpose / topic / goals on the conversation | — |
+| Latest summary | `ai_chat_summary` | newest by coverage |
+| Pending checkpoint | `ai_chat_checkpoint` | newest pending |
+| Relevant memories | keyword + relevance/recency retrieval | 8 |
+| Context refs | active `ai_chat_context_ref` rows | 10 |
+
+Exactly what was supplied is recorded as **provenance** on the stored assistant message (message ids, summary id, checkpoint id, memory ids, context-ref ids, approximate tokens, the AI Core ledger `ref` and token usage) — inspectable on the admin Activity tab.
+
+---
+
+## Personas and Gating
+
+Personas live on the **AI Assistant** settings page. Each persona holds identity (name, colours, greeting), five style sliders (directness, agreeableness, formality, verbosity, enthusiasm), vocabulary (technical level, preferred/avoided terms), content preferences (emoji, humour, analogies, uncertainty acknowledgement, profanity), interaction options (proactive suggestions, clarifying questions, challenge assumptions) and ND-friendly options (reduce overwhelm, explicit priorities, time estimates, gentle redirects, celebrate wins), plus free-text personality notes and custom instructions and an extended-thinking toggle.
+
+At reply time the active persona resolves by precedence — the conversation's persona, then the user's default, then any active persona, then a freshly created balanced default — and flattens into a **variables map** passed to the AI Core run. Prompt text itself lives in AI Core records; persona data only fills declared `{token}` slots, and user-authored values (name, roles, personality, custom instructions) are injection-fenced as data.
+
+Admin gating (see [Configuration](/modules/ai-chat/configuration/#personagating--what-users-may-customise)) is enforced server-side and mirrored honestly in the UI: when `userEditable` is off the list is read-only, locked fields render disabled and are stripped from writes, and the *New persona* button caps at `maxPersonas`.
+
+---
+
+## Memories
+
+Long-term memories follow the **CoALA** taxonomy: `episodic`, `semantic`, `procedural`, `preference`, `error_learning`. The extract-memories background task infers them from conversations (confidence-floored, deduplicated per source conversation); users and other modules can also create them directly through the API. Baseline retrieval is keyword + relevance/recency with type and tag filters — semantic retrieval over the knowledge graph belongs to the Cognitive Pipeline boost, not the baseline. Memories are user-level, not conversation-level: deleting a conversation leaves its extracted memories intact.
+
+---
+
+## Branching and Handover
+
+The **branch** action on an assistant reply creates a new conversation from that point. The child inherits the parent's persona, purpose/topic/scope, language and entity link; the branch row records the type (`topic_divergence`, `deep_dive`, `side_quest` or `manual`) and an AI-written **handover**: a summary of where things stand, the key decisions and the open questions, generated from the turns up to the branch point. If handover generation degrades (operation unauthored, AI Core refusal), the branch still happens — without a summary, visibly, never an invented one. The thread header on a branched conversation shows what it branched from.
+
+---
+
+## Checkpoints
+
+Checkpoints verify alignment — distinct from summaries, which compress. A checkpoint carries the AI's restatement of the current understanding and a snapshot of the goals, triggered by `time`, `drift` or `return`. It renders as a card in the chat until the user responds `confirmed`, `corrected` (with a free-text correction) or `dismissed`. A pending checkpoint is also fed into the next reply's context so the assistant knows confirmation is outstanding.
+
+---
+
+## Saved Sections
+
+Any assistant reply (or a text selection inside one) can be saved as a **section** of an admin-defined type — the save dialog lists the types the admin configured (the defaults are *Email copy* and *Note*; a legal app might define `email`, `affidavit-paragraph`, `order`). Where sections go is the admin's **destination ladder**:
+
+- **Local** (default) — the module's own `ai_chat_saved_section` table holds the content.
+- **Structure** — a node is created under the admin-chosen parent and node type; the local row becomes a pointer carrying the node id in `externalRef`.
+- **Cognitive Pipeline** — the content is submitted to the configured ingest source and joins the knowledge graph; the local row points at the ingest job.
+
+Degrade is automatic and **visible**: when the chosen destination's module is absent or the routing fails, the section falls back to the local table and the response says so (`fellBackToLocal: true` plus a reason), which the UI surfaces.
+
+### The sections page
+
+`/ai-chat/sections` lists saved sections in a DataTable — searchable, filterable by the admin-defined types, expandable to read the content, with copy-to-clipboard and delete actions. The **Saved to** column shows where each section actually landed, so a fallback is never hidden. Deleting removes the local row only; a routed copy is governed by its destination module.
+
+---
+
+## The Dashboard Widget
+
+The **Recent chats** widget (2×1, category `ai`, hideable) lists the five most recently active conversations and links straight into each thread; the compact tile shows three.
+
+---
+
+## API Reference
+
+All routes are mounted at `/api/v1/ai-chat` and require authentication; admin routes additionally require the admin role. The paginated lists (conversations, messages, action bank, sections) return `{ items, nextCursor, hasMore }` with `limit` clamped to 1–200 (default 50); the bounded per-conversation lists (summaries, checkpoints, branches, context refs) and the persona/memory lists return plain arrays.
+
+<Tabs>
+<TabItem label="Conversations & messages">
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/conversations?status=&limit=&cursor=` | Paginated conversation list |
+| POST | `/conversations` | Create a conversation |
+| GET | `/conversations/:id` | Full conversation row |
+| PATCH | `/conversations/:id` | Update title, focus, persona, links |
+| POST | `/conversations/:id/archive` | Archive (also archives the mirror node when the boost is on) |
+| DELETE | `/conversations/:id` | Delete the whole aggregate in one transaction |
+| GET | `/conversations/:id/content` | Plain-text transcript + summaries (the content-exposure endpoint) |
+| GET | `/conversations/:id/messages?limit=&cursor=` | Messages, by index ascending |
+| POST | `/conversations/:id/messages` | Append a **user** message |
+| POST | `/conversations/:id/reply` | Generate the assistant reply (non-streamed JSON; the baseline path) |
+| POST | `/conversations/:id/reply/stream` | Streamed reply as an AI SDK UI message stream; 501 + `ai-chat-streaming-unavailable` on an older AI Core |
+
+</TabItem>
+<TabItem label="Domain features">
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET / POST | `/conversations/:id/summaries` | List / manually create summaries |
+| GET / POST | `/conversations/:id/checkpoints` | List / create checkpoints |
+| POST | `/checkpoints/:id/respond` | Confirm / correct / dismiss |
+| GET | `/conversations/:id/branches` | Branches touching a conversation |
+| POST | `/branches` | Branch a conversation (creates child + handover) |
+| GET / POST | `/conversations/:id/context-refs` | List / attach context references |
+| DELETE | `/context-refs/:id` | Soft-remove a context ref |
+| GET | `/personas` · `/personas/active?conversationId=` · `/personas/:id` | List / resolve active / fetch |
+| POST / PATCH / DELETE | `/personas`, `/personas/:id` | Persona CRUD (admin gating enforced) |
+| GET | `/memories?type=&active=&limit=` | List memories |
+| GET | `/memories/search?q=&type=&tags=&limit=` | Keyword search |
+| POST / PATCH / DELETE | `/memories`, `/memories/:id` | Memory CRUD |
+| GET / PATCH | `/action-bank`, `/action-bank/:id` | List / action / park / dismiss |
+| GET / POST | `/sections` | List / save a section through the destination ladder |
+| DELETE | `/sections/:id` | Delete the local row |
+| GET | `/config` | The public config slice (section types, persona gating, attachments mode) |
+
+</TabItem>
+<TabItem label="Admin">
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/admin/config` | Merged defaults + admin-edited rows |
+| PUT | `/admin/config/:key` | Save one config key's whole value |
+| GET | `/admin/stats?userId=` | Counters for the Activity tab |
+| POST | `/admin/ensure-operations` | Seed config defaults + the `ai-chat/*` AI Core records |
+| GET | `/export` | Download the versioned data envelope |
+| POST | `/import` | Restore an envelope (merge / replace) |
+
+</TabItem>
+</Tabs>
+
+### Frontend hooks
+
+All server state flows through TanStack Query hooks exported from `@/features/ai-chat` — components never call the API service directly. Chat data: `useConversations`, `useConversation`, `useMessages`, `useSendMessage` (the non-streamed pair with an optimistic user-message append), `useCreateConversation`, `useUpdateConversation`, `useArchiveConversation`, `useDeleteConversation`, `useBranches`, `useCreateBranch`, `useCheckpoints`, `useRespondToCheckpoint`, `useContextRefs`, `useAddContextRef`, `useRemoveContextRef`. User data: `usePublicConfig`, `usePersonas` + persona mutations, `useMemories`, `useSearchMemories` + memory mutations, `useSections`, `useSaveSection`, `useDeleteSection`, `useActionBank`, `useUpdateActionBankItem`, `useSummaries`. Admin data: `useAdminConfig`, `useSetAdminConfig`, `useAdminStats`, `useEnsureOperations`, `useExportData`, `useImportData`. Query keys are exported as `aiChatKeys` for cross-module cache invalidation.

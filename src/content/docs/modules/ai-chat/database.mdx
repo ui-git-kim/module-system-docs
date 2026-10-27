@@ -1,0 +1,78 @@
+---
+title: Database
+description: The eleven ai_chat_ tables that back the AI Chat module — purpose, key columns, deletion behaviour and the admin-config exclusion
+sidebar:
+  order: 4
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+AI Chat ships a **self-contained** Prisma schema: eleven tables, all prefixed `ai_chat_`. The schema adds **no `@relation` directives** and never touches the `User` model or any other module's tables — foreign keys are plain `String` columns with compound `@@index` entries, per the [module database rules](/module-starter/database/). Referential cleanup is the service layer's job, in one transaction per aggregate delete.
+
+## The Tables
+
+### `ai_chat_persona`
+
+User-facing AI customisation. Identity (`name`, `avatarUrl`, `primaryColour`, `secondaryColour`, `preferredLanguage`), the five style sliders (`directness`, `agreeableness`, `formality`, `verbosity`, `enthusiasm`, 0–100), content preferences (`allowProfanity`, `useEmoji`, `useHumour`, `useAnalogies`, `acknowledgeUncertainty`), explanation and vocabulary settings (`explanationStyle`, `preferredFormats`, `technicalLevel`, `customTerminology`, `avoidedTerms`, `preferredTerms`), interaction options, the ND-friendly options (`reduceOverwhelm`, `explicitPriorities`, `timeEstimates`, `gentleRedirects`, `celebrateWins`), free-text `personality` and `customInstructions`, flags (`isDefault`, `isActive`), learning bookkeeping and an `extendedThinking` toggle. At run time these resolve into the variables map passed to AI Core — prompt text never lives here.
+
+### `ai_chat_conversation`
+
+One row per conversation. Focus fields (`title`, `purpose`, `topic`, `scope`, `goals`), the persona link (`personaId`, scalar — deletion null-outs happen in the service), optional app linking (`linkedEntityType` / `linkedEntityId`, e.g. a matter or a node), `modelPurpose` (an AI Core purpose/preset the admin allows — never a provider model id), `status` (`active` | `archived` | `branched`), counters (`messageCount`, `lastSummarised`), drift tracking (`driftScore`, `lastDriftCheck`) and `structureNodeId` — the mirrored Structure session node when that boost toggle is on.
+
+### `ai_chat_message`
+
+The turns. `role` (`user` | `assistant` | `system`), `content`, `parts` (AI SDK message parts — the tool seam: tool events render from here; there is deliberately no dedicated tool-call table in v1), persisted extended thinking (`reasoning`, `reasoningTokens`), `tokenCount`, `messageIndex` (allocated atomically from the conversation's counter so concurrent appends can never share an index), `isSummarised`, `isBranchPoint`, and `attachments` — Document Management **references** only, never files. An assistant message's `metadata` carries its provenance record.
+
+### `ai_chat_summary`
+
+Compressed history (distinct from checkpoints, which *verify*). `summaryType` (`rolling` | `section` | `handover`), `content`, the structured extras (`keyPoints`, `decisions`, `actionItems`), the covered range (`fromMessageIndex`, `toMessageIndex`, `messagesCovered`) and token accounting (`originalTokens`, `summaryTokens`).
+
+### `ai_chat_checkpoint`
+
+Alignment verification. `trigger` (`time` | `drift` | `return`), `atMessageIndex`, the AI's `understanding` restatement, a `goalsSnapshot`, `status` (`pending` | `confirmed` | `corrected` | `dismissed`) and the user's free-text `userResponse`.
+
+### `ai_chat_memory`
+
+CoALA long-term memory. `memoryType` (`episodic` | `semantic` | `procedural` | `preference` | `error_learning`), `content`, provenance (`sourceType`, `sourceConversationId`, `sourceMessageId`), retrieval weights (`relevance`, `confidence`), access bookkeeping (`accessCount`, `lastAccessed`), `tags`, `category`, an optional `expiresAt` and `isActive`. Keyword/recency retrieval runs over this table in the baseline; semantic retrieval is the Cognitive Pipeline boost's territory.
+
+### `ai_chat_branch`
+
+Branch relationships with handover context: `parentConversationId`, `childConversationId`, `branchMessageId`, `branchType` (`topic_divergence` | `deep_dive` | `side_quest` | `manual`), plus `handoverSummary`, `keyDecisions`, `openQuestions` and `branchReason`.
+
+### `ai_chat_action_bank_item`
+
+Detected patterns awaiting action. `patternType` (one of the eight: `topic_divergence`, `decision_made`, `idea_mentioned`, `action_item`, `preference_stated`, `similar_exists`, `open_question`, `role_change`), `confidence`, `title`, `content`, `context`, `status` (`pending` | `actioned` | `parked` | `dismissed`) and the action bookkeeping (`actionTaken`, `actionedAt`, `parkedUntil`, `parkReason`).
+
+### `ai_chat_context_ref`
+
+External material attached to a conversation. `referenceType` (`document` | `structure-node` | `url` | `memory` | `conversation`), `referenceId`, `referenceName`, `status` (`active` | `removed` — removal is soft), `addedBy`, `relevanceScore`, access bookkeeping, `tokenCount` and `previewContent`. A compound unique on `[conversationId, referenceType, referenceId]` makes re-adding a removed ref an upsert back to active.
+
+### `ai_chat_saved_section`
+
+Saveable reply sections — the **baseline fallback** destination of the ladder. `sectionType` (an admin-defined type id), `title`, `content`, source pointers (`sourceConversationId`, `sourceMessageId`), `destination` (`local` | `structure` | `cognitive-pipeline`) and `externalRef` — the Structure node id or ingest job id when routed. A local row is always recorded: content-bearing when local, a pointer when routed; fallback metadata (`fellBackToLocal`, `fallbackReason`, `configuredDestination`) lands in `metadata`.
+
+### `ai_chat_admin_config`
+
+Admin-editable records (records-not-config): one row per key (`tasks`, `integrations`, `sectionTypes`, `sectionsDestination`, `personaGating`), a Json `value` and a `seeded` flag — `true` when planted by the module's defaults, flipped to `false` on any admin edit so re-seeding never overwrites.
+
+<Aside type="note" title="Not user data">
+`ai_chat_admin_config` holds app configuration, not personal records. It is deliberately excluded from the security manifest's data categories, the account-erasure deletion handler, the personal-data export and the admin data envelope.
+</Aside>
+
+---
+
+## Self-Containment
+
+Every table keys ownership on a plain `userId String` (the schema declares `ownedModels: []` in the security manifest — the foundation isolates by ownership, not RLS tenancy). Cross-module pointers (`structureNodeId`, attachment `documentId` refs, `externalRef`) are stored as opaque strings and resolved through the boost seams at call time, so the schema migrates and uninstalls cleanly whatever else is installed. Prisma model names stay concrete (`ai_chat_*`) by design: the scaffold's rename tool rewrites code identity but leaves database tables alone.
+
+---
+
+## Deletion Behaviour
+
+With no `@relation` directives there is no database-level cascade — deletion is explicit, in the service layer:
+
+- **Deleting a conversation** removes its messages, summaries, checkpoints, branches (as parent or child), action-bank items, context refs and *locally stored* sections sourced from it, plus the conversation row, in **one transaction**. Memories are **not** deleted — they are user-level, not conversation-level. Sections routed to a boost module keep their pointer rows (the content lives in the destination). The Structure mirror node, if any, is archived fire-and-forget before the row disappears.
+- **Deleting a persona** null-outs `personaId` on that user's conversations in the same transaction; the resolver recreates a default persona when next needed.
+- **Account erasure** — the security registry's deletion handler hard-deletes all **ten user-keyed tables** in one transaction (idempotent `deleteMany`, refusing to run unscoped), matching the manifest's data categories one for one. `ai_chat_admin_config` is intentionally left untouched.
+
+The matching export handler delegates to the service's `exportData`, so what the cascade can erase is exactly what the personal-data download covers. See [Integration](/modules/ai-chat/integration/#data-exportimport-envelope) for the envelope.

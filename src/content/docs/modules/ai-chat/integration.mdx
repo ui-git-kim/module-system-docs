@@ -1,0 +1,177 @@
+---
+title: Integration
+description: How other modules consume, react to and extend AI Chat — the service registry surface, action hooks, background jobs, boost seams and the data export/import envelope
+sidebar:
+  order: 3
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+AI Chat registers its service for runtime access, fires an action hook on every successful write, registers six background job handlers, and reaches the optional boost modules through degrade-safe seams. This page is for developers building modules that talk to AI Chat — or boost modules wanting to know what changes when they are installed.
+
+## Integration Points at a Glance
+
+<CardGrid>
+  <Card title="Call the Service" icon="puzzle">
+    The full chat domain — conversations, messages, replies, personas, memories, sections — via `serviceRegistry.get('ai-chat')`.
+  </Card>
+  <Card title="React to Events" icon="rocket">
+    24 action hooks fire through `doActionAll` on every successful write, from message creation to data import.
+  </Card>
+  <Card title="Pull Chat Content" icon="open-book">
+    `getConversationContent` exposes plain-text transcripts and summaries so Cognitive Pipeline (or anything else) can ingest chat.
+  </Card>
+  <Card title="Boost It" icon="add-document">
+    Structure, Cognitive Pipeline and Document Management are feature-detected at call time — installing them lights up seams without any code change.
+  </Card>
+</CardGrid>
+
+| Integration | Frontend | Backend | Mechanism |
+|-------------|----------|---------|-----------|
+| Access the chat domain | — | ✅ | `serviceRegistry.get('ai-chat')` |
+| React to chat events | — | ✅ | `actionRegistry` (`ai-chat.*` hooks) |
+| Pull conversation content | — | ✅ | `aiChatService.getConversationContent` / `GET /conversations/:id/content` |
+| Display chat data in UI | ✅ | — | Hooks and `aiChatKeys` from `@/features/ai-chat` |
+| Read the public config slice | ✅ | — | `usePublicConfig` / `GET /config` |
+| Use chat types | ✅ | ✅ | `export type *` from both barrels |
+
+---
+
+## Service Registry
+
+The backend service registers under the key **`ai-chat`** (exported as `AI_CHAT_SERVICE_KEY`), with a `ServiceTypes` augmentation so `serviceRegistry.get('ai-chat')` is fully typed:
+
+```typescript
+import { serviceRegistry } from '../../config/service.registry.js';
+
+const chat = serviceRegistry.getOptional('ai-chat');
+if (chat) {
+  const content = await chat.getConversationContent(conversationId, userId);
+}
+```
+
+The method surface mirrors the routes — every method is userId-scoped and Zod-validates its input:
+
+| Area | Methods |
+|------|---------|
+| Conversations | `listConversations`, `getConversation`, `createConversation`, `updateConversation`, `archiveConversation`, `deleteConversation`, `getConversationContent` |
+| Messages & replies | `listMessages`, `addUserMessage`, `prepareReply`, `finaliseStreamedReply`, `generateReply` |
+| Personas | `listPersonas`, `getPersona`, `createPersona`, `updatePersona`, `deletePersona`, `resolveActivePersona`, `personaToVariables` |
+| Memories | `listMemories`, `searchMemories`, `addMemory`, `updateMemory`, `deleteMemory` |
+| Summaries & checkpoints | `listSummaries`, `createSummary`, `listCheckpoints`, `createCheckpoint`, `respondToCheckpoint` |
+| Branches | `createBranch`, `listBranches` |
+| Context refs | `listContextRefs`, `addContextRef`, `removeContextRef` |
+| Action bank | `listActionBankItems`, `updateActionBankItem` |
+| Sections | `saveSection`, `listSections`, `deleteSection` |
+| Admin & data | `getAdminConfig`, `getPublicConfig`, `setAdminConfig`, `ensureConfigDefaults`, `getStats`, `exportData`, `importData` |
+
+<Aside type="note" title="Chat as an ingest source (design decision 11)">
+AI Chat never pushes its conversations into the knowledge graph. Instead it exposes content cleanly so **Cognitive Pipeline pulls**: `getConversationContent(id, userId)` returns `{ title, transcript, summaries }` as plain text (also served at `GET /conversations/:id/content`), and the `ai-chat.conversation.*` / `ai-chat.summary.created` hooks tell a listener when there is something new to pull. The "chat" ingest-source option itself is Cognitive Pipeline's side of the seam, filed on its roadmap.
+</Aside>
+
+---
+
+## Action Hooks
+
+Every successful write fans out through `actionRegistry.doActionAll` (reaching sync and async listeners), fire-and-forget so a failing listener never breaks the write path. **24 hooks:**
+
+| Hook | Fired when | Context shape |
+|------|-----------|---------------|
+| `ai-chat.conversation.created` | A conversation is created — also for the child of a branch (then with `branched: true`) | `{ userId, conversation, branched? }` |
+| `ai-chat.conversation.updated` | A conversation is updated (also by the title job, with `changes: { title }`) | `{ userId, conversation, changes }` |
+| `ai-chat.conversation.archived` | A conversation is archived | `{ userId, conversation }` |
+| `ai-chat.conversation.deleted` | A conversation aggregate is deleted | `{ userId, conversationId }` |
+| `ai-chat.message.created` | A message is stored — fires for the user turn and the assistant reply | `{ userId, message, role }` |
+| `ai-chat.persona.created` | A persona is created (auto-created defaults carry `autoCreated: true`) | `{ userId, persona, autoCreated? }` |
+| `ai-chat.persona.updated` | A persona is updated | `{ userId, persona, changes }` |
+| `ai-chat.persona.deleted` | A persona is deleted | `{ userId, personaId }` |
+| `ai-chat.memory.created` | A memory is stored — manual or extracted by the pipeline | `{ userId, memory }` |
+| `ai-chat.memory.updated` | A memory is updated | `{ userId, memory, changes }` |
+| `ai-chat.memory.deleted` | A memory is deleted | `{ userId, memoryId }` |
+| `ai-chat.summary.created` | A summary is written — by the summarise job or the manual endpoint | `{ userId, summary }` |
+| `ai-chat.checkpoint.created` | A checkpoint is created | `{ userId, checkpoint }` |
+| `ai-chat.checkpoint.responded` | A checkpoint is confirmed / corrected / dismissed | `{ userId, checkpoint }` |
+| `ai-chat.branch.created` | A branch is created (the child's `conversation.created` fires too) | `{ userId, branch, conversationId }` |
+| `ai-chat.pattern.detected` | The pipelines create an action-bank item — pattern detection, or a drift nudge | `{ patternType, confidence, itemId, userId }` |
+| `ai-chat.actionbank.updated` | An action-bank item is actioned / parked / dismissed | `{ userId, item, changes }` |
+| `ai-chat.contextref.added` | A context ref is attached (or re-activated) | `{ userId, ref }` |
+| `ai-chat.contextref.removed` | A context ref is soft-removed | `{ userId, refId }` |
+| `ai-chat.section.saved` | A section is saved — whatever the destination | `{ userId, section, destination, fellBackToLocal }` |
+| `ai-chat.section.deleted` | A local section row is deleted | `{ userId, sectionId }` |
+| `ai-chat.adminconfig.updated` | An admin-config key is saved, or defaults are seeded | `{ key }` or `{ seededDefaults: true }` |
+| `ai-chat.data.exported` | The data envelope is exported | `{ userId, counts }` |
+| `ai-chat.data.imported` | An envelope import commits | `{ userId, imported, mode }` |
+
+---
+
+## Background Jobs
+
+Six handlers register with the host jobs seam at import time (`jobs.registration.ts`): `ai-chat.summarise`, `ai-chat.extract-memories`, `ai-chat.detect-patterns`, `ai-chat.drift-check`, `ai-chat.title` and `ai-chat.mirror-session`. Payloads are Zod-parsed like any untrusted input, every handler re-checks its admin toggle at run time, and all are idempotent — safe for a durable runner to re-deliver. Triggers and behaviour are documented in [Configuration](/modules/ai-chat/configuration/#background-tasks-and-their-triggers).
+
+---
+
+## Boost Seams
+
+The boost modules are never imported and never declared in `depends` — they are resolved from the service registry at call time through structural facades, and every absence degrades visibly.
+
+### Structure (`ai-chat.cognitive-boost.ts`)
+
+With Structure installed, two things light up:
+
+- **Session mirroring** — when the admin toggle `integrations.structureSessionMirror` is on, every conversation is mirrored to a Structure node (default node type `chat-session`, carrying `{ module: 'ai-chat', kind: 'chat-session-mirror', conversationId }` in its data). The node id persists on `ai_chat_conversation.structureNodeId`; archiving the conversation archives the node; deleting the conversation archives the node before the row disappears. A vanished node is recreated; a missing Structure answers `{ mirrored: false, reason }`.
+- **Saved-section destination** — `sectionsDestination.destination: 'structure'` routes saved sections into a node (the section text in the description so the generic Structure UI renders it; provenance in data) under the admin-chosen parent and node type.
+
+Structure ships no guaranteed node types, so the admin names real ones in config — an unknown type makes the create throw, which degrades to local with the error as the reason.
+
+### Cognitive Pipeline (`ai-chat.cognitive-boost.ts`)
+
+- **Saved-section destination** — `destination: 'cognitive-pipeline'` submits the section through `ingest()` (content type `text`, tagged `ai-chat` + the section type), and the ingest job id becomes the section's `externalRef`. The ingest source is the configured `ingestSourceId`, else a source slugged `ai-chat-sections` or `ai-chat`, else a single active source — ambiguity degrades to local rather than guessing a pipeline.
+- **Chat as content** — the pull direction described above: `getConversationContent` + the conversation/summary hooks.
+
+Working memory and `retrieve()` are deliberately **not** wired here — ecosystem context (working memory, graph retrieval, curation) is AI Core's context-assembly engine's job; ai-chat passes only its own domain context into each run.
+
+### Document Management (`ai-chat.doc-boost.ts`)
+
+With `integrations.attachments: 'document-management'`, a user message may carry **attachment references** — `{ documentId, fileName? }` objects stored on `ai_chat_message.attachments`. The seam normalises the refs and resolves them against the user's own documents via `getDocument(documentId, userId)` (ownership-checked by Document Management itself); a ref that does not resolve rejects the message visibly, so an unchecked foreign id is never stored. The module stores references only — never file bytes. With attachments `'off'` (the default) a message carrying refs is rejected outright rather than silently stripped.
+
+---
+
+## The Public Config Slice
+
+`GET /api/v1/ai-chat/config` (authenticated, not admin) serves the slice of the admin config the UI needs to render:
+
+```typescript
+interface AiChatPublicConfig {
+  sectionTypes: SectionTypeDef[];                    // the save-section picker
+  personaGating: PersonaGatingConfig;                // the settings page's gating
+  attachments: 'off' | 'document-management';        // whether to offer attachments
+}
+```
+
+Everything else in the admin config stays behind `requireAdmin`.
+
+---
+
+## Data Export/Import Envelope
+
+`GET /export` and `POST /import` (both `requireAdmin`) round-trip all **ten user-keyed tables** as a versioned envelope — `ai_chat_admin_config` is deliberately excluded as app configuration, not personal data:
+
+```typescript
+interface AiChatExportEnvelope {
+  version: string;        // envelope FORMAT version (currently '1'), not the module version
+  moduleId: string;       // 'ai-chat' — the cross-module guard
+  exportedAt: string;
+  counts: { personas; conversations; messages; summaries; checkpoints;
+            memories; branches; actionBankItems; contextRefs; savedSections };
+  data: { /* the ten arrays, userId redacted, dates as ISO strings */ };
+}
+```
+
+Guarantees:
+
+- **Version and module gates run before any write** — a foreign or unreadable envelope is rejected with a 400.
+- **Fresh ids** — exported row ids are included so import can remap cross-references (persona → conversation → message), but rows are always created under new server ids and the importing user's userId.
+- **Atomic** — the whole import runs in one transaction; `replace` wipes *this user's* rows first inside the same transaction, so a failed import rolls everything back, wipe included.
+- **Honest skips** — a row referencing something the envelope does not contain is skipped and reported in `errors`, never fabricated. `structureNodeId` is not restored (it points at another environment's node; the mirror job recreates it).
+
+The security registry's export handler delegates to the same `exportData`, so the personal-data download and the admin export stay one code path; the deletion handler erases the same ten tables in one transaction (see [Database](/modules/ai-chat/database/#deletion-behaviour)).

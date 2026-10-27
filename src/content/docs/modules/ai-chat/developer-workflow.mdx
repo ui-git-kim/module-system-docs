@@ -1,0 +1,167 @@
+---
+title: Developer Workflow
+description: How to develop, test, version and maintain the AI Chat module — repo layout, the template files, the pre-commit gates and the veradai reference host
+sidebar:
+  order: 5
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This page is for developers maintaining the **AI Chat module itself**, not app builders consuming it. The mental model: this repository is a **code generator**. You edit *templates* — backtick-delimited TypeScript strings holding the source of generated files — build the module, then run `npx ai-chat init` in a starter-template app to generate the real files. Nothing in `src/templates/` runs in this repo.
+
+---
+
+## Repository Layout
+
+```
+src/
+├── module.ts                      # Module definition: id, depends, schema,
+│                                  # templates map, registrations, features
+├── cli.ts                         # CLI entry (scaffold-owned — do not edit)
+├── scaffold/                      # Shared install/update/uninstall logic
+│                                  # (scaffold-owned — do not edit)
+└── templates/
+    ├── schema.ts                  # The 11 ai_chat_* Prisma models
+    ├── backend/                   # 14 backend templates + the barrel
+    └── frontend/                  # 21 frontend templates + registrations + barrel
+```
+
+### Backend templates and what each emits
+
+| Template | Emits | Holds |
+|----------|-------|-------|
+| `types.ts` | `ai-chat.types.ts` | Domain enums, entity types, every Zod input schema, the admin-config keys/defaults/validators, the export/import envelope types |
+| `service.ts` | `ai-chat.service.ts` | `aiChatService` — all business logic, the prepare/finalise reply split, action fan-out, job enqueues, export/import |
+| `pipelines.ts` | `ai-chat.pipelines.ts` | The LLM domain logic: summarise, memory extraction, pattern detection, drift check, title, branch handover |
+| `routes.ts` | `ai-chat.routes.ts` + `index.ts` | The Express router (streamed reply route included) and the backend barrel |
+| `llm-gateway.ts` | `ai-chat.llm-gateway.ts` | The AI Core seam: structural facade, reply runners, six JSON runners, the seeded record specs and `ensureDefaultOperations()` |
+| `cognitive-boost.ts` | `ai-chat.cognitive-boost.ts` | Structure session mirroring + the saved-sections destination ladder |
+| `doc-boost.ts` | `ai-chat.doc-boost.ts` | Attachment-ref normalisation and resolution against Document Management |
+| `jobs.ts` | `ai-chat.jobs.ts` | The six idempotent job handlers |
+| `*.registration.ts` (6) | same names | Route, service, security, module, usage and jobs registrations |
+
+### Frontend templates and what each emits
+
+| Template | Emits |
+|----------|-------|
+| `pages.ts` | `MyFeaturePage` (chat), `MyFeatureSettingsPage` (personas), `MyFeatureAdminPage` (four tabs) — generated as `AiChat*` |
+| `sections-page.ts` | The saved-sections DataTable page |
+| `components.ts` | The dashboard widget and the preferences section |
+| `ai-el-*.ts` (7) | The AI Elements: conversation, message, prompt-input, reasoning, sources, suggestion, tool |
+| `services.ts` | The typed API client (`aiChatApi`) |
+| `hooks-keys.ts`, `hooks-chat.ts`, `hooks-user.ts`, `hooks-admin.ts` | `aiChatKeys` and the TanStack Query hooks |
+| `types.ts` | Frontend mirrors of the backend entity/input types |
+| `routes.ts` | `routes.config.tsx` (lazy routes) and the frontend barrel |
+| `registrations.ts` | Navigation, dashboard, preferences, settings-page and admin-page registrations |
+
+`ai-el-inline-citation.ts` exists in the repo but is **deliberately unwired** in `module.ts` until a citations consumer lands (it alone needs the carousel and hover-card primitives) — see the [Roadmap](/modules/ai-chat/roadmap/).
+
+<Aside type="caution">
+Never edit `src/scaffold/` or `src/cli.ts` — they are shared infrastructure updated via `npm run scaffold:update`. Report bugs upstream to the module starter.
+</Aside>
+
+---
+
+## Development Loop
+
+```
+Edit templates → Build → Gates → Test in app → Version bump → Commit → Push
+```
+
+<Tabs>
+<TabItem label="Build & link">
+
+```bash
+npm install
+npm run build        # tsup + declaration-only tsc
+npm run dev          # watch mode
+npm link             # makes 'ai-chat' runnable in test apps
+```
+
+</TabItem>
+<TabItem label="Gates">
+
+Run before every commit:
+
+```bash
+npm run type-check          # tsc --noEmit
+npm run check:templates     # unescaped ${ and backtick guard — the build
+                            # silently interpolates an unescaped ${...}; this
+                            # check is the only thing that flags it
+npm run conformance:check   # template conventions
+npm run parity:check        # template/module.ts parity
+npm run contract:check      # scaffold contract sync
+npm run build               # must pass clean
+```
+
+</TabItem>
+<TabItem label="Test in an app">
+
+```bash
+npx ai-chat init             # fresh install
+npx ai-chat update           # apply template changes
+npx ai-chat update --dry-run # preview
+npx ai-chat init --force     # overwrite everything
+npx ai-chat uninstall        # clean removal (schema models included)
+npx ai-chat info             # installed vs available version
+```
+
+</TabItem>
+</Tabs>
+
+### The reference host: veradai
+
+The module is built and verified against **veradai** — a starter-template app (v2.15.1) with Structure 1.38.0 (configured as the legal Matters/Evidence app), AI Core 1.79.0, Cognitive Pipeline 2.0.0, Document Management 1.18.0 and billing. Every boost seam has a live target there: streaming against the emitted AI Core, session mirroring and the Structure section destination, Cognitive Pipeline ingest routing, and attachment resolution. Link-install into veradai (or a fresh starter clone for the baseline) before releasing.
+
+After an install, verify in the app:
+
+1. Admin → AI Chat → AI operations → **Ensure defaults**, then check the created/existing report.
+2. Map the `chat` / `summary` / `analysis` / `titles` purposes to models in the AI Core admin.
+3. Send a message — the reply should stream; check the Activity tab's provenance inspector afterwards.
+4. Toggle a boost (session mirror, a section destination) and confirm the degrade reporting with the module absent.
+
+---
+
+## Version Management
+
+**Bump after any change to `src/templates/**` or `src/module.ts`** — the update system compares versions before file hashes, so no bump means `npx ai-chat update` reports "already up to date".
+
+| Command | Use for |
+|---------|---------|
+| `npm run version:patch` | Template fixes, small adjustments |
+| `npm run version:minor` | New features or templates (changelog entry) |
+| `npm run version:major` | Breaking changes (changelog entry + migration notes) |
+| `npm run release:patch/minor/major` | Bump + commit + git tag |
+
+Each bump updates `package.json` and `src/module.ts` and creates its own commit. Two generated files repeat the version at install time (`service.registration.ts` and `module.registration.ts` via `{{moduleVersion}}`), which `npx ai-chat update` keeps current.
+
+---
+
+## Scaffold Updates
+
+The install/update/uninstall infrastructure comes from the module starter. `npm run scaffold:check` shows what is available; `npm run scaffold:update` merges it in (git merge — conflicts in `src/scaffold/` should resolve to the upstream side). Since scaffold v1.30.0 the updater also restores scaffold-owned files that have gone missing; record deliberate removals in `.scaffoldignore`.
+
+---
+
+## Common Scenarios
+
+- **Adding a backend endpoint** — handler in `templates/backend/routes.ts`, method in `service.ts`, schema in `types.ts`. Use `.js` extensions on all relative imports.
+- **Adding an AI operation** — add the id to `AI_CHAT_OPERATIONS` and a spec to `CHAT_OPERATIONS` in `llm-gateway.ts` (purpose, objective, schema), a typed runner beside the other six, and mirror the id/label in the admin page's operation list in `pages.ts`.
+- **Adding a table** — model in `templates/schema.ts` (scalar FKs + `@@index`, no `@relation`), name in `schema.modelNames` in `module.ts`, and extend the security manifest, deletion handler and export envelope if it is user-keyed.
+- **Changing admin config** — key/default/validator in `templates/backend/types.ts` (`ADMIN_CONFIG_KEYS`, `ADMIN_CONFIG_DEFAULTS`, `adminConfigValueSchemas`), then the matching section component in the admin page.
+- **Template escaping** — templates are JS backtick strings: write `` \` `` for a literal backtick and `\${` for a literal dollar-brace in *generated* code. `npm run check:templates` catches what the build silently swallows.
+
+---
+
+## Documentation Workflow
+
+The docs live in the `docs/` git submodule (this site) and deploy on push:
+
+```bash
+cd docs
+git add . && git commit -m "Docs: description" && git push
+cd ..
+git add docs && git commit -m "docs: update docs submodule" && git push
+```
+
+The sidebar section for this module autogenerates from `docs/src/content/docs/modules/ai-chat/` — page order comes from each file's `sidebar.order` frontmatter, so new pages need no `astro.config.mjs` change.

@@ -1,0 +1,145 @@
+---
+title: Configuration
+description: The AI Chat admin page — admin-config records and their defaults, the embedded AI operations editor, the Ensure defaults button, and background task configuration
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+AI Chat has **no environment variables and no init prompts** — API keys and model choice live entirely in [AI Core](/modules/ai-core/). Everything configurable is an admin decision made at runtime on the module's admin page at `/admin/ai-chat`, which has four tabs: **Configuration**, **AI operations**, **Activity** and **Data**.
+
+<Aside type="note" title="Records, not config">
+Admin configuration is stored as rows in `ai_chat_admin_config` (one row per key, `seeded: true` when planted by the module's defaults). Defaults are created *if absent*; an admin edit sets `seeded: false` and is **never** overwritten by re-seeding. Background jobs re-read the rows on every run, so a toggle takes effect immediately — even for work already queued.
+</Aside>
+
+---
+
+## Configuration Tab
+
+The Configuration tab edits the module's five admin-config keys. Each key is validated against its own Zod schema on `PUT /admin/config/:key`, and reads merge the stored row over the seeded defaults, so a partial row keeps the other defaults.
+
+### `tasks` — background tasks
+
+Which background tasks run, and how often the interval-based ones fire. See [Background tasks](#background-tasks-and-their-triggers) for what each does.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `summarise.enabled` | `true` | Roll unsummarised messages into a summary |
+| `summarise.everyNMessages` | `12` | Summarise once this many messages are unsummarised |
+| `extractMemories.enabled` | `true` | Extract CoALA memories after each reply |
+| `detectPatterns.enabled` | `true` | Detect action-bank patterns after each reply |
+| `driftCheck.enabled` | `true` | Score focus drift |
+| `driftCheck.everyNMessages` | `8` | Check drift every N messages |
+| `title.enabled` | `true` | Title untitled conversations automatically |
+
+Intervals accept 1–500.
+
+### `integrations` — boost toggles
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `structureSessionMirror` | `false` | Mirror each conversation to a Structure session node (requires the Structure module; gives the graph something to hang chat sessions on) |
+| `attachments` | `'off'` | `'off'` rejects message attachments visibly; `'document-management'` resolves attachment references against the user's own documents through the doc-boost seam |
+
+### `sectionTypes` — saveable section types
+
+An array of admin-defined types (up to 50), each `{ id, label, hint }` — the hint doubles as the extraction guidance shown in the save dialog. Apps reconfigure these for their domain; the seeded defaults are:
+
+| id | label | hint |
+|----|-------|------|
+| `email` | Email copy | A ready-to-send email drafted in the reply |
+| `note` | Note | A reusable note or snippet worth keeping |
+
+Saving a section whose type is not in this list is rejected.
+
+### `sectionsDestination` — the destination ladder
+
+Where saved sections live:
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `destination` | `'local'` | `'local'`, `'structure'` or `'cognitive-pipeline'` |
+| `structureParentId` | `null` | Structure destination: the parent node for created section nodes (root when absent) |
+| `structureNodeType` | — | Structure destination: the node type to create (the seam falls back to `note`; an unknown type degrades to local, visibly) |
+| `ingestSourceId` | — | Cognitive Pipeline destination: the ingest source to submit to. When absent, the seam looks for a source slugged `ai-chat-sections` or `ai-chat`, else a *single* active source — anything more ambiguous degrades to local rather than guessing |
+
+A destination whose module is absent falls back to the local table and says so.
+
+### `personaGating` — what users may customise
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `userEditable` | `true` | When `false`, persona create/update/delete are refused (403) and the settings page is read-only |
+| `lockedFields` | `[]` | Persona fields stripped from user writes (the admin UI offers the full field catalogue, from `name` to `extendedThinking`) |
+| `maxPersonas` | `5` | Per-user persona cap (1–100) |
+
+The non-admin slice of all this — `sectionTypes`, `personaGating` and the `attachments` mode — is served to every signed-in user by `GET /api/v1/ai-chat/config`, which the save-section picker and the persona settings page render from. Everything else stays behind `requireAdmin`.
+
+---
+
+## AI Operations Tab
+
+AI Chat's prompt domain lives in AI Core as records under the `ai-chat/*` category, and this tab is where it is authored and refined.
+
+### Ensure defaults
+
+**Nothing seeds at boot** (admin-authored-first). The **Ensure defaults** button calls `POST /admin/ensure-operations`, which seeds *both* record families create-if-absent — the admin-config default rows above, and the module's AI Core records:
+
+- the `conversation-history` **marker** (a built-in on current AI Core versions; create-if-absent either way)
+- the `ai-chat/epistemic-discipline` **discipline** with its `ai-chat/claims-grounded` guardrail (created in one transaction, attached to every operation): grounded claims, named uncertainty, no invention
+- fifteen **persona prompt variables** (`persona_name`, the five slider values, `persona_technical_level`, `persona_explanation_style`, `persona_response_length`, `persona_greeting_style`, `persona_language`, `persona_content_preferences`, `persona_roles`, `persona_personality`, `persona_custom_instructions`) — user-authored ones are injection-fenced as data
+- three **persona style approaches** (`ai-chat/persona-voice`, `ai-chat/persona-content`, `ai-chat/persona-role`) composed into the `ai-chat/persona-style` segment the reply operation references
+- the **seven operations** below
+
+The call is idempotent and safe to press repeatedly: existing records — admin edits included — are never overwritten. Per-record failures are collected into a report (created / existing / failed) rather than aborting the run.
+
+### The seven operations
+
+Each operation binds a model **purpose** the host admin maps to a model in the AI Core admin — the module never names a model id. The JSON operations carry a structured-output schema, and the gateway Zod-parses every result against the same contract; a refusal, an unauthored operation or an unparseable result degrades visibly (`{ degraded: true, reason }`) and nothing is fabricated.
+
+| Operation | Purpose | What it does |
+|-----------|---------|--------------|
+| `ai-chat/reply` | `chat` | Generates the assistant reply — the only streamed operation. Composes the persona-style segment and answers the latest user turn grounded in the curated history and the supplied context sections |
+| `ai-chat/summarise` | `summary` | Compresses a transcript window into `{ content, keyPoints, decisions, actionItems }`, carrying forward what is still live from the previous rolling summary |
+| `ai-chat/extract-memories` | `analysis` | Extracts durable CoALA memories (`{ memories: [...] }`) — only what the transcript states or clearly implies; an empty list when nothing qualifies |
+| `ai-chat/detect-patterns` | `analysis` | Detects the eight action-bank pattern types in recent turns (`{ patterns: [...] }`), each with a confidence and grounding text |
+| `ai-chat/title` | `titles` | Writes a short, specific conversation title (terse output richness, at most eight words) |
+| `ai-chat/handover` | `summary` | Writes the handover context a branched conversation starts from: `{ handoverSummary, keyDecisions, openQuestions }` |
+| `ai-chat/drift-check` | `analysis` | Scores drift from the declared focus 0–1 with the current topic, shared/new elements, a branch recommendation and a confidence |
+
+### Editing prompts
+
+Below the seeding button, the tab embeds **AI Core's operation prompt editor** (`EmbeddedSlot id="ai-core.operation-prompt-editor"`) — pick one of the seven operations from the dropdown and edit its objective, dials and composition in place; everything saves into AI Core, where admin edits always win. Models, purposes and app-wide prompt records are administered in the AI Core admin (`/admin/ai-core`), not here.
+
+---
+
+## Activity Tab
+
+Observability for refinement:
+
+- **Counters** — conversations (total / active / archived), messages, memories, personas, summaries, pending checkpoints, branches, active context refs, saved sections and the action bank by status. The tab shows app-wide counts across every user; scoping to one user (`GET /admin/stats?userId=`) is an API capability not yet surfaced in the tab.
+- **Provenance inspector** — pick a conversation and an assistant reply, and read exactly what went into its prompt (the message ids and count, summary id, checkpoint id, memory ids, context-ref ids, approximate tokens) and what the run reported back (the AI Core ledger `ref` and token usage). The picker lists the signed-in admin's **own** conversations — the conversations API is user-scoped. Provenance is persisted on each assistant message's metadata at finalise time, so this works retrospectively.
+
+---
+
+## Data Tab
+
+The versioned JSON export/import surface — download this user's data as an envelope, or restore one in `merge` (append) or `replace` (wipe this user's rows first) mode. The envelope format and guarantees are documented under [Integration](/modules/ai-chat/integration/#data-exportimport-envelope).
+
+---
+
+## Background Tasks and Their Triggers
+
+AI Chat registers six job handlers with the host jobs seam at import time; the admin config gates **execution**, not registration, and every handler re-checks its toggle at run time and is idempotent, so re-delivered jobs are harmless.
+
+| Job | Enqueued when | What it does |
+|-----|---------------|--------------|
+| `ai-chat.summarise` | After an assistant reply, when the unsummarised message count reaches `tasks.summarise.everyNMessages` | Rolls the unsummarised range into a rolling summary, marks those messages summarised and advances `lastSummarised` |
+| `ai-chat.extract-memories` | After every assistant reply (when enabled), over the last user turn + the reply | Extracts CoALA memories above the confidence floor (0.5), deduplicated per source conversation |
+| `ai-chat.detect-patterns` | After every assistant reply (when enabled), anchored on the triggering user message | Creates action-bank items for detected patterns above the confidence floor (0.6), at most 10 per message; a message already processed is skipped |
+| `ai-chat.drift-check` | After a reply, when the message count is a multiple of `tasks.driftCheck.everyNMessages` and the conversation declares a focus | Scores drift, stores `driftScore`/`lastDriftCheck`, and past 0.7 creates a `topic_divergence` action-bank nudge; re-runs within 60 seconds are skipped |
+| `ai-chat.title` | After a reply, when the conversation is untitled and has at least two messages | Titles the conversation from the opening turns; a concurrent manual rename always wins |
+| `ai-chat.mirror-session` | On conversation create, archive, branch and after each reply — only while `integrations.structureSessionMirror` is on | Ensures/updates the Structure session node for an active conversation; archives the mirror for an archived one |
+
+Expected shortfalls (task disabled, rows deleted, an LLM operation degrading) are logged and swallowed; unexpected errors propagate so a durable runner can retry.

@@ -347,6 +347,11 @@ export default defineConfig({
               autogenerate: { directory: "modules/ai-core" },
             },
             {
+              label: "AI Chat",
+              collapsed: true,
+              autogenerate: { directory: "modules/ai-chat" },
+            },
+            {
               label: "Billing",
               collapsed: true,
               autogenerate: { directory: "modules/billing" },
