@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: Planned features, known issues, and future direction for AI Core
-lastUpdated: 2026-10-01
+lastUpdated: 2026-10-27
 sidebar:
   order: 15
 ---
@@ -573,6 +573,88 @@ The first real install confirmed exactly this class: `ErrorAlert`'s real prop is
 ## Planned Improvements
 
 ### Short-Term
+
+#### Streaming runs — proposed design (ai-chat request, 2026-10-27)
+
+**Status: proposed, waiting on the owner's four decisions below. Nothing is built yet.** Requested by ai-chat, which is being rebuilt on the current module starter and will call AI Core for every reply. A chat lives on streaming: the user watches the answer arrive.
+
+**What the run engine does today (v1.78.1).**
+
+- `runLanguageOperation` (`run/run.ts`) is one pass of about 1,000 lines. In order: spending limits and the usage gate, resolution, the input contract, context assembly, `buildPrompt`, the cache plan and parameter validation; then **one** `adapter.generate()`; then reading the reply, the schema, the built-in checks and the check report, feedback, **one** ledger row, the review queue and `ai-core.run.completed`. Everything before and after the provider call can be reused as it is; only the call in the middle blocks.
+- `GenerateRequest` carries one `instructions` string and one `input` string, so a run is always a system prompt plus one user turn. There is no conversation history: today a chat would pass its earlier turns as a context item under the `conversation-history` marker.
+- The adapter (`providers/adapters.ts`, the only file that imports the SDK) calls `generateText` from AI SDK v7. The host has v7.0.48, whose `streamText` gives a `fullStream` of `text-delta`, `reasoning-delta`, `finish-step` (usage per step), `finish` (`totalUsage`) and `abort` parts. Its `onAbort` reports **only the steps that finished**, and it ships the chat-UI helpers `createUIMessageStream` and `pipeUIMessageStreamToResponse`.
+- The ledger's `outcome` is a plain string (`ok`, `refused`, `error`, `abstained`), so a `cancelled` outcome needs no migration. A `streamed` flag needs one new column. A ledger id can be made before the call and passed in when the row is written.
+- With a spending limit on or a usage gate registered, a caller's abort does not stop a provider call already sent today: it runs to its deadline so its cost is counted (`paidCallSignal`). A chat's Stop button needs a decision here (decision 1).
+
+**The design.**
+
+1. **One engine, two endings.** Split `runLanguageOperation` into `prepareLanguageRun` (the steps before the call, unchanged) and `finishLanguageRun` (the steps after it). `run()` is prepare, then `generate`, then finish — the same as today. `stream()` is prepare, then `generateStream`, then finish. There is no side door: every gate, refusal, price check and ledger rule is the same code.
+2. **`aiCore.stream(operationId, input, opts): Promise<RunStream>`.** The promise settles after the pre-flight. A refusal (`spend-limit-reached`, `usage-limit-reached`, `model-unpriced` or any resolution refusal) **throws** exactly as `run()` throws, before any event, so an HTTP route can still answer 409 with a normal error body. `RunStream` is `{ events: AsyncIterable<RunStreamEvent>; result: Promise<RunStreamResult> }`. `events` feeds the client. `result` resolves at the end with the same `{ result, feedback, audit }` as `RunResult`, plus `outcome`, so the consumer can save the reply. Leaving the loop early (`break`) cancels the stream.
+3. **The events (version 1).** The stream always ends with exactly one `finish` or one `error`. **Consumers must ignore event types they don't know.** That documented rule lets `reasoning-delta`, `tool-call`, `tool-result` and `source` arrive later without breaking anyone.
+
+   | Event | Carries |
+   |---|---|
+   | `start` | `ref` (the ledger id, made up front), `operationId`, `modelRecordId`, `requestedModelId`, `streamed` |
+   | `text-delta` | `delta` |
+   | `finish` | `outcome` (`'ok'` or `'cancelled'`), `text`, `feedback`, `audit` (everything `RunAudit` carries, including usage and cost basis, plus `streamed`) |
+   | `error` | `code`, `reason?`, `message`, `retryable`, `feedback`, `ref` |
+4. **History, for `run` and `stream` alike.** `RunInput.history?: Array<{ role: 'user' | 'assistant'; content: string; media?: MediaAttachment[] }>`, oldest first.
+   - **Where the turns go.** They are sent as real turns between the system prompt and the final user turn. The final turn carries what `input` carries today: the context material plus the new message.
+   - **No `system` role.** The system prompt belongs to the operation and is written in the admin. A chat's persona or memory goes in as context, preferences or variables.
+   - **Attachments.** Attachments on earlier turns ride as file parts on those turns, under the same link and size limits, counted across the whole request.
+   - **Length.** The consumer chooses which turns to send. AI Core sends what it is given, and names an over-long prompt rather than trimming it silently.
+   - **Where history comes from.** **History must come from the app's own store, never the browser.** A browser that could send assistant turns could put words in the model's mouth.
+   - **The old pattern still works.** Apps that want history as material can keep using the `conversation-history` marker.
+5. **The adapter.** `ProviderAdapter.generateStream?(modelId, req): AsyncIterable<ProviderStreamPart>`.
+   - **Optional,** like `embedMultimodal` and `rerank`.
+   - **Its parts are AI Core's own,** never SDK types: `text-delta`, and a `finish` with `NormalizedUsage`, the finish reason, warnings and `cacheHandled`.
+   - **Built on `streamText`** in `providers/adapters.ts`. It shares with `generate` the request shape, the cache directive, `store: false`, the attachment downloads and the tool translation.
+   - **Deadlines.** A first-chunk deadline and an idle deadline replace the single whole-call deadline.
+   - **Which providers.** Anthropic, OpenAI and Google get it.
+   - **No streaming means a visible degrade.** An adapter without it runs the call through `generate` and sends the whole answer as one `text-delta`. `start` and `finish` then say `streamed: false`, and feedback names `stream-unavailable:<provider>`.
+6. **What streams.** A language operation whose answer is text: a **Task** with no schema. Decision 3 covers operations with output fields (a schema, a Check, a Router); decision 2 covers a Task set to JSON answer sections. Tools work on a stream: text arrives between search steps, and `toolsRun` and `toolSources` arrive in `finish`.
+7. **Cancellation** is decision 1. Either way the row is written once, at the end, with outcome `cancelled`. It has no `reason`, so it never lands on the review queue, and `missing` names `stream-cancelled-by-caller`. `ai-core.run.completed` fires with it.
+8. **A stream that dies part-way** (a dropped connection, a provider error, a timeout) sends an `error` event and ends. The row is `error`, with the usage of the steps that finished plus an estimate for the one that didn't (`costBasis: 'estimated'`).
+9. **The ledger.** One row per stream, as for a run. Three changes: a new `streamed` column (`Boolean @default(false)`), `cancelled` added to the Usage tab's outcome filter, and a Streamed marker in the ledger table. Spending totals, `getCurrentUsage` and the cost rules are unchanged.
+10. **The chat-UI helper.** `pipeRunStreamToUiMessageResponse(stream, res, opts?)`, plus `runStreamToUiMessageStream(stream)` for a web `Response`. Both live in `providers/adapters.ts`, so the SDK stays in one file, and are exported from the barrel.
+
+    | AI Core event | Chat-UI chunk |
+    |---|---|
+    | `start` | `start` |
+    | `text-delta` | `text-start`, `text-delta`, `text-end` |
+    | `finish` | `finish`, with message metadata (`ref`, usage, cost) |
+    | `error` | `error`, with a plain message; the detail stays in the server log |
+
+    They are built on the host SDK's own `createUIMessageStream`, so they keep up with the protocol as the SDK moves. A consumer's route imports nothing from `ai` or `@ai-sdk/*`.
+
+**The four decisions (the owner's).**
+
+1. **What Stop does.**
+   - (a) **Recommended.** The AI stops at once. The cost of the stopped answer is estimated from what streamed: the input in full, and the output from the text and any visible reasoning (hidden reasoning can be missed). The row says `estimated`.
+   - (b) The user's stream stops at once, but the AI finishes in the background, so the cost is exact and the whole answer is paid for. This is today's rule for unstreamed calls while a limit is on.
+2. **The check report on a stream.**
+   - (a) **Recommended.** Phase 1 streams a JSON-sections Task as Plain text. The disciplines and their measures are still in the prompt, no report is asked for, and feedback names `answer-sections-not-streamed`.
+   - (b) Build the report now. The model writes it after the answer, behind a fixed marker; AI Core holds that part back from the stream, and the verdict arrives in `finish` (`self-check-failed:D2`, as on `run`).
+3. **Operations with output fields.**
+   - (a) **Recommended.** `stream()` refuses them (`stream-structured-output-unsupported`).
+   - (b) Run them unstreamed and send the result as one event.
+4. **The version.**
+   - (a) **Recommended.** Minor, v1.79.0: a new subsystem under the LLM rules.
+   - (b) Patch.
+
+**Not in phase 1:** reasoning and tool events; a cache point at the end of the history, the biggest saving on long chats and the next step; an AI Core HTTP stream route; streaming flows; and a Chat category.
+
+**What changes in the contracts.**
+
+- **All additive:** the service surface, `RunInput`, `RunAudit` (`streamed`), `ProviderAdapter` and the `run.completed` outcomes.
+- **One new ledger column,** an ordinary additive migration.
+- **The JSON config format does not change,** so there is no new stamp.
+- **One thing for subscribers:** a subscriber that switches on `outcome` should handle `cancelled`.
+
+**For a consumer's route.**
+
+- **A browser request.** Set `callerSupplied: true` when the request comes from a browser, so the HTTP rules for variables and markers apply.
+- **Rate limiting.** AI Core's per-minute rate limit covers only its own HTTP routes, so this work exports it for a consumer route to call.
 
 #### Step 3: code checks move into Evals
 
