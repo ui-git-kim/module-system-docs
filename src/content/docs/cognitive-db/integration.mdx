@@ -1,6 +1,6 @@
 ---
 title: Integration & Delivery
-description: How an app wires cognitive-db in via initConfig() (an AiAdapter onto AI Core, a StructureAdapter onto Structure), the sourceId/sourceType source-identity contract, the Structure requirement, and how the engine is delivered — vendored into Cognitive Pipeline or installed standalone from Git.
+description: How an app wires cognitive-db in via initConfig() (an AiAdapter onto AI Core, a StructureAdapter onto Structure), the sourceId/sourceType source-identity contract, the Structure requirement, isolation sections, and how the engine is delivered — vendored into Cognitive Pipeline or installed standalone from Git.
 sidebar:
   order: 3
   label: "Integration & Delivery"
@@ -78,7 +78,7 @@ Each `ingest()` call takes a `processingLevel` that sets how much the model is a
 | `deep` | + `extract-concepts` | + decisions, intentions, memories, questions | 4,000 tokens |
 | `full` | + `infer-implicit`, run only when the earlier calls found entities or relationships | + implied entities and relationships | 8,000 tokens |
 
-- **Summary.** With the `understanding` switch on, a `summarise` call (capped at 500 tokens) follows whenever entities were found or the content is over 8,000 characters. This applies at `minimal` too: long content is still summarised, so its vector is never built from truncated text. Separately, when `retrieveToConnect` is on (above `minimal`, with a scope supplied and embeddings on), a short `summarise` call (capped at 300 tokens) and a query embedding run before extraction to find existing entities to link to; the `understanding` switch does not gate it.
+- **Summary.** With the `understanding` switch on, a `summarise` call (capped at 500 tokens) follows whenever entities were found or the content is over 8,000 characters. This applies at `minimal` too: long content is still summarised, so its vector is never built from truncated text. Separately, when `retrieveToConnect` is on (above `minimal`, with embeddings on), a short `summarise` call (capped at 300 tokens) and a query embedding run before extraction to find existing entities to link to; the `understanding` switch does not gate it.
 - **Each call builds on the last.** `extract-concepts` gets the entity list, `infer-implicit` gets the entities and relationships, and `summarise` gets the entity names.
 - **Stated versus implied.** The seeded `extract-entities` operation asks only for what the content states (its `explicit-only` approach, editable in AI Core), so implied items come only from `infer-implicit`, at `full`. They are written with evidence tier `inferred`.
 - **Caps are per call.** The cap limits each call's output. It is not a budget for the whole ingest: the engine keeps no token budgets, and spending limits are AI Core's (see [Providers](/cognitive-db/providers/)).
@@ -141,7 +141,7 @@ The `sourceId` is how re-ingest stays idempotent:
 - **A relationship stated again** strengthens the existing connection instead of adding another.
 
 <Aside type="note" title="userId is the ownership boundary">
-The engine follows a **`tenantId === userId`** model: in a solo-business design, one user *is* the tenant. There is no separate multi-tenant layer and no `tenantId` column. Isolation is by **ownership**: every read and write is scoped to the `userId` you pass, and every entry point rejects an empty one.
+The engine follows a **`tenantId === userId`** model: in a solo-business design, one user *is* the tenant. There is no separate multi-tenant layer and no `tenantId` column. Isolation is by **ownership**: every read and write is scoped to the `userId` you pass, and every entry point rejects an empty one. [Isolation sections](#isolation-sections) divide one user's own data further; they are not a tenant layer.
 </Aside>
 
 ### Storage
@@ -162,12 +162,129 @@ A few engine functions need optional adapter methods:
 - `strengthenConnection`, `weakenConnection` and `updateConnectionStrength` need `getConnection` (Structure 1.37.1 or later). `createMetaConnection` uses it too when present, and falls back to `getNode`.
 - `findByConnectionType` needs `listConnections`; without it, it returns nothing.
 - `removeConnection` needs `deleteConnection`.
+- In an app with isolated node types, ingest into a section and `expandGraph` need `getIsolationModel` (see [Isolation sections](#isolation-sections)).
 
-Structure 1.38.0 or later is recommended, for complete secret redaction in change-log snapshots (`redactSecretValues`).
+Structure 1.38.0 or later is recommended, for complete secret redaction in change-log snapshots (`redactSecretValues`). An app with isolated node types needs Structure 1.39.0 or later.
 
 The `database.mode` is `integrated`: you pass your app's own `PrismaClient`, and the engine's tables live in your database. A Prisma-free `standalone` mode is planned but not built.
 
 All engine-owned tables are prefixed **`cog_`**, so they never collide with your own. New engine options go into existing JSON columns (`data` / `metadata`) wherever possible, so new capabilities rarely need a schema migration.
+
+### Isolation sections
+
+An admin can mark a Structure node type **isolated**, a client matter for example. Each record of that type is the root of an **isolation section**: the record itself, everything filed under it, and every record labelled with it. Inside a section the engine sees only that section's records and links, plus records of **global** node types, which every section can find. Since 2.0.1 every engine read and write goes through one *section guard* that applies this. In an app with no isolated node types the section guard is a pass-through (one cached isolation-model read), and the change-gate and thread keys are unchanged. The came-from links (`derived_from` / `mentions`, or one warning per unseeded type) and retrieve-to-connect running without a scope apply to every app.
+
+The two kinds of type come from each node type's isolation settings in Structure (`primaryScope`):
+
+| Node type | Set in Structure as | What the engine does with its records |
+|---|---|---|
+| **Isolated** | `isPrimary: true`, `isolation: 'enforced'` | Each record is a section root. The engine never creates one, because a new record would start a new section. |
+| **Global** | `global: true` (and not `isPrimary`) | Searchable and linkable from every section, but never changed and never created by the engine. Only the admin adds global records. |
+| Any other type | — | Belongs to the section of the document it came from. |
+
+A link to a global record belongs to the section that made it, so a shared global record never becomes a bridge from one section into another. The records the engine makes (entities, emotions, concepts, questions) stay top-level in Structure and are **labelled** with their section rather than filed in its folder tree: they show in that section's searches and open from it, but not in its sidebar tree. The same document uploaded into two sections becomes two separate copies that share nothing but global records.
+
+<Aside type="note" title="A boundary inside one user's data">
+Sections divide a single user's records, one matter from another for example. They are not a multi-tenant layer: every section belongs to the same `userId`, and ownership by `userId` remains the boundary between users (see [Security](/cognitive-db/security/)).
+</Aside>
+
+#### Modes
+
+Every engine call runs in one of three modes:
+
+| Mode | When | The engine sees |
+|---|---|---|
+| `off` | The app has no isolated node types | Everything the user owns, plus global records (2.0.0 behaviour) |
+| `section` | Inside `withIsolationSection` with a section root | That section's records and links, plus global records |
+| `none` | Inside `withIsolationSection` with `isolationRootId: null`, **or any call made outside a context** | Records and links in no section, plus global records |
+
+#### Ingest: the document's section
+
+Resolve a document's section when it is received or queued, from the record it is filed to, and store it with the job. Never take it from the section the user has open on screen: the job may run later, after the user has moved on.
+
+```typescript
+import { ingest, resolveIsolationSection } from 'cognitive-db';
+
+// When the document arrives (or is queued):
+const isolationRootId = await resolveIsolationSection(userId, filedToNodeId); // a root id, or null
+
+// When the job runs:
+await ingest(prisma, {
+  userId, sourceId, sourceType, content,
+  isolationRootId,               // the document's section (null or absent: no section)
+  sourceNodeId: documentNodeId,  // the Structure record the document came from, when it exists
+  unreadableTypes,               // node types this user may not read
+});
+```
+
+- **`isolationRootId`** must be the id of a section root: the user's own top-level record of an isolated node type, not deleted. Anything else throws `IsolationSectionError` before anything is written, and so does any root in an app with no isolated node types. `ingest()` and each `ingestBatch` item run inside that section.
+- **The change gate is per section.** The same `sourceId` ingested into a second section is `'new'` there and becomes a separate copy, and a thread's `followed_by` link never reaches into another section.
+- **Came-from links.** With `sourceNodeId`, the content record links to that record (`derived_from`). The content record also links to each entity it mentions (`mentions`), and each emotion, concept and question links to the content (`derived_from`). Seed both connection types: they are in `COGNITIVE_DB_CONNECTION_TYPES`.
+- **`attachSource({ userId, contentNodeId, sourceNodeId, isolationRootId, unreadableTypes })`** writes the content → source link for a host that creates the document's record only after ingest. It is idempotent, and both records must be in the section (the source may instead be a global record). So create the document's record inside the document's section before calling it:
+  - file it under the origin node or the section root (`parentId`), or create it top-level and label it with the section: `createNode(userId, input, { isSystem: true, scopeRootId: isolationRootId })` (Structure refuses global and isolated types there);
+  - a split container uses the job's `isolationRootId`, never the section open on screen;
+  - fail loudly rather than fall back to an unlabelled top-level record. For a document in a section, a source record in no section (or in another section) makes `attachSource` throw `IsolationViolationError` (`'outside-section'`), unless its node type is global.
+
+#### Every other engine call: `withIsolationSection`
+
+Wrap every engine call other than `ingest()` in `withIsolationSection` for the section the user is working in, or `null` for no section. That covers search, retrieval and traversal, insights and `runFullCheck`, patterns, learning, working-memory tracking and `consolidate`, and metrics:
+
+```typescript
+import { withIsolationSection, listIsolationSections, runFullCheck } from 'cognitive-db';
+
+const insights = await withIsolationSection(
+  { userId, isolationRootId: matterId, unreadableTypes },
+  () => runFullCheck(prisma, userId),
+);
+
+// Background work: one pass per section, plus one for "no section".
+for (const isolationRootId of await listIsolationSections(userId)) {
+  await withIsolationSection({ userId, isolationRootId, unreadableTypes }, () => runFullCheck(prisma, userId));
+}
+```
+
+<Aside type="caution" title="Per-section host state comes first">
+Before running `runFullCheck` once per section, make the host's Suggestions inbox per section: a section column and index on `cog_ingest_suggestion`, a section-prefixed `dedupKey`, a section parameter on the Suggestions routes, and a refresh whose stale-row clean-up touches only the section being refreshed. Otherwise each per-section pass deletes the other sections' open suggestions. Key the host's duplicate gates by the job's section too (`skipUnchanged`, the cross-source and near-duplicate quarantine lookups, and the retrieve stage's possible-duplicate search), or a second section's copy of a document is skipped or quarantined before it reaches the engine.
+</Aside>
+
+Everything the function does, however deep, is confined to that section. The root is validated first, as for ingest. A nested `withIsolationSection` replaces the section for its own work only. `getIsolationContext()` (inside a context) and `getIsolationScope(userId)` (anywhere) report the current mode and section.
+
+Always pass `unreadableTypes`. Inside a context the engine reads through Structure's trusted system tier, which skips Structure's own per-type read permission, so the engine drops those types itself. Leave them out only when the user may read every node type.
+
+Call `getUsageMetrics` inside `withIsolationSection` too. Inside a context, `listNodes` returns a total of 0 when every queried type is unreadable, and drops unreadable types from a mixed `types` list; a query that names no type still counts records of the unreadable types. Outside a context its `total` and `totalPages` are Structure's count for the section open on screen, not the guard's.
+
+#### Required adapter forwarding (Structure 1.39.0 or later)
+
+The section guard needs Structure 1.39.0, which labels records and links with their section and confines lists, searches and graph walks. The host's `StructureAdapter` must forward these options unchanged:
+
+| Adapter method | Forward |
+|---|---|
+| `getNode` | the `options` argument (`isSystem`, `includeChildren`) |
+| `listNodes` | the `options` argument (`isSystem`, `scopeRootId`, `null` included) |
+| `createNode` | the `options` argument (`isSystem`, `scopeRootId`) |
+| `createConnection` | the seventh argument (`origin`, `status`, `isSystem`, `scopeRootId`) |
+| `getNodeConnections` | the `options` argument, `isSystem` included |
+| `listConnections` | the `options` argument (`isSystem`) |
+| `embeddings.semanticSearchNodes` / `findSimilarNodes` | `scopeRootId` (`null` included) and `excludeNodeTypes` |
+| `expandGraph` | `scopeRootId` (`null` included) and `excludeNodeTypes` |
+| `getIsolationModel` | wire it to `structureService.getIsolationModel(userId)` |
+
+Connection reads must also pass Structure's results through untouched: each link's own section label (`rootNodeId`) and its hydrated `fromNode` / `toNode`. Until `getNode` forwards its options, the guard checks each write target on Structure's user tier, which hides records outside the section open on screen, so such writes are refused. `getIsolationModel` is required to ingest into a section, because it is the engine's signal that Structure can label a new record with its section. Ship it together with, or after, the `createNode` options forwarding. If it is wired while `createNode` still drops its options, Structure writes an unlabelled top-level record. The guard archives it only if `archiveNode` is wired; otherwise the record stays in no section and its id is reported as `orphanNodeId`. Wiring `archiveNode` is recommended for this reason.
+
+#### Fail-closed behaviour
+
+When something is missing, the engine shows less, never more:
+
+- **A call outside any context** runs as `none` in an app with isolated node types, so a forgotten wrapper returns emptier results instead of another section's records.
+- **A model that cannot be loaded** (`getIsolationModel` or the type registry fails) throws `IsolationSectionError` (`'model-unavailable'`). Entering a context never falls back to an older model.
+- **Without `getIsolationModel`**, a section ingest is refused before any model call, so no tokens are spent and nothing is written (`IsolationViolationError`, reason `'unlabelled'`). Any other new top-level record inside a section is refused before it is written, and `expandGraph` returns no results.
+- **A write that would touch a global record, or anything outside the section**, throws `IsolationViolationError`. So does a write whose target the engine cannot read to check it: until `getNode` forwards its options, the engine's checks read on Structure's user tier, so a write to a record outside the section open on screen is refused. Structure's own section refusals are reported the same way, and nothing is written.
+- **A link's label alone is never trusted.** A link a user made in Structure's UI takes its label from one of its endpoints, and Structure never relabels a link when one of its endpoints is later filed into a section or moved out of one, the engine's own links included. So a link is shown only when both endpoints are readable and in the current scope; otherwise it is hidden, and updating, promoting or deleting it is refused. The same holds for a link read as a record (`getNode` of its id) and for a link that is the endpoint of a meta-link, whose own endpoints are checked too. The check goes one level down, so a meta-link of a meta-link is hidden, and the engine refuses to create one.
+- **Pages can come back short.** Inside a context a `listNodes` query that names no type reads the unreadable types too, and the guard drops them from the page; links from other sections are dropped from `listConnections` pages the same way. Page on `totalPages`, never on a page shorter than its `limit`.
+- **A record Structure did not label** is archived when the host wires `archiveNode`, never kept in the section, and named in the error (`orphanNodeId`).
+
+**Retrying.** Treat `IsolationViolationError` and `IsolationSectionError` as permanent job failures that are not retried. The one exception is `IsolationSectionError` with reason `'model-unavailable'`, which is transient. `'not-found'` usually means the section was deleted after the job was queued.
+
 
 ### Running the engine's AI operations directly
 
@@ -279,6 +396,15 @@ As noted above, the Cognitive Pipeline lifecycle hook detects this symlink and s
 **`CognitiveDB: storage.structure adapter is required (Structure is the engine's only storage)`** — `initConfig()` was called without a Structure adapter. Pass `storage: { structure }`. Since v2.0.0 there is no fallback store.
 
 **`userId cannot be empty`** — every entry point (`ingest`, `trackEvent`, `consolidate`, `runFullCheck`, …) requires the caller's `userId`.
+
+**`IsolationSectionError`** — the section root given to `ingest()`, `attachSource` or `withIsolationSection` is not one: it is missing or deleted, belongs to another user, is not of an isolated node type, or is not top-level. Its `reason` says which; `model-unavailable` means the isolation model could not be loaded from Structure. Only `model-unavailable` is worth retrying.
+
+**`IsolationViolationError` with reason `unlabelled`** — the engine could not label a new record with its section. There are three cases:
+- `getIsolationModel` is not wired, or Structure is older than 1.39.0. A section ingest is refused before any model call, so no tokens are spent; any other top-level create inside a section is refused before it writes. Nothing was written.
+- `getIsolationModel` is wired, but the adapter does not forward `createNode`'s `isSystem` / `scopeRootId`. Structure wrote the record without a label. The guard archived it, or left it in place when `archiveNode` is not wired, and its id is in the error's `orphanNodeId`.
+- Structure refused the section root, for example one deleted mid-ingest, or refused a `scopeRootId` sent without `isSystem`. Nothing was written.
+
+See [Isolation sections](#isolation-sections).
 
 **`no Structure node type for content`** — ingest maps `sourceType` to a Structure node type, falling back to `content`, `document`, `note` or `source`. Seed one of these in Structure. This is checked before any model call, so no tokens are spent.
 
