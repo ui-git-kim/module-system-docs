@@ -37,6 +37,60 @@ Completed: **[YYYY-MM-DD, vX.X.X] [module/app name]** — Description — fixed 
 
 - **[2026-09-30] document-management module** — **Conformance C2's frontend "deferred" marker (v1.31.18) never matches a barrel that lives in a template file, so the by-design hits it was meant to clear still fail `conformance:check`.** `resolveBarrels` reads each barrel body with `exportedTemplateBody(decl.file.codeText, decl.exportName)`. `codeText` is the comment-stripped view of the file, and `stripComments` only knows `'` and `"` strings — it treats a backtick as an ordinary character and drops everything after `//` on a line. So the `// import './registrations/…'` marker lines *inside* `INDEX_TEMPLATE` are erased before `commentedBases` scans the body, and it never finds a marker. document-management still gets all six C2 hits (its optional Structure registrations) on scaffold **1.31.19**. **Suggested fix:** in `resolveBarrels`, carry the raw template body alongside the stripped one — `const rawBody = exportedTemplateBody(decl.file.content, decl.exportName); if (body !== null) sources.push({ label, body, rawBody: rawBody ?? body });` (and the same with `.content` in the legacy and candidate fallbacks) — and have `commentedBases` iterate `(s.rawBody ?? s.body).split('\n')`. `sideEffectBases` keeps using the stripped body, so a commented import still never counts as a live one. Add a regression fixture with a commented frontend import inside a template barrel. **Downstream workaround:** document-management runs the checker in CI through a module-owned wrapper (`.github/scripts/check-conformance-baseline.cjs`) that tolerates exactly the six named hits while their commented imports are present, and tells you to delete it once this is fixed — see [Document Management → Developer Workflow → The conformance baseline](/document-management/developer-workflow/#the-conformance-baseline). Manifests in `scripts/check-conformance.cjs` (`resolveBarrels`, `commentedBases`). Severity: Medium.
 - **[2026-09-30] document-management module** — **The scaffold toolchain carries esbuild advisory GHSA-g7r4-m6w7-qqqr into every module, and `npm audit fix` cannot clear it.** `tsup` `^8.5.0` — the latest release, 8.5.1, included — pins its nested esbuild to `^0.27.0`, while the patched release is esbuild **0.28.1**, so `npm audit fix` is a no-op even with `--force`. The advisory is low severity and not reachable through `tsup` (which never starts esbuild's serve mode), but it shows up in every module's `npm audit` and in any dependency-audit CI job. **Suggested fix:** ship the override in the module starter's own `package.json` — `"overrides": { "tsup": { "esbuild": "$esbuild" } }` with `dependencies.esbuild` raised to `^0.28.1` — so modules can pick it up through `scaffold:update` (its `package.json` handling would need to carry the `overrides` block and the esbuild floor). Drop the override once a `tsup` release accepts esbuild `^0.28`. document-management applies exactly this locally (see [Developer Workflow → Dependency audit and the esbuild override](/document-management/developer-workflow/#dependency-audit-and-the-esbuild-override)). Manifests in `package.json` (`devDependencies.tsup`, `dependencies.esbuild`). Severity: Low.
+- **[2026-10-27] structure module** — **No module gate runs the generated backend against a database, so raw SQL that is valid and type-checks but corrupts data passes every check. Structure has a working runtime harness (`npm test`: vitest, PGlite, Prisma 7) with no Structure-specific code, and the scaffold could ship it to every module through `scaffold:update`.** It is a reference implementation offered for the lift, not a request to build from scratch.
+  - **Evidence.**
+    - Structure's `updateDescendantPaths` ran `substring("path" from $n)` through `tx.$executeRaw`. Prisma 7's `@prisma/adapter-pg` sends values without parameter types, so Postgres resolved the regex form `substring(text from pattern)`. Moving or merging an entry with children wrote each child's `path` as NULL or a stray fragment.
+    - By code reading, `@prisma/adapter-neon` 7.10.0 binds values the same way. Neon hosts (the starter's default, `backend/src/config/env.ts:73`) were very likely exposed too. That is not runtime-tested, because the harness cannot run that adapter.
+    - `type-check`, `build`, `check:templates`, `conformance:check` and a host `tsc --noEmit` cannot see this class of bug. The harness's first runtime tests caught it.
+    - It is fixed in structure v1.39.0 with an `::int` cast (`bdb5a3b`) and a guarded, idempotent repair migration, `1.39.0__descendant-path-repair.sql` (added in `5cf6ac5`, relabelled in `36a7c6c`). See [Structure changelog → v1.39.0](/modules/structure/changelog/#v1390).
+    - Any template that binds a parameter whose type Postgres must infer from an overloaded function can change meaning the same way. Counting `$queryRaw` / `$executeRaw` occurrences in templates, including the `Unsafe` forms: Structure has 69, colour 58, builder 20 and ai-core 5; the other local modules surveyed have none.
+  - **How it works** (`d7a8878`, merged in `ba2b8ee`).
+    - A vitest `globalSetup` renders the backend templates into `tests/.sandbox/` over 14 host stubs. It uses the scaffold's own `processTemplate`, `resolveTemplateEntry`, `addVersionHeader` and `syncModuleMigrationFiles`. It then runs `prisma generate` and `prisma migrate diff --from-empty --to-schema … --script`.
+    - Each test file boots PGlite (Postgres 17.5) behind `@electric-sql/pglite-socket`. It applies the DDL, runs the module migrations through the scaffold's `runModuleMigrations`, and calls the generated services through the host's `PrismaPg` client.
+    - 66 tests in 4 files pass across two variants, `default` and `embeddings` (pgvector 0.8.1 with its HNSW index), in about 15-20 s. So far this is only on Windows 11 and Node 24.
+    - A trial on a scratch copy of the module starter's `my-feature-module`, with `tests/harness/` unchanged, rendered 8 backend files and passed a CRUD test (not re-run).
+  - **Relation to the roadmap.**
+    - This is a third, runtime layer for [Generated-code validation & install-free regeneration](/module-starter/roadmap/#generated-code-validation--install-free-regeneration), not a substitute for it.
+    - Vite strips types, so the harness gives only an implicit L1 check for the backend files a test imports. It covers nothing for routes, the barrel or the frontend.
+    - Both should share one exported render step. That step should also replace Structure's hand-rolled `scripts/regen-host.cjs`.
+  - **Ask.**
+    1. **Ship the harness as scaffold-owned.**
+       - Ship `tests/harness/**` (21 files), `vitest.config.ts`, `tests/tsconfig.json` and `tests/.gitignore`. Add them to `SCAFFOLD_OWNED_PATHS`, to the auto-accept-theirs conflict case and to `SCAFFOLD_FILES` in both `update-scaffold.*`.
+       - `vitest.config.ts` must set `passWithNoTests: true`, because vitest 5.0.5 exits 1 when it finds no test files. The starter's `backend/vitest.config.ts` already sets it.
+       - It should read optional settings from `tests/harness.config.ts`, so modules never edit it.
+       - Modules own `tests/harness.config.ts` (optional), `tests/*.test.ts` and `tests/README.md`.
+    2. **Add the script.** Add `"test": "vitest run"` to `scripts/add-scaffold-scripts.cjs`.
+    3. **Reconcile `package.json` instead of merging it.**
+       - Today a conflict in `package.json` or `package-lock.json` stops the update, and aborts a non-interactive run (`update-scaffold.sh:971-985`). Structure hand-merged one in `609c083`.
+       - Resolve both files as ours, then add only the missing harness devDependencies, at ranges that track the starter's `backend/package.json`.
+       - Also add `engines.node` `^22.22.0 || ^24.0.0 || >=26.0.0`, and `allowScripts` for `prisma`, `@prisma/engines` and `esbuild`.
+       - Then prompt for `npm install`.
+    4. **Skip instead of failing.** Skip when there is no backend (`render.ts:118`) or no tables (`prisma-cli.ts:58`). A module without backend templates gets no devDependencies and no `test` script.
+    5. **Give the module starter its own self-test.**
+       - Put it at an exact path no module will use, such as `tests/scaffold-self.test.ts`.
+       - List it in `SCAFFOLD_ONLY_FILES` in `update-scaffold.*` and in `create-module.*`, which keeps its own copy of the list.
+       - The updater deletes every scaffold-only path in each module after a merge (`update-scaffold.sh:814-821`). So the module starter must not ship a `tests/harness.config.ts` or `tests/README.md` either.
+       - Run the self-test on Linux under Node 22 and 24, gated like the starter's `.github/workflows/ci.yml`.
+  - **Later.**
+    - Extension SQL names (`uuid_ossp` is `"uuid-ossp"`).
+    - Modules that import another module (builder, cognitive-pipeline), and stubs for other modules' host imports.
+    - Syncing the stubs from a starter checkout, with a line-ending-safe `--check`.
+    - A `tsc -p tests/tsconfig.json` gate.
+    - A per-run sandbox directory.
+    - Directory prefixes in `.scaffoldignore`.
+  - **Limits.**
+    - PGlite is a single session (pool `max: 1`), so row locks and serialisation failures go untested.
+    - Lifecycle hooks, Lakebase and the route layer do not run.
+    - A green run does not replace `tsc` or a test against real Postgres.
+    - The toolchain adds about 208 lockfile packages and a Prisma engine postinstall.
+    - The details are in the structure repo's `tests/README.md`.
+  - **Done when** Structure and a module with no harness both complete `npm run scaffold:update -- --yes` without a merge abort, and Structure's 66 tests pass after `npm install`.
+  - **Versioning.** A scaffold patch by default (`versioning.mdx:86-104`), or a minor if it is treated as a new subsystem. It is infra-only downstream, so modules need no version bump.
+  - **Manifests in**:
+    - `update-scaffold.{sh,ps1}`, `create-module.{sh,ps1}`, `scripts/add-scaffold-scripts.cjs` and `package.json`.
+    - The docs it changes: `getting-started/llm-rules.mdx:961` (the "no `test` script" rule) and its module checklist, `module-starter/developer-workflow.mdx:128`, `building-modules.mdx:1092`, and `versioning.mdx` (`:267` backfill list; `:291` and `:339` on `package.json` ownership).
+    - The EDIT / DO NOT EDIT tables in `CLAUDE.MODULE.md` (`:108-132`).
+  - **Severity: Medium.** It is dev tooling, not a shipped codegen defect, but the class of bug it catches silently corrupted production data.
 
 ### Previously reviewed
 
