@@ -1,7 +1,7 @@
 ---
 title: Service API
 description: The full aiCoreService surface a consumer programs against, method by method
-lastUpdated: 2026-10-01
+lastUpdated: 2026-10-27
 sidebar:
   order: 6
 ---
@@ -23,6 +23,7 @@ This page describes AI Core as checked against module v1.78.0 (September 2026). 
 | Method | Purpose | Returns |
 |---|---|---|
 | [`run`](#run) | Run a named language operation | `Promise<RunResult>` |
+| [`stream`](#stream) | The same run, with the answer sent as it is written (v1.79.0) | `Promise<RunStream>` |
 | [`embed`](#embed) | Run a named embedding operation over a batch | `Promise<EmbedRunResult>` |
 | [`embedMultimodal`](#embedmultimodal) | Embed text and/or images into one vector space | `Promise<EmbedRunResult>` |
 | [`rerank`](#rerank) | Order documents by relevance to a query | `Promise<RerankRunResult>` |
@@ -118,6 +119,7 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 - `model-purpose-missing` / `model-purpose-disabled` — the purpose the operation binds does not exist, or is switched off.
 - `no-purpose-default` — the bound purpose has no default model yet; the message says to set one on the Models tab. An embedding purpose refuses instead with `embedding-purpose-missing-width` (the operation declares no vector width), `no-purpose-default-for-width` (no default at that width) or `purpose-default-wrong-width` (the default, or a user-chosen model, can't produce that width).
 - `no-tool-under-acceptable-terms` — the operation is handled as sensitive and opts into a tool that sends content to a third party (web search or fetch). A sensitive operation may not use one; `detail` names the tools.
+- `stream-structured-output-unsupported` (v1.79.0, `stream()` only) — the operation answers in fields and names no streamed field. `stream-field-invalid` — its streamed field is not a text field of its schema.
 - `input-port-unknown` — a run segment's `inputKey` names a port the operation does not declare (`detail.declaredPorts` lists the ones it has). It is refused rather than passed through, because passing it through would silently drop that port's framing.
 
 **Example**
@@ -136,6 +138,77 @@ if (feedback.reason) {
   // The run did less than asked — render feedback.missing / coverage as the app sees fit.
 }
 // audit.ledgerId is the durable reference for this exact call.
+```
+
+## `stream`
+
+Stream a named language operation (v1.79.0): the same run as [`run`](#run) — every spending limit, the usage gate, resolution, prompt assembly, every refusal and the ledger row — with the answer sent as it is written. There is no side door: it is the same code with a different ending.
+
+```ts
+stream(operationId: string, input: RunInput, opts: RunOptions): Promise<RunStream>
+
+interface RunStream {
+  events: AsyncIterable<RunStreamEvent>;  // read once; leaving the loop early stops the call
+  result: Promise<RunStreamResult>;       // how it ended — await it to save the reply
+  cancel(): void;                         // stop now (the same as leaving the loop)
+}
+```
+
+**The promise settles after every check has passed**, just before the provider call. So a refusal — `spend-limit-reached`, `usage-limit-reached`, `model-unpriced`, any resolution refusal — is **thrown by `stream()` itself**, exactly as `run()` throws it, before any event. So is an attachment link that would be refused (an unsafe address, too many links). An HTTP route can still answer 409 or 400 with a normal error body before it starts streaming. Only a download that fails is found later, and it arrives as an `error` event.
+
+**The events.** One `start`, then `text-delta` events as the answer is written, then exactly one `finish` or one `error`.
+
+```ts
+type RunStreamEvent =
+  | { type: 'start'; ref: string; operationId: string; modelRecordId: string; requestedModelId: string; streamed: boolean }
+  | { type: 'text-delta'; delta: string }
+  | { type: 'finish'; outcome: 'ok' | 'cancelled'; text: string; structured: unknown; feedback: Feedback; audit: RunAudit }
+  | { type: 'error'; ref: string; code: string; reason: string | null; message: string; retryable: boolean };
+
+interface RunStreamResult {
+  outcome: 'ok' | 'cancelled';
+  result: { text: string; structured: unknown };
+  feedback: Feedback;
+  audit: RunAudit;
+}
+```
+
+- **Skip event types you don't know.** More will be added (reasoning, tool calls, sources); this rule is what lets them arrive without breaking anyone.
+- `start.ref` is the ledger id the call's row will have, made before the call — the same id that ends up in `feedback.ref`.
+- `finish.text` is the answer the user read: every `text-delta` joined. `feedback` and `audit` are what `run()` returns, with `audit.streamed` and `audit.cost`.
+- `error` carries AI Core's own message (provider prose never reaches it). The call's row is written either way.
+
+**What streams.**
+
+| The operation | What the user watches being written |
+|---|---|
+| A Task with no output fields, **Plain text** | The answer as the model writes it. With tools, text the model writes before a search streams too, and is part of `finish.text` |
+| A Task with no output fields, **JSON sections** (the default) | The answer section only. The check report is never sent while the model writes: it is read at the end, as on a run, and its verdict is in `finish.feedback` (`self-check-failed:D2` when a discipline failed and the operation is set to tell the app) |
+| An operation with output fields and a **streamed field** | That field (a text field the admin picks on the operation, `streamField`). The other fields arrive in `finish.structured` |
+| An operation with output fields and **no** streamed field | Refused before any spend: `stream-structured-output-unsupported` (409) |
+
+A streamed field that is not a text field of the operation's schema is refused as `stream-field-invalid`.
+
+**Stopping.** Leave the loop (`break`), call `cancel()`, or abort `opts.signal`. The provider call stops **at once**, even while a spending limit is on. That is unlike a `run()`, whose sent call runs on so its exact cost is counted. The row is written with outcome `cancelled`, at the provider's figures for the requests that finished, plus an **estimate** for the one cut off: its prompt in full (for a later tool step, at least the step before it), and the larger of what it had written (text and visible reasoning, at about four characters a token) and about 100 tokens a second for the time it ran, up to the call's output limit — so reasoning the provider never showed is counted too. Its cost basis is `estimated`. A stop before anything was sent (during the file downloads) costs nothing. `feedback.missing` names `stream-cancelled-by-caller`, followed by the run's other known gaps, and `reason` stays `null`, so a stopped stream never lands on the review queue. A reader still in the loop gets a `finish` event with `outcome: 'cancelled'`.
+
+**A stream that fails part-way** — a dropped connection, a provider error, a timeout — sends an `error` event and ends. The row is `error`, counted the same way once the provider had started answering. A request the provider rejected outright (a 400, a 429, an outage) is not charged.
+
+**Timeouts.** Once a request has started writing, a stream that then sends nothing for 120 seconds is ended as a retryable timeout. At each tool step the clock waits for the new request's first text again. A whole stream may run for 30 minutes.
+
+**A tool step after the shown field had started:** in the rare case where the model begins the field the user watches and then calls a tool, nothing more is shown. `feedback.missing` names `stream-answer-restarted`, and the final fields are in `finish.structured`.
+
+**A provider that cannot stream** answers through `generate()`. The whole answer then arrives as one `text-delta`, `start.streamed` and `audit.streamed` are `false`, and `feedback.missing` names `stream-unavailable:<provider>`. Anthropic, OpenAI and Google all stream.
+
+**For a chat screen**, hand the stream to [`pipeRunStreamToUiMessageResponse`](/modules/ai-core/integration/#streaming-a-chat-reply-v1790), which answers useChat with no SDK import of your own.
+
+```ts
+const ai = serviceRegistry.getOptional('ai-core');
+const s = await ai.stream('chat-reply', { segments, history }, { userId, signal });
+for await (const event of s.events) {
+  if (event.type === 'text-delta') send(event.delta);
+  // any other type: skip it
+}
+const { result, feedback, audit } = await s.result; // save the reply; audit.ledgerId is its row
 ```
 
 ---
@@ -766,6 +839,13 @@ A run's input is a list of segments — the assembly currency. A consumer segmen
 ```ts
 interface RunInput {
   segments: ConsumerSegment[];
+  history?: ConversationTurn[];   // v1.79.0 — earlier turns of a conversation, oldest first
+}
+
+interface ConversationTurn {
+  role: 'user' | 'assistant';     // no system role: the system prompt is the operation's own
+  content: string;
+  media?: MediaAttachment[];      // user turns only
 }
 
 interface ConsumerSegment {
@@ -798,6 +878,13 @@ interface ConsumerSegment {
 ```
 
 **The consumer assigns `origin`; AI Core honours it** and never treats an undeclared segment as authored. Content wears two independent axes — the SEMANTIC `marker` (what a content item *is*) and the SECURITY `injectionRisk` flag (whether a model might wrongly obey instructions hidden in it) — covered in [Integration](/modules/ai-core/integration/).
+
+**Conversation history (v1.79.0).** `history` sends earlier turns as real turns, between the system prompt and the final user turn. The final turn carries what it always has: the context material and the new message (the segments). It works for `run` and `stream` alike.
+
+- **Limits.** At most 1,000 turns of up to 1,000,000 characters each. A turn must not be empty unless it carries files, and files go on user turns only. They are counted with the final turn's under the same link and size limits.
+- **No trimming.** AI Core sends what it is given and never trims it. An over-long conversation fails with the provider's error, named as usual.
+- **Where it comes from.** **Pass history from your own store, never from a browser.** Whoever writes the assistant turns puts words in the model's mouth, so `POST /run` refuses a `history` in its body (400).
+- **The other way.** An app that wants history treated as material can still pass it as a context item under the `conversation-history` marker.
 
 **Named input ports (v1.56.0).** An operation's input contract declares items, each with a stable `key` — a port id shown in the operation editor. A caller binds a segment to a port by setting `inputKey` to that key, and the **port defines the framing**: a raw upload wired to an `upload` port arrives as marked, injection-defended context material with no marker or type set by the caller; a plain text port is the instruction. This lets a pipeline wire its own outputs — a user message, one or several file uploads — to the operation's inputs by name rather than by position, so reordering the contract never re-points a binding. Bind every input by key once you use keys (a keyed run frames the keyed segments and passes others through). With no `inputKey` anywhere, the contract still applies positionally (nth input segment ← nth declared item), exactly as before.
 
@@ -835,7 +922,7 @@ interface RunOptions {
   session?: string[];                   // caller-supplied Session context (sanitised and injection-fenced)
   preferences?: CommunicationStyle;     // caller-supplied communication-style prefs (context, not instructions: sanitised + fenced)
   variables?: Record<string, string>;   // prompt-variable values; only declared tokens substitute (at prompt assembly)
-  callerSupplied?: boolean;             // set by the HTTP routes, never by you — see "HTTP callers" below
+  callerSupplied?: boolean;             // true when the request came from a browser: AI Core's routes set it, and so should yours — see "HTTP callers" below
   sensitivityFloor?: 'normal' | 'sensitive'; // tighten-only: can raise the call's sensitivity, never lower it; AI Core sets it on its own nested calls
 }
 ```
@@ -943,6 +1030,8 @@ interface RunAudit {
   toolSources?: Array<{ url: string; title?: string }>; // web search: the sources the model was handed (returned to you, never stored)
   toolStepCount?: number;           // search-and-read rounds; absent when no tool ran
   promptLayout?: PromptLayoutReport; // v1.70.0 — what the framework's layout settings did; only when it has any
+  streamed?: boolean;               // v1.79.0 — true when the answer was sent as it was written (stream())
+  cost?: { usd: number | null; basis: string }; // v1.79.0 — what the row was costed at (basis: priced, estimated, …)
 }
 
 interface PromptLayoutReport {      // counts and flags only, never content
@@ -1077,6 +1166,8 @@ Since v1.71.0 (Voyage kept current, terms catalogue refreshed):
 ---
 
 Since v1.77.0: `POST /admin/operations/:id/preview` takes an optional `draft` — the operation as the editor would save it (the update body, with `segmentKeys`, `toolIds`, `approaches`, `disciplines` and `objective` always present). The preview then shows the draft instead of the saved operation: every field it leaves out keeps its saved value, the operation need not be saved yet, unknown segment or approach keys are refused as a save would refuse them, and nothing is written.
+
+Since v1.79.0: `POST /run` refuses a body that carries `history` (400 — conversation history is accepted only from server code), and the operation routes take `streamField` (a top-level text field of the schema, or `null`; a field that is not one is refused as `stream-field-invalid`). Operation rows carry `streamField` and ledger rows carry `streamed`. `GET /admin/usage` accepts the outcome `cancelled`. AI Core's per-user rate limit is exported from the barrel as `aiCoreRateLimit` (Express middleware, the same per-process count its paid routes use), for a consumer's own route that calls the service in-process.
 
 ## Related
 

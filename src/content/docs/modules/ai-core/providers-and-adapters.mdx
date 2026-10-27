@@ -1,7 +1,7 @@
 ---
 title: Providers & Adapters
 description: The owned provider interface, how the Vercel AI SDK is contained to one file, and adding a provider or model
-lastUpdated: 2026-09-30
+lastUpdated: 2026-10-27
 sidebar:
   order: 10
 ---
@@ -42,14 +42,32 @@ export interface ProviderAdapter {
   embed(modelId: string, values: string[], opts?: { dimensions?: number; maxInputTokens?: number; signal?: AbortSignal }): Promise<EmbedResult>;
   embedMultimodal?(modelId: string, inputs: MultimodalEmbedInput[], opts?: { dimensions?: number; maxInputTokens?: number; signal?: AbortSignal }): Promise<EmbedResult>;
   rerank?(modelId: string, query: string, documents: string[], topN?: number, opts?: { signal?: AbortSignal }): Promise<RerankResult>;
+  generateStream?(modelId: string, req: GenerateRequest): ProviderStream;  // v1.79.0
+}
+
+type ProviderStreamPart = { type: 'text-delta'; text: string; step: number };
+
+interface ProviderStream {
+  parts: AsyncIterable<ProviderStreamPart>; // read once; stopping early stops the provider call
+  result: Promise<GenerateResult>;          // how it ended — what generate() returns for the same call
 }
 ```
+
+**Streaming (v1.79.0).**
+
+- **The method.** `generateStream` is optional, like `embedMultimodal` and `rerank`. The Anthropic, OpenAI and Google adapters have it, built on the SDK's `streamText`. It takes the very request `generate` takes, and builds it the same way: the cache directive, `store: false`, the attachment downloads, the tool translation and the history.
+- **What comes back.** `parts` gives the text as it arrives, tagged with the provider request it belongs to (a tool call makes one request per search-and-read round). `result` settles with the same `GenerateResult` `generate` returns. Without a schema, its `text` is the text that was sent as parts. With one, it is the final request's JSON reply, and `structured` is parsed from it.
+- **Structured answers.** Current Claude models are asked for structured output natively. Older ones answer through a JSON tool, whose input the SDK hands over as text, so both stream.
+- **The caller stops it.** `result` rejects with `StreamCancelledError`. That is a `ProviderCallError` whose `usage` is the provider's figures for the requests that finished, plus an **estimate** for the one cut off: its prompt in full (for a later tool step, at least the step before it), and the larger of what it had written (text and visible reasoning, at about four characters a token) and about 100 tokens a second for the time it ran, up to the call's output limit — so reasoning the provider never showed is counted too. It is marked `usage.estimated`. A stop during the file downloads, before anything was sent, carries no usage and is a 'no-call'.
+- **Errors.** A provider error part-way becomes the usual typed error, counted the same way. A request the provider rejected outright, before it started answering, carries no estimate.
+- **Deadlines.** A stream may run for 30 minutes. Once a request has started writing, 120 seconds with nothing new ends it as a retryable timeout. At each tool step the clock waits for that request's first text again, because a model may think, or a search may run, for minutes first.
+- **An adapter without it.** The run engine falls back to `generate` and names `stream-unavailable:<provider>`.
 
 `generate` and `embed` are mandatory shapes; `embedMultimodal` and `rerank` are optional — `embedMultimodal` present only on a provider with a multimodal embedding model (Voyage), `rerank` only where a provider serves reranking. The `signal` in each opts bag (v1.52.0) is the caller's abort signal — the controller wires client disconnects to it, so an adapter must hand it to its transport (the AI SDK takes it as `abortSignal`) or cancellation silently stops propagating for that provider. The request and result types are AI Core's own, chosen so nothing the SDK returns escapes normalisation:
 
 | Type | What it carries |
 |---|---|
-| `GenerateRequest` | `instructions`, `input`, `parameters: ResolvedParameters`, optional `schema` (structured output), optional `tools: ResolvedTool[]` (provider-native), optional `attachments: MediaAttachment[]`, optional `signal` |
+| `GenerateRequest` | `instructions`, `input`, `parameters: ResolvedParameters`, optional `schema` (structured output), optional `tools: ResolvedTool[]` (provider-native), optional `attachments: MediaAttachment[]`, optional `signal`, optional `history: ConversationTurn[]` (v1.79.0 — earlier turns, oldest first, sent as real turns between the system prompt and the final user turn; files on a user turn ride as file parts on that turn, under the request's one link count and byte budget) |
 | `GenerateResult` | `text`, optional `structured`, optional `toolCalls` (name + count, by reference), optional `toolSources` (url + title), optional `stepCount`, `usage: NormalizedUsage`, `warnings: ProviderWarning[]`, `finishReason`, optional `rawFinishReason`, optional `reportedModelId`, optional `cacheHandled` (`explicit` · `automatic` · `none`; absent = no caching was asked for), `latencyMs` |
 | `NormalizedUsage` | `inputTokens?`, `outputTokens?`, `totalTokens?`, `cacheReadTokens?`, `cacheWriteTokens?`, `cacheWriteLongTokens?` (v1.67.0 — of the writes, those kept for the long lifetime, when the provider reports the split), `reasoningTokens?`, and the provider-native `raw?` passed through for the ledger |
 | `GenerateRequest.cache?` | a resolved `CacheDirective` (v1.67.0: `{ mode: 'explicit' \| 'automatic', systemBreaks, inputBreaks, keep: 'short' \| 'long', cacheKey }`, each break `{ at, keep }`) — owned character offsets, not an SDK type; absent = no caching, and the request is exactly the one sent before caching existed (apart from OpenAI's `store: false`, sent on every OpenAI call since v1.70.0) |
@@ -76,13 +94,15 @@ Two design commitments are baked into these shapes:
 
 ```ts
 // backend/src/features/ai-core/providers/adapters.ts — the ONLY SDK import site
-import { APICallError, LoadAPIKeyError, NoObjectGeneratedError, Output, embedMany, generateText, jsonSchema, rerank, stepCountIs, zodSchema } from 'ai';
-import type { EmbeddingModel, LanguageModel, RerankingModel, SystemModelMessage, TextPart, ToolSet } from 'ai';
+import { APICallError, LoadAPIKeyError, NoObjectGeneratedError, Output, createUIMessageStream, createUIMessageStreamResponse, embedMany, generateText, jsonSchema, pipeUIMessageStreamToResponse, rerank, stepCountIs, streamText, zodSchema } from 'ai';
+import type { EmbeddingModel, LanguageModel, ModelMessage, RerankingModel, SystemModelMessage, TextPart, ToolSet } from 'ai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createGoogle } from '@ai-sdk/google';
 import { createVoyage } from 'voyage-ai-provider';
 ```
+
+The same file holds the **chat-UI helpers** (v1.79.0), `pipeRunStreamToUiMessageResponse` and `runStreamToUiMessageResponse`. They turn a run stream into the AI SDK's UI message stream with the SDK's own `createUIMessageStream`, so the protocol keeps up as the SDK moves. They take AI Core's `RunStream` and return nothing of the SDK's but a stream or a `Response`. They are reached through the service (`aiCoreService.pipeStreamToUiMessageResponse` / `streamToUiMessageResponse`) and the barrel, so a consumer imports nothing from the SDK. See [Integration → Streaming a chat reply](/modules/ai-core/integration/#streaming-a-chat-reply-v1790).
 
 Everything downstream imports the owned interface instead:
 

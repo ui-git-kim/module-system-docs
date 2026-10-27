@@ -1,7 +1,7 @@
 ---
 title: Integration
 description: The consumer contract, content from outside, feedback, retrieval, and what AI Core does not own
-lastUpdated: 2026-09-30
+lastUpdated: 2026-10-27
 sidebar:
   order: 4
 ---
@@ -322,6 +322,57 @@ serviceRegistry.register('promptVariableFields', {
 Binding a field only records what the variable stands for (`sourceRef`); **AI Core never resolves it at run time** — the app resolves the field against the actual node (Structure's own resolver) and passes the value in `variables`, exactly as above. This keeps AI Core a generic `{token}` substitutor with no dependency on Structure.
 
 ---
+
+## Streaming a chat reply (v1.79.0)
+
+A chat lives on streaming: the user watches the answer arrive. [`aiCore.stream()`](/modules/ai-core/service-api/#stream) is the same run as `aiCore.run()` — every spending limit, gate, refusal and ledger rule — with the answer sent as it is written. The service also carries a helper that turns the stream into the AI SDK's UI message stream, which the `useChat` hook reads. So a chat module's route needs **no `ai` or `@ai-sdk/*` import of its own**, and reaches everything through the service registry, the same degrade-don't-fail way as every other call.
+
+```ts
+// The chat module's route (backend). AI Core is optional: without it, the
+// route says so and the rest of the chat module still loads.
+router.post('/conversations/:id/reply', requireAuth, async (req, res) => {
+  const ai = serviceRegistry.getOptional('ai-core');
+  if (!ai) {
+    res.status(503).json({ error: 'AI is not available' });
+    return;
+  }
+  // History comes from YOUR store, never from the browser.
+  const conversation = await chatStore.load(req.params.id, req.user.id);
+  const stop = new AbortController();
+  res.once('close', () => stop.abort()); // the browser went away: stop the call
+  let stream;
+  try {
+    stream = await ai.stream(
+      'ai-chat/reply',
+      {
+        segments: [{ type: 'input', content: req.body.message }],
+        history: conversation.turns, // [{ role: 'user' | 'assistant', content, media? }]
+      },
+      { userId: req.user.id, signal: stop.signal, callerSupplied: true },
+    );
+  } catch (err) {
+    sendError(res, err); // your own error handler: a refusal arrives HERE, before any streaming (409 + its reason)
+    return;
+  }
+  ai.pipeStreamToUiMessageResponse(stream, res);
+  // Save the reply once it is finished. A stopped reply comes back with
+  // outcome 'cancelled' and the text the user saw.
+  const finished = await stream.result.catch(() => null);
+  if (finished) {
+    await chatStore.saveReply(conversation.id, finished.result.text, finished.audit.ledgerId);
+  }
+});
+```
+
+On the frontend, point `useChat` at the route with the AI SDK's `DefaultChatTransport`. The assistant message's id is the call's ledger id (`start.ref`) unless you pass `messageId`. Its metadata holds `ref` and `outcome`. Pass `{ includeUsage: true }` to add the call's token counts and cost; they are off by default, because they are the app's figures, not the user's. When the stream ends with an error, the browser is shown a plain sentence (override it with `errorText`), never the error itself. For a route that returns a web `Response`, `ai.streamToUiMessageResponse(stream, options)` does the same; pass the request's abort signal to `stream()`.
+
+**What to get right.**
+
+- **History from your own store.** A browser that could send assistant turns could put words in the model's mouth. AI Core's own `POST /run` refuses a `history` for exactly that reason.
+- **`callerSupplied: true`** when the request came from a browser, as above. Only variables whose source is *Caller* then take a value from it, and a made-up marker id is refused instead of degrading to a gap — the rules AI Core's own HTTP routes apply.
+- **A rate limit.** AI Core's per-user rate limit covers its own HTTP routes. In-process calls are not limited, so put a limit on your route. A module that already imports AI Core's barrel can use `aiCoreRateLimit` (Express middleware, the same count AI Core's paid routes use): `router.post('/…', requireAuth, aiCoreRateLimit, handler)`.
+- **Spending.** Every limit and your usage gate apply as on a run. Stopping a reply stops the provider call at once, and that call is counted at an estimate (its row's cost basis is `estimated`). The estimate includes about 100 tokens a second for the time the model ran, so stopping before the text appears does not make a model's hidden thinking free.
+- **The operation.** Seed it like any other operation. A plain chat reply is a Task with no output fields. With JSON answer sections (the default) the user watches only the answer section, and the check report's verdict is in the final feedback. With output fields, choose the field the user watches as the operation's streamed field, or the stream is refused.
 
 ## Embedding the prompt editor
 
