@@ -200,7 +200,7 @@ Incoming hex matches an entry in group `X`; incoming name matches an entry in gr
 
 ### Transaction scope
 
-Each record ingests inside its **own** transaction. That transaction takes the thesaurus write lock (a transaction-scoped Postgres advisory lock, v2.50.1+), so a record can't join a group that a source delete running at the same moment is removing. There is no batch-wide transaction, so a failed record is reported and skipped while the rest still land. `/ingest` accepts at most **1,000 records per request** (v2.49.0+), and an oversized body gets a 400 whose message names the cap. The admin Import tab sends larger pastes in chunks automatically, and the editorial path uses 25-record chunks. Reports collect per-record outcomes (`created`, `merged-by-hex`, `merged-by-name`, `ambiguous`, `upserted`, `failed`) for the admin UI.
+Each record ingests inside its **own** transaction. That transaction takes the thesaurus write lock (a transaction-scoped Postgres advisory lock, v2.50.1+), so a record can't join a group that a source delete running at the same moment is removing. There is no batch-wide transaction, so a failed record is reported and skipped while the rest still land. `/ingest` accepts at most **1,000 records per request** (v2.49.0+), and an oversized body gets a 400 whose message names the cap. The admin Import tab sends larger pastes in chunks automatically, and the editorial path uses 200-record chunks (v2.54.0+; it was 25). `/ingest` asks the admin to confirm it's them (an emailed code, valid 5 minutes, so one prompt covers a whole import) and allows 30 requests a minute per admin; the Import tab waits out a rate-limit pause and re-sends the same chunk. Reports collect per-record outcomes (`created`, `merged-by-hex`, `merged-by-name`, `ambiguous`, `upserted`, `failed`) for the admin UI.
 
 ## Derived Views
 
@@ -582,11 +582,13 @@ Every record runs through rule 1 (exact `(source, code, hex)` match, or `(source
 
 1. **Parse** — recognises `{ entries }`, bare array of entries, or `{ records }`. The first two route through the editorial path.
 2. **Expand** — each entry becomes one ingest record per source. The first record carries the entry's `altNames` and `oklch`; later records get the source-specific label as an altName if it differs from the entry's `masterName`.
-3. **Chunk + ingest** — records go to `/ingest` in 25-record sub-batches with progress reported between chunks. Each record runs in its own transaction (no batch-wide atomicity ceiling).
+3. **Chunk + ingest** — records go to `/ingest` in 200-record sub-batches with progress reported between chunks. Each record runs in its own transaction (no batch-wide atomicity ceiling).
+   - If the rate limit pauses the run, the progress line says "Waiting for the rate limit…" and the same chunk is sent again once the wait is over. Nothing is written twice: a limited request is refused before it touches the data.
+   - If the admin cancels the "Confirm it's you" prompt or a chunk fails, the run stops and the report shows what landed so far.
 4. **Stitch** — the per-record outcomes are grouped back by originating entry. Each entry's destination group is picked by outcome majority.
-5. **Merge editorial** — for each entry's destination group, the importer fetches the current `DerivedGroupView`, unions the entry's editorial fields (`meaning`, `origin`, `attributes`, `deprecatedNames`; any old `psychology*` fields are ignored) into it, and `PATCH`es only when the merge changed something.
+5. **Merge editorial** — for each entry's destination group, the importer fetches the current `DerivedGroupView`, unions the entry's editorial fields (`meaning`, `origin`, `attributes`, `deprecatedNames`; any old `psychology*` fields are ignored) into it, and `PATCH`es only when the merge changed something. Entries with no editorial fields skip this step (v2.54.0+), so a plain list of names makes no extra requests.
 
-Total wall time for a 200-entry file against Neon ≈ 10 seconds. The Import tab shows a per-phase progress bar with `done / total (pct%)`.
+Total wall time for a 200-entry file against Neon is a few seconds (more when many entries carry notes). The Import tab shows a per-phase progress bar with `done / total (pct%)`.
 
 ---
 
