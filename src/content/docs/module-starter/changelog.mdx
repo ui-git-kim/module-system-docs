@@ -17,13 +17,41 @@ A new command or template on its own is a **patch**, not a minor. If you're reac
 
 <Aside type="tip">
 The module starter has **two version numbers**:
-- **Scaffold version** (`VERSION` file) — Infrastructure version (currently 1.31.21)
+- **Scaffold version** (`VERSION` file) — Infrastructure version (currently 1.32.0)
 - **Module version** (`package.json`) — Your module's version
 </Aside>
 
 <Aside type="note" title="Dependency enforcement is fully wired end-to-end (v1.29.0)">
 The cross-repo arc this changelog tracked is complete. The host enforces `depends` at boot (**starter v2.0.0**, `MODULES_DEPENDENCY_POLICY` — **fail** by default in production, ordered init over `computeModuleOrder().order`, `disable` honoured via `.module-state.json`), the synced contract is on **v1.3.0** (`src/scaffold/module-contract.ts`, hash `40630e6d`), and the generated `module.registration.ts` emits a **gateable `init` callback** so a module is sequenceable and withholdable rather than a bare import-time side effect. See the [v1.29.0 entry](#scaffold-v1290) and the [starter changelog](/starter-template/changelog/) for the semantics.
 </Aside>
+
+---
+
+## Scaffold v1.32.0
+
+**Every backend module gets `npm test`: the PGlite runtime test harness is now scaffold-owned**
+
+A genuinely new subsystem (hence the rare minor): no module gate ran the **generated** backend against a database, so raw SQL that type-checks clean but corrupts data passed every check — the class of bug that silently NULLed structure's descendant paths (`$executeRaw` + Prisma 7's typeless parameter binding resolving `substring(text from pattern)` instead of `(text from int)`). Structure built a working harness and offered it upstream (2026-10-27 report); this release generalises and ships it to every module.
+
+**How it works.** A vitest `globalSetup` (`tests/harness/`) renders the module's backend templates into `tests/.sandbox/` using the scaffold's own `processTemplate` / `resolveTemplateEntry` / `addVersionHeader` / `syncModuleMigrationFiles` over 14 host stubs (the starter's `backend/src` surface), then runs `prisma generate` and `migrate diff --from-empty` (cached by schema hash). Each test file boots an in-memory Postgres — PGlite behind `@electric-sql/pglite-socket` — applies the DDL, runs the module's migrations through the scaffold's `runModuleMigrations`, and calls the generated services through the host's real `PrismaPg` adapter. No host app, Docker or database.
+
+**Ownership.** Scaffold-owned (merged + backfilled + auto-accept-theirs on conflict, in both `update-scaffold.*`): `tests/harness/**` (21 files), `vitest.config.ts` (with `passWithNoTests: true`), `tests/tsconfig.json`, `tests/.gitignore`. Module-owned: `tests/*.test.ts`, the optional `tests/harness.config.ts` (prompt-answer variants, PGlite extensions such as `vector`, extra host stubs) and `tests/README.md`. The module starter's own `tests/scaffold-self.test.ts` (renders the default templates; CRUD, ownership isolation, validation, export/import round-trip against PGlite) is **scaffold-only** — deleted from modules by `update-scaffold.*` and `create-module.*`.
+
+**Degrades instead of failing.** A frontend-only module renders no sandbox and `npm test` still passes; a backend module with no Prisma models gets a no-op `schema.sql`; a module with no test files passes via `passWithNoTests`.
+
+**package.json handling changed (the part that used to abort updates).**
+- A merge **conflict** in `package.json` / `package-lock.json` now auto-resolves to **your** version (it used to stop the update, and abort it outright under `--yes`/CI). Because that discards upstream's hunks wholesale, the updater prints the dropped upstream `package.json` diff as an **advisory** to hand-port, and the preview lists `package.json` under its own mixed-ownership heading instead of "WILL be merged". The post-merge `add-scaffold-scripts.cjs` then re-adds anything scaffold-owned that's **missing**, and the updater tells you to `npm install` when it added devDependencies.
+- That helper now also maintains: `"test": "vitest run"` + the 7 harness devDependencies (`vitest ^5.0.5`, `@electric-sql/pglite ^0.4.6`, `@electric-sql/pglite-socket ^0.1.6`, `prisma`/`@prisma/client`/`@prisma/adapter-pg ^7.10.1`, `zod ^4.6.7`) + `engines.node ^22.12.0 || ^24.0.0 || >=26.0.0` (vitest 5's own engines) + `allowScripts` for `prisma`/`@prisma/engines` — **backend modules only** (detected by `src/templates/backend/` or a `backend:` block in `src/module.ts`), add-if-missing, your own pins always win. Ungated for every module: the `allowScripts.esbuild` approval (npm 11.19+ gates install scripts, and esbuild is the build engine even in frontend-only modules) and the tsup esbuild override from v1.31.21. The scaffold-owned script **aliases** (`scaffold:*`, `version:*`, `release:*`, the check aliases) are now kept on their canonical `node scripts/run.cjs` bodies — a stale body is updated and reported (`test` is exempt: customise it freely). A `package.json` that exists but can't be parsed now makes the helper exit non-zero and the updater **warn** instead of printing "All npm scripts already present" (a UTF-8 BOM is stripped and heals itself).
+
+**Two long-standing updater bugs found by the acceptance runs, fixed here.**
+- `update-scaffold.ps1`'s self-update re-exec built an **array** of `"-Merge"`/`"-Yes"` strings and splatted it — PowerShell passes those as literal positional arguments, so every switch was silently dropped and a non-interactive `scaffold:update -- --yes` **cancelled itself** right after a self-update (exit 0, no merge). Now hashtable splatting. One consequence remains for modules coming **from ≤ v1.31.x**: their *old* script performs that re-exec, so the first `scaffold:update -- --yes` only self-updates — **run it twice**. The sh variant forwards correctly and completes in one run.
+- `update-scaffold.sh`'s re-execs used `exec "$0"`, which PATH-looks-up a relative `$0` — `bash update-scaffold.sh` died with `not found` after a self-update. Now `exec bash "$0"`.
+
+**CI.** New `.github/workflows/scaffold-ci.yml` — deliberately **not** named `ci.yml`, so it can never collide with a module's own CI workflow (ai-core and document-management already have one; everything else under `.github/` stays module-owned and resolves to *yours* on conflict, while `scaffold-ci.yml` itself is scaffold-owned). It runs the static gates + the self-test on Linux under Node 22 and 24, repo-gated like the starter's (a module runs it only via `workflow_dispatch` or `CI_AUTO_RUN=true` — and then `npm run test --if-present` runs the *module's own* tests, passing as a no-op in a frontend-only module that has no `test` script). `check-parity.cjs` grew to **46 invariants across 4 pairs**, including a new `create-module.ps1`/`.sh` pair — and in a cloned module (where `create-module.*` are scaffold-only-deleted) it now **skips** that pair instead of aborting.
+
+**`.scaffoldignore` learned directory lines.** A line like `tests/harness` now suppresses the backfill for everything under it — previously only exact file paths matched, so a deliberate wholesale deletion of a scaffold-owned directory (e.g. a frontend-only module dropping the harness) was re-restored on every update. The bash variant also now strips CR, fixing a latent bug where a CRLF-saved `.scaffoldignore` never matched at all.
+
+**Verified:** the module starter's 5 self-tests pass (Windows/Node 24, ~6 s); a structure clone updated via both script variants without a merge abort, kept its own `package.json`, and its **66 tests passed** after `npm install`; a pickers clone (scaffold v1.4.14!) updated cleanly and received the harness. A 4-lens adversarial review then raised 17 findings, confirmed 13, and all 13 were fixed before this shipped (the `scaffold-ci.yml` naming, the `--if-present` CI steps, the parity skip, the package.json advisory, the esbuild approval gate, the BOM handling and the directory-ignore above all came out of it). Limits (PGlite is single-session; routes/lifecycle hooks don't run; it complements, not replaces, a host-app type-check) and the module-author guide: [Building Modules → Testing](/module-starter/building-modules/#running-the-generated-backend-npm-test).
 
 ---
 
