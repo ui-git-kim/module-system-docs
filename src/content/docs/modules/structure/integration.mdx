@@ -1011,9 +1011,9 @@ Then pass that array as `excludeNodeTypes` on every retrieval call:
 | `hybridSearchNodes` | `structureEmbeddings` | `excludeNodeTypes`, `scopeRootId` |
 | `hybridSearchChunks` | `structureEmbeddings` | `excludeNodeTypes`, `scopeRootId` |
 | `findSimilarNodes` | `structureEmbeddings` | `excludeNodeTypes`, `scopeRootId` |
-| `expandGraph` | `structure` | `excludeNodeTypes` (scope is anchored on the seeds automatically) |
+| `expandGraph` | `structure` | `excludeNodeTypes`; `scopeRootId` optional (v1.39.0+) — omitted, the scope is anchored on the seeds |
 
-`scopeRootId` is the second half of the contract. When the app uses **enforced spaces**, results must be confined to the active space: pass that space's root node id (`structure_node.rootNodeId`) as `scopeRootId`. Your module resolves and validates the active space; Structure only applies the filter, and rows with a null `rootNodeId` are excluded when it's set. `expandGraph` is the exception — it anchors traversal on the seed nodes' own space, so it needs no `scopeRootId`.
+`scopeRootId` is the second half of the contract. When the app uses **enforced spaces**, results must be confined to the active space: pass that space's root node id (`structure_node.rootNodeId`) as `scopeRootId`. Your module resolves and validates the active space; Structure only applies the filter, and rows with a null `rootNodeId` are excluded when it's set. When `expandGraph` is not given `scopeRootId`, it anchors traversal on the seed nodes' own space; since v1.39.0 you can pass one to choose the section explicitly (see [Isolation Sections](#isolation-sections-v1390)).
 
 <Aside type="caution" title="Omitting these leaks data">
 `excludeNodeTypes` and `scopeRootId` both default to "no filtering". A consumer that forgets them will happily surface admin-only node types, and content from spaces the user isn't in, inside its own results. Structure cannot catch this for you.
@@ -1080,7 +1080,7 @@ Connections carry provenance (`origin`) and lifecycle (`status`). Your module ca
 
 | Method | Description |
 |--------|-------------|
-| `createConnection(userId, fromNodeId, toNodeId, connectionType, data?, metadata?, options?)` | `options` is `{ origin?, status?, skipHooks?, isAdmin?, viaHttp? }`. `origin` is a lowercase-kebab provenance tag stamped into `data.origin` (default `'explicit'`; other well-known values: `'discovered'`, `'active'`). `status` is `'active'` (default, goes live immediately) or `'pending'` (fires `structure.connection.proposed` instead of `created`). `skipHooks: true` suppresses that per-connection hook — it's how bulk creation trades the per-row fan-out for the single `structure.connections.bulkCreated` summary. `isAdmin` and `viaHttp` are set by the HTTP routes; leave `viaHttp` unset in-process (see [In-Process Writes vs Request Writes](#in-process-writes-vs-request-writes-v1380)) |
+| `createConnection(userId, fromNodeId, toNodeId, connectionType, data?, metadata?, options?)` | `options` is `{ origin?, status?, skipHooks?, isAdmin?, viaHttp?, isSystem?, scopeRootId? }` (the last two since v1.39.0 — see [Isolation Sections](#isolation-sections-v1390)). `origin` is a lowercase-kebab provenance tag stamped into `data.origin` (default `'explicit'`; other well-known values: `'discovered'`, `'active'`). `status` is `'active'` (default, goes live immediately) or `'pending'` (fires `structure.connection.proposed` instead of `created`). `skipHooks: true` suppresses that per-connection hook — it's how bulk creation trades the per-row fan-out for the single `structure.connections.bulkCreated` summary. `isAdmin` and `viaHttp` are set by the HTTP routes; leave `viaHttp` unset in-process (see [In-Process Writes vs Request Writes](#in-process-writes-vs-request-writes-v1380)) |
 | `getConnection(id, userId, options?)` | Reads one connection the caller owns, with secret field values unsealed, or `null`. A soft-deleted edge is `null`, and so is an edge with an endpoint of a read-restricted type unless `options` is `{ isAdmin: true }` or `{ isSystem: true }` |
 | `updateConnection(id, userId, input, options?)` | Replaces the connection's `data` and/or `metadata` (`input` is `{ data?, metadata? }` — pass the full merged object). `options` is `{ isAdmin?, viaHttp? }`: request writes get the field locks and full validation; in-process writes keep the value-shape rules only. Fires `structure.connection.updated` |
 | `promoteConnection(id, userId, options?)` | Promotes a pending connection to active. Re-validates that both endpoints are still active and re-checks the connection type's `isUnique`/`maxConnections` rules against the active set (`BadRequest` with machine-readable prefixes `duplicate-active-connection:`, `max-connections-reached:`, `endpoint-not-active:`). Fires `structure.connection.created` then `structure.connection.promoted`. `options` (`{ isAdmin?, isSystem? }`) affects only the returned endpoint nodes: without it, an endpoint of a read-restricted type is left out |
@@ -1102,6 +1102,50 @@ The `NodeConnection` wire type now includes `status` and `origin` (legacy rows r
 `structureService.getUsage(userId, { nodeId? })` (also `GET /api/v1/structure/usage?nodeId=`) returns a `StructureUsage`: `totals` (`entries`, `connections`, `bytes`), `byType` (count and text bytes per node type), and `items` — one `ModuleUsageItem` (`key`, `label`, `count`, `bytes`) each for entries, deleted entries, connections, text prepared for search, search vectors, text chunks and chunk vectors. `bytes` is the stored text size (UTF-8); vector bytes are estimated as count × dimensions × 4; a figure the install cannot provide (no embeddings) is `null`. It scans the user's rows, so call it for a usage view, not per request. Other modules can return the same `ModuleUsageItem` lines so a host or Cognitive Pipeline can add the figures up.
 
 **Merge ids (v1.38.1+).** `structure.node.merged` also carries `reparentedChildIds`, `repointedConnectionIds` and `droppedConnectionIds` (each capped at 1,000; `idsTruncated` says when a list was cut), which is enough for an "undo merge": a re-pointed edge's endpoint that is now `intoId` was `fromId` before the merge.
+
+### Isolation Sections (v1.39.0+)
+
+An **isolated node type** is one the admin configures with `primaryScope` isolation set to enforced. Each top-level record of that type is the root of an **isolation section**. Everything under that record belongs to the section, and so does every row whose `rootNodeId` is that record's id. Request reads are confined to the user's active section. Shared/global types stay visible from every section.
+
+The options below let an in-process consumer, such as the cognitive-db engine, write into and read from a section it chooses, without placing records in the folder tree. They are for **system callers only** (`isSystem: true`); a request caller that passes them gets `BadRequest`. A caller that leaves them out sees no change.
+
+| Method | What's new |
+|--------|------------|
+| `getIsolationModel(userId)` | Returns `{ isolatedTypes, globalTypes, sectionRootIds }`: the isolated types, the shared/global types, and the user's section roots, which are their top-level records of an isolated type that are not deleted, oldest first. All three lists are empty when nothing is isolated. |
+| `createNode(userId, input, options)` | `options.scopeRootId` (a string) labels a **top-level** record with that section. The record stays top-level in the tree, but its `rootNodeId` becomes the section root. The id must be one of the user's section roots. Records of isolated or shared/global types can't be labelled. With a `parentId`, the parent must already be in that section. `bulkCreateNodes` takes the same option for the whole batch. |
+| `createConnection(userId, fromId, toId, type, data, metadata, options)` | `options.scopeRootId` sets the link's `rootNodeId` explicitly: a string labels it with that section, and `null` means no section. An endpoint in a different section is refused unless it is of a shared/global type. For `isUnique` connection types, uniqueness is checked within each section. The section is also recorded in `metadata.isolationSection`, so `promoteConnection` checks a pending link against the same section. |
+| Every connection read | `NodeConnection` now carries `rootNodeId`, the link's section or `null`. This covers `getConnection`, `getNodeConnections`, `getConnectionsForNodes`, `listConnections`, and the results of create, promote and update. |
+| `expandGraph(userId, seedIds, options)` | `options.scopeRootId` set to a section id walks only links labelled with that section, and reaches only nodes in the section or of a shared/global type. `null` walks outside every section, keeping shared/global nodes. Leaving it out keeps the seed-anchored behaviour. |
+| `listNodes`, `semanticSearchNodes`, `findSimilarNodes` | `scopeRootId: null` returns rows outside every section, keeping shared/global types. |
+
+```typescript
+const structure = serviceRegistry.get('structure');
+const { sectionRootIds } = await structure.getIsolationModel(userId);
+const sectionId = sectionRootIds[0];
+
+// A record that belongs to the section but is not filed in its folder tree
+const note = await structure.createNode(
+  userId,
+  { nodeType: 'note', name: 'Meeting summary' },
+  { isSystem: true, scopeRootId: sectionId },
+);
+
+// A discovered link, labelled with the same section
+await structure.createConnection(userId, note.id, sourceEntryId, 'derived-from', undefined, undefined, {
+  isSystem: true, origin: 'discovered', status: 'pending', scopeRootId: sectionId,
+});
+
+// Walk only that section's links
+const graph = await structure.expandGraph(userId, [note.id], { scopeRootId: sectionId });
+```
+
+**How labelled records behave:**
+
+- **Reads:** a labelled record counts as inside its section for every read: lists, `getNode`, searches, and `getUsage` with the section root as `nodeId`. It does not appear in `getTree`.
+- **Deleting the section root:** this moves the labelled records to Deleted. It also deletes the links labelled with the section, but only those whose endpoints are both deleted or of a shared/global type.
+- **Purging the root:** this takes the labelled records too. A restored labelled record stops the purge.
+- **Moves, merges and copies:** a record keeps its label through moves, merges, duplicates and the module's migrations.
+- **Moving the section root:** a root can't be moved under one of its own records. Moving it under any other parent needs the type's `allowCrossSpaceMove` rule. When it moves, its labelled rows and links follow it to the new root.
 
 ### Node Type Proposals (v1.16.0+)
 
