@@ -1,7 +1,7 @@
 ---
 title: Integration
 description: How other modules depend on and integrate with Cognitive Pipeline
-lastUpdated: 2026-10-13
+lastUpdated: 2026-10-28
 sidebar:
   order: 3
 ---
@@ -59,6 +59,37 @@ The init script verifies Cognitive Pipeline exists in both frontend and backend 
 
 Structure is the engine's **only** record store: its records, connections and vectors are `structure_node` rows. At boot the module loads Structure's barrel (a guarded dynamic import — a no-op when the host already loaded it), builds the Structure adapter, and calls `initConfig` with `storage: { structure: adapter }`. There is no fallback store and no `COG_ENGINE_STORAGE` escape hatch any more: without Structure the backend stops with a clear error. The adapter forwards `getConnection` (the engine's strengthen / weaken / update-strength calls need it), `redactSecretValues` (secret field values are stripped from the engine's change-log snapshots and from the ingest results this module stores) and `listConnections` (for the engine's `findByConnectionType`); `deleteConnection` stays unwired, so the engine cannot hard-delete edges. The engine's connection types are seeded per user with their direction (`bidirectional`, default `false`), and a type seeded earlier as two-way that the engine declares one-way is corrected.
 
+### Isolation sections (cognitive-db 2.0.1, module v2.1.0)
+
+There are no "spaces", only node types. An admin can mark a Structure node type **isolated** (`primaryScope.isPrimary` with `isolation: 'enforced'`). Each record of that type, together with everything filed under it, is one **isolation section** — one matter, for example. Inside a section the engine sees only that section, plus records of **global** node types (`primaryScope.global`), which it links to but never creates or changes. A document in no section is in its own scope, **"No section"**, which never sees section records. In an app with no isolated node types nothing changes.
+
+**The document's section is fixed when the document is received or queued, never taken from the screen.** Every way in carries the node the document is filed to (`originNodeId`):
+
+| Way in | Where the node comes from |
+|---|---|
+| Ingest form (text, URL, upload) | The form's **Section** picker, which starts on the section open on screen |
+| `POST /ingest`, `/ingest/batch` | `originNodeId` in the request body (or `structureNodeId`, the record the document belongs to) |
+| `POST /ingest/by-reference` | `originNodeId` beside the stored file's reference |
+| RSS | The feed's **File into** setting, captured on each entry when it is detected |
+| Document Management upload | The event's `nodeId` (Document Management 1.18.2+, else `hint.nodeId`) |
+
+The module resolves the section with the engine's `resolveIsolationSection(userId, node)`, stores it on the job (`cog_ingest_job.sectionRootId`), and passes it to the engine as `IngestInput.isolationRootId`, with `sourceNodeId` (the document's own record, when it already exists) and the user's `unreadableTypes`. A queued job keeps its stored section, whatever the user has open when the worker runs. A section is never accepted from a client: `isolationRootId` is not part of the request schema. A node that does not exist, or is not the user's, is a **400** before anything is stored; when Structure cannot be read the request gets a **503**. An absent node means "No section"; a Document Management upload that names a node the module cannot use is skipped with a warning rather than filed into "No section" (when Structure merely cannot be read, the file is queued and its section resolved by the worker, with the same retries).
+
+**The adapter** forwards every method's options (`getNode`'s `isSystem` / `includeChildren`, `listNodes`' `isSystem` / `scopeRootId`, `createNode`'s section label, `listConnections`' `isSystem`), passes link reads through untouched (each link's own `rootNodeId` and its hydrated ends), and wires `getIsolationModel` and `archiveNode` (user tier, so Structure's per-type archive permission applies). Wiring `getIsolationModel` is the engine's signal that Structure labels records with their section; it ships together with the options forwarding. Requires **Structure ≥ 1.39.0**.
+
+**Records the module makes** (the document's own record from **Create node**, a split's container, a record **Find + connect** creates) go inside the document's section: under the filing node, else under the section root. If the node-type hierarchy refuses that parent inside a section, the record is created at the top level and **labelled** with the section instead (Structure S1), and the job page shows a filing note. It is never left as an unlabelled top-level record, which would put it in "No section". The module then links the engine's content record to the document's record (`attachSource`, a `derived_from` link). It never creates a record of an isolated type (each one would start a new section) or of a global type (shared, added only by the admin); a source that maps to one records a warning instead.
+
+**Per section, everywhere a pass runs:**
+
+- **Duplicate gates** — *skip unchanged*, the cross-source exact-hash check, the near-duplicate check and the retrieve stage's possible-duplicate search compare only jobs and records in the same section, so a document uploaded into two sections is processed in each.
+- **Suggestions** — one inbox per section plus one for "No section" (`GET /suggestions?section=<id|none>`; absent = the section on screen). A refresh runs the engine's proactive pass inside that section and touches only that section's rows; the post-ingest refresh uses the job's section. Suggestion keys carry the section (`<section|none>::<key>`).
+- **Working-memory consolidation** runs once per section (from `listIsolationSections`), each pass inside its section.
+- **`retrieve()`** searches one section (`options.section`; absent = the section on screen). For "No section" it over-fetches and keeps only hits in no section, and a one-hop link is kept only when its own label and both of its ends are in the section and readable.
+
+**Errors.** The engine's isolation errors are permanent (`IsolationViolationError`, and `IsolationSectionError` for any reason but one); the job fails and stores the reason in `cog_ingest_job.errorReason`, which the job page shows in plain words. The one transient case, `IsolationSectionError` `'model-unavailable'` (Structure could not be read), puts a queued job back on the queue up to three times, waiting 30 s, then 60 s, then 120 s. An RSS entry whose ingest fails permanently ends in `error` with the reason, rather than being retried on every poll.
+
+**Deleting and moving.** Deleting a section's root (decision 4): Structure soft-deletes the section's records and links itself; the module drops that section's suggestions and keeps its jobs as history. Moving a document into another section (decision 5): the module archives the old section's copy of the engine's records (content, emotion, concept and expected-question records — not entities, which other documents share) and queues the document again, so it is processed in its new section. Moving a section's root under a parent ends that section: its jobs and suggestions join the section it moved into.
+
 ---
 
 ## Action Hooks
@@ -106,6 +137,8 @@ interface IngestCompletedContext {
     connectionsFound: number;
     durationMs: number;
     structureNodeId: string | null;
+    // The document's isolation section (null = no section), fixed when it was received or queued
+    sectionRootId: string | null;
     createdAt: Date;
     updatedAt: Date;
   };
@@ -218,11 +251,13 @@ If your handler does async work (database queries, API calls), use `addActionAsy
 
 ### Hooks Cognitive Pipeline Listens To
 
-Cognitive Pipeline itself listens to one Structure hook:
+Cognitive Pipeline itself listens to these hooks from other modules:
 
 | Hook | Handler ID | Behaviour |
 |------|-----------|-----------|
-| `structure.node.deleted` | `cognitive-pipeline-cleanup-jobs` | Logs the deletion — ingest jobs remain as history (no cascade delete) |
+| `structure.node.deleted` | `cognitive-pipeline-cleanup-jobs` | Ingest jobs remain as history (no cascade delete). When the deleted record was an isolation section's root, that section's suggestions are dropped |
+| `structure.node.moved` | `cognitive-pipeline-section-move` | A document moved into another isolation section is processed again there and the old section's copy archived; a section root moved under a parent ends that section (its jobs and suggestions join the destination) |
+| `documents.document.uploaded` | `cognitive-pipeline-auto-ingest` | Queues an auto-ingest for a source that opts in, filed into the section of the event's `nodeId` (checked through Structure first) |
 
 Internally, the RSS poller also subscribes (async) to the module's own `cognitive-pipeline.source.created` / `source.updated` / `source.deleted` hooks to start, reconfigure, or stop feed polling as sources change — no app restart required.
 
