@@ -77,7 +77,7 @@ The shape:
 
 <Steps>
 
-1. On a successful upload, Document Management emits an enriched, **awaited async** `documents.document.uploaded` event carrying a storage **reference** — `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }` — never the bytes.
+1. On a successful upload, Document Management emits an enriched, **awaited async** `documents.document.uploaded` event carrying a storage **reference** — `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId, nodeId }` — never the bytes. (`nodeId`, added in v1.18.2, is the node the uploader asked to file the upload under, or `null`.)
 
 2. Each consumer subscribes with `actionRegistry.addActionAsync`, does near-zero work in the callback (validate + `enqueueJob`), and returns immediately.
 
@@ -231,7 +231,20 @@ v1.18.1 added [`getUsage(userId)`](/document-management/integration/#storage-usa
 - **Personal-data export handler** (medium). Document Management registers an account-erasure handler but no export handler (`securityRegistry.registerExportHandler`, starter v2.13.0+), although the starter pairs them. A user's references, links, bookmarks, included folders and parsed-artefact records should be exportable, scoped on the subject exactly as the erasure handler is.
 - **Deleting a reference leaves shared-storage bytes** (medium). Deleting a document reference removes the row, its links and any staged bytes, but a shared-default upload's file stays under `u/<userId>/` until account erasure. Those bytes are invisible to `getUsage` and to the user. Options: delete the file when the reference that created it (a server-created shared upload) is deleted, or offer a sweep.
 - **A usage view in the app** (low). An owner-scoped `GET /usage` route and a **Storage** section on the Document Storage settings page, mirroring Structure's (a Total row, "Not available" for a `null` size).
-- **A combined per-user total is not this module's job.** Structure's roadmap notes that adding the modules' figures up needs a home (Cognitive Pipeline, or a starter-level usage registry). Document Management's report is ready for either.
+- **Register with the starter's `usageRegistry`** (medium, small). Starter v2.14.0 added the [storage-usage foundation](/starter-template/usage-feature/). Modules register a `UsageProvider` from a side-effect `usage.registration.ts`, and the account page adds the figures up, so a combined total now has a home. `getUsage` already returns the `ModuleUsage` shape. What's missing:
+  - a `usage.registration.ts` that registers it through the guarded dynamic import (a no-op on older hosts), as ai-chat does;
+  - honouring `ctx.signal`.
+
+  Noticed on 2026-10-28; not started.
+
+### Isolation-section follow-ups (v1.18.2)
+
+v1.18.2 put `nodeId` on the [upload event](/document-management/integration/#nodeid-is-the-uploaders-claim) and made [`linkDocument` work across isolation sections](/document-management/integration/#linking-into-an-isolation-section-v1182) for cross-module callers. The review of that change found these, none of which Cognitive Pipeline's current calls hit:
+
+- **The node-type folder lookups are still request-tier** (medium). `resolveNodeUploadLocation`, its ancestor read (`getNodePath`) and `resolveNodeSaveLocation` call Structure's `getNode` with no options. A cross-module caller that passes `nodeId` **without** a `folder`, for a node outside the active space, therefore gets no node-type folder: the file lands in the default location and only a warning is logged. These reads also load the node's children, which they never use. Fix them the way `linkDocument` was fixed: a trusted read for cross-module callers and a request-tier read when a principal is passed, both with `includeChildren: false`. Cognitive Pipeline always passes an explicit folder today, so it isn't affected yet.
+- **Manual ingest carries no node** (low). **Ingest to KB** on a node's Documents tab sends `nodeId: null`, because `requestIngest` takes no `nodeId`. A consumer then has to fall back to the user's active space at job time. Option: an optional `nodeId` on `RequestIngestInput`, passed by the Documents tab.
+- **Owned uploads by provider id carry no node** (low). `DocumentUpload` with a `providerId` calls `POST /upload/:providerId`, which takes no `nodeId`. The event's `nodeId` is `null` even when the component was given one.
+- **The reachability probe leaves its timer running** (low). `isProviderReachable` doesn't clear its 5-second probe timeout after the probe settles. Every probe leaves that timer pending for its full 5 seconds, which means every upload to a Local Connect default, reachable or not. It's harmless, but it should be `clearTimeout`'d.
 
 ### Short-term
 
@@ -626,7 +639,7 @@ V1 already fires the hooks other modules need to react to. These remain stable i
 | `documents.document.updated` | `{ userId, documentId }` |
 | `documents.document.linked` | `{ userId, documentId, nodeId, linkType }` |
 | `documents.document.unlinked` | `{ userId, documentId, nodeId }` |
-| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }` (awaited async fan-out; `contentHash` populated for streamed uploads) |
+| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId, nodeId }` (awaited async fan-out; `contentHash` populated for streamed uploads; `nodeId` since v1.18.2, the uploader's claim, `null` when no node was given) |
 | `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` |
 | `documents.provider.connected` | `{ userId, providerId, providerType }` |
 | `documents.provider.disconnected` | `{ userId, providerId }` |

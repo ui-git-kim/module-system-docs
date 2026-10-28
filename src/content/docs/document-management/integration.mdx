@@ -392,7 +392,7 @@ The exact event ids and context shapes (from `action.registration.ts` and the se
 |------|---------|------------|
 | `documents.document.linked` | `{ userId, documentId, nodeId, linkType }` | A document reference is linked to a Structure node. `linkType` is `'attachment' \| 'reference' \| 'primary'`. |
 | `documents.document.unlinked` | `{ userId, documentId, nodeId }` | A document reference is unlinked from a node. |
-| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId }` | A file is uploaded through the module, or manually re-emitted via `requestIngest`. Emitted as an **awaited async fan-out** (`doActionParallel`), so job-worker consumers receive it. `contentHash` is populated for streamed HTTP uploads (`null` for included-folder **Sync now**, which reads no bytes). **`documentId` carries the durable `doc_document` id whenever the upload creates a reference** — the user's default when it is the shared app default, an offline-staged Local Connect upload, a global upload, and the manual-ingest path — so an event-driven (auto-ingest) consumer can pull by reference and the handle survives an offline reconcile re-point. It is `null` only for a bare upload to a user's own provider (no reference is created). |
+| `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId, nodeId }` | A file is uploaded through the module, or manually re-emitted via `requestIngest`. Emitted as an **awaited async fan-out** (`doActionParallel`), so job-worker consumers receive it. `contentHash` is populated for streamed HTTP uploads (`null` for included-folder **Sync now**, which reads no bytes). **`documentId` carries the durable `doc_document` id whenever the upload creates a reference** — the user's default when it is the shared app default, an offline-staged Local Connect upload, a global upload, and the manual-ingest path — so an event-driven (auto-ingest) consumer can pull by reference and the handle survives an offline reconcile re-point. It is `null` only for a bare upload to a user's own provider (no reference is created). **`nodeId`** (v1.18.2+) is the Structure node the uploader asked to file the upload under — `opts.nodeId` on `uploadToDefault` / `uploadGlobal`, or `?nodeId=` on `POST /upload` / `POST /upload-global` — so a consumer can file what it derives into that node's isolation section. It is `null` when no node was given, and always `null` for **Sync now** and manual ingest. See [`nodeId` is the uploader's claim](#nodeid-is-the-uploaders-claim). |
 | `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` | A document reference (and optionally its underlying file) is deleted. |
 | `documents.document.created` | `{ userId, documentId, providerId, remotePath }` | A `doc_document` reference is created (favourite/link/tag/notes, or a cross-module `createDocument`). |
 | `documents.document.updated` | `{ userId, documentId }` | A reference's tags, notes, favourite, or status changes. |
@@ -489,6 +489,24 @@ actionRegistry.addActionAsync(
 <Aside type="tip" title="Soft Structure detection at the data layer too">
 Beyond these hooks, the service also calls `serviceRegistry.getOptional('structure')` inside `linkDocument` to verify a node exists before creating a `doc_node_link`. If Structure is absent, that check is skipped and links are created without node validation. Your module gets the same graceful-degradation behaviour for free if you follow the `getOptional` pattern above.
 </Aside>
+
+### Linking into an isolation section (v1.18.2+)
+
+Since Structure v1.34.0, a request-tier `getNode` of an enforced type is confined to the space open on screen. That is the user's persisted active space, so the confinement applies even to a background job. Structure v1.39.0's [isolation sections](/modules/structure/integration/#isolation-sections-v1390) count section-labelled records in too. A node in another section therefore reads as "not found". `linkDocument` checks the node at one of two tiers, depending on who calls it:
+
+| Caller | Node check | Effect |
+|--------|------------|--------|
+| Another module, in-process: `linkDocument(nodeId, userId, input)` | `getNode(nodeId, userId, { isSystem: true, includeChildren: false })` | Links into **any** of the user's sections, for example a background job filing an ingested file. Structure still checks ownership: the node must be the user's own, or of a shared/global type. |
+| The HTTP route, `POST /nodes/:nodeId/documents` | `getNode(nodeId, userId, { includeChildren: false })` | Unchanged. The node must be in the section open on screen and of a type the user may read. |
+
+The HTTP route passes its caller principal as a fourth argument, and that is what keeps it at request tier. `isSystem` is a trusted in-process tier:
+- Structure's own routes never pass it for a request.
+- Structure cannot tell a request from an in-process call, so Document Management is responsible for not passing it on behalf of a web or device request.
+- Passing it for such a request would lift the section confinement and skip Structure's per-type read gate.
+
+`includeChildren: false` skips loading the node's children, which the check never needs. Structure has honoured `isSystem` on `getNode` since v1.34.0 and `includeChildren` since v1.34.20. An older `getNode` that takes no options ignores the argument.
+
+A module calling in-process should leave the fourth argument out. Pass a principal only when you are relaying an HTTP request and want its section confinement.
 
 ---
 
@@ -949,6 +967,27 @@ A consumer routes an upload into the node's folder by passing `nodeId` to `uploa
 await dm.uploadToDefault(userId, fileName, bytes, { nodeId, mimeType });
 // Precedence: opts.folder > node-type template (nodeId) > uploadPath > basePath > root.
 ```
+
+### `nodeId` is the uploader's claim
+
+Since v1.18.2 the `nodeId` given to an upload is also carried on the [`documents.document.uploaded`](#reacting-to-events-action-hooks-fired) event. It is passed through even when an explicit `opts.folder` decides where the file lands. A consumer such as Cognitive Pipeline uses it to file what it derives from the upload into that node's isolation section.
+
+Document Management passes `nodeId` through **without checking it**. Over HTTP it comes straight from the `?nodeId=` query, so treat it as the uploader's claim, not as a verified fact. Before acting on it, read the node through Structure as the event's `userId`. Structure's reads are owner-scoped, so another user's private node reads as "not found":
+
+```typescript
+actionRegistry.addActionAsync('documents.document.uploaded', 'my-module-file-under-node', async (ctx) => {
+  const { userId, nodeId } = ctx as { userId: string; nodeId: string | null };
+  if (!nodeId) return;
+  const structure = serviceRegistry.getOptional('structure') as
+    | { getNode?: (id: string, userId: string, options?: { isSystem?: boolean; includeChildren?: boolean }) => Promise<unknown> }
+    | undefined;
+  const node = await structure?.getNode?.(nodeId, userId, { isSystem: true, includeChildren: false }).catch(() => null);
+  if (!node) return; // not the user's node (or Structure absent): ignore the claim
+  // ...file the derived records in that node's isolation section
+});
+```
+
+The id is trimmed. A blank one (`''` or whitespace) counts as no node: it is sent as `null` and never looked up.
 
 <Aside type="note" title="Optional, safe, and namespace-guarded">
 The node's type / name is read through `serviceRegistry.getOptional('structure')` — no `@/features/structure` import, and resolution is inert (falls back to `uploadPath` / root) when Structure is not installed or the node is unreachable. The resolved template still flows through [the upload contract](#the-upload-contract): on a shared+isolated default it nests under `u/<userId>/` and is rejected if it would escape, so neither a template nor a node name can climb out of a user's namespace.
