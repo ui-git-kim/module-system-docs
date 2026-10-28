@@ -97,7 +97,7 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 | `RefusedError` | The operation exists but cannot run under its declared constraints. See the reasons below. |
 | `UnsupportedModelKindError` | The operation resolved to a model whose kind is not `language`. |
 | `BadRequestError` | A dial mapped to a parameter the model's rules reject as out of range (for example a rejecting `temperature` bound). Over HTTP only (`callerSupplied` runs, v1.61.0): a caller segment names a marker id the catalogue does not hold. |
-| `ProviderCallError` | The upstream provider call failed; carries a `retryable` flag and, where known, the provider status. |
+| `ProviderCallError` | The upstream provider call failed; carries a `retryable` flag and, where known, the provider status. A reply that was not the JSON asked for is one too (its class is `AnswerShapeError` since v1.80.0); with the operation's [answer retries](/modules/ai-core/configuration/#when-the-answer-comes-back-broken-v1800) set, AI Core asks again before it gives up, and the error then says how many times it asked and carries the usage of every attempt. |
 | `ProviderUnavailableError` | The resolved model's provider has no API key configured or is disabled at the adapter layer. |
 
 `RefusedError` carries a machine-readable `reason` and a `detail` object naming which constraint failed. Verified reasons `run` can raise, from resolution and from the run engine:
@@ -105,6 +105,7 @@ run(operationId: string, input: RunInput, opts: RunOptions): Promise<RunResult>
 - `operation-disabled` — the operation record is disabled.
 - `discipline-integrity-violation` — the resolved discipline set names a discipline that does not exist (`detail.violations` lists each `unknown-discipline:<id>`). Re-validated on **every** call. A discipline with no guardrail measure is **not** refused — since v1.73.0 it is written into the prompt as an approach (see [Disciplines & Guardrails](/modules/ai-core/disciplines-and-guardrails/#discipline-or-approach)).
 - `model-choice-not-granted` / `model-not-in-allow-list` — a `userSelectedModelRecordId` was passed to an operation that does not grant user model choice, or the model is not in its allow-list.
+- `thinking-choice-not-granted` / `thinking-level-not-allowed` (v1.80.0) — a `userSelectedThinking` was passed to an operation that does not let users choose how much the model thinks, or the level is not one it lists. Checked before anything is read or spent; `detail.allowed` lists the levels it does allow.
 - `no-available-model` — the resolved model or its provider is missing, disabled, or has no key (`detail.failed` names which).
 - `model-turned-off` (v1.69.0) — the model the operation resolves to (pinned, through a purpose, or chosen by the user) is past its [turn-off date](/modules/ai-core/configuration/#model-turn-off-dates-v1690): from 00:00 UTC on that day its provider no longer serves it. Checked before the enabled check, so the refusal names the date even though AI Core has also switched the model off. The message names the model, its id and the day, and says where to change it (the purpose's default, or the operation's model); `detail` is `{ operationId, modelRecordId, modelId, providerId, retiresAt, source, modelPurposeId, failed: 'model-turned-off' }` (`retiresAt` as `YYYY-MM-DD`, `source` where the date came from). HTTP 409. A preview of such an operation shows the same refusal.
 - `no-model-under-acceptable-terms` — the sensitivity gate: the operation handles sensitive content but the model's provider is not under recorded zero-retention terms. Unrecorded terms are refused, not assumed compliant.
@@ -156,18 +157,19 @@ interface RunStream {
 
 **The promise settles after every check has passed**, just before the provider call. So a refusal — `spend-limit-reached`, `usage-limit-reached`, `model-unpriced`, any resolution refusal — is **thrown by `stream()` itself**, exactly as `run()` throws it, before any event. So is an attachment link that would be refused (an unsafe address, too many links). An HTTP route can still answer 409 or 400 with a normal error body before it starts streaming. Only a download that fails is found later, and it arrives as an `error` event.
 
-**The events.** One `start`, then `text-delta` events as the answer is written, then exactly one `finish` or one `error`.
+**The events.** One `start`, then `text-delta` events as the answer is written (with `status` events between them since v1.80.0), then exactly one `finish` or one `error`.
 
 ```ts
 type RunStreamEvent =
   | { type: 'start'; ref: string; operationId: string; modelRecordId: string; requestedModelId: string; streamed: boolean }
   | { type: 'text-delta'; delta: string }
-  | { type: 'finish'; outcome: 'ok' | 'cancelled'; text: string; structured: unknown; feedback: Feedback; audit: RunAudit }
+  | { type: 'status'; status: 'thinking' | 'searching' | 'writing'; tool?: string }   // v1.80.0
+  | { type: 'finish'; outcome: 'ok' | 'cancelled'; text: string; structured: unknown; sections?: Record<string, unknown>; feedback: Feedback; audit: RunAudit }
   | { type: 'error'; ref: string; code: string; reason: string | null; message: string; retryable: boolean };
 
 interface RunStreamResult {
   outcome: 'ok' | 'cancelled';
-  result: { text: string; structured: unknown };
+  result: { text: string; structured: unknown; sections?: Record<string, unknown> };
   feedback: Feedback;
   audit: RunAudit;
 }
@@ -176,6 +178,8 @@ interface RunStreamResult {
 - **Skip event types you don't know.** More will be added (reasoning, tool calls, sources); this rule is what lets them arrive without breaking anyone.
 - `start.ref` is the ledger id the call's row will have, made before the call — the same id that ends up in `feedback.ref`.
 - `finish.text` is the answer the user read: every `text-delta` joined. `feedback` and `audit` are what `run()` returns, with `audit.streamed` and `audit.cost`.
+- **`status` (v1.80.0)** says what the model is doing, each time it changes: `thinking` when a request starts (and again after a tool ran), `searching` while a tool runs (`tool` is its name, as `audit.toolsRun` names it — never its input), `writing` just before the first text. A chat screen can show it before the words arrive. It starts after `start`: the context is built before `stream()` resolves.
+- **`finish.sections` (v1.80.0)** holds the operation's [extra sections](#runresult), when it declares any. They are written after the answer, so they arrive here, never as text.
 - `error` carries AI Core's own message (provider prose never reaches it). The call's row is written either way.
 
 **What streams.**
@@ -726,6 +730,16 @@ interface OperationInfo {
   variables: OperationVariable[];     // the declared prompt variables (v1.58.0)
   category: OperationCategory;        // 'task' | 'check' | 'system-prompt' | 'router' (v1.64.0)
   routes: string[] | null;            // a router's route names; null for any other category (v1.64.0)
+  thinking: { level: ThinkingLevel | null; userChoices: ThinkingLevel[] };  // v1.80.0
+  extraSections: ExtraAnswerSection[];  // v1.80.0: what result.sections holds
+}
+
+type ThinkingLevel = 'off' | 'low' | 'medium' | 'high';
+
+interface ExtraAnswerSection {
+  name: string;            // its key in result.sections
+  description?: string;    // what the model puts there
+  schema: JsonSchemaField; // its shape
 }
 
 interface OperationInputPort {
@@ -753,6 +767,10 @@ interface OperationVariable {
 **Declared prompt variables (v1.58.0).** `variables` surfaces which `{token}` [prompt variables](/modules/ai-core/integration/) an operation declares (admin-authored in the editor's Variables block), so a consumer reads what to supply in `RunOptions.variables` and how each is treated. Skip any with `builtin: true` — AI Core fills `date` / `time` / `communication_style` itself. **The trust boundary:** a `/run` request body comes from the **client** (the app's own frontend, but editable by the end user), so over HTTP only variables with `source: 'caller'` accept a value; `user` / `field-source` / `builtin` variables are app- or AI-Core-filled and a client value for them is refused (and named `prompt-variable-caller-blocked:<name>` in feedback), so a client cannot spoof e.g. `user_name` into the prompt. Trusted in-process `aiCore.run()` consumers apply all variables. `variables` is empty when the operation declares none. Since v1.61.0 an HTTP `variables` key must look like a variable name (letters, digits, `_`, `.`, `-`, at most 200 characters) or the request is a 400, and feedback names at most five refused variables, counting the rest as `prompt-variable-caller-blocked-more:<n>`. `communication_style` is always reported with `injectionRisk: true`, because every run fences it (see [`RunOptions`](#runoptions)).
 
 **Categories (v1.64.0).** `category` says what kind of job the operation is, so a consumer can find the **checks** and **routers** it may call: `task` does a job (the default), `check` judges another operation's answer against its source, `system-prompt` is the standing frame other operations fold in (it never runs on its own), and `router` picks which route should handle a request. For a router, `routes` lists the route names in order — they are the `enum` of its output schema's `route` field, the one place they are stored (`[]` while it lists none yet); for every other category `routes` is `null`. A Check built from the admin's starting shape answers `{ passed, score, issues, cannotJudge }` and a Router answers `{ route, reason }` — but the shape is a starting point the admin can edit, so read the operation's schema if your code depends on it. A Check that answers `cannotJudge: true` has not passed: treat it as a named gap, never as a pass. See [Operation categories](/modules/ai-core/configuration/#operation-categories-v1640).
+
+**Thinking (v1.80.0).** `thinking.level` is the operation's own [Thinking](/modules/ai-core/configuration/#execution-dials) dial (`null` = the model's own default). `thinking.userChoices` lists the levels a user may pick, in order from `off` to `high`; `[]` means users cannot choose. A chat app shows a dropdown of `userChoices` and passes the pick as `RunOptions.userSelectedThinking`.
+
+**Extra sections (v1.80.0).** `extraSections` lists the parts of the reply the operation hands back beside the answer, as `result.sections` (see [`RunResult`](#runresult)). Read it to know which sections to expect, and fall back to your own way of doing that work when a section is absent.
 
 **Throws** — `NotFoundError` when the operation does not exist.
 
@@ -921,8 +939,10 @@ interface RunOptions {
   tenantId?: string;                    // solo product: defaults to userId
   signal?: AbortSignal;
   userSelectedModelRecordId?: string;   // only honoured when the operation grants model choice
+  userSelectedThinking?: ThinkingLevel; // v1.80.0: only honoured when the operation lists that level
   maxOutputTokens?: number;             // tighten-only — see below
   lastMessageAt?: Date;                 // contextual-time anchor: when the previous message was sent
+  sessionStartedAt?: Date;              // v1.80.0 contextual-time: when the user's current session began
   flowRunId?: string;
   memory?: string[];                    // caller-supplied Memory context (sanitised and injection-fenced)
   session?: string[];                   // caller-supplied Session context (sanitised and injection-fenced)
@@ -932,6 +952,10 @@ interface RunOptions {
   sensitivityFloor?: 'normal' | 'sensitive'; // tighten-only: can raise the call's sensitivity, never lower it; AI Core sets it on its own nested calls
 }
 ```
+
+**`userSelectedThinking` (v1.80.0)** is the user's pick of how much the model thinks (`'off'` · `'low'` · `'medium'` · `'high'`). It replaces the operation's own Thinking dial for this call, but only when the operation lists that level in its user choices (see [`getOperationInfo`](#getoperationinfo)); otherwise the call is refused, `thinking-choice-not-granted` or `thinking-level-not-allowed`. `POST /run` takes it too.
+
+**`sessionStartedAt` (v1.80.0)** is when the user's current session began; your app decides what a session is. The date anchor then says how long the session has run, in minutes within the hour and hours within the day (*"This session began about 25 minutes ago."*). With `lastMessageAt` as well, it says whether the previous message was in this session (*"The previous message in this session was about 2 minutes ago."*) or before it. Neither is stored, and a future moment is ignored. The date anchor sits after the last cache point, so a changing minute never stops the prompt being cached.
 
 **`internal` was removed in v1.66.0.** It let any caller skip the usage gate (and would have skipped the spending limits). AI Core marks its own nested calls with a private marker instead, so a call from another module is always checked. See [Spending limits](#spending-limits-v1660).
 
@@ -952,6 +976,7 @@ interface RunResult<T = unknown> {
   result: {
     text: string;
     structured: T | null;   // present when the operation declares a schema
+    sections?: Record<string, unknown>;  // v1.80.0: the extra sections, when the operation declares any
   };
   feedback: Feedback;
   audit: RunAudit;
@@ -959,6 +984,10 @@ interface RunResult<T = unknown> {
 ```
 
 Unchanged in v1.72.0. With [JSON answer sections](/modules/ai-core/prompt-assembly/#json-answer-sections-v1720), `result` holds the answer section only: a string answer is `text` (with `structured` null), an answer with fields is `structured` — validated against the operation's schema, as before — with `text` being that answer as JSON (so a key the schema doesn't declare, which the SDK drops, is not in it). The check report is never part of the result. On **Plain text**, `text` is the model's text as written, as before.
+
+**Extra sections (v1.80.0).** An operation can declare [extra sections](/modules/ai-core/configuration/#extra-sections-for-the-app-v1800): more parts of the same reply that the app receives, such as things to remember or actions found in a conversation. One call then does that background work too. They come back in `result.sections`, by name, beside the answer, which is unchanged. Each one is checked on its own against its shape. One that came back in its shape is in `sections`; one that is missing or the wrong shape is left out and named in `feedback.missing` (`extra-section-missing:<name>`, `extra-section-invalid:<name>`), and the answer still comes back. `sections` is absent when the operation declares none.
+
+**A broken answer can be asked for again (v1.80.0).** With the operation's **When the answer comes back broken** set to ask again (once or up to twice), a reply that is not the JSON asked for, or whose fields or extra sections are the wrong shape, is asked for again with what was wrong stated at the end of the input. `feedback.missing` then names `answer-retried:<n>`, `audit.answerRetries` is `n`, and `audit.usage`, the cost, `toolsRun` and `warnings` cover every attempt. Only a reply that finished is asked again (one cut by its output limit would be cut again), and a `stream()` never is. A usable answer is never lost to a retry: when the answer was fine and only an extra section was wrong, and a later try fails or does no better, that earlier answer is returned, and `feedback.missing` names `answer-kept-from-attempt:<n>` (plus `answer-retry-failed` when the later try was an error).
 
 ### `Feedback`
 
@@ -991,6 +1020,14 @@ interface Feedback {
   - `cache-layer-changes-every-call:<layer>` — Choose the parts only: a chosen layer was cached although it changes on every call, so each call pays to write it and nothing is read back.
 
   `prompt-cache-defeated-by-injection-nonce` is retired: with caching on, flagged material no longer stops caching, because its fence tag is keyed per content.
+
+  Answer gaps added in v1.80.0, all in `missing` only, never in `reason`:
+  - `answer-retried:<n>` — the answer came back broken and was asked for again `n` times (see [`RunResult`](#runresult)).
+  - `answer-kept-from-attempt:<n>` — the answer returned is attempt `n`'s (1 = the first call), because a later try did no better or failed. `answer-retry-failed` — a later try ended in an error.
+  - `extra-section-missing:<name>` / `extra-section-invalid:<name>` — an extra section the reply left out (or that was cut off), or one not in its shape. The answer still comes back.
+  - `extra-sections-not-asked` — the operation declares extra sections, but this call ran without JSON sections, for the reason named beside it (`answer-sections-unavailable:<why>` or `answer-sections-suppressed-by-override`).
+  - `extra-section-unreadable:<n>` — `n` stored extra sections could not be read (a hand-edited record), so they were not asked for.
+  - `thinking-unsupported` — the operation (or the user) asked for thinking, but the model's facts say it cannot think, so no level was sent. The ledger's parameter changes record it (`thinking`, sent `null`, rule `model-cannot-think`).
 
   Self-check and answer-section gaps (v1.72.0). See [Disciplines & Guardrails → The check report](/modules/ai-core/disciplines-and-guardrails/#the-check-report-v1720). What the model found is never in `feedback`.
   - `self-check-failed:<numbers>` — the model's check report marks these disciplines as failed, e.g. `self-check-failed:D2` or `self-check-failed:D2,D4` (the numbers the prompt gave them). Only when the operation's fail setting is **Tell the app** (the default); it also sets `reason` to `self-check-failed` when no earlier reason is set, so test for the `self-check-failed:` prefix in `missing` rather than for the reason. With **Record only** nothing is added.
@@ -1038,6 +1075,7 @@ interface RunAudit {
   promptLayout?: PromptLayoutReport; // v1.70.0 — what the framework's layout settings did; only when it has any
   streamed?: boolean;               // v1.79.0 — true when the answer was sent as it was written (stream())
   cost?: { usd: number | null; basis: string }; // v1.79.0 — what the row was costed at (basis: priced, estimated, …)
+  answerRetries?: number;           // v1.80.0 — how many times a broken answer was asked for again; usage and cost cover every attempt
 }
 
 interface PromptLayoutReport {      // counts and flags only, never content
@@ -1152,6 +1190,12 @@ Since v1.70.0 (the framework editor, layout settings and evidence):
 - `POST /admin/operations/:id/preview` and the framework preview return `promptLayout` (the [layout report](#runaudit), or `null` when the framework has no layout settings) and add plain notes saying what the layout did.
 - `GET /admin/models` rows carry `instructionChannel` for language models (`system-parameter`, `developer-message`, `system-message`, `system-instruction`, `first-user-message` or `provider-default`; `null` for other kinds) — how the AI SDK sends the instructions to that model, as information only.
 - Models are bound to a framework with the existing `PUT /admin/models/:id` (`{ frameworkId }`); the editor's **Add models** and **Move to…** call it once per model. No new event: framework writes fire `ai-core.framework.updated` (`'upserted'` or `'deleted'`) and model changes `ai-core.model.updated`, as before.
+
+Since v1.80.0 (thinking, extra sections, answer retries):
+
+- `POST /run` takes `userSelectedThinking` (`off` · `low` · `medium` · `high`), honoured only when the operation lets users choose that level (otherwise 409 `thinking-choice-not-granted` / `thinking-level-not-allowed`). `sessionStartedAt` is server-code only, like `lastMessageAt`.
+- The operation routes take and return `extraSections` (`[{ name, description?, schema }]`, at most 10; a name starts with a letter and holds letters, digits or `_`, and may not be `answer` or `checkReport`), `answerRetries` (0–2) and `userThinkingChoices` (levels). Extra sections on a System prompt or a Plain text operation are a 400 naming why. `dials.thinking` is a new dial.
+- No new route and no new event.
 
 Since v1.72.0 (tone follows importance, emphasis, JSON answer sections):
 
