@@ -352,6 +352,11 @@ export default defineConfig({
               autogenerate: { directory: "modules/billing" },
             },
             {
+              label: "Tasks",
+              collapsed: true,
+              autogenerate: { directory: "modules/tasks" },
+            },
+            {
               label: "Cognitive Pipeline",
               collapsed: true,
               autogenerate: { directory: "modules/cognitive-pipeline" },
