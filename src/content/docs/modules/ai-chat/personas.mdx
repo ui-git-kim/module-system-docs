@@ -1,0 +1,392 @@
+---
+title: Personas
+description: How personas shape the assistant's replies — what a persona holds, how the persona for a reply is chosen, exactly what reaches the prompt, admin gating, the API and the known gaps
+lastUpdated: 2026-10-29
+sidebar:
+  order: 1.5
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+A **persona** is a saved set of preferences that shapes how the assistant talks to one user — what it calls itself, its tone, how much detail it gives, what it includes and how it supports the user. Each user keeps their own personas on the **AI Assistant** settings page, and the admin decides how much users may change.
+
+Personas hold no prompt wording of their own. The sentences the model reads are AI Core records — three *approaches* the module seeds — and a persona only fills the `{persona_*}` slots in them at reply time, some of them with the user's own free text (custom instructions, personality notes, roles). Changing the wording is an AI Core edit; changing the values is a persona edit. Personas are entirely ai-chat's (design decision 2): AI Core never stores them.
+
+<Aside type="note" title="Current as of v1.7.5">
+This page documents personas as they behave today, gaps included — several stored fields and three settings-page toggles do not yet change replies. The gaps are collected under [Limitations and Known Gaps](#limitations-and-known-gaps) and tracked on the [Roadmap](/modules/ai-chat/roadmap/#persona-refinement).
+</Aside>
+
+---
+
+## Division of Responsibility
+
+| Owner | Responsibility |
+|-------|----------------|
+| **ai-chat** | The `ai_chat_persona` table, the AI Assistant settings page, the `personaGating` admin config, choosing the persona for each reply and turning it into prompt values |
+| **AI Core** | The fifteen `persona_*` prompt variables, the three persona approaches, the `ai-chat/persona-style` segment that composes them, and the `ai-chat/reply` operation that references the segment — plus fencing and substitution at run time |
+| **Host user preferences** | The *Preferred persona* choice, stored as `preferences['ai-chat'].defaultPersonaId` |
+| **Admin** | Persona gating, and the approach wording in AI Core |
+| **User** | Creating and tuning their own personas |
+
+---
+
+## What a Persona Holds
+
+Every column of `ai_chat_persona` except the server-managed `id`, `userId`, `createdAt` and `updatedAt`, grouped, with whether the settings page edits it and whether it reaches the prompt. **API only** means the field can be set through the routes or the service but has no control in the UI; **—** means the routes cannot write it at all.
+
+| Group | Fields | Default | Settings page | Reaches the prompt |
+|-------|--------|---------|---------------|--------------------|
+| Identity | `name` | `Assistant` | Name | `persona_name` |
+| | `avatarUrl`, `primaryColour`, `secondaryColour` | empty | API only | No — stored only |
+| Language | `preferredLanguage` | empty | API only | `persona_language` |
+| Voice | `directness`, `agreeableness`, `formality`, `verbosity`, `enthusiasm` | 50 each (0–100) | Voice and style sliders | One token each |
+| | `technicalLevel` | 50 (0–100) | Voice and style slider | `persona_technical_level` |
+| Explanation | `explanationStyle` | `balanced` | API only | `persona_explanation_style` |
+| | `includeExamples`, `stepByStepDefault` | on, off | Content toggles | Folded into `persona_explanation_style` |
+| | `preferredFormats` | empty list | API only | No — stored only |
+| Length | `responseLength` | `adaptive` | Content dropdown (Concise · Balanced · Detailed) | `persona_response_length` |
+| Content | `useEmoji`, `useHumour`, `useAnalogies`, `acknowledgeUncertainty`, `allowProfanity` | off, on, on, on, off | Content toggles | `persona_content_preferences` |
+| Greeting | `greetingStyle` | `friendly` | API only | `persona_greeting_style` |
+| | `customGreeting` | empty | API only | No — stored only |
+| Vocabulary | `customTerminology`, `avoidedTerms`, `preferredTerms` | empty | API only | No — stored only |
+| Interaction | `proactiveSuggestions`, `askClarifyingQuestions`, `challengeAssumptions` | on, on, off | Interaction toggles | `persona_content_preferences`, when on |
+| | `rememberContext`, `extendedThinking`, `learningEnabled` | on, off, on | Interaction toggles | **No — no effect yet** |
+| Support | `reduceOverwhelm`, `explicitPriorities`, `timeEstimates`, `gentleRedirects`, `celebrateWins` | off ×4, on | Neurodivergent-friendly support toggles | `persona_content_preferences`, when on |
+| Role | `roles` | empty list | API only | `persona_roles` |
+| | `personality` | empty | API only | `persona_personality` |
+| | `customInstructions` | empty | Custom instructions | `persona_custom_instructions` |
+| Flags | `isDefault` | off | The star | No — used to choose the persona |
+| | `isActive` | on | API only (`PATCH { isActive: false }` deactivates) | No — used to choose the persona |
+| Bookkeeping | `configuredVia`, `lastLearnedAt` | `manual`, empty | — (set only by import, and `default` on the automatic persona) | No — reserved for the planned adaptive profile |
+| | `metadata` | empty | API only | No |
+
+**Limits** (enforced by the server, which answers 400 when a value is too long — the settings page does not check them as you type): `name` 1–120 characters after trimming · `customInstructions` 4,000 · `personality` 2,000 · `customGreeting` 500 · `avatarUrl` 1,000 · colours 50 · `explanationStyle` 50 · `greetingStyle` 50 · `responseLength` 30 · `preferredLanguage` 20 · `roles` up to 20 items of 100 · `avoidedTerms` / `preferredTerms` up to 100 items of 100 · `preferredFormats` up to 20 items of 50 · `customTerminology` values 200. The three text "presets" (`explanationStyle`, `responseLength`, `greetingStyle`) are free text, not a fixed list.
+
+<Aside type="caution" title="Two sets of starting values">
+A persona's starting values depend on how it was made. The **database defaults** above apply to a persona created through the API with fields left out, and to the automatic *Assistant* persona. The settings page's **New persona** form starts from its own values, which differ in three places:
+
+| Field | Database default | *New persona* form |
+|-------|------------------|--------------------|
+| `useHumour` | on | off |
+| `celebrateWins` | on | off |
+| `responseLength` | `adaptive` | `balanced` |
+
+If the admin has locked one of these three, the form still shows its own value (greyed out), but the server drops the field and the persona is saved with the database default — *Use humour* shows off but saves on, and *Response length* shows *Balanced* but saves `adaptive`.
+
+The length dropdown has no *Adaptive* option, so a persona holding `adaptive` cannot show or re-pick it there. Despite its name, `adaptive` is not connected to AI Core's output dials — the word goes into the prompt as it is.
+</Aside>
+
+---
+
+## Ownership and the Automatic Persona
+
+- **Per user.** Every persona belongs to one user, and every read and write is scoped to the signed-in user — another user's persona id answers 404 *Persona not found*. There are no shared, system or admin-authored personas, and nothing seeds persona rows.
+- **One default, by convention.** Starring a persona — or creating or updating one with `isDefault: true` — clears the flag on the user's other personas in the same transaction. The automatic *Assistant* persona and *merge* imports set the star without clearing it elsewhere, so a user can end up with two. The database does not enforce a single default, and nothing chooses a new default when the starred one is deleted or un-starred.
+- **The automatic *Assistant* persona.** When a reply (or `GET /personas/active`) needs a persona and the user has **no active persona at all**, the module creates one: named *Assistant*, every database default, starred, stamped `configuredVia: 'default'`. It fires `ai-chat.persona.created` with `autoCreated: true`. It is created whatever the gating says, and from then on it counts towards the user's `maxPersonas`.
+- **List order.** The default first, then oldest first. Inactive personas are listed too.
+
+---
+
+## Managing Personas
+
+Users manage personas at **Settings → AI Assistant** (`/settings/ai-chat-ai`, registered through `settingsPagesRegistry` with the description *Create and customise the personas your assistant uses*).
+
+The page lists each persona by name; the default carries the line *Default persona — used when a conversation has no persona of its own*. When the admin allows editing, each row has three actions:
+
+- **Star** — make this the default persona.
+- **Pencil** — open it in the editor.
+- **Bin** — delete it, after a confirmation that names the persona and promises *Conversations that used it keep their history.*
+
+<Steps>
+
+1. Press **New persona**. The button only appears when editing is allowed, and is disabled at the persona cap or while another persona is open in the editor.
+
+2. Give it a **Name** — required (*e.g. Coach, Solicitor, Study buddy*).
+
+3. Set the dials and toggles in the editor's groups (below).
+
+4. Press **Save persona**. Edits take effect from that persona's next reply. A new persona is not starred, so it only answers once you star it or choose it as *Preferred persona* for new chats — or when it is your only active persona.
+
+</Steps>
+
+The editor opens inline below the list, not in a dialog:
+
+| Group | Controls |
+|-------|----------|
+| **Voice and style** | Six sliders, 0–100 in steps of 5, each with pole words: Directness (Softened ↔ Straight), Agreeableness (Challenging ↔ Agreeable), Formality (Casual ↔ Formal), Verbosity (Brief ↔ Thorough), Enthusiasm (Reserved ↔ Energetic), Technical level (Plain ↔ Expert) |
+| **Content** | Response length (Concise · Balanced · Detailed); Use emoji · Use humour · Use analogies · Include examples · Step-by-step by default · Acknowledge uncertainty · Allow strong language |
+| **Interaction** | Proactive suggestions · Ask clarifying questions · Remember context · Challenge assumptions · Extended thinking · Learn from conversations |
+| **Neurodivergent-friendly support** | Reduce overwhelm · Explicit priorities · Time estimates · Gentle redirects · Celebrate wins |
+| **Custom instructions** | Free text (*Anything else this persona should always keep in mind*) |
+
+Saving sends every field in the editor; the server quietly drops any field the admin has locked.
+
+**Not yet possible from the page:** duplicating a persona, deactivating one, un-starring the default, setting the API-only fields (roles, personality notes, explanation style, greeting style, preferred language), or viewing a persona's settings when editing is off (read-only users see only the names and which one is the default). Pressing another pencil while the editor is open — including while drafting a new persona — discards the unsaved changes without warning.
+
+---
+
+## Choosing Which Persona Speaks
+
+Two settings decide which persona answers, and they act at different moments.
+
+<Aside type="caution" title="Two kinds of default">
+- The **star** (`isDefault`) is read by the server **on every reply** in a conversation that has no persona of its own.
+- **Preferred persona** (a dropdown under Settings → Preferences) is read only by the **chat welcome screen**, which stamps it onto each new conversation it starts. The server never reads it. Leaving it on *Default persona* means "use the star".
+</Aside>
+
+### When a Conversation Starts
+
+The welcome screen creates the conversation with the Preferred persona, if one is set; otherwise the conversation starts with no persona and each reply resolves one. Creating a conversation through the API or the service takes an optional `personaId`, which must belong to the user (else 400 *Unknown persona*) — it is not checked for being active.
+
+### On Every Reply
+
+<Steps>
+
+1. **The conversation's persona** — if it still exists, belongs to the user and is active.
+
+2. **The starred default** — the user's active persona with `isDefault`.
+
+3. **The oldest active persona.**
+
+4. **The automatic *Assistant* persona** — created and used when the user has no active persona.
+
+</Steps>
+
+Because this runs per reply, a conversation without a persona follows the star as it moves. A conversation with a persona keeps it until it is switched or deleted — deleting a persona sets its conversations back to no persona, and an inactive one is silently skipped.
+
+### Language
+
+The reply language comes from the conversation's `languageOverride`, then the persona's `preferredLanguage`, then the fallback *the user's own language*. Neither field has a control in the UI yet; both are set through the API.
+
+### Switching and Branching
+
+- **Switching mid-conversation** — `PATCH /conversations/:id` with `{ personaId }` (a persona id, or `null` to go back to resolving) changes the persona for later replies. No page calls it yet, and it is not blocked when the admin turns persona editing off.
+- **Branching** — a branch starts with its parent's persona, language override and model purpose. It does not carry a starter card's operation binding, so the branch replies through the canonical `ai-chat/reply`.
+- **What is recorded** — the conversation row holds the persona id. A reply does not record which persona wrote it, and the thread shows no persona name, avatar or colour.
+
+---
+
+## What a Persona Puts in the Prompt
+
+At reply time the service resolves the persona, turns it into the token values below (every value sent as a string) and passes them as `variables` on the AI Core run. AI Core substitutes them into the three approach records, which the `ai-chat/persona-style` segment composes into the `ai-chat/reply` operation.
+
+### The Three Approaches
+
+As seeded by **Ensure defaults**:
+
+| Approach | Seeded text |
+|----------|-------------|
+| `ai-chat/persona-voice` — *Persona voice* | Adopt the configured voice. Directness `{persona_directness}`/100, agreeableness `{persona_agreeableness}`/100, formality `{persona_formality}`/100, verbosity `{persona_verbosity}`/100, enthusiasm `{persona_enthusiasm}`/100 — let high values show and low values recede. Pitch vocabulary at technical level `{persona_technical_level}`/100. Explanation style: `{persona_explanation_style}`. Response length preference: `{persona_response_length}`. |
+| `ai-chat/persona-content` — *Persona content preferences* | Content preferences: `{persona_content_preferences}`. Greeting style: `{persona_greeting_style}`. Reply in `{persona_language}` when a preferred language is set. |
+| `ai-chat/persona-role` — *Persona role* | You are `{persona_name}`. Roles to take: `{persona_roles}`. Personality notes: `{persona_personality}`. Instructions from the user about how to assist them: `{persona_custom_instructions}`. |
+
+These are AI Core records: admins change the wording in AI Core's prompt admin, and pressing **Ensure defaults** again never overwrites an edit. Where AI Core places the segment beside the reply objective and the epistemic discipline is AI Core's concern — see [Prompt Assembly](/modules/ai-core/prompt-assembly/).
+
+### The Tokens
+
+| Token | Built from | Fenced as data |
+|-------|------------|----------------|
+| `persona_name` | `name` | Yes |
+| `persona_directness` · `persona_agreeableness` · `persona_formality` · `persona_verbosity` · `persona_enthusiasm` | The five voice sliders, 0–100 | No |
+| `persona_technical_level` | `technicalLevel`, 0–100 | No |
+| `persona_explanation_style` | `explanationStyle`, then *, include examples* or *, no examples*, then *, step-by-step by default* when that toggle is on | **No** |
+| `persona_response_length` | `responseLength` as stored | **No** |
+| `persona_greeting_style` | `greetingStyle` as stored | **No** |
+| `persona_language` | The language cascade above; fallback *the user's own language* | **No** |
+| `persona_content_preferences` | The content-preferences sentence (below) | No |
+| `persona_roles` | `roles` joined with commas; fallback *none specified — be a capable general assistant* | Yes |
+| `persona_personality` | `personality`; fallback *none specified* | Yes |
+| `persona_custom_instructions` | `customInstructions`; fallback *none* | Yes |
+
+*Fenced as data* means the variable is declared `injectionRisk: true`, so AI Core frames its value as material to read, never as an instruction to follow. The fallbacks are module text, used so the approach sentences never dangle when a field is empty.
+
+The **content-preferences sentence** always has five parts — *emoji: yes/no; humour: yes/no; analogies: yes/no; acknowledge uncertainty: yes/no; profanity: allowed/not allowed* — then one clause for each toggle that is on: *offer proactive suggestions*, *ask clarifying questions when unsure*, *challenge assumptions*, *reduce overwhelm (small steps, calm tone)*, *state priorities explicitly*, *give time estimates*, *redirect gently*, *celebrate wins*. A toggle that is off adds nothing.
+
+### Worked Example
+
+The automatic *Assistant* persona (every database default) fills the approaches like this, shown with the values substituted plainly — AI Core adds its own framing around the fenced ones:
+
+```text
+Adopt the configured voice. Directness 50/100, agreeableness 50/100, formality 50/100,
+verbosity 50/100, enthusiasm 50/100 — let high values show and low values recede. Pitch
+vocabulary at technical level 50/100. Explanation style: balanced, include examples.
+Response length preference: adaptive.
+
+Content preferences: emoji: no; humour: yes; analogies: yes; acknowledge uncertainty: yes;
+profanity: not allowed; offer proactive suggestions; ask clarifying questions when unsure;
+celebrate wins. Greeting style: friendly. Reply in the user's own language when a
+preferred language is set.
+
+You are Assistant. Roles to take: none specified — be a capable general assistant.
+Personality notes: none specified. Instructions from the user about how to assist them: none.
+```
+
+### Bound Operations
+
+A conversation bound to its own operation (`metadata.replyOperationId`) — usually by a [starter card](/modules/ai-chat/configuration/#startercards--welcome-screen-starter-cards), though any conversation create or update can set it — still sends the persona tokens. They only take effect where that operation's prompt contains them, normally by referencing the `ai-chat/persona-style` segment. For a starter card's operation, add the segment in the AI operations tab's editor.
+
+<Aside type="caution" title="Where persona settings and fixed instructions disagree">
+- The seeded reply objective always says *when the message is ambiguous, ask one brief clarifying question rather than guessing* — switching off **Ask clarifying questions** removes the clause from the persona sentence, not that instruction.
+- The epistemic discipline always says to *name uncertainty plainly* — switching off **Acknowledge uncertainty** is outweighed by it.
+- The greeting style is sent on every turn, not just the first.
+- Four tokens — `persona_explanation_style`, `persona_response_length`, `persona_greeting_style` and `persona_language` — are not fenced. Through the settings page they only ever carry fixed values, but through the API they accept short free text (20–50 characters) that reaches the prompt as instruction. A conversation's `languageOverride` (up to 20 characters, set on `POST` or `PATCH /conversations`) fills `persona_language` ahead of the persona's own language, and persona gating does not cover it.
+</Aside>
+
+---
+
+## How Personas Meet the Rest of the Module
+
+- **Memory** — memories belong to the user, not the persona. Every persona draws on the same memories, and switching persona does not change what is remembered. *Remember context* and *Learn from conversations* do not affect memory today.
+- **Background tasks** — summaries, memory extraction, pattern detection, drift checks, titles, handovers and custom tasks run without persona tokens. Personas shape replies only.
+- **Saved sections** — the `section_formats` variable travels in the same run as the persona tokens, but it is section-type config, not part of a persona.
+- **Boosts** — Structure, Cognitive Pipeline and Document Management see no persona data.
+- **Provenance** — the per-reply provenance record does not include the persona.
+- ***Show reasoning* versus *Extended thinking*** — *Show reasoning* (Preferences) decides whether stored reasoning shows in the thread. The persona's *Extended thinking* toggle is stored but does not yet change how the model runs.
+
+---
+
+## Admin Controls
+
+Admins set persona gating at **Admin → AI Chat → Configuration → Personas** (`/admin/ai-chat`). The values are one admin-config record, `personaGating` — its defaults are listed under [Configuration](/modules/ai-chat/configuration/#personagating--what-users-may-customise). This section covers what each setting actually does.
+
+### Users May Edit Personas (`userEditable`)
+
+When off, creating, editing and deleting personas answer 403 *Persona editing is disabled by the administrator*, and the settings page reads *Personas are managed by your administrator in this app, so they are read-only here.* Users then see their personas' names and the default star, but cannot open a persona's settings.
+
+Still allowed when off: the automatic *Assistant* persona, choosing a Preferred persona, switching a conversation's persona through the API, and admin import. There is no admin surface yet for authoring personas on users' behalf, despite the read-only note.
+
+### Locked Fields (`lockedFields`)
+
+- A locked field renders disabled in the editor and is removed from the user's write on the server (and logged).
+- On a **new** persona a locked field takes the database default, which is not always what the editor shows: the *New persona* form starts from its own values, so a locked *Use humour* or *Celebrate wins* shows off but is saved on, and a locked *Response length* shows *Balanced* but is saved as `adaptive`. On an **existing** persona a locked field keeps whatever value it held when the lock was set. There is no way for the admin to set the value.
+- The checkbox list offers 29 fields: name, the six sliders, explanation style, response length, greeting style, preferred language, five content toggles, five interaction toggles (all but *Learn from conversations*), the five support toggles, roles, personality notes and custom instructions. *Include examples*, *Step-by-step by default*, *Learn from conversations* and the default star cannot be locked from the list. Five of the lockable fields — explanation style, greeting style, preferred language, roles and personality notes — have no control on the settings page anyway.
+- Locking **Name** makes creating a persona impossible from the settings page: the name box is disabled and empty, and the page requires a name.
+- The server accepts any string as a field id, so a typo locks nothing.
+
+### Maximum Personas (`maxPersonas`)
+
+1–100, default 5. Creating a persona is refused once the user's total — inactive personas and the automatic *Assistant* included — reaches the cap (400 *Persona limit reached (N allowed)*). Lowering the cap removes nothing; a user above it simply cannot create more. The automatic persona and imports are not capped.
+
+Saving the sub-tab writes the whole record — `PUT /admin/config/personaGating` with `{ value: { userEditable, lockedFields, maxPersonas } }`, all three fields required.
+
+### Ensure Defaults
+
+**Ensure defaults** (AI operations tab) plants the fifteen persona variables, the three approaches and the persona-style segment in AI Core — create-if-absent, alongside the `personaGating` defaults row and the module's other records. It creates no persona rows. After a clean run the admin page shows counts only (*N created, N already existed*); if anything fails it lists just the failures by id with their errors (for example `approach:ai-chat/persona-voice`). The raw response, `{ ok, created, existing, failed }`, lists every AI Core record by id; the admin-config rows, `personaGating` included, are not in it.
+
+### Activity
+
+The Activity tab's Overview **Personas** counter is the app-wide total across every user.
+
+---
+
+## API and Service Reference
+
+### Routes
+
+All under `/api/v1/ai-chat` and authenticated. The persona routes act on the signed-in user's own personas.
+
+| Method | Path | Behaviour |
+|--------|------|-----------|
+| GET | `/personas` | List — default first, then oldest; inactive included; not paginated |
+| GET | `/personas/active?conversationId=` | The persona the next reply would use. **Can create** the automatic *Assistant* persona |
+| GET | `/personas/:id` | One persona; 404 when it is not the user's |
+| POST | `/personas` | Create (201). Gating applies: 403 when editing is off, locked fields dropped, 400 at the cap |
+| PATCH | `/personas/:id` | Partial update. Gating applies without the cap: 403 when editing is off, locked fields dropped; 404 when it is not the user's. `isDefault: true` clears the user's other defaults |
+| DELETE | `/personas/:id` | Hard delete (204); 403 when editing is off, 404 when it is not the user's. Conversations using it go back to no persona |
+| POST | `/conversations` | Optional `personaId` and `languageOverride` |
+| PATCH | `/conversations/:id` | `personaId` (id or `null`) and `languageOverride` |
+| GET | `/config` | The public config slice, including `personaGating` |
+| PUT | `/admin/config/personaGating` | Admin only; the whole value |
+
+Persona bodies are Zod-validated: every field is optional on both create and update, unknown keys are dropped, and `configuredVia` / `lastLearnedAt` are not writable. An empty body creates a persona named *Assistant* with every database default.
+
+### Service
+
+Through `serviceRegistry.get('ai-chat')`:
+
+| Method | Notes |
+|--------|-------|
+| `listPersonas(userId)` · `getPersona(id, userId)` | As the routes |
+| `createPersona(userId, input)` · `updatePersona(id, userId, input)` · `deletePersona(id, userId)` | The same gating as the routes |
+| `resolveActivePersona(userId, conversationId?)` | The four-step choice above — can create the automatic persona |
+| `personaToVariables(persona)` | The **raw** token map: sliders as numbers, without a conversation's language override. Reply runs use a stringified copy with the override applied |
+
+### Events
+
+| Hook | Context |
+|------|---------|
+| `ai-chat.persona.created` | `{ userId, persona, autoCreated? }` |
+| `ai-chat.persona.updated` | `{ userId, persona, changes }` — `changes` is the write after locked fields were removed |
+| `ai-chat.persona.deleted` | `{ userId, personaId }` |
+
+Switching a conversation's persona fires only `ai-chat.conversation.updated`, with the persona id in `changes`. Of the three persona writes, only deletes are audit-logged.
+
+### Frontend
+
+From `@/features/ai-chat`: `usePersonas`, `useCreatePersona`, `useUpdatePersona` and `useDeletePersona` (each mutation invalidates the persona list), `usePublicConfig` for the gating, and `useUpdateConversation` for switching a conversation's persona. The API client also has `getActivePersona` and `getPersona`, without hooks.
+
+---
+
+## Deletion, Export and Erasure
+
+- **Deleting a persona** is permanent. In one transaction the user's conversations that used it are set back to no persona and the row is removed; their history stays. No other persona becomes the default.
+- **Export** — personas are in both the admin data envelope (`GET /export`, the calling admin's own data) and the personal-data export, oldest first with the user id removed.
+- **Import** — personas get new ids and conversations are re-pointed to them (or to no persona when the envelope lacks the id). Each persona's fields are validated, but import skips gating, locked fields and the cap, and keeps the default flag as exported, so a *merge* can leave two defaults. *Replace* deletes the importing admin's personas first.
+- **Account erasure** deletes all of the user's personas with the rest of their chat data, in one transaction.
+- **Encryption** — `personality` and `customInstructions` are stored as plain text; the module's field-encryption declaration ships commented out.
+
+<Aside type="caution" title="Deleting the Preferred persona blocks new chats">
+Deleting a persona does not clear a *Preferred persona* that points at it — and neither does a *replace* import, which gives every persona a new id. The welcome screen keeps sending the old id, and every new chat fails with *Unknown persona* — while the *Preferred persona* dropdown misleadingly shows *Default persona*. To recover, pick another persona in that dropdown (then switch back to *Default persona* if that is what you want); re-picking the option it already shows changes nothing.
+</Aside>
+
+---
+
+## Limitations and Known Gaps
+
+Each of these is tracked on the [Roadmap](/modules/ai-chat/roadmap/#persona-refinement).
+
+**Settings that do nothing yet**
+
+- *Remember context*, *Extended thinking* and *Learn from conversations* are stored but read by nothing.
+- `avatarUrl`, the colours, `customGreeting`, `preferredFormats`, `customTerminology`, `avoidedTerms` and `preferredTerms` are stored only. `configuredVia` and `lastLearnedAt` wait on the adaptive profile.
+
+**Fields that work but have no control** — roles, personality notes, explanation style, greeting style, preferred language, and the conversation's language override.
+
+**Choosing and showing personas**
+
+- Two defaults — the star and *Preferred persona* — decide the persona at different moments.
+- No persona picker or mid-chat switch in the chat, and replies neither show nor record which persona answered.
+- `isActive` has no control; an inactive persona can still be attached to a conversation, and is then skipped without notice.
+
+**Integrity**
+
+- A single default is a service convention only. A user can end up with two — after a *merge* import; by deactivating their starred persona when no other is active (so an *Assistant* is created) and then reactivating it; or when two replies race to create the automatic persona — and resolution then picks one arbitrarily.
+- The automatic persona ignores gating and the cap, and is created again each time the user has no active persona.
+- Deleting the Preferred persona blocks new chats (see above).
+
+**Gating**
+
+- The lock list is out of step with the editor, locking *Name* blocks creation, admins cannot set locked values, and unknown field ids are accepted.
+- On a new persona, a locked *Use humour*, *Celebrate wins* or *Response length* shows the form's starting value (off, off, *Balanced*) but is saved with the database default (on, on, `adaptive`) — the two sets of starting values disagree on these three fields.
+- Turning editing off also hides each persona's settings from its user, but does not stop conversation switching.
+- Lowering the cap removes nothing.
+
+**Prompt**
+
+- Fixed instructions outweigh *Ask clarifying questions* and *Acknowledge uncertainty* when they are off.
+- Four tokens carrying user-settable text are not fenced as data.
+- The greeting style is sent on every turn, and with no language set the language sentence reads awkwardly.
+- An operation a conversation is bound to (a starter card's, say) needs the persona-style segment added by hand.
+- `responseLength: 'adaptive'` has no option in the UI and is not tied to AI Core's output dials.
+- No per-persona model purpose — the conversation's `modelPurpose` column is stored and branched but never sent to AI Core.
+- How personas relate to AI Core's own per-user preferences (`RunOptions.preferences`) is undecided; ai-chat does not pass them today.
+
+---
+
+## Related
+
+- [Usage](/modules/ai-chat/usage/) — the chat page and the other user-facing features
+- [Configuration](/modules/ai-chat/configuration/#personagating--what-users-may-customise) — the `personaGating` record and the AI operations tab
+- [Database](/modules/ai-chat/database/#ai_chat_persona) — the `ai_chat_persona` table
+- [Integration](/modules/ai-chat/integration/) — the service, hooks and data envelope
+- [AI Core Prompt Assembly](/modules/ai-core/prompt-assembly/) — how approaches, segments and fenced variables become the prompt
