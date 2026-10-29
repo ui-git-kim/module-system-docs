@@ -293,49 +293,65 @@ Retrieval is a capability, not a mandate. A consumer that already knows exactly 
 
 ## Prompt Variables (v1.49.0)
 
-An admin can place a `{token}` in any segment; AI Core substitutes it by name at assembly time. The **value** is the consumer's to supply — pass it on the run:
+An admin can place a `{token}` in any segment; AI Core puts its value in when the prompt is built. Each variable says **where its value comes from**:
+
+| Value from | Who fills it | Example |
+|---|---|---|
+| **Typed here** (`authored`, v1.81.4) | The admin types it once, on the Variables tab | `{app_name}` = Veradai |
+| **The app** (`caller`) | Your app passes it on each run, in `variables` | `{policy_clause}` |
+| **Structure** (`field-source`, v1.81.4) | AI Core reads a Structure field, from a pinned node or the node the call is about | `{matter_number}` |
+| **The user** (`user`) | Your app passes the user's name; preferences fill `{communication_style}` | `{user_name}` |
+| **Built-in** (`builtin`) | AI Core: `{date}`, `{time}`, `{communication_style}` | `{date}` |
 
 ```ts
 await aiCore.run('answer-question', input, {
   userId,
   preferences,                        // fills {communication_style}
+  nodeId: matter.id,                  // Structure variables read this node (v1.81.4)
   variables: {
     user_name: 'Dana',
-    policy_clause: resolvedStructureField, // the app resolved this itself
+    policy_clause: clauseText,        // a variable whose value comes from the app
   },
 });
 ```
 
-Built-in `{date}`/`{time}` and `{communication_style}` (from `preferences`) are filled by AI Core; everything else arrives in `variables`. A declared token with no value follows its admin-set behaviour (a fallback string, or skip), and the outcome is named in feedback. Only **declared** tokens substitute, so a JSON format segment is never touched. A variable flagged **injection risk** in the admin is sanitised and fenced before it lands (the fence tag is random per call with caching off and keyed per content with caching on — see [the keyed fence](/modules/ai-core/prompt-assembly/#the-keyed-fence)) — so a longer field is safe to inline — but bulk content that may carry instructions still belongs in a **marked input/context** item, not a variable.
+**A typed value is the value.** It is used as written on every run, and a value the app passes under the same name never replaces it: over HTTP it is refused and named `prompt-variable-caller-blocked:<name>`, and from your own code it is named `prompt-variable-typed-kept:<name>`. A new typed variable starts as *Stays the same*, so prompt caching can reuse a prompt that holds it.
+
+A declared token with no value follows its admin-set behaviour — **Leave it out**, or **Use this text** — and the outcome is named in feedback. Only **declared** tokens substitute, so a JSON format segment is never touched. A variable flagged **injection risk** in the admin is sanitised and fenced before it lands (the fence tag is random per call with caching off and keyed per content with caching on — see [the keyed fence](/modules/ai-core/prompt-assembly/#the-keyed-fence)) — so a longer field is safe to inline — but bulk content that may carry instructions still belongs in a **marked input/context** item, not a variable.
 
 **`{communication_style}` is context, not instructions (v1.61.0).** The preferences are the user's own words, so AI Core always fences them as material, whatever the variable record says, with a plain lead-in telling the model to adapt its tone, length, vocabulary and structure to them where they don't conflict with its instructions. One cost to know for [prompt caching](/modules/ai-core/prompt-assembly/#prompt-caching-v1670): with caching on, the fence tag is keyed to the content (since v1.67.0), so the fenced preferences can be cached, but they differ for each user. `{communication_style}` in an **instruction** segment therefore makes the instructions different for each user, so they are cached per user rather than shared. A context builder's **Communication style** block carries the same preferences on the input side and keeps the instructions the same for everyone. (With caching off, the fence tag is still drawn at random per call, as before.)
 
+### Structure fields (v1.81.4)
+
+When Structure is installed, AI Core reads a variable's value from Structure itself — no code in your app.
+
+- **Binding a field.** On the Variables tab, choose **Structure: a field of a node**, pick a **node type**, then the field. The list holds the node's own name, description, reference number and slug, each field that holds a value, each field-group subfield (its first row), and one hop through a node reference (`client->email`). **Secret fields are never listed.**
+- **Which node.** You can **pin one node** (search the nodes of that type), for a fact that is the same on every run: your own company's details, say. With none pinned, AI Core reads **the node the call is about**: `RunOptions.nodeId`, or else the call's space (`spaceId`). A flow's steps use the flow's space.
+- **Read as whom.** The call's node is read **as the signed-in user**, so Structure's own rules decide what they may see: their own records, their space, the record types they may read. A pinned node is read **as the admin who pinned it** (recorded when the pin is saved, never taken from the request), so only a node that admin can read (their own, or a shared one) can be pinned. A reference followed from either node is read the same way, so neither reaches a record its reader could not open.
+- **Text a user wrote is always fenced.** A Structure value that is free text (a name, a description, a text field) is sanitised and fenced as material on every run, whatever the variable's injection-risk switch says, because the people who use the app write it. A choice from the type's own options, a number, yes/no, a date, the slug and the reference number go in plainly unless the switch is on.
+- **Never a secret.** The field path is checked against the node type's definitions, and the node's data passes through Structure's own secret redaction before a value is read. A Structure that cannot redact is not read at all.
+- **How values read.** Text as it is; a select shows its option's label; a list is joined with commas; yes/no fields read *Yes* or *No*; an address's parts are joined with commas.
+- **When there's no value.** A value the app passes under the same name is used first (as before v1.81.4, so an app that already resolves its fields keeps working), then the variable's own rule: **Leave it out**, or **Use this text**. Each field that gave no value is named in feedback as `prompt-variable-field-unresolved:<name>:<why>`, where `<why>` is one of `structure-unavailable`, `not-bound`, `no-node`, `node-unreadable`, `wrong-type` (the node is not of the bound type or one of its subtypes), `secret-field`, `empty` or `read-failed`. When the app's value stood in, only `read-failed` is named: otherwise the app filled it, as before.
+- **Only what the prompt uses is read.** A Structure variable whose `{token}` sits in none of the operation's text is never looked up.
+- **The preview** reads a pinned node, and says when a variable reads the call's node (a preview is about no node).
+
+All of AI Core's Structure reads for variables sit in one file (`structure-fields.ts`), so when Structure publishes its own contract for other modules, that file is the one to change.
+
 ### Registering a field source (optional)
 
-So the Variables editor can *search* a field source (e.g. Structure) when binding a variable, a host registers a provider under the `promptVariableFields` service key — the same optional-service pattern retrieval uses. AI Core defines the interface and never imports the provider, so this is entirely opt-in; without it, the editor falls back to manual token entry.
+A host can still register its own field source under the `promptVariableFields` service key. When it does, the Variables editor searches **it** instead of Structure, and no node can be pinned. A field picked from it is marked as that source's (`from: 'host'`), so a run never reads Structure for it: the app's value fills it, as before. AI Core defines the interface and never imports the provider:
 
 ```ts
-// In the host app (which knows both AI Core and Structure):
+// In the host app:
 serviceRegistry.register('promptVariableFields', {
   async listNodeTypes() {
-    return structure.listNodeTypes(); // [{ type, label }]
+    return myFields.listTypes(); // [{ type, label }]
   },
   async searchFields(nodeType, query) {
-    const tokens = await structure.getMergeFieldSchema(nodeType); // MergeFieldToken[]
-    return tokens
-      .filter((t) => t.label.toLowerCase().includes(query.toLowerCase()))
-      .map((t) => ({
-        path: t.path,
-        insertText: t.insertText,
-        label: t.label,
-        type: t.type,
-        multiple: t.multiple,
-      }));
+    return myFields.search(nodeType, query); // [{ path, insertText, label, type, multiple? }]
   },
 });
 ```
-
-Binding a field only records what the variable stands for (`sourceRef`); **AI Core never resolves it at run time** — the app resolves the field against the actual node (Structure's own resolver) and passes the value in `variables`, exactly as above. This keeps AI Core a generic `{token}` substitutor with no dependency on Structure.
 
 ---
 
