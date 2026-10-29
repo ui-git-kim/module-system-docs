@@ -1,6 +1,6 @@
 ---
 title: Design philosophy
-description: How the Style module owns app-wide styling by matching shadcn create exactly and extending it through the catalogue pattern
+description: How the Style module owns app-wide styling, matches shadcn's tokens and preset codes, and extends them through the catalogue pattern
 sidebar:
   order: 1
 ---
@@ -13,9 +13,47 @@ The Style module is the **sole stylist** for apps built on the module system. No
 Other modules must not call `styleRegistry.register()` or edit `components/ui/*` files. If a module needs a visual tweak, it requests a catalogue entry here and the Style module ships it.
 </Aside>
 
-<Aside type="tip" title="Match shadcn, then extend">
-The core `baseColor + theme + radius + menuAccent + menuColor + font + iconLibrary + style + chartColor + fontHeading` pipeline produces CSS **byte-identical to `shadcn init`** for the same preset code. Our own features (sidebar accent, the data-slot default-styling layer, the other catalogue entries) are layered on top as additive registry entries — never baked into the shadcn baseline.
+One exception exists today: the Colour module registers `colour.status-tokens`, which defines `--success`, `--warning` and their foregrounds inside `@layer base`. The names match the Style module's, and the Style theme is injected unlayered, so an active Style theme overrides them (see [Why the cascade wins](#why-the-cascade-wins)).
+
+<Aside type="tip" title="Match shadcn's tokens, then extend">
+For any preset shadcn accepts, the palette tokens the module generates are the ones `shadcn init` writes (checked against shadcn 4.23.0), and preset codes are interchangeable with `ui.shadcn.com/create`. The module's own features (status colours, the sidebar accent, menu colour, the default-styling layer, the catalogue entries) sit after that baseline, never inside it. The match is token for token, not byte for byte: see [Token parity with shadcn](#token-parity-with-shadcn).
 </Aside>
+
+---
+
+## Token parity with shadcn
+
+Parity here means the same tokens, not the same file. For a preset shadcn accepts, with no hand-tuned colours on top, compared with what shadcn 4.23.0's `init` writes:
+
+- **The baseline tokens match exactly.** The `:root` and `.dark` blocks hold shadcn's colour tokens only, with shadcn's values, in shadcn's order. `--radius` is always written, straight after `--chart-5` (`default` is `0.625rem`, as in shadcn).
+- **`@theme inline` has shadcn's variable set.** The font variables come first (`--font-sans`, `--font-heading`, `--font-mono`, plus `--font-serif` for a serif body font), then shadcn's `--color-*` mappings, then shadcn's multiplicative radius scale: `--radius-sm` (`--radius` × 0.6) up to `--radius-4xl` (× 2.6).
+- **v2 preset codes are bit-for-bit interchangeable** with `ui.shadcn.com/create` (see [Preset codec](#preset-codec--bit-compatible-with-shadcn)).
+
+These differences are intended:
+
+1. **Formatting.** Indentation, blank lines and the order of some mappings come from the module's generator, not the CLI's postcss output.
+2. **No font import.** shadcn adds a `@fontsource` import for the preset font. The module leaves font loading to the host.
+3. **Module tokens get their own `:root` / `.dark` pair, after the baseline.** It holds `destructive-foreground` (shadcn 4.x themes no longer define it, but saved configs carry it), `success` / `warning` / `info` and their foregrounds, `code` / `code-foreground` / `code-border`, the font, spacing, letter-spacing and shadow tokens, then custom variables.
+4. **Extra `@theme inline` mappings.** The status tokens are always mapped. Any other module token gets a `--color-*` mapping only when its value is a colour, and `font-*` and `shadow-*` tokens never do (`shadow-color` holds a colour, but it is a shadow setting), so fonts, spacing and shadow settings never become `bg-*` / `text-*` utilities. A custom variable maps as `--color-<name>` for a colour value and `--<name>` otherwise. `--color-destructive-foreground` stays, as create's manual-install CSS still writes it.
+5. **Font variables.** An inherited `--font-heading` carries the body font's family itself, where shadcn writes `var(--font-sans)`, because the module's own `:root` font tokens would otherwise shadow the variable. A `--font-sans` or `--font-mono` the preset font doesn't claim maps to the matching `:root` token only when the config has that token. `--font-serif` is mapped only for a serif body font.
+6. **Extensions shadcn doesn't write:** the sidebar accent, the menu colour rules and the default-styling layer.
+
+<Aside type="caution" title="Known issue: fonts in the running app">
+The font and heading font drive the preview, the preset code and the exported `global.css`. The running app gets the injectable CSS, which has no `@theme` block, and the module loads no fonts at runtime. So the live font is still whatever the `:root` `font-sans` token says. See the [Roadmap](/modules/style/roadmap/).
+</Aside>
+
+### Generated CSS layout
+
+`generateThemeCSS` (`utils/css-generator.ts`) writes the copyable `global.css` in this order:
+
+1. The `@import` lines: `tailwindcss`, `tw-animate-css`, `shadcn/tailwind.css`.
+2. `@custom-variant dark (&:is(.dark *));`
+3. `@theme inline`: the font mappings, shadcn's `--color-*` set, the radius scale, then the module's own mappings.
+4. The baseline `:root` / `.dark` blocks.
+5. The module extensions (`generateExtensionsCSS`): the module token pair, the sidebar-accent override, the menu colour rules and the default-styling layer.
+6. `@layer base`: the border and body defaults, plus `html { @apply font-<category> }` for a preset body font.
+
+`generateInjectableCSS` is parts 4 and 5 only, the parts a plain `<style>` tag can apply without Tailwind. It is what the running app gets, through the `style.app-theme` registry entry. The builder canvas receives the full `generateThemeCSS` output as a plain stylesheet, so there too only parts 4 and 5 take effect.
 
 ---
 
@@ -23,7 +61,7 @@ The core `baseColor + theme + radius + menuAccent + menuColor + font + iconLibra
 
 A project's theme is edited through two structure-node tabs that share **one** stored `StyleConfig`. To stop them from fighting over the same `cssVars` blob, the config is read as **two layers**:
 
-- **Layer 1 — the shadcn config (preset).** `componentLibrary`, `styleName`, `baseColor`, `colorPreset`, `chartColor`, `radius`, `menuColor`, `menuAccent`, `sidebarAccent`, `font`, `fontHeading`, `iconLibrary`. Edited in the **Shadcn Config** tab, it resolves to the base palette via `resolveTheme`.
+- **Layer 1 — the shadcn config (preset).** `componentLibrary`, `styleName`, `baseColor`, `colorPreset`, `chartColor`, `radius`, `menuColor`, `menuAccent`, `sidebarAccent`, `font`, `fontHeading`, `iconLibrary`. Edited in the **Shadcn Config** tab, it resolves to the base palette via `resolveTheme`. Every change to it is normalised to a combination shadcn accepts (see [Preset codec](#preset-codec--bit-compatible-with-shadcn)).
 - **Layer 2 — the custom delta.** The palette tokens whose value differs from the resolved base. Edited in the **Theme** tab. It is *derived*, not stored separately: `delta = cssVars − resolveTheme(config)` over the resolved token keys. Non-palette tokens (fonts, spacing, shadows) and custom variables are never part of the preset layer and always pass through.
 
 The **effective theme is `base ⊕ delta`**. The helpers live in `utils/css-generator.ts` — `computePaletteDelta`, `rebaseCssVars`, `reseedCssVars`, `affectsPalette`.
@@ -34,13 +72,13 @@ The **effective theme is `base ⊕ delta`**. The helpers live in `utils/css-gene
 
 ### Rebase — ask per change
 
-Changing a palette-affecting preset field (`baseColor` / `colorPreset` / `chartColor` / `menuAccent`) regenerates the base. When the project has a custom delta a reseed would destroy, the Shadcn Config tab **prompts before applying**:
+Changing a palette-affecting preset field (`baseColor` / `colorPreset` / `chartColor` / `menuAccent`) regenerates the base. `affectsPalette` compares the resolved palettes, not the raw fields, so an equivalent spelling (a legacy `'default'` theme against the base colour, an unset chart colour against the theme) never counts as a change. When the project has a custom delta a reseed would destroy, the Shadcn Config tab **asks before applying**, in a modal dialog:
 
 - **Rebase** — recompute the base from the new preset and re-apply the delta on top (keep hand-tuned tokens on the new palette).
-- **Keep** — leave the colours exactly as they are; only the preset field changes.
+- **Keep** — leave the colours exactly as they are; only the preset field changes. Pressing Escape counts as Keep.
 - **Discard** — take the clean new base and drop the delta.
 
-The prompt only appears when a real, affecting delta exists; with no delta the base reseeds silently (the previous behaviour). Restoring from the preset history and pasting a preset code both flow through the same check.
+The prompt only appears when a real, affecting delta exists; with no delta the base reseeds silently. Restoring from the preset history and pasting a preset code both flow through the same check.
 
 ### Shadcn-config history
 
@@ -48,64 +86,89 @@ The Shadcn Config tab keeps its **own history**, separate from the Theme tab's c
 
 ---
 
+## App theme storage
+
+The app-wide theme is stored differently from project themes:
+
+- **Source of truth: `AppSettings.appTheme`.** The starter's [`AppSettings.appTheme`](/starter-template/admin-feature/#app-theme-apptheme) holds an envelope, `{ kind: 'style.app-theme', schemaVersion: 1, config, css, savedAt }`: the full `StyleConfig`, plus its injectable CSS rendered at save time for a reader that can't run the generator. The starter treats the value as opaque, so the module shape-guards it on every read (`parseAppThemeEnvelope`).
+- **The module tables keep history and project themes.** `style_theme` holds the project themes, personal reusable themes, the system themes and one shared app-history row that every admin's saves land on. `style_theme_version` holds the version snapshots, and `style_shadcn_config_version` the preset-layer snapshots.
+- **Save order.** The Theme page writes `appTheme` first, and a failure there fails the save. It then records a version through `PUT /api/v1/style/app/config`. That step is best effort: if it fails, the theme is still saved and the page shows a warning. Last, `applyAppTheme` applies the CSS app-wide, so the change shows without a reload.
+- **Bootstrap.** At import, `style.registration.ts` claims the `style.app-theme` entry (order 50) with the CSS this device cached in `localStorage` under `style.app-theme-css`, so a returning visitor sees the last-known theme on first paint. It then reads the starter's public `GET /api/v1/theme`, which answers signed-out visitors too, and regenerates the CSS from `envelope.config` with the current generator (loaded lazily), falling back to `envelope.css`.
+- **Legacy fallback and migration.** With no envelope, the bootstrap reads the module's older `GET /api/v1/style/app/active` row. That read needs a session, so a signed-out `401` just keeps the cached CSS; when both reads say there is no app theme, the cached CSS is dropped. When an admin opens the Theme page while `appTheme` is still `null`, the editor is seeded from the legacy row and the theme is copied into `appTheme` once. A non-null `appTheme` the module doesn't recognise is left alone until an admin saves.
+
+---
+
 ## Menu ≠ Sidebar — the most important distinction
 
-Shadcn's "Menu" controls in `shadcn.com/create` govern **dropdowns, popovers, and select menus** — not the sidebar.
+Shadcn's "Menu" controls in `ui.shadcn.com/create` govern **menu surfaces**: dropdown menus, context menus, menubars, selects and comboboxes. Not the sidebar.
 
 | You set | What changes |
 |---------|--------------|
-| Menu Colour: **Inverted** | Dropdowns, popovers, select menus render with dark-mode tokens on a light page (and vice versa). The sidebar is **not affected**. |
-| Menu Colour: **Translucent** | Those same menus get a translucent backdrop. Sidebar not affected. |
-| Menu Accent: **Bold** | The global `--accent` token is redirected to `--primary`. Hover/active states on buttons, menu items, and selection highlights across the whole app pick up the primary colour. |
+| Menu Colour: **Inverted** | Menu surfaces take the dark palette, on a light page as well as a dark one. The sidebar is **not affected**. |
+| Menu Colour: **Translucent** | Menu surfaces get a see-through background over a blurred backdrop. Sidebar not affected. |
+| Menu Colour: **Inverted Translucent** | Both of the above. |
+| Menu Accent: **Bold** | The global `--accent` token is redirected to `--primary`. Hover/active states on buttons, menu items, and selection highlights across the whole app pick up the primary colour. Not allowed with a translucent menu colour: it becomes Subtle. |
 
-Menu colour is applied **at runtime**, not in the generated CSS. The module installs a binding that toggles `.dark` on every element with the `.cn-menu-target` class and sets `data-menu-translucent` on `[data-menu-translucent]` elements. Starter template dropdowns must carry `.cn-menu-target` for this to take effect.
+### Menu colour is CSS
 
-Menu accent IS in the generated CSS — `buildRegistryTheme` (our `resolveTheme`) mutates `--accent` and `--accent-foreground` to match `--primary` when bold.
+shadcn applies `menuColor` when it **installs** a component: its CLI rewrites the `cn-menu-target` hook class to `dark` and `cn-menu-translucent` into utilities. So the primitives in an app's `components/ui` keep no hook class for anything to find at runtime.
+
+The module therefore emits menu colour as CSS, in the extensions layer (`generateMenuColorCSS`), on the menu surfaces' data-slots: `dropdown-menu-content`, `dropdown-menu-sub-content`, `context-menu-content`, `context-menu-sub-content`, `menubar-content`, `menubar-sub-content`, `select-content` and `combobox-content`. Popover content is not on the list.
+
+- **Inverted** (`inverted`, `inverted-translucent`): the surfaces get every colour token of the dark palette, plus `color-scheme: dark`, in both page modes, as shadcn's `dark` class does. One limit: `dark:` variant utilities inside a menu still follow the page mode, because they key off a `.dark` ancestor class, which a stylesheet can't add.
+- **Translucent** (`default-translucent`, `inverted-translucent`): a port of shadcn's `.cn-menu-translucent` rule. The popover colour drops to 70% over a `blur(40px) saturate(1.5)` backdrop, focused and highlighted items and open triggers get a 10% foreground tint, separators 5%, and destructive items take the accent foreground colour.
+
+The rules are unlayered, so they beat the primitives' own utilities without `!important` (see [Why the cascade wins](#why-the-cascade-wins)). Both `generateThemeCSS` and `generateInjectableCSS` carry them, so the running app, the builder canvas and the exported `global.css` agree.
+
+The runtime binding is still there for markup that keeps the raw class. `bindMenuColor` (started by the app-theme bootstrap) and the `useMenuColorBinding` hook (which the admin Theme page runs for the choice being edited) add `.dark` to `.cn-menu-target` elements and set `data-menu-translucent` where it is present. That only reaches un-installed registry copies, such as the builder's pristine primitives. The theme preview iframe applies the same rule to its own demo menus with its own script.
+
+Menu accent is part of the palette: `resolveTheme` (our port of shadcn's `buildRegistryTheme`) points `--accent` and `--accent-foreground` at `--primary` and `--primary-foreground` when bold. Like shadcn, it leaves `--sidebar-accent` alone.
 
 ---
 
 ## Sidebar Accent — our extension
 
-Shadcn ships `--sidebar-*` tokens but no UI to make the active nav item bold. That's a reasonable design knob that sits cleanly alongside shadcn without breaking preset compatibility.
+Shadcn ships `--sidebar-*` tokens but no control that makes the active nav item bold. That's a reasonable design knob that sits cleanly alongside shadcn without breaking preset compatibility.
 
-Our `sidebarAccent` field (values `'subtle' | 'bold'`):
+Our `sidebarAccent` field (values `'subtle'` or `'bold'`):
 
-- Stored in `StyleConfig`, not encoded in the shadcn preset code — codes still round-trip cleanly with `shadcn.com/create`
-- Implemented as the `style.sidebar-accent-bold` catalogue entry:
+- Stored in `StyleConfig`, in the preset layer, but not encoded in the shadcn preset code, so codes still round-trip cleanly with `ui.shadcn.com/create`.
+- Carried by the generated CSS alone. `generateExtensionsCSS` emits this block whenever `sidebarAccent === 'bold'`, through both `generateThemeCSS` and `generateInjectableCSS`, so the running app, the builder canvas and the exported `global.css` all reflect the setting with no runtime JS:
 
 ```css
-:root, .dark {
+:root,
+.dark {
   --sidebar-accent: var(--primary);
   --sidebar-accent-foreground: var(--primary-foreground);
 }
 ```
 
-- Toggled on/off via `styleRegistry.setOverride()` by the admin settings page when the user picks Bold. Pure additive layer — the baseline `:root` / `.dark` blocks stay byte-identical to shadcn's output.
-- Baked into the persisted `global.css` and the iframe-preview CSS as well: `generateExtensionsCSS` emits the same `--sidebar-accent` override block whenever `sidebarAccent === 'bold'` (via `generateThemeCSS` and `generateInjectableCSS`), so the shipped CSS reflects the setting with no runtime JS. The catalogue entry drives the live admin toggle; the generated CSS carries the choice into persisted output.
+- No longer a catalogue entry. The `style.sidebar-accent-bold` entry and the `setOverride()` calls that drove it are gone. An older app may still have a `style.sidebar-accent-bold` key in `AppSettings.styleOverrides`; it is harmless, and the Style catalogue tab saves it back unchanged.
+- Purely additive: it sits in the extensions, after the baseline `:root` / `.dark` blocks, which keep shadcn's tokens.
 
 ---
 
 ## The catalogue pattern
 
-Beyond the shadcn baseline, the module ships opt-in `styleRegistry` entries targeting shadcn's **stable public API**: the `data-slot`, `data-variant`, and `data-state` attributes every primitive renders.
+Beyond the shadcn baseline, the module ships `styleRegistry` entries targeting shadcn's **stable public API**: the `data-slot` attribute every primitive renders, plus the `data-variant`, `data-size` and `data-state` attributes many of them add. Check which element carries which attribute. Tabs, for example, put `data-variant` on the list, not on each trigger:
 
 ```html
 <div data-slot="tabs" data-orientation="horizontal">
   <div data-slot="tabs-list" data-variant="line">
-    <button data-slot="tabs-trigger" data-variant="line" data-state="active">…</button>
+    <button data-slot="tabs-trigger" data-state="active">…</button>
   </div>
 </div>
 ```
 
-A catalogue entry hooks those attributes:
+A catalogue entry hooks those attributes. A sketch:
 
 ```typescript
 styleRegistry.register({
-  id: 'style.tabs-line-primary',
+  id: 'style.my-thing',
   order: 60,
   enabled: false,
   css: `
-    [data-slot="tabs-trigger"][data-variant="line"][data-state="active"] {
+    [data-slot="tabs-list"][data-variant="line"] [data-slot="tabs-trigger"][data-state="active"] {
       color: var(--primary);
       border-color: var(--primary);
     }
@@ -115,13 +178,50 @@ styleRegistry.register({
 
 Zero changes to `components/ui/tabs.tsx`. Zero template edits. Purely additive.
 
+The current entries (`CATALOGUE_IDS` in `registrations/catalogue.registration.ts`):
+
+| Entry | Restyles | When on | Default |
+|-------|----------|---------|---------|
+| `style.tabs-line-primary` | Tabs | Line-variant tabs get larger, heavier labels that turn the primary colour on hover and when selected, a primary underline on the active tab, and more space between tabs | off |
+| `style.button-bold` | Button | Default-variant buttons get heavier text and, at the default size, a taller (2.5rem), wider box | off |
+| `style.card-elevated` | Card | Cards sit slightly raised and lift a little further on hover | off |
+| `style.sidebar-rounded` | Sidebar | Sidebar menu buttons get rounder corners that follow the theme radius | off |
+| `style.designer-density` | The module's own panels | Compact text inside `[data-style-designer]` | always on |
+
+The four opt-in entries register at order 60 with `enabled: false`, and each has a `CATALOGUE_ENTRIES` row (`id`, `label`, `description`, `primitive`) for the admin panel. `style.designer-density` registers at order 80, always on, and has no row. The app theme's own entry, `style.app-theme` (order 50), is not part of the catalogue.
+
+<Aside type="note" title="Line tabs: where the variant lives">
+shadcn's tabs put `data-variant` on the tabs **list**, not on the triggers, so `style.tabs-line-primary` selects `[data-slot="tabs-list"][data-variant="line"] [data-slot="tabs-trigger"]`, and colours the active tab's `::after` underline bar. Before v1.15.0 its label rules keyed on the trigger and matched nothing, so only the wider gap applied.
+</Aside>
+
+### The Style catalogue tab
+
+Admins switch the opt-in entries on the Theme page (`/admin/app-theme`), on its **Style catalogue** tab (`CatalogueSettingsPanel`). It lists the `CATALOGUE_ENTRIES` rows grouped by primitive, with a switch for each:
+
+- A switch applies at once (`styleRegistry.setOverride`), then saves the full explicit-override map (`styleRegistry.getOverrides()`) to `AppSettings.styleOverrides` with `PUT /api/v1/admin/style-overrides`. The starter applies that map at start-up, so the choice reaches everyone.
+- If the save fails, the switch rolls back and the error shows.
+- **Reset to default** clears the explicit override (`styleRegistry.clearOverride`), so the entry follows the module's default again.
+
+### Designer density and `data-style-designer`
+
+`style.designer-density` keeps the module's own compact panels (the className designer, the theme editors, the structure tabs and their controls) at one small, even text size, so their markup never sizes text by hand.
+
+- **Scope.** It reaches only elements under the boolean attribute `data-style-designer`. The convention: put `data-style-designer=""` on each panel root, and on every `PopoverContent`, `SelectContent`, `DropdownMenuContent` and `TooltipContent` the panel opens, because those portal outside the root. Ordinary admin UI, such as the Style catalogue and Import and export panels, doesn't carry it. Neither does the rebase dialog, which keeps standard dialog type.
+- **What it sets,** all from Tailwind's `--text-xs` step, which is an absolute size, so nested scopes don't compound:
+  - the scope root's own font size and line height;
+  - the starter's typography role tokens that `<Text>` reads: `--ui-body-size` and `--ui-label-size` at `--text-xs`, `--ui-caption-size` and `--ui-overline-size` at 0.875 × `--text-xs`;
+  - font size and line height on primitives whose own utilities size their text: input, textarea, select trigger and item, toggle and toggle-group item, tabs trigger, the dropdown-menu items, item title, empty title and description, alert title and description, and field label and description. Label gets the size only, keeping shadcn's `leading-none`. Buttons are left alone: panels size them with the Button `size` prop;
+  - the size and gap that `style.tabs-line-primary` reads, so turning that entry on app-wide leaves the designer's line tabs compact.
+- **Retune** it with `--style-designer-text-size`, `--style-designer-caption-size` and `--style-designer-leading`.
+- **Zero specificity.** Every selector is wrapped in `:where()`. The rules still beat the primitives' utilities, because they are unlayered, and any other unlayered rule overrides them with a single attribute selector.
+
 ---
 
-## Preset codec — byte-compatible with shadcn
+## Preset codec — bit-compatible with shadcn
 
-The module's `preset-codec.ts` is a line-for-line port of `shadcn/preset/preset.ts`. A preset code generated in `shadcn.com/create` decodes identically here, and vice versa.
+The module's `utils/preset-codec.ts` is a port of shadcn's codec, [`packages/registry/src/preset/preset.ts`](https://github.com/shadcn-ui/ui/blob/main/packages/registry/src/preset/preset.ts), taken at shadcn 4.23.0. (The file moved there from `packages/shadcn` in shadcn 4.21.1.) A v2 code made in `ui.shadcn.com/create` or by the shadcn CLI decodes to the same settings here, and a code the module encodes decodes the same way there.
 
-**Format:** version character prefix (`"b"` = current v2) + base62-encoded bit-packed integer. The decoder also accepts legacy `"a"`/v1 codes (40-bit, 8-field) and back-fills the newer `fontHeading` / `chartColor` fields.
+**Format:** a version character, then a base62-encoded bit-packed integer. `"b"` is the current v2 format, and the module always encodes `"b"`. The decoder also accepts legacy `"a"` (v1) codes: 40 bits, 8 fields. A code is at most **10 characters** (the version character plus up to 9 base62 digits); `isPresetCode` rejects anything longer.
 
 **V2 field layout (51 bits):**
 
@@ -129,6 +229,20 @@ The module's `preset-codec.ts` is a line-for-line port of `shadcn/preset/preset.
 menuColor (3) | menuAccent (3) | radius (4) | font (6) | iconLibrary (6)
   | theme (6) | baseColor (6) | style (6) | chartColor (6) | fontHeading (5)
 ```
+
+**v1 codes** carry no heading font or chart colour. The decoder sets `fontHeading` to `'inherit'` and takes the chart colour from the **theme**, as create does: a base-tone theme gets its legacy chart theme from `V1_CHART_COLOR_MAP` (neutral → blue, stone → lime, zinc → amber, mauve → emerald, olive → violet, mist → rose, taupe → cyan), and an accent theme keeps its own charts.
+
+**What you can paste.** `parsePresetInput` takes what people actually copy: a bare code, a `--preset <code>` flag, the full `npx shadcn@latest init --preset <code>` command, or any URL carrying `?preset=<code>`. Input is trimmed and surrounding quotes are dropped. Anything else shows "Invalid preset code".
+
+**Normalisation.** shadcn create corrects every settings change, and `init` rejects combinations its schema doesn't allow. The module applies the same rules. `normalisePresetChange` normalises one edit, and can correct fields the edit didn't touch; it runs on panel edits, pasted codes, restored snapshots and resets. `normalisePresetFields` normalises a whole config, and `styleConfigToPreset` runs it before encoding. `presetToStyleConfigPartial` normalises a decoded code as well, so the module never produces a code `shadcn init` rejects:
+
+- The base colour must be one with palette data, else it becomes neutral. `gray` exists only in the codec, so it becomes neutral too.
+- The theme and chart colour must be offered for the base colour (the base's own tone, or any accent theme), else they fall back to the base colour. A legacy `'default'` theme becomes the base colour, which gives the same palette.
+- An unset or `'default'` chart colour follows the theme. It is stored as it is and encoded as chart = theme.
+- A bold menu accent becomes subtle under a translucent menu colour.
+- A heading font equal to the body font becomes `'inherit'`.
+
+**Custom fonts.** A free-text font has no index in the codec, so it is encoded as the field's default, as shadcn does, and decodes as `'inter'` (body) or `'inherit'` (heading). `isPresetFont` lets the settings panel warn about it.
 
 Value arrays (`PRESET_STYLES`, `PRESET_FONTS`, etc.) follow shadcn's ordering exactly. Rule: **never reorder existing arrays — only append**. Reordering breaks all existing codes.
 
@@ -138,10 +252,16 @@ Our `sidebarAccent` and `defaultStyling` are NOT encoded in the preset code. The
 
 ## Why the cascade wins
 
-Catalogue entries land on top of shadcn's CSS reliably because:
+Catalogue entries and the app theme override shadcn's styling without `!important`, because of how the host injects them:
 
-1. **Source order** — the style pipeline appends `<style id="module-styles">` to `<head>` **after** `globals.css` and any Tailwind utilities. On ties, later wins.
-2. **Specificity on attribute selectors** — shadcn's `data-[state=active]:text-foreground` compiles to class + attribute, specificity `(0,2,0)`. A catalogue selector like `[data-slot="tabs-trigger"][data-variant="line"][data-state="active"]` is `(0,3,0)` — strictly higher.
+1. **Unlayered beats layered.** The starter's style pipeline (`lib/style-pipeline.ts`) writes every active entry's `css` as-is into one `<style id="module-styles">` tag at the end of `<head>`, with no `@layer` wrapper. Tailwind v4 puts its utilities in `@layer utilities`, and the starter's own foundation entry wraps its `.ui-*` typography roles in `@layer components`. In the cascade, a normal unlayered declaration beats any layered one, **whatever the specificity**. So designer density's `:where()` rules, at `(0,0,0)`, still override a primitive's own `text-sm` utility, at `(0,1,0)`: the layer decides, not the selector.
+2. **Source order against the app's own unlayered CSS.** The `:root` / `.dark` token blocks in `globals.css` are unlayered too. The `module-styles` tag comes after `globals.css`, so on equal specificity the module's tokens win.
+3. **Between entries, specificity and then order decide.** The pipeline concatenates entries by `order`: the app theme (`style.app-theme`, 50), the opt-in catalogue entries (60), then designer density (80).
+
+Two choices build on this:
+
+- **`:where()` keeps specificity at zero.** Designer density still beats the primitives' utilities (layer), but any other unlayered rule, such as an app stylesheet or a later entry, overrides it with a single attribute selector.
+- **Default styling stays layered on purpose.** Its rules are wrapped in `@layer components` even inside the injected CSS, so they sit below utilities and a class on an instance always wins. See [Default styling](#default-styling-all-instances) for the trade-off.
 
 You don't need `!important` outside of rare edge cases (see caveats).
 
@@ -156,12 +276,15 @@ When writing a new catalogue entry, decide:
 | Colours (primary, background, sidebar) | `tokens` → `--primary`, `--sidebar-*` | shadcn reads these via `@theme inline`; modules just redefine them |
 | Radius | `tokens` → `--radius-*` | Same |
 | Font family | `tokens` → `--font-sans`, `--font-mono` | Same |
-| Typography sizing, weight, spacing | `css` | shadcn hardcodes these as Tailwind utilities, no CSS var to override |
+| Starter type roles (`Text`, `Heading`) | `tokens` → `--ui-<role>-size`, `-weight`, `-leading`, `-tracking` | The starter's `.ui-*` roles read these (see [Typography](/starter-template/typography/)); designer density sets them |
+| Typography sizing, weight, spacing on primitives | `css` | shadcn hardcodes these as Tailwind utilities, no CSS var to override |
 | Layout (gaps, padding on a variant) | `css` | Same |
 | State-driven styles (hover, active, disabled) | `css` | Radix exposes state via data attributes |
 | Animations / transitions | `css` | Same |
 
-**Rule of thumb:** if shadcn's `@theme inline` block lists a CSS variable for it, use `tokens`. Otherwise use `css` targeting data attributes.
+**Rule of thumb:** if shadcn's `@theme inline` block or a starter role lists a CSS variable for it, use `tokens`. Otherwise use `css` targeting data attributes.
+
+A `tokens` value is set as an inline style on `<html>` by the starter's pipeline, so it applies in light and dark mode alike. For values that differ per mode, write `:root` and `.dark` blocks in `css`, as the app theme does.
 
 ---
 
@@ -173,17 +296,17 @@ Sometimes you want user-facing toggles to drive typography or spacing (sizing, w
 2. Keep the property values in a preset map keyed by a user choice
 3. Write the active preset's tokens into the catalogue entry via `styleRegistry.update(id, { tokens })`
 
-This keeps the CSS static and auditable while letting user choices travel entirely through tokens. It's the approach we'll use for the future App Typography tab (see roadmap).
+This keeps the CSS static and auditable while letting user choices travel entirely through tokens. `style.tabs-line-primary` shows step 1 on a small scale: it reads `--style-tabs-line-size` and `--style-tabs-line-gap` (`1rem` and `2rem` by default), and the designer-density scope sets both in its own CSS rather than through `tokens`. The full pattern is the approach planned for the future App Typography tab (see roadmap).
 
 ---
 
 ## Status colour tokens
 
-The module ships four semantic status tokens alongside shadcn's standards:
+The module adds three semantic status tokens, each with a `-foreground` pair, next to shadcn's `destructive`:
 
 | Token | Purpose | Light default |
 |-------|---------|---------------|
-| `destructive` | Errors, delete actions | `oklch(0.577 0.245 27.325)` |
+| `destructive` (shadcn) | Errors, delete actions | `oklch(0.577 0.245 27.325)` |
 | `success` | Confirmations | `oklch(0.517 0.174 142.5)` |
 | `warning` | Cautions | `oklch(0.769 0.188 70.08)` |
 | `info` | Informational states | `oklch(0.55 0.18 250)` |
@@ -198,48 +321,54 @@ Downstream components should consume semantic tokens:
 <Badge className="bg-destructive/10 text-destructive">Expired</Badge>
 ```
 
+The status tokens are module tokens, so they sit in the extensions pair, not the baseline. The exported `global.css` maps them (`--color-success` and so on), but the running app's injected CSS only defines the variables. Unless the app's own `globals.css` maps them (the starter's doesn't), use the variable form, such as `text-(--success)`.
+
 The Style module only ships the tokens. Migrating starter-template badges to use them is a separate starter PR.
 
 ---
 
 ## Shadow pass
 
-Default shadcn primitives ship no shadow utilities — apps opt into `style.card-elevated` for card elevation. Keeps elevation a deliberate choice and lets an app tune the elevation scale globally.
+`style.card-elevated` is the module's opt-in card elevation: a soft two-layer shadow that deepens, with a 1px lift, on hover. It ships off, so elevation stays a deliberate choice an admin makes on the Style catalogue tab. While it is on, it sets the card's whole `box-shadow`. Tailwind v4 draws `ring-*` utilities with `box-shadow` too, so the host card's `ring-1` outline is replaced while the entry is on.
 
 ---
 
 ## Adding a new catalogue entry
 
-1. Export the CSS from `utils/catalogue.ts`:
+1. Export the CSS from `utils/catalogue.ts` (the `CATALOGUE_FILE` template in `src/templates/frontend/catalogue.ts`). It sits in a template string inside a template string, so escape backticks and `${` and run `npm run check:templates`:
    ```typescript
    export const CATALOGUE_MY_THING = `
      [data-slot="..."][data-variant="..."] { … }
    `;
    ```
-2. Register it in `registrations/catalogue.registration.ts`:
+2. Add its id to `CATALOGUE_IDS` and register it in `registrations/catalogue.registration.ts` (written `my-feature.my-thing` in the template; the placeholder becomes `style` at install):
    ```typescript
    styleRegistry.register({
-     id: 'style.my-thing',
+     id: CATALOGUE_IDS.myThing, // 'style.my-thing'
      order: 60,
      enabled: false,
      tokens: {},
      css: CATALOGUE_MY_THING,
    });
    ```
-3. Bump the module version and ship. Apps pick up the new entry with `npx style update`.
+3. Add a `CATALOGUE_ENTRIES` row, `{ id, label, description, primitive }`, so admins can switch it on from the Style catalogue tab.
+4. Bump the module version and ship. Apps pick up the new entry with `npx style update`.
 
 ---
 
 ## Caveats
 
-### `!important` as escape hatch
-If a shadcn class has higher specificity than your selector (rare — happens with some `[&>...]` Tailwind compound selectors), use `!important` for that rule. Document why in a comment.
+### `!important` is rarely needed
+Against Tailwind utilities, an unlayered rule already wins, whatever the selectors. `!important` only helps against an inline `style` attribute, or another unlayered rule with a stronger selector. It can't beat a Tailwind important utility (`p-2!`): important declarations reverse the layer order, so a layered important utility beats even an unlayered `!important`. If you do use it, say why in a comment.
 
-### `@source` in module CSS
-Tailwind v4 refuses `@source` directives inside module CSS that goes through `@layer`. If an entry needs Tailwind utilities, generate them up-front at the module's build time and ship the compiled CSS string. Raw CSS (what the catalogue ships today) is always safe.
+### Entry CSS never goes through Tailwind
+The pipeline writes entry `css` into the `<style>` tag as text, so Tailwind never processes it: `@apply`, `@source`, `@theme` and utility class names inside it do nothing. Write plain CSS against data attributes and tokens, as the catalogue does.
 
 ### Value arrays are append-only
 The preset codec's value arrays (`PRESET_STYLES`, `PRESET_FONTS`, etc.) mirror shadcn's. Reordering or removing entries breaks every existing preset code. Only append new values to the end.
+
+### The cascade relies on the host
+Everything in [Why the cascade wins](#why-the-cascade-wins) relies on the starter injecting `module-styles` unlayered, as it does today. If a future starter wrapped that tag's CSS in a layer, the zero-specificity density rules and the menu colour rules would lose to the primitives' utilities.
 
 ---
 
@@ -261,20 +390,22 @@ Since v1.14.11 the designer also merges against a component's **baked-in base cl
 
 ```ts
 defaultStyling: [
-  { slot: 'sheet-content', properties: { 'max-width': '48rem' } },
-  { slot: 'card', properties: { 'border-radius': 'var(--radius-lg)' }, scope: 'dark' },
+  { slot: 'card-title', properties: { 'letter-spacing': '-0.01em' } },
+  { slot: 'card', properties: { 'background-image': 'linear-gradient(var(--card), var(--muted))' }, scope: 'dark' },
 ]
 ```
 
-`generateThemeCSS` and `generateInjectableCSS` emit these as `[data-slot="…"] { … }` rules inside `@layer components` (with a `.dark` prefix when `scope: 'dark'`), so per-instance utilities still win. Values pass the same injection guard as custom variables; slot and property names are constrained to their own strict identifier patterns. This is the upgrade-safe way to change base-component appearance from the theme itself; the authoring UI is a follow-up.
+`generateThemeCSS` and `generateInjectableCSS` emit these as `[data-slot="…"] { … }` rules inside `@layer components` (with a `.dark` prefix when `scope: 'dark'`), so per-instance utilities still win. That cuts both ways: a primitive's own classes are utilities too, so a rule only changes a property the primitive doesn't already set with a utility. The host's card sets `rounded-xl`, for example, which beats a default-styling `border-radius`; to override a base class, use an unlayered catalogue entry instead. Values pass the same injection guard as custom variables; slot and property names are constrained to their own strict identifier patterns. The authoring UI is a follow-up.
 
 ---
 
 ## Related
 
 - [Overview](/modules/style/) — install, architecture, dependencies
+- [Configuration](/modules/style/configuration/) — the `StyleConfig` fields and the catalogue entries
 - [Roadmap](/modules/style/roadmap/) — known issues and planned improvements
 - [Style System](/starter-template/style-system/) — the starter-side pipeline this module feeds
 - [Registry Reference](/starter-template/registries/#style-registry) — the `styleRegistry` API
-- [shadcn preset.ts](https://github.com/shadcn-ui/ui/blob/main/packages/shadcn/src/preset/preset.ts) — upstream codec we mirror
-- [shadcn buildRegistryTheme](https://github.com/shadcn-ui/ui/blob/main/apps/v4/registry/config.ts) — upstream CSS generation we mirror
+- [Typography](/starter-template/typography/) — the starter's `.ui-*` roles and their `--ui-*` tokens
+- [shadcn preset.ts](https://github.com/shadcn-ui/ui/blob/main/packages/registry/src/preset/preset.ts) — upstream codec we mirror (in `packages/registry` since shadcn 4.21.1)
+- [shadcn buildRegistryTheme](https://github.com/shadcn-ui/ui/blob/main/apps/v4/registry/config.ts) — upstream palette generation we mirror

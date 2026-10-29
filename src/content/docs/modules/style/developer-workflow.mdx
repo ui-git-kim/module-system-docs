@@ -7,9 +7,9 @@ sidebar:
 
 import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-This page is for contributors working on the **Builder Style module repository itself** — editing templates, building the module, and shipping a new version. It is **not** about using the installed module in an app. For that, see [Usage](/modules/style/usage/) and [Configuration](/modules/style/configuration/).
+This page is for contributors working on the **Builder Style module repository itself**: editing templates, building the module, testing it, and shipping a new version. It is **not** about using the installed module in an app. For that, see [Usage](/modules/style/usage/) and [Configuration](/modules/style/configuration/).
 
-Everything the module produces lives in `src/templates/**` (template strings) and `src/module.ts` (the module definition that maps those strings to output paths). The scaffold under `src/scaffold/**` and `src/cli.ts` is shared infrastructure and off-limits — treat those as read-only.
+Everything the module generates comes from `src/templates/**` (template strings) and `src/module.ts` (the module definition that maps those strings to output paths). The module's own dev tools live in `tools/` and its backend tests in `tests/*.test.ts`. Most of the rest came from the module starter (the "scaffold") and is shared infrastructure that you don't edit. [What You Own](#what-you-own) has the full split. The repository is on scaffold 1.32.2 (the `VERSION` file).
 
 ---
 
@@ -25,179 +25,386 @@ Everything the module produces lives in `src/templates/**` (template strings) an
    git submodule update --init --recursive   # pulls the docs/ submodule
    ```
 
-2. Install dependencies and link the CLI for local testing.
+2. Install dependencies and build.
 
    ```bash
    npm install
    npm run build
-   npm link            # makes `npx style` / `style` resolve to this checkout
+   npm link            # optional: makes `style` resolve to this checkout
    ```
 
-3. Read `CLAUDE.md` (the edit-vs-don't-edit table and the "Before You Finish" checklist) and skim `src/module.ts` to see how template strings map to generated file paths.
+   The repo needs Node `^22.12.0`, `^24.0.0` or `>=26.0.0` (`engines` in `package.json`). `npm run audit:styling` needs Node 22.18 or later, because it imports the template `.ts` files directly through Node's built-in TypeScript support.
+
+3. Put a starter checkout where the styling audit can find it. `npm run audit:styling` runs the starter's own `scripts/audit-template-styling.mjs` (starter v2.14.4 or later). By default it looks in `../../unique-react-fullstack-starter`, measured from the repo root (so a sibling of the folder that holds this repo). Point it somewhere else with the `STYLE_AUDIT_STARTER` environment variable or `npm run audit:styling -- --starter <path>`. Any starter-based app that has the script works too.
+
+4. Have a starter-based test app for regenerating into. The examples on this page use `use-foundry-ui`, a sibling of the `Blocks` folder that lists the module as `"style": "file:../Blocks/style"`.
+
+5. Read `CLAUDE.md` (the edit-vs-don't-edit table and the "Before You Finish" checklist) and skim `src/module.ts` to see how template strings map to generated file paths.
 
 </Steps>
 
-<Aside type="caution" title="Do not edit the scaffold">
-Only `src/templates/**`, `src/module.ts`, `package.json`, `README.md`, `CLAUDE.md`, and `docs/` are yours to edit. `src/cli.ts` and `src/scaffold/**` are shared scaffold infrastructure — if you find a bug there, report it upstream to the module starter rather than patching locally.
+---
+
+## What You Own
+
+`scaffold:update` (see [Scaffold Updates](#scaffold-updates)) merges the scaffold from the module starter. Which files it may change depends on who owns them:
+
+| Path | Owner | What that means |
+|------|-------|-----------------|
+| `src/templates/**`, `src/module.ts` | Module | Your files are never overwritten. Upstream edits to them only arrive as an advisory diff for you to hand-port. Brand-new upstream template files are added. |
+| `tools/**` | Module | The module's own dev tools: `sync-shadcn.mjs`, `audit-styling.mjs` and `.shadcn-version`. |
+| `tests/*.test.ts` (and an optional `tests/harness.config.ts`) | Module | The module's tests. The harness that runs them is scaffold-owned. |
+| `README.md`, `docs/` | Module | `docs/` is a separate repo (a git submodule). See [Documentation Workflow](#documentation-workflow). |
+| `CLAUDE.md` | Shared | The sections between the `SCAFFOLD:START` / `SCAFFOLD:END` markers are refreshed from upstream. Everything else is yours. |
+| `package.json`, `package-lock.json` | Shared | Clean upstream changes merge. On a conflict your copy wins, and for `package.json` the updater prints what upstream changed. |
+| `src/scaffold/**`, `src/cli.ts`, `src/index.ts`, `scripts/**`, `update-scaffold.*`, `VERSION`, `tsconfig.json`, `tsup.config.ts`, `vitest.config.ts`, `tests/harness/**`, `tests/tsconfig.json`, `tests/.gitignore`, `.vscode/`, `.github/workflows/scaffold-ci.yml` | Scaffold | Don't edit. On a conflict the upstream copy wins, and a missing file is restored. Report bugs upstream to the module starter. |
+
+<Aside type="caution" title="Module tools go in tools/, never scripts/">
+`scripts/**` is scaffold-owned. When a file there conflicts, `scaffold:update` takes upstream's copy, so a module tool kept in `scripts/` is only safe until upstream happens to ship a file with the same name. The shadcn sync tool sat in `scripts/` from v1.14.3 to v1.14.14 and moved to `tools/sync-shadcn.mjs` in v1.15.0. The new styling-audit tool, `tools/audit-styling.mjs`, lives there from the start. Put any new module tooling in `tools/` and give it an npm script in `package.json`.
 </Aside>
 
 ---
 
 ## Development Loop
 
-The loop is: **edit a template → build → reinstall into a test app → verify no new type errors → bump the version**.
+The loop is: **edit a template → static checks → styling audit → backend tests → build → regenerate into a test app → type-check the generated code → check it in the browser → bump the version**.
 
 <Steps>
 
-1. Edit a template string under `src/templates/**` (or `src/module.ts` if you are changing the module definition, prompts, or the template map).
+1. Edit a template string under `src/templates/**`, or `src/module.ts` if you are changing the template map, the prompts or `shadcnComponents`. A new template constant needs an export in `src/templates/frontend/index.ts` (or `src/templates/backend/index.ts`) as well as an entry in `src/module.ts`, which reads the templates through those barrels.
 
-2. Compile the module.
+2. Run the fast static checks.
 
    ```bash
-   npm run build      # one-off
+   npm run check:templates     # an unescaped ${ inside a template string
+   npm run type-check          # the template source files, compiled as TypeScript
+   npm run conformance:check   # the module contract, checked against src/templates
+   ```
+
+   `type-check` only sees each template as a string. It catches a stray backtick that closes a template early, but never a type error inside the code a template generates. That comes in step 7.
+
+3. Audit the frontend styling.
+
+   ```bash
+   npm run audit:styling                                          # every frontend template
+   npm run audit:styling -- src/templates/frontend/style-panel.ts # one file
+   ```
+
+   The tool imports each frontend template file, writes every string constant out into a temp folder with the module-name placeholders replaced as `init` replaces them (`my-feature` → `style`, `MY_FEATURE` → `STYLE` and the other casings), and runs the starter's structure-only styling audit over it. It exits 0 when every file is clean. As of v1.15.0 that is 48 constants from 23 template files, all clean, with 52 hits allowed by annotation. You can't point the starter's audit at `src/templates` directly: there, each template is a single string literal, so the audit scans comment text as classes and can't see the annotations.
+
+4. Run the backend tests.
+
+   ```bash
+   npm test
+   ```
+
+   This is `vitest run` over `tests/*.test.ts` (20 tests in two files as of v1.15.0). Before the tests run, the harness renders the backend templates from `src/module.ts` into `tests/.sandbox/` the same way `init` does, and builds a Prisma client for the rendered schema. Each test file then gets its own in-memory Postgres (PGlite). It reads the templates directly, so no build is needed first. It tests the generated backend only, not the frontend.
+
+5. Build the module.
+
+   ```bash
+   npm run build      # tsup && tsc --emitDeclarationOnly
    # or
-   npm run dev        # watch mode — rebuilds on save
+   npm run dev        # tsup --watch: rebuilds on save, no type declarations
    ```
 
-   `tsup` bundles the template strings verbatim into `dist/`. They are not transpiled — a template is just a string constant, so its *contents* are never type-checked by the build.
+   `tsup` bundles the CLI and the module definition, with every template string, into `dist/`. `tsc --emitDeclarationOnly` then writes the type declarations, because tsup's own declaration step doesn't work with TypeScript 7. Template contents are copied through verbatim, never compiled.
 
-3. Regenerate into the linked test app (`use-foundry-ui` is npm-linked at `file:../Blocks/style`).
+6. Regenerate into the test app with the CLI you just built. Run it from the app root (`use-foundry-ui` sits beside the `Blocks` folder, so from this repo it is `../../use-foundry-ui`):
 
    ```bash
-   cd ../use-foundry-ui
-   npx style update -f --skip-schema
+   cd ../../use-foundry-ui
+   node ../Blocks/style/dist/cli.js update --skip-schema
    ```
 
-   Use `--skip-schema` for template-only changes so Prisma is left alone; drop it (and run a migration) when you have touched `src/templates/schema.ts`. `-f` overwrites the previously generated files.
+   Call `dist/cli.js` by path rather than `npx style`. `npx style` runs whatever the app's `node_modules/style` holds. That is usually a symlink to this checkout, but if the `file:` dependency was installed as a copy, it holds the `dist/` from the last `npm install`, and `update` lists no files to update even though you changed a template. The path removes the doubt: it runs exactly the build from step 5.
 
-4. Verify the generated code type-checks. The style feature must contribute **zero** TypeScript errors — the test app has unrelated pre-existing errors elsewhere, so filter to the style feature:
+   `update` asks before it applies changes. It also asks before removing generated files that no longer have a template (it backs them up to `.module-backups/`), and whether to **sync UI components**, which re-runs `shadcn@latest add` over the primitives in `shadcnComponents`. That last prompt defaults to **No**: say yes only when a primitive is missing from the app. `--force` answers yes to every prompt, including the UI sync, so only add it when you want that. `--dry-run` prints the plan and writes nothing.
+
+   Use `--skip-schema` for template-only changes, so Prisma is left alone. Drop it, and let `update` migrate, when you have touched `src/templates/schema.ts`.
+
+   <Aside type="caution" title="Fix the template, not the generated file">
+   `update` rewrites any generated file whose template changed, even if you edited that file in the app. It keeps no copy of the old template, so it can't tell your edits from its own. Hand-fixes in the test app are lost on the next run.
+   </Aside>
+
+7. Type-check the generated code in the app. The style feature must contribute **zero** TypeScript errors on both sides. The test app has unrelated errors elsewhere, so filter to the style feature:
 
    ```bash
    cd frontend
    npx tsc --noEmit | grep features/style     # must return nothing
+   cd ../backend
+   npx tsc --noEmit | grep features/style     # must return nothing
    ```
 
    <Aside type="caution" title="This is the real type-check">
-   `npm run type-check` in the module repo only compiles `src/` — it lints the template **strings**, never the generated output. Type errors in the code your templates produce surface **only** when you run `tsc` inside a real app. Always do this step before committing.
+   Nothing in the module repo type-checks the generated code: `type-check` sees strings, `npm test` runs the generated backend without type-checking it, and CI does neither of these app checks. Type errors in what your templates produce show up **only** here. Always do this step before committing.
    </Aside>
 
-5. Bump the module version (see [Version Management](#version-management)) and commit.
+8. Check it in the browser. Run the app, sign in as an admin, and open **Appearance → Theme** (`/admin/app-theme`): the Theme, Style catalogue and Import and export tabs. In a full-mode install, also open a builder project's Style tab and the project node's Shadcn Config and Theme tabs. Designer text should be compact everywhere, popups included. A popup whose text looks too big is missing the `data-style-designer` attribute (see [The designer density attribute](#the-designer-density-attribute)).
+
+9. Bump the module version (see [Version Management](#version-management)) and commit.
 
 </Steps>
 
-### CLI Commands
+---
 
-The module ships these npm scripts:
+## Commands
 
-| Command | Purpose |
-|---------|---------|
-| `npm run build` | Bundle templates into `dist/` with `tsup` |
-| `npm run dev` | Same, in watch mode |
-| `npm run type-check` | `tsc --noEmit` over `src/` — lints template **strings only**, **not** generated code |
-| `npm run check:templates` | Guards against an unescaped `${` inside a template string (silent build-time interpolation) |
-| `npm run sync:shadcn` | Regenerate `utils/shadcn-data.ts` from the pinned shadcn release tag |
-| `npm run version:patch` \| `:minor` \| `:major` | Bump the version in `package.json` + `src/module.ts` and commit |
-| `npm run release:patch` \| `:minor` \| `:major` | Same as `version:*`, plus a git tag for the release |
+### npm Scripts
 
-The generated CLI (run inside a target app) exposes:
+| Command | What it does |
+|---------|--------------|
+| `npm run build` | `tsup && tsc --emitDeclarationOnly`: bundles the CLI and module definition into `dist/`, then writes the type declarations. |
+| `npm run dev` | `tsup --watch`: rebuilds on save (no declarations). |
+| `npm run type-check` | `tsc --noEmit` over `src/`. Checks the template files as TypeScript, so it sees template **strings** only, never the generated code. It doesn't cover `tests/`; check those with `npx tsc -p tests/tsconfig.json`. |
+| `npm run check:templates` | Fails on an unescaped `${` inside a template string, which the build would interpolate silently. |
+| `npm run conformance:check` | Checks the module Conformance Contract against `src/templates/**` at the pattern level. Examples: action hooks fired with `doActionAll`, no hard-coded service version, registration files in the barrel, no `console.*` in backend code, namespaced query keys, a guarded deletion handler and an import that checks the envelope's `moduleId`. 0 violations as of v1.15.0. |
+| `npm test` | `vitest run` over `tests/*.test.ts` on the PGlite harness: `style.service.test.ts` (15 tests) and `style.security.test.ts` (5). |
+| `npm run audit:styling` | `tools/audit-styling.mjs`: the starter's styling audit over the rendered frontend templates. Pass `.ts` paths to audit only those files, or `--starter <path>` to use another starter checkout. |
+| `npm run sync:shadcn` | `tools/sync-shadcn.mjs`: regenerates the shadcn data template from the pinned shadcn tag, `shadcn@4.23.0` (see [Syncing shadcn Data](#syncing-shadcn-data)). |
+| `npm run parity:check` | Checks that each paired `.ps1` / `.sh` scaffold script still has the same flags and behaviours, by looking for a list of required markers in both. These scripts are scaffold-owned, so run it after a scaffold update. |
+| `npm run scaffold:check` | Previews a scaffold update (see [Scaffold Updates](#scaffold-updates)). |
+| `npm run scaffold:update` | Merges the scaffold update straight away. Add `-- --yes` so a conflict it can't resolve aborts the merge instead of waiting for you. |
+| `npm run version:patch`, `version:minor`, `version:major` | Runs the conformance gate, bumps the version in `package.json` and `src/module.ts`, builds, and commits. |
+| `npm run release:patch`, `release:minor`, `release:major` | The same, plus a `vX.Y.Z` git tag. |
+| `npm run scaffold:version:*` | Bumps the scaffold `VERSION` file. That belongs to the module starter, so don't use it here. |
 
-| Command | Purpose |
-|---------|---------|
-| `npx style init` | First-time install (prompts for install mode + project node type) |
-| `npx style init --force` | Overwrite existing files on install |
-| `npx style update` | Re-generate templates + schema in an installed app |
-| `npx style update --skip-schema` | Templates only — leave Prisma alone |
-| `npx style update --dry-run` | Preview changes without writing |
-| `npx style uninstall` | Remove the module |
-| `npx style info` | Print module metadata (id, version, templates, registrations) |
+### Generated CLI
+
+The CLI is the module's `bin`. Inside an app run it as `npx style <command>`, or as `node <module>/dist/cli.js <command>` to be sure you get a fresh build.
+
+| Command | What it does |
+|---------|--------------|
+| `init` | First-time install. Asks for the install mode (`admin` or `full`) and, in full mode, the project node-type slug. It then confirms the frontend and backend feature paths, and asks whether to auto-register, install the shadcn components and install the npm dependencies. |
+| `init --dry-run` | Shows what would be generated and writes nothing. |
+| `init --no-interactive` | Installs with the defaults and asks nothing. |
+| `init --force` | Overwrites existing files. |
+| `init --skip-dep-check` | Installs even when a required module is missing or outside its declared version range. |
+| `update` | Rewrites generated files whose template changed, adds new ones, offers to remove orphaned ones, updates the schema, and offers the UI-component sync (default No). |
+| `update --dry-run` | Shows the plan and writes nothing. |
+| `update --skip-schema` | Leaves the Prisma schema alone. |
+| `update --force` | Answers yes to every prompt, including the UI-component sync. |
+| `update --set key=value` | Shortcut for `reconfigure --set`. |
+| `reconfigure --set key=value` | Changes an install-time answer and re-syncs the files. The supported way to change the project node type is `reconfigure --set projectNodeType=<slug>`. Also takes `--dry-run`, `--force` and `--skip-schema`. |
+| `rename <oldId> [newId]` | Re-emits an installed module under a new id and keeps its database. Takes `--dry-run` and `--force`. |
+| `migrate` | Adds version headers to files from an install that predates version tracking. |
+| `migrate-db` | Runs the module's database migrations (SQL and TypeScript backfills). `--dry-run` lists the pending ones. `--repair` adds any of the module's tables, columns or indexes the database is missing, and never drops anything. |
+| `disable`, `enable` | Turns the module off without removing its files, and back on. |
+| `uninstall` | Removes the module. `--keep-data` keeps the tables, `--export <path>` exports the data first, and `--force` skips the confirmation. |
+| `info` | Prints the module's name, version, description, features and commands. |
+| `update-schema` | Deprecated. Schema updates are part of `update`. |
 
 <Aside type="tip" title="Update not detecting changes?">
-`update` compares version + per-file hashes. If it reports "no changes" after you edited a template, you almost certainly forgot to **bump the version** or **rebuild** (`npm run build`) before re-running `npx style update`.
+Every generated file starts with a version header such as `// @generated-by: style v1.15.0 | hash: 1a2b3c4d`. The hash is taken from the template, before placeholders are filled in. `update` rewrites a file when that hash differs from the template in the CLI you are running. So if it lists no files to update after you edited a template, the CLI you ran doesn't have your edit: run `npm run build`, then call `node <module>/dist/cli.js` by path. Don't wait for "Everything is up to date!": this module declares shadcn components, so `update` goes on to offer the UI-component sync instead of printing that line. A version bump is still needed for a release, but a bump on its own doesn't regenerate anything.
 </Aside>
 
 ---
 
 ## Version Management
 
-**Bump the version after ANY change to `src/templates/**` or `src/module.ts`.** The version is the only signal a target app has that an update exists, and the version header embedded in each generated file drives hash comparison during `npx style update`.
+**Bump the version after any change that affects generated output**: anything under `src/templates/**`, or `src/module.ts`. The version is how a target app learns that an update exists. It is stamped into each generated file's version header and into the backend service registration (the `{{moduleVersion}}` placeholder).
 
 | Change | Bump? |
 |--------|:-----:|
 | `src/templates/**/*.ts` | Yes |
 | `src/module.ts` | Yes |
+| `tools/**`, `tests/**` | No, unless a tool rewrote a template (`npm run sync:shadcn` rewrites `src/templates/frontend/shadcn-data.ts`) |
 | `CLAUDE.md`, `README.md`, `docs/` | No |
+
+The level follows the [LLM rules](/getting-started/llm-rules/#2-version-bumping): **default to patch; if unsure, it's a patch.**
 
 <Tabs>
   <TabItem label="Patch">
     ```bash
     npm run version:patch
     ```
-    Bug fix in a template, typo, internal refactor with no output shape change.
+    Almost everything: a bug fix, an additive feature (a new designer section, catalogue entry, `StyleConfig` field or backend route), a refactor, a dependency bump, or the removal of dead code.
   </TabItem>
   <TabItem label="Minor">
     ```bash
     npm run version:minor
     ```
-    New template file, new designer section, new registration, new `StyleConfig` field, new backend route.
+    Rare: a whole new subsystem or registry, or a headline release that bundles several features. v1.15.0, the catch-up with scaffold 1.32.2 and starter v2.15.4, is one.
   </TabItem>
   <TabItem label="Major">
     ```bash
     npm run version:major
     ```
-    Breaking change — a renamed/removed `StyleConfig` field, a removed export, a schema column rename, or a changed `theme_config` contract.
+    A deliberate milestone, or a breaking change after launch that downstream apps must migrate for together, such as a changed `theme_config` contract.
   </TabItem>
 </Tabs>
 
-Each `version:*` script updates the version in **both** `package.json` and `src/module.ts` and creates the bump commit. Because the script runs before `build`, rebuild afterwards so `dist/` (git-ignored) carries the new version header. `release:*` does the same and adds a git tag — push tags with `git push --tags`.
+What `version:*` and `release:*` do, in order:
+
+<Steps>
+
+1. **Conformance gate.** They run the conformance check first. If it fails, they ask whether to carry on (default no). In CI, or with no terminal to ask in, they print a warning and carry on, so run `npm run conformance:check` yourself, or as its own CI step, when you need a hard stop.
+
+2. **Version files.** They write the new version into `package.json` and `src/module.ts`.
+
+3. **Build.** They run `npm run build`, so `dist/` already carries the new version. **You don't need to rebuild after bumping.** If the build fails they stop before committing. The version files have already changed by then, so fix the build, run `npm run build` and commit by hand, or `git checkout` the two files. Don't re-run the bump: it would bump twice.
+
+4. **Commit.** They commit `package.json` and `src/module.ts` as `chore(release): vX.Y.Z`. `dist/` is git-ignored in this repo, so it isn't committed.
+
+5. **Tag** (`release:*` only). They create the annotated tag `vX.Y.Z`. Push it with `git push block-style --tags`.
+
+</Steps>
+
+To skip the build, run the script yourself: `bash scripts/bump-module-version.sh patch --commit --no-build`, or `pwsh scripts/bump-module-version.ps1 -Type patch -Commit -NoBuild`. The npm scripts go through `scripts/run.cjs`, which prefers PowerShell and doesn't translate `--no-build` for it.
 
 <Aside type="caution">
-Skipping the bump means target apps compare identical version headers and may silently miss your change. When in doubt, bump.
+If you skip the bump, the target app sees the same version and has no sign that an update exists. When in doubt, bump.
 </Aside>
+
+---
+
+## Scaffold Updates
+
+The scaffold-owned files (see [What You Own](#what-you-own)) come from the module starter through a git remote called `scaffold-upstream`. In this checkout it points at a local module-starter folder. v1.15.0 moved the module from scaffold 1.18.1 to 1.32.2.
+
+<Steps>
+
+1. Preview the update.
+
+   ```bash
+   npm run scaffold:check
+   ```
+
+   It lists the incoming scaffold changes, the `package.json` changes, any upstream edits to module-owned files (as an advisory), and any scaffold files it would restore.
+
+2. Merge it.
+
+   ```bash
+   npm run scaffold:update            # merges straight away
+   npm run scaffold:update -- --yes   # same, but never waits on a conflict (CI=1 does the same)
+   ```
+
+   `scaffold:update` passes `--merge`, so it doesn't show the updater's Update / Preview / Cancel menu (you only get that menu when you run `update-scaffold.ps1` or `.sh` directly). The one place it can stop is a merge conflict it can't resolve itself. Run in a terminal, it leaves the merge in progress and prints a resolution guide. With `-- --yes`, with `CI` set, or with no terminal, it runs `git merge --abort` instead and leaves the tree clean.
+
+3. Read what it resolved for you.
+   - **Scaffold-owned files** take upstream's copy.
+   - **Module-owned files** (`src/templates/**`, `src/module.ts`) keep yours. Upstream edits to them are only an advisory: hand-port the ones you want. A brand-new upstream template file is added, but one you deleted is not brought back.
+   - **`package.json` / `package-lock.json`** keep yours on a conflict. That drops every upstream change to the file, clean ones included, so the updater prints the upstream diff as an **advisory**. A follow-up helper (`scripts/add-scaffold-scripts.cjs`, committed as `chore: sync scaffold npm scripts`) re-adds any scaffold npm scripts and devDependencies you are missing, but never changes an entry you already have. Hand-port the rest of the advisory yourself, then run `npm install` to refresh the lockfile. v1.15.0 did exactly this in `chore: hand-port scaffold 1.32.2 package changes`.
+   - **Missing scaffold files** are restored in a separate `chore: restore missing scaffold file(s)` commit.
+   - **The module version** is bumped only when the pull changed `src/templates/**` or `src/module.ts`.
+
+4. Re-run the checks: `npm install`, `npm run check:templates`, `npm run conformance:check`, `npm run parity:check`, `npm run type-check`, `npm test` and `npm run build`.
+
+</Steps>
+
+<Aside type="note" title="The updater updates itself first">
+If the updater script being run changed upstream (`update-scaffold.ps1` whenever PowerShell is installed, because `scripts/run.cjs` prefers it, otherwise `update-scaffold.sh`), either command first checks out the new copy, commits it **locally** as `chore: update scaffold script to latest version`, and re-runs itself with the same flags. It never pushes that commit unless you pass `--push-self-update` (`-PushSelfUpdate` in PowerShell), and even then only outside a preview and only when the repo has a remote named `origin`, which this checkout doesn't. So expect an extra local commit, even from `scaffold:check`, and push it to `block-style` yourself.
+</Aside>
+
+The scaffold's CI workflow (`.github/workflows/scaffold-ci.yml`) runs `check-templates`, `check-conformance`, `check-parity`, `type-check` and `npm test` on Node 22 and 24. In a module repo its jobs only run when started by hand or when the repository variable `CI_AUTO_RUN` is `true`. It doesn't run `audit:styling` (that needs a starter checkout) or the generated-code type-check from step 7 of the [Development Loop](#development-loop). Those stay manual.
 
 ---
 
 ## The Template-String Discipline
 
-Every template is a JavaScript **backtick string**. That means any literal backtick or `${...}` you want to appear in the *generated* code must be escaped in the *template source*, or it will be interpreted at build time instead of copied through.
+Every template is a JavaScript **backtick string**. So any literal backtick, `${...}` or backslash that you want in the *generated* code must be escaped in the *template source*. Otherwise the build interprets it instead of copying it through.
 
-<Aside type="caution" title="Escape backticks and interpolations">
+<Aside type="caution" title="Escape backticks, interpolations and backslashes">
 In the generated code you want a template literal like this:
 
 ```tsx
-const cls = `text-${size} p-4`;
+aria-label={`Custom ${label.toLowerCase()}`}
 ```
 
-In the template **source** you must write it with escapes, otherwise `${size}` interpolates against the module's build-time scope (usually to an empty string) and the backticks prematurely close the outer template:
+In the template **source** you must write it with escapes (this one is in `style-sections.ts`). Otherwise `${label...}` interpolates against the module's build-time scope and the backticks close the outer template early:
 
 ```tsx
-const cls = \`text-\${size} p-4\`;
+aria-label={\`Custom \${label.toLowerCase()}\`}
 ```
 
-Escape a literal backtick as `` \` `` and a literal interpolation as `\${`.
+Escape a literal backtick as `` \` `` and a literal interpolation as `\${`. Backslashes need doubling too: `/\s+/` in the template source comes out as `/s+/`, so to get `/\s+/` in the generated code, write `/\\s+/` in the template (as `preset-codec.ts` does).
 </Aside>
 
-The two guards catch **different** failure modes — run both:
+The two guards catch **different** failure modes, so run both:
 
 | Tool | Catches | Misses |
 |------|---------|--------|
-| `npm run check:templates` | An unescaped `${` (which the build would interpolate silently — the build itself does **not** error) | A stray unescaped backtick in a comment |
-| `npm run type-check` | A stray unescaped backtick (it prematurely closes the outer template literal, producing a `tsc` syntax error in `src/`) | Any type error *inside* the generated code — it only sees strings |
+| `npm run check:templates` | An unescaped `${`, which the build would interpolate silently (the build itself does **not** error) | An unescaped backtick or a single backslash |
+| `npm run type-check` | An unescaped backtick (it closes the outer template literal early, which `tsc` reports as a syntax error in `src/`) | Any type error *inside* the generated code, because it only sees strings |
+
+---
+
+## Styling and Composition Rules
+
+Most of the v1.15.0 work was bringing every frontend template in line with [LLM Rules](/getting-started/llm-rules/) 7 (structure and semantic tokens only) and 8 (compose blocks and canonical shadcn, never hand-roll). These are the parts that came up most.
+
+### Typography lanes (Rule 7)
+
+Module UI may not set its own type scale, font weight, colour literals, decorative shadows, `!important` or opacity tints. Text gets its size from one of these lanes:
+
+- **Inside a shadcn primitive**, use the primitive and its size prop: `<Label htmlFor>` for field labels, `SelectTrigger size="sm"`, and Button sizes such as `xs`, `sm`, `icon-xs` and `icon-sm`. Don't restyle a primitive's text.
+- **Standalone text** uses `<Text>` / `<Heading>` from `@/components/typography` (starter v2.6.0). The designer uses `<Text variant="overline">` for group eyebrows, `<Text variant="label" as="h4">` for small headings and `<Text variant="caption">` for sub-labels.
+- **Compact designer type** comes from one Style Registry entry, never from `text-xs` or `text-[10px]` in the markup. See the next section.
+
+### The designer density attribute
+
+The always-on catalogue entry `style.designer-density` (order 80) owns the compact text in the module's own designer panels: the className designer, the theme editors and the structure tabs. It applies only under the boolean attribute `data-style-designer`, so:
+
+- Put `data-style-designer=""` on every designer panel root.
+- Put it on every `PopoverContent`, `SelectContent`, `DropdownMenuContent` and `TooltipContent` a panel opens. These render in a portal outside the panel root, so the root's attribute doesn't reach them.
+- Leave it off modal dialogs (`AlertDialog`), which keep standard dialog type.
+- Don't set font sizes in panel markup. Buttons are outside the entry, so size them with the `size` prop.
+
+The attribute nests (a control's root inside a panel root), so the entry uses absolute sizes taken from `--text-xs`, which don't compound. Apps can retune it with `--style-designer-text-size`, `--style-designer-caption-size` and `--style-designer-leading`.
+
+### Annotations go inside the template string
+
+A real exception to Rule 7 needs an in-file annotation that names the rule and gives a reason: `styling-audit: allow <rule> <reason>`, or an `allow-start` … `allow-end` range. Write it **inside the template string**, as part of the generated code, not as a comment in the surrounding `.ts` file. Then it lands as a real comment in the generated file. That is where `npm run audit:styling` looks, and where the starter's own audit looks when a host runs it over its `frontend/src` (it doesn't skip module features).
+
+```ts
+export const CLASS_GENERATOR = `...
+// styling-audit: allow-start typography,font-weight Tailwind class vocabulary written into builder content, not module styling
+...
+// styling-audit: allow-end
+...`;
+```
+
+In JSX, write `{/* styling-audit: allow … */}`. The 52 annotated hits in v1.15.0 are of four kinds:
+
+- the class designer's vocabulary (`class-parser.ts` and `class-generator.ts` read and write Tailwind classes in builder content)
+- the transition `shadow` option value
+- swatch contrast edges over arbitrary user colours
+- the type specimen in the theme layout section
+
+Never annotate just to get past the audit. The audit doesn't scan inline `style` objects, so an annotation on one would be stale, and a stale annotation fails the run. Contrast markers drawn with inline styles get a plain explanatory comment instead.
+
+### Compose primitives (Rule 8)
+
+Don't rebuild a primitive's role in raw markup. v1.15.0 replaced hand-made buttons, toggles, overlays and dropdowns with `ToggleGroup`, `Collapsible`, `Slider`, `DropdownMenu`, `AlertDialog`, `Empty`, `Spinner`, `Alert` and `Item`, plus the starter's `LoadingState` and `ErrorAlert` from `@/components/page-blocks`. Two traps came up during the conversion:
+
+- shadcn's `Button` sets no `type`. When you replace a raw `<button type="button">`, keep `type="button"` on the `Button`, or it submits any form around it.
+- `Alert` hard-codes `role="alert"`. For a warning that isn't an error, pass `role="status"`: the prop is spread after the built-in one, so it wins.
+
+### Declare every primitive in shadcnComponents
+
+`frontend.shadcnComponents` in `src/module.ts` must list every `@/components/ui/*` primitive the templates import: 23 as of v1.15.0. Nothing detects them for you. An undeclared import compiles in an up-to-date host but breaks an older one that lacks the primitive. All 23 are in the starter's shadcn baseline except `scroll-area` and `slider`. On `update`, a missing primitive is only installed when the operator accepts the UI-component sync (or passes `--force`). To compare the list with what the templates import:
+
+```bash
+grep -rhoE "@/components/ui/[a-z-]+" src/templates | sort -u
+```
 
 ---
 
 ## Syncing shadcn Data
 
-`utils/shadcn-data.ts` is the module's single synced source of truth for shadcn's colour, preset, and per-style data (base/accent OKLCH values, preset arrays, font maps, per-style defaults). It is **generated**, not hand-edited.
+`utils/shadcn-data.ts` is the module's single synced copy of shadcn's colour, preset and per-style data: base and accent OKLCH values, the preset arrays, font maps and per-style defaults. It is **generated**, not hand-edited.
 
 ```bash
 npm run sync:shadcn                    # uses the pinned default tag
 npm run sync:shadcn -- --tag=shadcn@X  # override the tag
 ```
 
-The script (`scripts/sync-shadcn.mjs`) fetches the pure-data source files from a **pinned** shadcn release tag (currently `shadcn@4.13.0`) and regenerates the template.
+The tool, `tools/sync-shadcn.mjs`, fetches the pure-data source files from GitHub at a **pinned** shadcn release tag, currently `shadcn@4.23.0`. It rewrites `src/templates/frontend/shadcn-data.ts` (which generates `utils/shadcn-data.ts` in the app) and records the tag it used in `tools/.shadcn-version`. It is a dev tool and never runs in a generated app. v1.15.0 moved the pin from `shadcn@4.13.0` to `shadcn@4.23.0`. The synced data is the same at both tags: only the recorded tag (`SHADCN_SOURCE_TAG` in the template, and `.shadcn-version`, which moved from `scripts/` to `tools/` with the tool) and the generated header changed.
+
+It reads five files: the preset codec (`packages/registry/src/preset/preset.ts`), `packages/shadcn/src/preset/defaults.ts`, `apps/v4/registry/themes.ts`, `apps/v4/lib/font-definitions.ts` and `apps/v4/registry/config.ts`. shadcn 4.21.1 moved the codec from `packages/shadcn/` to `packages/registry/`, and the old path returns 404 from that release on. The tool tries the new path first and falls back to the old one, so `--tag` still works for older tags. If a future sync fails with `Fetch failed: … HTTP 404`, a source file has moved: add its new path ahead of the old one in the tool's `FILES` object.
 
 <Aside type="caution" title="Index order is load-bearing">
-The preset **codec** encodes array *indices*, so the source order shadcn ships is significant. Always sync against a pinned tag — never hand-reorder the generated arrays — or existing preset codes will decode to the wrong theme. After a sync, treat it as a template change: rebuild, verify in the test app, and bump the version.
+The preset **codec** encodes array *indices*, so the order of shadcn's source arrays matters. Always sync against a pinned tag, and never hand-reorder the generated arrays, or existing preset codes will decode to the wrong theme. After a sync, treat it as a template change: run the checks, rebuild, verify in the test app, and bump the version.
 </Aside>
 
 ---
@@ -206,11 +413,11 @@ The preset **codec** encodes array *indices*, so the source order shadcn ships i
 
 ### Add a designer section
 
-The className designer's collapsible sections (Layout, Sizing, Spacing, Typography, Background, Border, Effects, Position) are full-mode-only components.
+The className designer's style sections (Layout, Sizing, Spacing, Typography, Background, Border & Shadow, Effects, Position) are full-mode-only components, one file each. The panel's last section, Classes & Tokens, is the shared `CustomClassInput` control.
 
 <Steps>
 
-1. Add the section template string to `src/templates/frontend/style-sections.ts` (e.g. `export const MOTION_SECTION = ...`).
+1. Add the section template string to `src/templates/frontend/style-sections.ts` (for example `export const MOTION_SECTION = ...`) and export it from `src/templates/frontend/index.ts`.
 
 2. Map it in `src/module.ts` under `frontend.templates`, wrapped in `fullModeOnly(...)` so admin-only installs skip it:
 
@@ -218,23 +425,27 @@ The className designer's collapsible sections (Layout, Sizing, Spacing, Typograp
    'components/style/sections/MotionSection.tsx': fullModeOnly(frontend.MOTION_SECTION),
    ```
 
-3. Render it from `StylePanel` in `src/templates/frontend/style-panel.ts` and make sure any shared controls it needs already exist in `style-controls.ts`.
+3. In `StylePanel` (`src/templates/frontend/style-panel.ts`), add it to the `SECTIONS` list and give it a `case` in the switch that renders the open section. Make sure any shared controls it needs already exist in `style-controls.ts`.
 
-4. Bump the version (`minor`).
+4. Follow the [styling rules](#styling-and-composition-rules): `<Label htmlFor>` and `<Text>` for labels, `data-style-designer=""` on every popup it opens, and any new primitive added to `shadcnComponents`. Run `npm run audit:styling`.
+
+5. Bump the version (patch).
 
 </Steps>
 
 ### Add a catalogue entry
 
-Catalogue entries are opt-in `styleRegistry` contributions that target shadcn's stable `data-slot` / `data-variant` / `data-state` attributes — **never** class names. Style is the sole stylist, so this is how other modules' styling needs are met.
+Catalogue entries are opt-in `styleRegistry` contributions that target shadcn's stable `data-slot` / `data-variant` / `data-state` attributes, **never** class names. Style is the sole stylist, so this is how other modules' styling needs are met.
 
 <Steps>
 
-1. Add the entry to the catalogue template in `src/templates/frontend/catalogue.ts` (this generates `utils/catalogue.ts`). Key the selector off a `data-*` attribute, not a class.
+1. Add the entry's CSS constant to the catalogue template, `CATALOGUE_FILE` in `src/templates/frontend/catalogue.ts` (this generates `utils/catalogue.ts`). Key the selector off a `data-*` attribute, not a class. The starter injects entry CSS without a cascade layer, while Tailwind's utilities sit in `@layer utilities`, so an entry's rules beat a primitive's utilities whatever their specificity. No `!important` is needed, and the audit rejects it.
 
-2. The catalogue is surfaced through `registrations/catalogue.registration.ts` (`frontend.CATALOGUE_REGISTRATION`) — no `module.ts` change is needed unless you add a new file.
+2. Register it in `CATALOGUE_REGISTRATION` in the same file (it generates `registrations/catalogue.registration.ts`): import the constant, add a `CATALOGUE_IDS` key, and call `styleRegistry.register(...)`.
 
-3. Verify the entry renders as an admin-toggleable option in the theme editor, then bump the version (`minor`). See [Design philosophy](/modules/style/design/) for the tokens-vs-CSS decision matrix and [Integration](/modules/style/integration/) for how catalogue entries reach other modules.
+3. Add a `CATALOGUE_ENTRIES` row `{ id, label, description, primitive }`, so the **Style catalogue** tab on the Theme admin page offers a switch for it. The panel groups entries by `primitive`. Leave the row out only for an always-on entry, as `style.designer-density` does.
+
+4. No `module.ts` change is needed unless you add a new file. Check that the switch appears and works at `/admin/app-theme`, then bump the version (patch). See [Design philosophy](/modules/style/design/) for the tokens-vs-CSS decision matrix and [Integration](/modules/style/integration/) for how catalogue entries reach other modules.
 
 </Steps>
 
@@ -242,38 +453,58 @@ Catalogue entries are opt-in `styleRegistry` contributions that target shadcn's 
 
 <Steps>
 
-1. Add the field to the `StyleConfig` interface in `src/templates/frontend/types.ts` (generates `types/style.types.ts`). Keep the shape backwards-compatible — make new fields optional so older `theme_config` mirrors still parse.
+1. Add the field to the `StyleConfig` interface in `STYLE_TYPES` (`src/templates/frontend/types.ts`, which generates `types/style.types.ts`). Keep the shape backwards-compatible: make new fields optional so configs saved by older versions still parse.
 
 2. If the field affects generated CSS (a new token, or a new status colour alongside `destructive` / `success` / `warning` / `info` and their `-foreground` pairs), thread it through `utils/css-generator.ts` and the theme editor components under `components/theme/`.
 
-3. Because the backend mirrors the **whole** `StyleConfig` to `node.data.theme_config`, extra keys flow through automatically — but if the builder needs to read the new key, coordinate via the [builder integration contract](/modules/builder/integration/).
+3. The app theme is saved in the starter's `AppSettings.appTheme` as an envelope, and `coerceStyleConfig` in `registrations/style.registration.ts` shape-checks it when the app starts. It checks only the fields the CSS generator relies on and passes the rest through, so an optional field needs no change there. A field the generator can't do without does.
 
-4. Bump the version — `minor` for an additive field, `major` if you rename or remove one.
+4. The backend mirrors the **whole** project `StyleConfig` to `node.data.theme_config`, so extra keys reach the builder automatically. If the builder needs to read the new key, coordinate through the [builder integration contract](/modules/builder/integration/).
+
+5. Bump the version (patch for an additive field). Removing or renaming a field breaks configs that are already saved, so it needs a way to read the old shape and a changelog entry. Before launch, that still doesn't call for a major bump (see the [LLM rules](/getting-started/llm-rules/#2-version-bumping)).
 
 </Steps>
 
 ### Add a backend route
 
-The backend serves `/api/v1/style` and registers through `routeRegistry`; the service is exposed via `serviceRegistry.register('style', ...)`.
+The backend serves `/api/v1/style` and registers through `routeRegistry`. The service is registered with `serviceRegistry.register(STYLE_SERVICE_KEY, ...)` (the `MY_FEATURE_SERVICE_KEY` constant in the template).
 
 <Steps>
 
-1. Add the handler to `ROUTES_TEMPLATE` in `src/templates/backend/routes.ts`, and the corresponding method to `SERVICE_TEMPLATE` in `src/templates/backend/services.ts`.
+1. Add the handler to `ROUTES_TEMPLATE` in `src/templates/backend/routes.ts`, and the matching method to `SERVICE_TEMPLATE` in `src/templates/backend/services.ts`. Parse request bodies with the file's `parseBody` helper, so a malformed body is a 400 that lists the problems, not a 500. Declare literal paths before `/:id`.
 
-2. Add any new request/response types to `TYPES_TEMPLATE` in `src/templates/backend/types.ts`.
+2. Add any new request schemas or types to `TYPES_TEMPLATE` in `src/templates/backend/types.ts`.
 
-3. **Use `.js` extensions on every relative import** — backend templates run as ESM in the target app (see [Debugging](#debugging)).
+3. **Use `.js` extensions on every relative import**: backend templates run as ESM in the target app (see [Debugging](#debugging)).
 
-4. Mirror the call in the frontend client at `src/templates/frontend/services.ts`, and add a TanStack Query wrapper in `hooks.ts` if it needs caching (query keys stay namespaced as `['style', ...]`).
+4. Fire action hooks with `actionRegistry.doActionAll(...)` and include `userId` in the payload. `npm run conformance:check` fails on a plain `doAction(...)`.
 
-5. If the route touches user data, update the data-category manifest / erasure handler in `src/templates/backend/registrations.ts` (`security.registration.ts`).
+5. Mirror the call in the frontend client at `src/templates/frontend/services.ts`, and add a TanStack Query wrapper in `hooks.ts` if it needs caching (query keys stay namespaced as `['style', ...]`).
 
-6. Bump the version (`minor`).
+6. If the route touches user data, update the data-category manifest and the deletion and export handlers in `src/templates/backend/registrations.ts` (`security.registration.ts`).
+
+7. Add tests to `tests/style.service.test.ts` (or `style.security.test.ts`) and run `npm test`. Then bump the version (patch).
+
+</Steps>
+
+### Retire a generated file
+
+v1.15.0 retired six files that nothing imported. To retire one:
+
+<Steps>
+
+1. Grep the other templates for imports of the file first.
+
+2. Delete the template constant, its `src/module.ts` entry, and its export from `src/templates/frontend/index.ts` (or the backend barrel). A stale barrel export fails `npm run type-check`, and also `npm test`, whose harness loads `src/module.ts` before any test runs.
+
+3. On the next `update`, existing apps see the file listed as an orphan. When the operator approves, it is removed and backed up to `.module-backups/`.
+
+4. If the generated feature barrel (`INDEX_TEMPLATE`) re-exported anything from the file, apps may import it. [Rule 6](/getting-started/llm-rules/#6-deprecate-before-removing-public-exports) (deprecate before removing) is suspended until launch, so remove the export outright, update any repo that imports it in the same pass, and add a changelog entry. Once there are launched consumers, follow its deprecate-then-remove cycle instead.
 
 </Steps>
 
 <Aside type="note" title="Base-class merge (v1.14.11)">
-The class designer's twMerge behaviour reads the builder's per-project base-class manifest via `GET /api/v1/builder/projects/:id/component-set` (a **builder** endpoint — the style module consumes it, it does not own it). If you touch that merge logic, verify against the builder's [integration docs](/modules/builder/integration/) rather than adding a style-owned endpoint.
+The class designer's twMerge behaviour reads the builder's per-project base-class manifest via `GET /api/v1/builder/projects/:id/component-set` (a **builder** endpoint: the style module consumes it, it does not own it). If you touch that merge logic, verify against the builder's [integration docs](/modules/builder/integration/) rather than adding a style-owned endpoint.
 </Aside>
 
 ---
@@ -282,11 +513,19 @@ The class designer's twMerge behaviour reads the builder's per-project base-clas
 
 ### The generated-code type-check gap
 
-The single most common trap: `npm run type-check` passing does **not** mean the generated app compiles. It only checks the template strings as text. **Always** re-generate into `use-foundry-ui` and run `cd frontend && npx tsc --noEmit | grep features/style` (must stay at zero). Diff the generated output with `git diff` in the test app to see exactly what your template produced.
+The single most common trap: `npm run type-check` passing does **not** mean the generated app compiles. It only checks the template strings as text. **Always** regenerate into the test app and run `npx tsc --noEmit | grep features/style` in both `frontend` and `backend` (both must stay at zero). Run `git diff` in the test app to see exactly what your template produced.
+
+### `npm test` fails before any test runs
+
+The harness loads `src/module.ts`, and through it every template barrel, before the first test. A barrel that exports a constant you deleted or renamed fails the whole run at start-up, and vitest's message may not name the real cause. Run `npm run type-check` first: it names the broken import directly.
+
+### The styling audit can't run
+
+`[audit-styling] no audit script at …` (exit code 2) means it found no starter checkout. Pass `--starter <path>` or set `STYLE_AUDIT_STARTER` (see [Repository Setup](#repository-setup)). The tool also imports the `.ts` template files directly, which needs Node 22.18 or later.
 
 ### File headers on new templates
 
-Every new template file's generated output must start with the standard header block so apps can trace provenance:
+Each generated file starts with the scaffold's one-line version header (`// @generated-by: …`), added at install. Every new template must start its own content with the standard header block, so apps can trace where a file came from:
 
 ```ts
 // ========================================================================
@@ -297,7 +536,7 @@ Every new template file's generated output must start with the standard header b
 
 ### Backend `.js` imports
 
-All relative imports in backend templates **must** carry a `.js` extension — the generated backend runs as ESM and will fail at runtime otherwise:
+All relative imports in backend templates **must** carry a `.js` extension. The generated backend runs as ESM and fails at runtime otherwise:
 
 ```ts
 import { styleService } from './style.service.js';   // correct
@@ -307,24 +546,36 @@ import { styleService } from './style.service';       // fails at runtime
 Quick pre-commit grep (should return nothing):
 
 ```bash
-grep -rn "from '\.\./" src/templates/backend/ | grep -v "\.js'"
+grep -rnE "from '\.{1,2}/[^']*'" src/templates/backend/ | grep -v "\.js'"
 ```
 
 ### Placeholder casing
 
-The templates use the `my-feature` placeholder family, replaced with the module id at install: `my-feature` → `style`, `MyFeature` → `Style`, `myFeature` → `style`, `my_feature` → `style` (e.g. `my_feature_theme`). If a literal `my-feature` or `MyFeature` appears in generated output, you used the wrong casing (or a string the replacer doesn't recognise).
+The templates use the `my-feature` placeholder family, replaced with the module id at install:
+
+| Placeholder | Becomes | Example |
+|-------------|---------|---------|
+| `my-feature` | `style` | `/api/v1/my-feature` → `/api/v1/style` |
+| `MyFeature` | `Style` | `MyFeatureDataExport` → `StyleDataExport` |
+| `myFeature` | `style` | `myFeatureService` → `styleService` |
+| `my_feature` | `style` | `my_feature_theme` → `style_theme` |
+| `MY_FEATURE` | `STYLE` | `MY_FEATURE_SERVICE_KEY` → `STYLE_SERVICE_KEY` |
+
+`{{moduleVersion}}` is filled in with the module version. If a literal `my-feature` or `MyFeature` appears in generated output, you used the wrong casing, or a string the replacer doesn't recognise.
 
 ---
 
 ## Documentation Workflow
 
-`docs/` is a **git submodule** with its own remote (`origin`). The module repo itself pushes to the `block-style` remote. Push the submodule first, then update the pointer in the module.
+`docs/` is a **git submodule** with its own remote (`origin`). In this checkout the module repo pushes to its `block-style` remote. Push the submodule first, then update the pointer in the module.
+
+App-facing pages use the **installed** names, not the template placeholders: the tables `style_theme` / `style_theme_version` / `style_shadcn_config_version`, entry ids `style.*`, the event `style:theme-saved`, the API `/api/v1/style`, query keys `['style', ...]` and `STYLE_SERVICE_KEY`.
 
 <Steps>
 
-1. Edit pages under `docs/src/content/docs/modules/style/`. Add new pages to the sidebar in `docs/astro.config.mjs`.
+1. Edit pages under `docs/src/content/docs/modules/style/`. The Style sidebar group is generated from that folder (`autogenerate` in `docs/astro.config.mjs`), so a new page shows up on its own. Set its position with `sidebar.order` in the page's frontmatter.
 
-2. Commit and push the **docs submodule** to its own remote. Rebase first to avoid a stale push.
+2. Commit and push the **docs submodule** to its own remote. Rebase first, to avoid a stale push.
 
    ```bash
    cd docs
@@ -348,5 +599,5 @@ The templates use the `my-feature` placeholder family, replaced with the module 
 </Steps>
 
 <Aside type="caution">
-If you commit the pointer bump (step 3) without pushing the submodule first (step 2), the module will reference a docs commit that doesn't exist on `origin`, and CI will fail to clone the submodule. Push `docs` → then push `block-style`.
+If you commit the pointer bump (step 3) without pushing the submodule first (step 2), the module will reference a docs commit that doesn't exist on `origin`, and CI will fail to clone the submodule. Push `docs` first, then push `block-style`.
 </Aside>

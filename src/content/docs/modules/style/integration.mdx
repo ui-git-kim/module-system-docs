@@ -1,17 +1,19 @@
 ---
 title: Integration
-description: How other modules consume Style — the theme_config mirror, the service, registries, events, and the catalogue-request pattern.
+description: How other modules and companion apps consume Style — the REST API, the theme_config mirror, the app-theme envelope, the service, registries, hooks and events, and the catalogue-request pattern.
 sidebar:
   order: 4
 ---
 
 import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
 
-Style is the **sole stylist** for apps built on the module system: it is the only module that writes to the starter's [`styleRegistry`](/starter-template/style-system/) or edits `components/ui/*`. Every other module **consumes** Style rather than extending it — read the theme it produces, subscribe to its lifecycle hooks, or **request a catalogue entry** and let Style ship the visual change.
+Style is the **sole stylist** for apps built on the module system: it is the module meant to write to the starter's [`styleRegistry`](/starter-template/style-system/) and edit `components/ui/*` (the one current exception is the Colour Palette's `colour.status-tokens` entry; see [Colour](#colour)). Every other module **consumes** Style rather than extending it — read the theme it produces, subscribe to its lifecycle hooks, or **request a catalogue entry** and let Style ship the visual change.
 
-That gives two clean interaction shapes, and one hard rule:
+That gives a handful of clean interaction shapes, and one hard rule:
 
-- **Read** the active project theme from `node.data.theme_config` (the canonical mirror), or the backend service via `serviceRegistry.get('style')`.
+- **Read** the active project theme from `node.data.theme_config` (the canonical mirror), or through the backend service with `serviceRegistry.get(STYLE_SERVICE_KEY)`.
+- **Read** the app-wide theme from the host's `AppSettings.appTheme`. A companion app outside the browser can fetch it, signed out, from the starter's public `GET /api/v1/theme`.
+- **React** to theme changes through the backend `style.*` action hooks, or the `style:theme-saved` window event in the browser.
 - **Request** a visual tweak as a catalogue entry — Style owns the CSS and the `styleRegistry` slot.
 
 <Aside type="caution" title="Do not self-register styling">
@@ -22,74 +24,300 @@ Other modules must **not** call `styleRegistry.register()`, edit `components/ui/
 
 ## Public surface
 
-Style's install-time module id is `style`, so everything the templates author as `my-feature` lands in the target app as `style`: the feature folder `@/features/style`, the backend mount `/api/v1/style`, query keys `['style', ...]`, the DOM event `style:theme-saved`, catalogue ids `style.*`, and the action hooks `style.*`.
+Style's install-time module id is `style`, so everything the templates author as `my-feature` lands in the target app as `style`: the feature folder `@/features/style`, the backend mount `/api/v1/style`, the tables `style_theme`, `style_theme_version` and `style_shadcn_config_version`, query keys `['style', ...]`, the window event `style:theme-saved`, the `styleRegistry` ids `style.*`, the action hooks `style.*`, and the service key `STYLE_SERVICE_KEY` (the string `'style'`).
+
+The generated code needs **starter v2.13.1 or later**.
 
 ### What the barrels export
 
 <Tabs>
 <TabItem label="Frontend (@/features/style)">
 ```ts
-// Routes (spread into the app router) — empty today
+// Routes (spread into the app router) — an empty RouteObject[] today
 export { styleRoutes } from './routes.config';
-
-// Builder property-panel tab component (full install mode only)
-export { StylePanel } from './components/style/StylePanel';
 
 // Types — the contract
 export type * from './types';   // StyleConfig, ThemeConfig, CustomVariable,
-                                //  DefaultStyleRule, StyleState, SavedTheme, …
+                                //  DefaultStyleRule, SavedTheme, AppThemeEnvelope,
+                                //  PublicThemeResponse, StyleDataExport, …
 ```
 
-The frontend barrel deliberately exposes **types, not internals**. It does **not** re-export the service or the hooks (`useProjectTheme`, `useStyleQueries`, …) — those are module-private. A consumer reads the theme from the structure node's data, not by importing Style's data layer.
+The frontend barrel exposes **types only**. It does not re-export pages, components, the service or the hooks (`useProjectTheme`, `useAppTheme`, `useStyleQueries`, …) — those are module-private. The admin page and the builder's `StylePanel` reach the app through their registry entries, lazily, so re-exporting them would put them back in every visitor's first download. A consumer reads the theme from the structure node's data or from `AppSettings.appTheme`, not by importing Style's data layer.
 </TabItem>
 <TabItem label="Backend (@/features/style)">
 ```ts
 export { styleRoutes } from './style.routes.js';
 export { styleService } from './style.service.js';
+export { STYLE_SERVICE_KEY } from './service.registration.js'; // 'style'
 export type * from './style.types.js';
 ```
 
-Prefer `serviceRegistry.get('style')` over a direct `styleService` import — it decouples the caller from Style's file layout and is type-augmented (see [Consuming Style](#consuming-style-from-another-module)).
+Prefer `serviceRegistry.get(STYLE_SERVICE_KEY)` over a direct `styleService` import — it decouples the caller from Style's file layout and is type-augmented (see [Consuming Style](#consuming-style-from-another-module)).
 </TabItem>
 </Tabs>
 
-### The three ways to interact
+### Ways to interact
 
 | Interaction | Direction | Where |
 |-------------|-----------|-------|
 | Read `node.data.theme_config` | Style → you | Frontend or backend, via the structure node's `data` |
-| `serviceRegistry.get('style')` | Style → you | Backend service methods |
+| Read `AppSettings.appTheme` | Style → you | In the app through the starter's app settings; outside it through the public `GET /api/v1/theme` |
+| `serviceRegistry.get(STYLE_SERVICE_KEY)` | Style → you | Backend service methods |
+| Call the REST API | you → Style | `/api/v1/style`, signed in; some routes are admin-only |
+| Listen to `style.*` hooks or `style:theme-saved` | Style → you | Backend `actionRegistry` listeners; a window event in the browser |
 | Request a catalogue entry | you → Style | A `styleRegistry` entry Style authors and ships |
+
+---
+
+## REST API
+
+Every route is mounted under `/api/v1/style` and registered with `requiresAuth: true`, so each call needs a signed-in user. Routes marked **Admin** also run the host's `requireAdmin`. The theme and project routes are scoped to the caller: a user reads their own themes plus every global and system theme, and writes only their own rows. The app-theme routes work on the shared app-override rows, whoever created them.
+
+### Themes
+
+| Method | Path | Admin | What it does |
+|--------|------|-------|--------------|
+| `GET` | `/` | | The caller's own themes plus every global and system theme, newest first |
+| `POST` | `/` | When `isGlobal` or `isAppOverride` is set | Create a theme (`201`). Body: `name`, `displayName`, `config`, and optionally `description`, `projectId`, `isGlobal`, `isAppOverride`. System themes can't be created through the API |
+| `GET` | `/:id` | | One theme the caller can read (their own, global or system); `404` otherwise |
+| `PATCH` | `/:id` | | Edit the caller's own theme: `name`, `displayName`, `description`, `config`. It can't publish a theme (`isGlobal`) or activate one (`isActive`). `404` if the caller doesn't own it |
+| `DELETE` | `/:id` | | Delete the caller's own theme and both its histories (`204`). `403` for a system theme, `409` for the active app override |
+
+### Project config and history
+
+`:nodeId` is the project's structure node id. "The project's config" is what `GET /projects/:nodeId/config` returns: the caller's own active row for that node or, failing that, an active global or system row tied to it.
+
+| Method | Path | What it does |
+|--------|------|--------------|
+| `GET` | `/projects/:nodeId/config` | The project's config row, or `null` |
+| `PUT` | `/projects/:nodeId/config` | Save the caller's own config for the node. Body: `config`, and optionally `displayName` and `label`. Records a snapshot in the combined history (and in the preset-layer history when the preset layer changed) and mirrors the config to `node.data.theme_config` |
+| `GET` | `/projects/:nodeId/versions` | The combined history, newest first (`id`, `version`, `label`, `createdAt`); `[]` when there is no config |
+| `GET` | `/projects/:nodeId/versions/:version` | One snapshot with its full `config`; `404` when there is no config or no such version |
+| `PUT` | `/projects/:nodeId/versions/:version/restore` | Copy a snapshot back onto the caller's own config row and mirror it; `404` if the caller doesn't own that row |
+| `PATCH` | `/projects/:nodeId/versions/:version` | Relabel a snapshot. Body: `label`, a string of up to 200 characters, or `null` |
+| `GET` | `/projects/:nodeId/shadcn-versions` | The shadcn-config (preset-layer) history, same shape |
+| `GET` | `/projects/:nodeId/shadcn-versions/:version` | One preset-layer snapshot |
+| `PATCH` | `/projects/:nodeId/shadcn-versions/:version` | Relabel a preset-layer snapshot |
+| `PUT` | `/projects/:nodeId/activate/:themeId` | Make a theme the project's active config — see [Activating a theme on a project](#activating-a-theme-on-a-project) |
+
+### App theme
+
+| Method | Path | Admin | What it does |
+|--------|------|-------|--------------|
+| `GET` | `/app/active` | | **Legacy.** The active app-override row, or `null`. The live app theme is in `AppSettings.appTheme` (see [The app theme](#the-app-theme--appsettingsapptheme)) |
+| `PUT` | `/app/config` | Admin | Record an app-theme save in the **one shared history row** and snapshot it. Body as for the project `PUT`. It makes that row the active app override every time and deactivates every other one, including one switched on through `/app/activate/:id` |
+| `GET` | `/app/versions` | Admin | The shared app theme's history, same shape as the project list; `[]` before the first save |
+| `GET` | `/app/versions/:version` | Admin | One app-theme snapshot with its `config`; `404` before the first save or for no such version |
+| `PUT` | `/app/activate/:id` | Admin | Make an app override active; `404` if `:id` isn't an app override |
+
+The shared history row is the most recently updated app override named `app-config`, whoever saved it; the first admin to save creates it. Older installs kept one such row per admin: those rows are kept, and each save leaves only the shared row active.
+
+<Aside type="note" title="PUT /app/config does not change what the app shows">
+It writes history only. The admin Theme page saves `AppSettings.appTheme` first, then calls this route (best effort: if it fails, the theme is still saved and the page shows a warning). Calling it on its own records a version without changing the live theme.
+</Aside>
+
+### Data export and import
+
+| Method | Path | Admin | What it does |
+|--------|------|-------|--------------|
+| `GET` | `/export` | Admin | Return the module's theme data as a versioned JSON envelope |
+| `POST` | `/import` | Admin | Merge an exported envelope back in, in one transaction |
+
+The admin Theme page's **Import and export** tab calls these. The envelope and the import rules are under [Export envelope](#export-envelope).
+
+### Validation and errors
+
+- **Bad bodies are `400`, not `500`.** Every JSON body is validated with zod, and a bad one is answered with a `400` whose message lists each problem as `path: message` (zod's own message), joined with `; `. A problem with no path is listed by its message alone.
+- A `:version` that isn't a whole number of 1 or more is a `400` (`Invalid version number`).
+- A row that doesn't exist, or that the caller can't see, is a `404`. Deleting a system theme is a `403`; deleting the active app override, and an import that failed and rolled back, are `409`.
+
+### Activating a theme on a project
+
+<Aside type="caution" title="Changed in v1.15.0">
+`PUT /projects/:nodeId/activate/:themeId` no longer writes to a shared system theme, and it refuses one of the caller's own themes that belongs to another project.
+</Aside>
+
+The route accepts the caller's own theme or a system theme; anything else is a `404`.
+
+- **A system theme** is copied into the caller's own project-config row for the node (created if there isn't one yet), and that row becomes active. The shared system row is never written, so activating it can't change what other users of that system theme see. The copy is recorded in the project's history like a save (the preset-layer history only gets a snapshot when the preset layer changed), labelled `Applied <displayName>` (cut to 200 characters).
+- **One of your own themes** must already belong to this node. A theme from another node, or one with no `projectId`, is a `400` (`This theme belongs to a different project`).
+- Only the caller's own other active rows for that node are deactivated — never another user's.
+- The response is the row that is now active, so its `id` can differ from `:themeId`. The config is mirrored to `node.data.theme_config`.
+
+### Export envelope
+
+`GET /export` answers with this envelope, and `POST /import` takes the same shape:
+
+```jsonc
+{
+  "version": 1,            // envelope format; import refuses any other value
+  "moduleId": "style",     // import refuses a file from another module
+  "exportedAt": "2026-10-29T03:12:00.000Z",
+  "counts": { "themes": 2, "systemThemes": 1, "appThemes": 1, "themeVersions": 14, "shadcnConfigVersions": 6 },
+  "data": {
+    "themes": [],          // the exporting admin's own personal themes only
+    "systemThemes": [],    // every system theme
+    "appThemes": []        // every app override, newest first (the shared history row leads)
+  }
+}
+```
+
+Each theme carries `projectId`, `name`, `displayName`, `description`, `config`, `isGlobal`, `isActive`, `createdAt`, `updatedAt`, and its two histories as `versions` and `shadcnConfigVersions` (each snapshot: `version`, `label`, `config`, `createdAt`). Row ids and owner ids are never exported, and no other user's personal themes are included.
+
+How import treats a file:
+
+1. **Checked before any write.** The body must be an object, `moduleId` must be `style` and `version` must be `1`; then the whole shape is validated. Any failure is a `400` with a readable message. Unknown keys, such as a stray `id` or `userId`, are dropped, so a file can't choose row ids or owners.
+2. **Merge only, all or nothing.** Nothing is deleted. Every write runs in one transaction; if one fails, the transaction rolls back and the route answers `409` (`Import failed and was rolled back…`), with the database error in the server log.
+3. **Personal themes land under the importing admin**, matched on project and name. A match has its content updated and keeps its active flag. If the match is one of the admin's shared rows instead, the entry is skipped.
+4. **Shared themes are preserved.** A system theme or app override that already exists is left exactly as it is, history included. A missing one is created under the importing admin, unless that admin already has a theme with the same project and name, in which case it is skipped.
+5. **Activation.** A new personal theme or app override keeps its exported active flag only when nothing in its scope is active yet. A new system theme is never active.
+6. **History.** Snapshots keep their original numbers and dates. A number that already exists is skipped, so importing the same file twice adds nothing new.
+7. **Result:** `{ counts: { themes, systemThemes, appThemes, themeVersions, shadcnConfigVersions, skipped } }` — rows written per table, plus the entries left as they were.
+
+Import does **not** change `AppSettings.appTheme` (the live app theme) and does not re-mirror `node.data.theme_config`. An imported change to a project's active config reaches the builder at that project's next save or activation. Bodies fall under the host's 10 MB limit for signed-in JSON requests, and each list may hold up to 10,000 entries.
 
 ---
 
 ## Registry registrations
 
-Style contributes to six frontend registries and four backend registries. IDs shown are the **app-facing** ids (`my-feature` → `style`). Registrations tagged *(full)* only run in the full install mode (`installMode !== 'admin'`), which requires the builder and structure modules.
+Style contributes to six frontend registries and five backend ones: it registers into `routeRegistry`, `serviceRegistry`, `securityRegistry` and `moduleRegistry`, and fires its hooks through `actionRegistry`. IDs shown are the **app-facing** ids (`my-feature` → `style`). Registrations tagged *(full)* only run in the full install mode (`installMode !== 'admin'`), which requires the builder and structure modules.
 
 | Registry | ID / slot | Purpose |
 |----------|-----------|---------|
-| `styleRegistry` | `style.app-theme` | The one active app-wide theme; CSS patched in on bootstrap and on admin save |
-| `styleRegistry` | `style.tabs-line-primary`, `style.button-bold`, `style.card-elevated`, `style.sidebar-rounded`, `style.sidebar-accent-bold` | The opt-in catalogue — entries ship `enabled: false` and target `data-slot`/`data-variant`/`data-state` |
-| `adminPagesRegistry` | `app-theme` | Admin **Theme** settings page at `/admin/theme` |
+| `styleRegistry` | `style.app-theme` (order 50) | The one active app-wide theme. Filled at import from this device's first-paint cache, then from `AppSettings.appTheme`, and patched on every admin save |
+| `styleRegistry` | `style.tabs-line-primary`, `style.button-bold`, `style.card-elevated`, `style.sidebar-rounded` (order 60) | The opt-in catalogue. Entries ship `enabled: false`, target `data-slot` / `data-variant` / `data-state`, and are switched on the admin Theme page's **Style catalogue** tab |
+| `styleRegistry` | `style.designer-density` (order 80) | Always on. Compact text for Style's own designer panels; it only reaches elements marked `data-style-designer` |
+| `adminPagesRegistry` | `app-theme` | The admin **Theme** page at `/admin/app-theme`, in the Appearance section. Lazy-loaded, with `preload` so the admin panel can fetch it early |
 | `nodeTabRegistry` *(structure)* | `style-shadcn-config`, `style-theme` | **Shadcn Config** + **Theme** tabs on the project node type *(full)* |
-| `propertyPanelTabRegistry` *(builder)* | `style` | The **Style** tab (`StylePanel`) on the selected builder element *(full)* |
-| `filterRegistry` *(builder)* | hook `builder.canvas.globalCss`, id `style`, order 50 | Injects the project's generated CSS into the preview iframe *(full)* |
+| `propertyPanelTabRegistry` *(builder)* | `style` | The **Style** tab (`StylePanel`, lazy-loaded) on the selected builder element *(full)* |
+| `filterRegistry` | hook `builder.canvas.globalCss`, id `style`, order 50 | Injects the project's generated CSS into the builder's preview iframe *(full)* |
 | `structureRegistry` *(structure)* | field `theme_config` (moduleId `style`) | The hidden mirror field on the project node type *(full)* |
-| `routeRegistry` | path `/style`, feature `style`, versions `['v1']` | Mounts the API under `/api/v1/style` |
-| `serviceRegistry` | `style` | Exposes `styleService` with TypeScript augmentation |
-| `securityRegistry` | manifest moduleId `style` + deletion handler `style.personal-themes` | Data-category manifest and the account-erasure cascade |
-| `actionRegistry` | fires `style.*` hooks | Emits theme/version lifecycle events (see [Events](#events)) |
+| `routeRegistry` | path `/style`, feature `style`, versions `['v1']`, `requiresAuth: true` | Mounts the API under `/api/v1/style` |
+| `serviceRegistry` | `STYLE_SERVICE_KEY` (`'style'`) | Exposes `styleService` with TypeScript augmentation |
+| `securityRegistry` | manifest `style`; deletion and export handlers `style.personal-themes` | The data-category manifest, account erasure and personal-data export |
+| `moduleRegistry` | `style` | Tells the host's modules feature that Style is installed |
+| `actionRegistry` | fires `style.*` hooks | Theme, version, import and export lifecycle events (see [Events](#events)) |
 
 <Aside type="note" title="Catalogue ids are toggles, not APIs">
-The five catalogue ids exist so the admin **App Theme** UI (and `styleRegistry.setOverride`) can flip individual entries on and off. `style.sidebar-accent-bold` is driven automatically from `StyleConfig.sidebarAccent`; the other four are manual admin toggles. Consumer modules never register into these — they request a **new** entry instead.
+Admins switch the four opt-in entries on and off on the **Style catalogue** tab of the admin Theme page. The choice is applied through `styleRegistry.setOverride` and stored in the starter's `AppSettings.styleOverrides` with `PUT /api/v1/admin/style-overrides`. `style.designer-density` is always on and isn't offered there. Consumer modules never register into these ids — they request a **new** entry instead.
 </Aside>
+
+<Aside type="caution" title="Removed: style.sidebar-accent-bold">
+The `style.sidebar-accent-bold` entry no longer exists. The bold sidebar accent is now part of the generated theme CSS whenever `StyleConfig.sidebarAccent` is `'bold'`, so it needs no override. If your code switched the entry on with `styleRegistry.setOverride('style.sidebar-accent-bold', …)`, that call now targets nothing: set `sidebarAccent: 'bold'` in the theme instead. A stale key for it left in `AppSettings.styleOverrides` by an older version is harmless.
+</Aside>
+
+### Service registry
+
+```ts
+// service.registration.ts (generated)
+export const STYLE_SERVICE_KEY = 'style' as const;
+
+serviceRegistry.register(STYLE_SERVICE_KEY, styleService, {
+  feature: 'style',
+  description: 'Builder Style theme management service',
+  version: '1.15.0', // e.g. — the installed module version, kept current by `npx style update`
+});
+```
+
+A `ServiceTypes` augmentation in the same file types `serviceRegistry.get(STYLE_SERVICE_KEY)`.
+
+### Security registry
+
+- **Manifest.** `moduleId: 'style'` with `ownedModels: []`: personal, system and app-override rows share one `userId` column, so there is no clean owner column to declare, and the handlers scope their queries explicitly instead. Data categories: `style_personal_themes`, `style_theme_versions` and `style_shadcn_config_versions` are **owned**; `style_system_themes` and `style_app_theme_overrides` are **preserved**: system themes are served to every user, app overrides hold the app-wide theme's history, and both outlive the admin who wrote them.
+- **Deletion handler `style.personal-themes`.** Hard-deletes the subject's personal themes and both their histories in one transaction, and returns `{ action: 'hard-delete', recordsAffected }`. System themes and app overrides are left alone; the shared app-history row stays keyed to the admin who first saved it.
+- **Export handler `style.personal-themes`** (new in v1.15.0). Returns `{ themes, themeVersions, shadcnConfigVersions }` for the subject's personal themes — the same rows erasure removes — and lands in the [personal-data export](/starter-template/security-feature/#personal-data-export) under that id. Themes carry `id`, `projectId`, `name`, `displayName`, `description`, `config`, `isGlobal`, `isActive`, `createdAt` and `updatedAt`; snapshots carry `themeId`, `version`, `label`, `config`, `createdAt` and `updatedAt`.
+- **Who the subject is.** Both handlers use `ctx.subject.userId ?? ctx.subject.tenantId`. In the starter's single-user model the tenant is the user, so a space offboard that carries only a `tenantId` now erases the right rows. A subject with neither makes the handler throw rather than run an unscoped query: the deletion cascade records it as failed instead of reporting a deletion that never happened, and the export lists it as failed.
+
+### Module registry
+
+`module.registration.ts` registers Style with the host's `moduleRegistry` (the starter's [modules feature](/starter-template/modules-feature/), v1.48.0+; on an older starter the import fails quietly and nothing is registered):
+
+```ts
+moduleRegistry.register({
+  id: 'style',
+  name: "Builder Style",
+  version: '1.15.0', // e.g. — the installed module version
+  depends: {},       // builder and structure are optional, so none are declared
+  init: () => {
+    // No gateable startup work.
+  },
+});
+```
+
+- **`depends` is empty.** Builder and structure are optional (full mode only), so Style declares no hard dependency. The host enforces declared ranges at boot, so a module that can't work without Style declares `style` in its own `depends`. For a soft check in the UI, use `useModuleInstalled('style')` from `@/features/modules`.
+- **`init` is empty.** Supplying it makes Style gateable rather than reported as `ungateable`, but Style has no startup work: its routes, service and security handlers register at import time, so they stay wired when the module is disabled. Uninstall it to remove them.
+- Only the import of the modules feature is guarded. A real registration error, such as a duplicate id, now surfaces instead of being swallowed.
+
+---
+
+## The app theme — `AppSettings.appTheme`
+
+Since v1.15.0 the app-wide theme lives in the starter's [`AppSettings.appTheme`](/starter-template/admin-feature/#app-theme-apptheme), not in Style's own tables; the module keeps only its history. The starter stores `appTheme` as opaque JSON, and Style writes this envelope into it:
+
+| Field | Value | Meaning |
+|-------|-------|---------|
+| `kind` | `'style.app-theme'` | Marks the value as written by Style |
+| `schemaVersion` | `1` | The envelope format. Style treats any other value as not its own |
+| `config` | `StyleConfig` | The editable theme |
+| `css` | string | The injectable CSS rendered from `config` at save time |
+| `savedAt` | string | ISO timestamp of the save |
+
+`css` is ready to drop into a style tag. It starts with shadcn's baseline `:root` and `.dark` token blocks, followed by Style's extensions: a second `:root` / `.dark` pair with the module's own tokens (`destructive-foreground`, status colours, code, typography, spacing, shadows, custom variables) and, when the theme uses them, the bold sidebar accent, the menu-colour rules and the default-styling rules. It has no `@import` and no `@theme` block, so it doesn't need Tailwind.
+
+**How Style uses it.**
+
+- **Save.** The admin Theme page writes the envelope with the starter's `setAppTheme` (a failure fails the save), records a version with `PUT /api/v1/style/app/config` (best effort), then applies the theme at once.
+- **Start-up.** Style first applies the CSS this device cached on its last visit (`localStorage` key `style.app-theme-css`), so returning visitors see no flash of the default theme. It then reads the public `GET /api/v1/theme`, which works for signed-out visitors, and re-renders the CSS from `config` with the current generator, falling back to the stored `css`.
+- **Older apps.** With no envelope yet, Style falls back to the legacy `GET /api/v1/style/app/active` row, which needs a session. The first time an admin opens the Theme page, the legacy theme is copied into `appTheme`.
+
+**Reading it from a companion.** The starter's public `GET /api/v1/theme` (starter v2.9.1+) answers `{ appTheme, styleOverrides }` without auth, and accepts requests with no `Origin` header, so a desktop or headless companion can read it.
+
+- Parse it defensively. `appTheme` can be `null` (no theme saved yet, or an older app that hasn't been migrated) or a value another style module wrote. Treat it as Style's only when `kind` and `schemaVersion` match and `config` is an object.
+- If your renderer runs CSS, inject `css`. If it doesn't, or you'd rather not inject remote CSS, take only the custom-property declarations from its `:root` and `.dark` blocks.
+- `css` reflects the generator at save time. Style itself regenerates from `config`; a companion can't, so `css` is the field to use.
+- `styleOverrides` is the `styleRegistry` on/off map. Style's catalogue entries appear in it under their `style.*` ids once an admin has toggled them.
+
+```ts
+import type { AppThemeEnvelope } from '@/features/style'; // in-app; a companion copies the shape
+
+function readStyleTheme(value: unknown): AppThemeEnvelope | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (v.kind !== 'style.app-theme' || v.schemaVersion !== 1) return null;
+  if (typeof v.config !== 'object' || v.config === null) return null;
+  return { ...(v as unknown as AppThemeEnvelope), css: typeof v.css === 'string' ? v.css : '' };
+}
+
+const { appTheme } = await (await fetch(`${appOrigin}/api/v1/theme`)).json();
+const theme = readStyleTheme(appTheme);
+```
+
+Inside the authenticated app, a frontend module reads the same value from `useGlobalAppSettings().settings?.appTheme` (`@/features/admin`); `settings` stays `null` until the server answers. Style's own parser isn't exported from the barrel, so guard the value yourself, as above.
+
+---
+
+## Styling hooks — `data-slot` attributes
+
+Style's CSS never targets a component by its class names. It reaches components through the stable data attributes shadcn's primitives render, so **a module's UI is themed by Style as long as it is built from the host's `components/ui/*` primitives and keeps their attributes.** If you wrap a primitive, pass `data-slot` (and `data-variant`, `data-size`, `data-state`) through. If you build a menu or card from plain elements, Style can't reach it.
+
+| Style feature | Selector | Cascade |
+|---------------|----------|---------|
+| Default styling (`StyleConfig.defaultStyling`) | `[data-slot="<slot>"]`, or `.dark [data-slot="<slot>"]` for a dark-only rule. Any slot name made of letters, digits, `-` and `_` | Inside `@layer components`, so a per-instance utility class still wins |
+| Menu colour (`menuColor`) | The menu surfaces `dropdown-menu-content`, `dropdown-menu-sub-content`, `context-menu-content`, `context-menu-sub-content`, `menubar-content`, `menubar-sub-content`, `select-content`, `combobox-content` | Unlayered, so it beats the primitives' Tailwind utilities |
+| Catalogue entries | `tabs-trigger` / `tabs-list` with `data-variant="line"` (and `data-state="active"`), `button` with `data-variant="default"` / `data-size="default"`, `card`, `sidebar-menu-button`, `sidebar-menu-sub-button` | Unlayered, only when an admin switches the entry on |
+
+Two attribute hooks are **Style's own**, not for other modules' markup:
+
+- `data-style-designer` scopes the always-on `style.designer-density` entry to Style's designer panels and the popovers they open. Adding it to your UI would shrink your text.
+- `.cn-menu-target` is shadcn's menu hook class. The shadcn CLI strips it when it installs a component, so only un-installed registry copies (such as the builder's pristine primitives) still carry it. Style's start-up menu-colour binding toggles `.dark` on those and sets `data-menu-translucent` where that attribute is present; installed primitives get the colour through the data-slot rules above.
+
+The builder's base-class manifest is keyed by the same `data-slot` values (see [Builder](#builder) below).
 
 ---
 
 ## Events
 
-### Frontend DOM event — `style:theme-saved`
+### Frontend window event — `style:theme-saved`
 
 A `CustomEvent` dispatched on `window` whenever a **project** configuration changes, so live previews can refresh without a reload.
 
@@ -97,8 +325,8 @@ A `CustomEvent` dispatched on `window` whenever a **project** configuration chan
 |----------|-------|
 | Event name | `style:theme-saved` |
 | `detail` | `{ projectId: string }` — the structure node id whose config changed |
-| Dispatched by | `useProjectTheme.save`, `useSaveProjectConfig`, `useActivateProjectTheme` |
-| Consumed by | Style's own `builder-canvas` registration — it clears its per-project CSS cache and re-registers the `builder.canvas.globalCss` filter so the iframe re-renders |
+| Dispatched by | `useProjectTheme().save`, `useSaveProjectConfig`, `useActivateProjectTheme`, and a version restore on the project **Theme** tab |
+| Consumed by | Style's own `builder-canvas` registration — it clears that project's cached CSS and re-registers the `builder.canvas.globalCss` filter so the iframe re-renders |
 
 ```ts
 window.addEventListener('style:theme-saved', (e) => {
@@ -108,25 +336,27 @@ window.addEventListener('style:theme-saved', (e) => {
 ```
 
 <Aside type="note">
-This is primarily an **internal** cache-invalidation signal — Style both fires and handles it. App-wide theme saves do **not** dispatch it (they apply immediately via `styleRegistry.update`). A companion module may listen if it caches anything derived from a project's theme, but most consumers don't need to.
+This is primarily an **internal** cache-invalidation signal — Style both fires and handles it. App-wide theme saves do **not** dispatch it: they apply immediately through `styleRegistry.update`. A companion module may listen if it caches anything derived from a project's theme, but most consumers don't need to.
 </Aside>
 
 ### Backend action hooks fired
 
-The service fires these through `actionRegistry` on each mutation. Subscribe from another backend module's registration with `actionRegistry.addAction` / `addActionAsync`.
+The service fires these through `actionRegistry.doActionAll`, which runs both the sync pool (`addAction`) and the async pool (`addActionAsync`). Every payload includes `userId`. Rows travel as `theme` (the `style_theme` row after the change), `themeVersion` or `shadcnConfigVersion`.
 
-| Hook | Fired when | Context |
-|------|-----------|---------|
-| `style.theme.created` | A theme is created | `{ themeId, userId }` |
-| `style.theme.updated` | A theme is updated | `{ themeId, userId }` |
-| `style.theme.deleted` | A theme is deleted | `{ themeId, userId }` |
-| `style.theme.restored` | A theme is restored to a version | `{ themeId, version, userId }` |
-| `style.appTheme.saved` | The app-wide config is saved | `{ themeId, userId }` |
-| `style.appTheme.activated` | An app override is activated | `{ themeId }` |
-| `style.projectConfig.saved` | A project config is saved | `{ themeId, nodeId, userId }` |
-| `style.projectTheme.activated` | A project's active theme changes | `{ nodeId, themeId, userId }` |
-| `style.version.labelUpdated` | A combined-history version is relabelled | `{ themeId, version, userId }` |
-| `style.shadcnVersion.labelUpdated` | A shadcn-config snapshot is relabelled | `{ themeId, version, userId }` |
+| Hook | Fired by | Payload |
+|------|----------|---------|
+| `style.theme.created` | `POST /` | `{ userId, themeId, theme }` |
+| `style.theme.updated` | `PATCH /:id` | `{ userId, themeId, theme }` |
+| `style.theme.deleted` | `DELETE /:id` | `{ userId, themeId }` |
+| `style.theme.restored` | `PUT /projects/:nodeId/versions/:version/restore` | `{ userId, themeId, version, theme }` |
+| `style.appTheme.saved` | `PUT /app/config` | `{ userId, themeId, theme }` — the shared app-history row |
+| `style.appTheme.activated` | `PUT /app/activate/:id` | `{ userId, themeId, theme }` |
+| `style.projectConfig.saved` | `PUT /projects/:nodeId/config` | `{ userId, themeId, nodeId, theme }` |
+| `style.projectTheme.activated` | `PUT /projects/:nodeId/activate/:themeId` | `{ userId, nodeId, themeId, theme }` — `themeId` is the theme the caller chose; `theme` is the row now active (the caller's own copy when a system theme was chosen) |
+| `style.version.labelUpdated` | `PATCH /projects/:nodeId/versions/:version` | `{ userId, themeId, version, themeVersion }` |
+| `style.shadcnVersion.labelUpdated` | `PATCH /projects/:nodeId/shadcn-versions/:version` | `{ userId, themeId, version, shadcnConfigVersion }` |
+| `style.data.exported` | `GET /export` | `{ userId, counts }` |
+| `style.data.imported` | `POST /import` (after a successful commit) | `{ userId, counts }` |
 
 ```ts
 // In another backend module's registration file:
@@ -135,16 +365,44 @@ import { actionRegistry } from '../../config/action.registry.js';
 actionRegistry.addActionAsync(
   'style.projectConfig.saved',
   'my-module-on-theme-saved',
-  async ({ nodeId, userId }) => {
-    // react to the project's new theme
+  async ({ userId, nodeId, theme }) => {
+    // theme is the saved style_theme row; theme.config is the StyleConfig
   },
-  30, // priority — higher runs later
+  50, // order — lower runs first (default 50)
 );
 ```
+
+<Aside type="caution" title="Fixed in v1.15.0: async listeners now fire">
+Before v1.15.0 the service fired these hooks with `doAction`, which runs only the sync pool, so a listener added with `addActionAsync` — like the example above — never ran (the host logged a dev-mode warning and production skipped it silently). Async listeners that never ran before start firing after the update, so check that yours are idempotent.
+</Aside>
+
+Timing and scope:
+
+- Hooks fire **after** the write is committed, and the service doesn't await them: the response doesn't wait for async listeners, and the host's dispatcher catches listener errors, so a failing listener can't fail the request.
+- For `style.projectConfig.saved` and `style.projectTheme.activated`, the node mirror is written just after the hook is dispatched. Take the config from the payload's `theme`, not from `node.data.theme_config`.
+- An import fires only `style.data.imported` — not one `created` or `updated` per row.
 
 <Aside type="note" title="Subscribes to nothing">
 Style registers **no** action listeners of its own. Account erasure is handled by the `securityRegistry` deletion handler (`style.personal-themes`), not an action subscription, so there is no `structure.node.deleted`-style cleanup hook to be aware of.
 </Aside>
+
+---
+
+## Query keys
+
+Style's TanStack Query keys follow the starter's [`createModuleQueryKeys('style')`](/starter-template/data-fetching/) convention, so every key starts with `'style'`:
+
+| Key | Holds |
+|-----|-------|
+| `['style', 'themes']` | The caller's theme list |
+| `['style', 'theme', id]` | One theme |
+| `['style', 'project', nodeId]` | A project's config row |
+| `['style', 'app-theme', 'legacy']` | The legacy app-override row (`GET /app/active`) |
+| `['style', 'app-versions']` | The app theme's history |
+| `['style', 'app-version', version]` | One app-theme snapshot |
+| `['style', 'builder-component-set', projectId]` | The builder's base-class manifest for a project |
+
+Style invalidates `['style', 'project', nodeId]` after a project save, activation or restore, and every `['style', …]` key after an admin import. The hooks behind these keys are module-private. Another module may invalidate a key (for example `queryClient.invalidateQueries({ queryKey: ['style'] })` after changing Style data through the API), but shouldn't write into them.
 
 ---
 
@@ -163,9 +421,9 @@ Style registers **no** action listeners of its own. Account erasure is handled b
 
 **The `theme_config` mirror (Style → builder).** Rather than have the builder call Style, Style mirrors the whole active `StyleConfig` onto the project's structure node at `node.data.theme_config`, and the builder reads it from there. The builder derives its shadcn registry path as `` `${componentLibrary}-${styleName}` `` (e.g. `radix-luma`) and applies `cssVars` as the preview theme. The full contract — who writes it, the exact keys the builder reads, and the read fallbacks — is documented on the [Overview](/modules/style/#builder-integration--the-theme_config-contract) and the [builder Integration page](/modules/builder/integration/).
 
-**The preview CSS filter (Style → builder).** The builder exposes a `builder.canvas.globalCss` filter hook that swaps the iframe preview's stylesheet. Style's `builder-canvas` registration fetches the active project config for the current `projectId`, runs it through `generateThemeCSS()`, and returns the result — so the canvas shows the project's actual OKLCH tokens, custom variables, and sidebar accent instead of the default Zinc fallback. Because `filterRegistry.apply()` is synchronous, the filter returns the base CSS on a cache miss, fetches in the background, then re-registers to notify the builder's `IframeCanvas` subscribers. The `style:theme-saved` event clears the cache on save. See the builder's [filter reference](/modules/builder/integration/#buildercanvasglobalcss--preview-theme-css).
+**The preview CSS filter (Style → builder).** The builder exposes a `builder.canvas.globalCss` filter hook that swaps the iframe preview's stylesheet. Style's `builder-canvas` registration fetches the project's config for the current `projectId` (`GET /projects/:nodeId/config`), runs it through `generateThemeCSS()`, and returns the result — so the canvas shows the project's actual OKLCH tokens, custom variables and sidebar accent instead of the default Zinc fallback. Because `filterRegistry.apply()` is synchronous, the filter returns the base CSS on a cache miss, fetches in the background, then re-registers to notify the builder's `IframeCanvas` subscribers. The `style:theme-saved` event clears the cache on save. See the builder's [filter reference](/modules/builder/integration/#buildercanvasglobalcss--preview-theme-css).
 
-**The Style tab (Style → builder).** In full mode, Style registers a `StylePanel` tab (order 30) into the builder's `propertyPanelTabRegistry`, giving the selected element the visual className designer.
+**The Style tab (Style → builder).** In full mode, Style registers a `StylePanel` tab (order 30) into the builder's `propertyPanelTabRegistry`, giving the selected element the visual className designer. The panel is loaded with `React.lazy`, so the whole designer is its own chunk, fetched the first time the builder shows the tab; the builder's `PropertyPanel` renders each extension tab inside its own `Suspense` and error boundary.
 
 **The base-class manifest (builder → Style, reciprocal).** Since v1.14.11 the class designer merges each element's user classes against the component's **baked-in** Tailwind classes. It reads the builder's per-project component set — `GET /api/v1/builder/projects/:id/component-set` → `set.baseClasses`, keyed by `data-slot` — resolves the node's active `cva` variant, `twMerge`s the base against the user's classes, and **warns on variant-group mismatches** the merge can't fix (e.g. `max-w-2xl` won't beat a shipped `sm:max-w-sm`, so the Classes field suggests `sm:max-w-2xl`). With no manifest available (builder absent, no snapshot, or no matching `data-slot`) it degrades to merging the designer's own output only. The manifest itself is produced by the builder — see its [base-class manifest section](/modules/builder/integration/#base-class-manifest).
 
@@ -177,7 +435,7 @@ Neither module imports the other's data layer for theming. Style owns `style_the
 
 **Style registers UI and a field into structure, and mirrors config through structure's node service.** All of this is full-mode only.
 
-- **Node tabs (`nodeTabRegistry`).** The **Shadcn Config** and **Theme** tabs (`style-shadcn-config`, `style-theme`) attach to the project node type(s) in `PROJECT_NODE_TYPES` — set at install from the `projectNodeType` prompt (default `projects`) and editable in `structure.registration.ts`.
+- **Node tabs (`nodeTabRegistry`).** The **Shadcn Config** and **Theme** tabs (`style-shadcn-config`, order 30; `style-theme`, order 31) attach to the project node type(s) in `PROJECT_NODE_TYPES`, set at install from the `projectNodeType` prompt (default `projects`). Change it with `npx style reconfigure --set projectNodeType=<slug>` rather than by hand: an update that ships a new `structure.registration.ts` writes the recorded slug back over a hand edit.
 - **The mirror field (`structureRegistry`).** A single `hidden` field with the exact id `theme_config` (deliberately **not** module-namespaced — that id is the builder contract) on the same node types. Structure stores field values in the node's `data` JSON, so the value lands at `node.data.theme_config`.
 - **Writing the mirror.** On every change to the active project config — `saveProjectConfig`, `setActiveProjectTheme`, and project-scoped `restoreVersion` — the backend calls structure's node service through the registry:
 
@@ -186,15 +444,17 @@ const structureService = serviceRegistry.getOptional('structure' as never);
 await structureService?.updateNode(nodeId, userId, { data: { theme_config: config } });
 ```
 
-The write is **best-effort**: `input.data` is shallow-merged server-side (other node keys are untouched), and a failure is logged but never blocks the save. If structure is absent, `getOptional` returns undefined and mirroring is skipped — so the same service compiles and runs in an admin-only install. See the [Structure module](/modules/structure/).
+The write is **best-effort**: `input.data` is shallow-merged server-side (other node keys are untouched), and a failure is logged but never blocks the save. If structure is absent, `getOptional` returns undefined and mirroring is skipped — so the same service compiles and runs in an admin-only install. An admin import doesn't mirror at all (see [Export envelope](#export-envelope)). See the [Structure module](/modules/structure/).
 
 ### Colour
 
 <Aside type="note" title="Planned">
-Style and the [Colour Palette module](/colour-palette/integration/) are **independent today**. The integration arrives once palettes can be published.
+Style and the [Colour Palette module](/colour-palette/integration/) don't exchange theme data yet. The colour side can now publish palettes, but the palette-access service a consumer would read a published palette through hasn't shipped, so "import from palette" is still to come.
 </Aside>
 
-**The colour module produces palettes; Style will consume one to seed `cssVars`.** Colour generation already left Style — the hand-rolled OKLCH converters shrank to what theming needs and the `culori` runtime dependency was removed in v1.14.10, so the two modules no longer overlap. When publishing lands, a **published** palette will import into Style's theme editor ("import from palette"), mapping the palette's roles and neutral scale onto the shadcn CSS variables Style already manages. Until then, depend only on the `PaletteOutput` contract on the colour side and `StyleConfig` on the Style side. See the [colour Integration page](/colour-palette/integration/).
+**The colour module produces palettes; Style will consume one to seed `cssVars`.** Colour generation already left Style — the hand-rolled OKLCH converters shrank to what theming needs and the `culori` runtime dependency was removed in v1.14.10, so the two modules no longer overlap. When the palette-access service lands, a **published** palette will import into Style's theme editor ("import from palette"), mapping the palette's roles and neutral scale onto the shadcn CSS variables Style already manages. Until then, depend only on the `PaletteOutput` contract on the colour side and `StyleConfig` on the Style side. See the [colour Integration page](/colour-palette/integration/).
+
+**Status tokens overlap.** The colour module registers its own `styleRegistry` entry, `colour.status-tokens` (colour v2.56.0), which defines `--success`, `--warning` and their foregrounds in `@layer base` — an exception to the rule at the top of this page. The names match Style's status tokens. Style's theme CSS is injected without a layer, so when the active Style theme defines them, Style's values win.
 
 ---
 
@@ -217,31 +477,51 @@ const registryStyle = theme && `${theme.componentLibrary}-${theme.styleName}`; /
 const lightVars = theme?.cssVars.light;
 ```
 
-Tolerate a missing field — projects that predate Style, or that were never saved, won't have it.
+Tolerate a missing field — projects that predate Style, or that were never saved, won't have it. The mirror reflects the project's last save, activation or restore; an admin import doesn't rewrite it.
 </TabItem>
 <TabItem label="Backend service">
-For richer reads (a project's live config row, the active app theme, the user's themes) call the backend service through the registry. Access is type-augmented, so `get('style')` is fully typed.
+For richer reads (a project's live config row, the user's themes, a theme's history) call the backend service through the registry. Access is type-augmented, so `get(STYLE_SERVICE_KEY)` is fully typed.
 
 ```ts
 import { serviceRegistry } from '../../config/service.registry.js';
+import { STYLE_SERVICE_KEY } from '../style/index.js';
 
-const style = serviceRegistry.get('style');
+const style = serviceRegistry.get(STYLE_SERVICE_KEY);
 
-const projectRow = await style.getProjectConfig(nodeId, userId); // row | null
-const appRow     = await style.getActiveAppTheme();              // row | null
-const config     = projectRow?.config as StyleConfig | undefined;
+const projectRow = await style.getProjectConfig(nodeId, userId); // row or null
+const config = projectRow?.config as Record<string, unknown> | undefined;
+```
+
+That import makes Style a hard dependency. If Style is optional for your module, resolve it without importing from `features/style` — the same pattern Style uses for structure:
+
+```ts
+interface StyleServiceLike {
+  getProjectConfig(nodeId: string, userId: string): Promise<{ config: unknown } | null>;
+}
+
+const style = serviceRegistry.getOptional('style' as never) as StyleServiceLike | undefined;
+const row = await style?.getProjectConfig(nodeId, userId);
 ```
 
 Consumer-relevant read methods:
 
 | Method | Signature | Returns |
 |--------|-----------|---------|
-| `getProjectConfig` | `(nodeId, userId)` | The project's active theme row, or `null` |
-| `getActiveAppTheme` | `()` | The active app-override row, or `null` |
-| `getAll` | `(userId)` | The user's own + global + system themes |
-| `getById` | `(id, userId)` | A single accessible theme row |
+| `getProjectConfig` | `(nodeId, userId)` | The caller's own active row for the node, else an active global or system row tied to it; `null` if neither |
+| `getAll` | `(userId)` | The user's own themes plus every global and system theme |
+| `getById` | `(id, userId)` | One theme the user can read; throws a not-found error otherwise |
+| `listVersions` / `getVersion` | `(themeId)` / `(themeId, version)` | A theme's combined history, and one snapshot with its `config` |
+| `getActiveAppTheme` | `()` | **Legacy:** the active app-override row, or `null`. The live app theme is `AppSettings.appTheme` |
 
-The `StyleConfig` lives on `row.config`. The write/admin methods (`saveProjectConfig`, `setActiveProjectTheme`, `saveAppConfig`, `restoreVersion`, the version-history methods) exist but are Style's own editors — consumers rarely need them.
+The `StyleConfig` lives on `row.config`. The write and admin methods (`saveProjectConfig`, `setActiveProjectTheme`, `saveAppConfig`, `setActiveAppTheme`, `restoreVersion`, the label methods, `exportData`, `importData`) are Style's own editors; they fire the same hooks and mirror the same way as the routes. `setActiveAppTheme` now takes `(id, userId)`.
+</TabItem>
+<TabItem label="Read the app theme">
+The app-wide theme is the envelope in `AppSettings.appTheme` — not a row in Style's tables.
+
+- **In the app (frontend):** `useGlobalAppSettings().settings?.appTheme` from `@/features/admin`, inside the authenticated shell.
+- **Outside the app (companions):** the public `GET /api/v1/theme`, which needs no sign-in.
+
+Either way the value is opaque JSON: check `kind` and `schemaVersion` before using it. [The app theme](#the-app-theme--appsettingsapptheme) section has the fields and a guard you can copy.
 </TabItem>
 <TabItem label="Request a catalogue entry">
 Need a component to look different app-wide? Don't touch `components/ui/*` or `styleRegistry` — request an entry and Style ships it.
@@ -249,7 +529,7 @@ Need a component to look different app-wide? Don't touch `components/ui/*` or `s
 <Steps>
 1. Open an issue (or PR against Style) describing the visual change and the target primitive.
 2. Style adds the CSS to `utils/catalogue.ts`, targeting stable attributes — `[data-slot="…"]`, optionally `[data-variant="…"]` / `[data-state="…"]`, using theme tokens (`--primary`, `--destructive`) rather than hardcoded colours.
-3. Style registers it (`enabled: false`) in `catalogue.registration.ts`, bumps the module version, and ships. Apps opt in from the admin **App Theme** UI and pick it up with `npx style update`.
+3. Style registers it (`enabled: false`) in `catalogue.registration.ts`, adds a `CATALOGUE_ENTRIES` row (`id`, `label`, `description`, `primitive`) so admins can switch it on, bumps the module version, and ships. Apps pick it up with `npx style update` and opt in on the **Style catalogue** tab of the admin Theme page.
 </Steps>
 
 This keeps every styling decision auditable and upgrade-safe in one place. See the [catalogue pattern](/modules/style/design/#the-catalogue-pattern) for the full authoring guide.
@@ -257,7 +537,7 @@ This keeps every styling decision auditable and upgrade-safe in one place. See t
 </Tabs>
 
 <Aside type="tip" title="Which read do I want?">
-If you just need the theme the builder renders with, read `node.data.theme_config` — it's the mirror everyone agrees on and needs no service call. Reach for `serviceRegistry.get('style')` only when you need data that isn't on the active node: the app-wide theme, or the caller's saved theme list.
+If you just need the theme the builder renders with, read `node.data.theme_config` — it's the mirror everyone agrees on and needs no service call. For the app-wide theme, read `AppSettings.appTheme` (or the public `GET /api/v1/theme` from outside the app). Reach for `serviceRegistry.get(STYLE_SERVICE_KEY)` only when you need data that isn't on either: a user's saved themes, or a theme's history.
 </Aside>
 
 ---
@@ -270,4 +550,8 @@ If you just need the theme the builder renders with, read `node.data.theme_confi
 - [Colour Palette Integration](/colour-palette/integration/) — the palette contract Style will consume
 - [Structure module](/modules/structure/) — node tabs, fields, and the node service Style mirrors through
 - [Style System](/starter-template/style-system/) — the starter `styleRegistry` Style feeds
+- [Admin feature — App Theme](/starter-template/admin-feature/#app-theme-apptheme) — `AppSettings.appTheme` and the public `GET /api/v1/theme`
+- [Hooks](/starter-template/hooks/) — `addAction`, `addActionAsync` and `doActionAll`
+- [Modules feature](/starter-template/modules-feature/) — `moduleRegistry`, `depends`, `init` and `useModuleInstalled`
+- [Security feature](/starter-template/security-feature/#personal-data-export) — deletion and export handlers
 - [Data Fetching](/starter-template/data-fetching/) — the `['style', …]` query-key convention
