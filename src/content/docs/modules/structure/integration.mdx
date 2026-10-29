@@ -70,6 +70,7 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 | Register fields on node types | ✅ | — | `structureRegistry.register({ fields })` |
 | Register connection types | — | ✅ | `structureService` methods + admin tab (no registry) |
 | Register new node types | ✅ | ✅ | `nodeTypeRegistry` + `structureService` |
+| Supply a node type's stages (v1.40.0+) | — | ✅ | `structureService.stages` (backed by `stageSourceRegistry`) |
 | Write namespaced metadata | — | ✅ | `structureService.updateNodeMetadata()` |
 | Reference nodes (NodeSelector) | ✅ | — | Component import |
 | Customise UI labels per type | ✅ | — | `getLabel()` utility |
@@ -855,11 +856,11 @@ Every hook's `Context` below is a **named, exported interface** in Structure's `
 | `structure.nodeType.proposed` | `{ userId, proposal }` | A node type proposal is created (awaiting admin approval) |
 | `structure.nodeType.proposalApproved` | `{ userId, actorId, proposalId, nodeType, scope }` | A proposal is approved (fires alongside `structure.nodeType.created`). `userId` is the proposing user and `actorId` the reviewer — the same in-process, different when an admin reviews another user's proposal |
 | `structure.nodeType.proposalRejected` | `{ userId, actorId, proposalId, slug, config, meta }` | A proposal is rejected — the row is deleted; the full proposed config rides on the payload. `userId` / `actorId` as for approval |
-| `structure.nodeType.updated` | `{ userId, slug, changes }` | A node type is updated |
+| `structure.nodeType.updated` | `{ userId, slug, changes }` | A node type is updated, including by a stage source's `stages.registerTypeStages` or `stages.releaseTypeStages` (v1.40.0+), where `userId` is the acting id |
 | `structure.nodeType.deleted` | `{ userId, slug, purgedNodes? }` | A node type is deleted. Its entries already in Deleted are permanently removed with it, and `purgedNodes` counts them |
 | `structure.nodeType.sharingChanged` | `{ userId, slug, sharing }` | A type starts (`'enabled'`) or stops (`'disabled'`) being shared across all users — fired by create, update and both imports |
-| `structure.nodeType.imported` | `{ userId, stats, mode }` | Node types are imported (merge or replace) via the node-types-only endpoint |
-| `structure.config.imported` | `{ userId, result, mode }` | A full config bundle is imported atomically (`result` = per-category `{ created, updated, deleted }` for field templates, groups, node types, connection types, functions) |
+| `structure.nodeType.imported` | `{ userId, stats, mode, stagesKept? }` | Node types are imported (merge or replace) via the node-types-only endpoint. `stagesKept` (v1.40.0+) lists the types whose stage set the import kept because a live stage source supplies it |
+| `structure.config.imported` | `{ userId, result, mode, stagesKept? }` | A full config bundle is imported atomically (`result` = per-category `{ created, updated, deleted }` for field templates, groups, node types, connection types, functions). `stagesKept` (v1.40.0+) as on `structure.nodeType.imported`, and also on `result.stagesKept` |
 | `structure.nodeTypeGroup.created` | `{ userId, nodeTypeGroup }` | A node type group is created |
 | `structure.nodeTypeGroup.updated` | `{ userId, slug, changes }` | A node type group is updated |
 | `structure.nodeTypeGroup.deleted` | `{ userId, slug }` | A node type group is deleted |
@@ -1147,6 +1148,114 @@ const graph = await structure.expandGraph(userId, [note.id], { scopeRootId: sect
 - **Moves, merges and copies:** a record keeps its label through moves, merges, duplicates and the module's migrations.
 - **Moving the section root:** a root can't be moved under one of its own records. Moving it under any other parent needs the type's `allowCrossSpaceMove` rule. When it moves, its labelled rows and links follow it to the new root.
 
+### Stage Sources (v1.40.0+)
+
+A module can supply the stage sets of chosen node types, for example a module that keeps a library of stage templates and gives one to several types. It registers as a **stage source** and writes each type's set through Structure. Structure stores the set in the type's own `stageConfig` with the source recorded, keeps its own type editor and imports from changing it while the module runs, shows admins where the stages come from, and goes on enforcing it everywhere it already enforces stages. What an admin sees, the lock, and what happens when a source stops are on [Configuration](/modules/structure/configuration/#sourced-stage-sets-v1400).
+
+Structure does **no remapping**: it never translates, aliases or moves stored stages. When your new set drops or renames a stage, entries on the old slug keep it until your module moves them (with `updateNode`), and `getStageUsage` tells you how many there are.
+
+The methods are on `structureService.stages`, reached in-process as `serviceRegistry.get('structure').stages`. There are no HTTP routes. Don't import `stageSourceRegistry`; call `registerSource` instead, the way other modules reach Structure.
+
+| Method | What it does |
+|--------|--------------|
+| `registerSource({ moduleId, name, manageHref?, order? })` | Registers your module as a stage source in this process. Call it from your init. Your sourced sets are **live** while the registration stands. `manageHref` is the link the type editor shows: an app path such as `/stage-library`, or an http(s) URL. Anything else (`//host`, a backslash straight after the first slash, a tab or newline, another scheme) is ignored with a warning. A registration without a `moduleId` or `name` is logged and skipped, and so is a second registration of a `moduleId` that is already registered: call `unregisterSource` first. It never throws |
+| `unregisterSource(moduleId)` | Stops being a stage source in this process. Your sets stay as they are, but are no longer live |
+| `registerTypeStages(slug, actorId, set, opts)` | Writes `set` as the type's stage set. It records your module in `stageConfig.source`, with `opts.ref` and `opts.version` as your own id and version for the set, and turns `features.stages` on. Returns the type's `NodeTypeConfig` |
+| `releaseTypeStages(slug, actorId, opts)` | Removes `source` and keeps the stages, which become the type's own. A set with no source is left as it is, with no write and no hook. Your module doesn't have to be live to release |
+| `getStageUsage(slug, actorId, opts)` | Returns `StageUsage[]`, one `{ stage, live, binned }` per stored stage, `null` included: how many entries hold it, with binned (Deleted) entries counted apart and archived ones counted as live. Counts only, never content. Rows come in the set's own stage order, then any other stored stage A–Z, then `null` |
+
+`opts` is `{ moduleId, ownerId, caller, ref?, version?, expected? }` for `registerTypeStages`, `{ moduleId, ownerId, caller }` for `releaseTypeStages` and `{ ownerId, caller }` for `getStageUsage`. `caller` is a `StageCaller`, `{ isAdmin?, isSystem? }`.
+
+**Choosing the row: `ownerId` and the caller tier.** All three type methods choose the row by `ownerId`, never by "app-level first":
+
+| `ownerId` | Row | Who may call |
+|-----------|-----|--------------|
+| `null` | The app-level row of the slug | An admin (`caller.isAdmin`) or the system (`caller.isSystem`). Anyone else gets `403` |
+| A user id | That user's own row, matched exactly | That user (`actorId` equal to `ownerId`) or the system. Anyone else gets `403`. Refused with `409` while an app-level row of the slug exists, because it shadows the personal row: target it with `ownerId: null` instead |
+
+Leaving `ownerId` out is a `400`, and a row that doesn't exist is a `404`. The tier is there because `updateNodeType` resolves the app-level row first and has no role check of its own (its route's admin guard is its only gate). Without it, a call made with a person's id could rewrite a type every user has. `getStageUsage` counts every owner's entries for an app-level row and only the owner's own for a personal row. An app-level count reads the whole node table, so call it for an admin action and cache the answer, rather than per request.
+
+**What `registerTypeStages` refuses:**
+
+| Status | When |
+|--------|------|
+| `403` | The caller tier above |
+| `400` | `ownerId` is missing; `opts.moduleId` is not registered as a stage source in this process; `opts.ref` is not text or `opts.version` not a finite number; the set fails the shape checks: at least one stage, slugs unique and 1 to 100 characters, `defaultStage` one of the stages, every stage `group` listed in `groups`, move rules naming only stages in the set, and `ref`s unique where given |
+| `404` | No such row |
+| `409` | The personal row is shadowed by an app-level one; the set comes from a **different** stage source that is live ("The stages of '*Type*' come from *name*, another live stage source"); `opts.expected` doesn't match the stored source |
+
+`releaseTypeStages` has the same `400`, `403`, `404` and shadow `409`, and is also refused with `409` when the set comes from another module, live or not.
+
+**Compare-and-set with `expected`.** Pass the `ref` and `version` you last read, and the write only goes ahead if the stored source still has them:
+
+- Left out: no comparison.
+- `null`: the row must have no stored source.
+- `{ ref?, version? }`: the row must have a stored source with exactly that `ref` and `version`. A value you leave out matches only a stored value that is also absent. Which module wrote the stored source is not compared, so you can take over a set whose source is no longer running by the `ref` and `version` you read. A different **live** source is still refused, by the check before this one.
+
+A mismatch is a `409` asking you to read the set again and retry. Every write of a slug's stages runs under one lock, so of two concurrent writes with the same `expected`, one succeeds and the other gets the `409`.
+
+**Names.** While your source is live, `stageSource.name` on type responses, and the `409`s above and those the type editor gets, use the name you are registered with now. The name stored in `stageConfig.source` stays as written, and is the one shown once your source stops.
+
+**After a write**, as for every type write, Structure clears its type-config cache, fires `structure.nodeType.updated` with `{ userId: actorId, slug, changes }` (`changes` is `{ stageConfig, features }` for a register and `{ stageConfig }` for a release) and writes a `Node type updated` audit line. The audit line names the row it rewrote, `{ userId: actorId, ownerId, appLevel, slug, stageSource }` (`stageSourceReleased` for a release); the hook payload does not carry `ownerId`.
+
+**Responses.** `getNodeType`, `listNodeTypes` and their routes add `stageSource`, `{ moduleId, name, ref?, version?, live, manageHref? }`, before the `structure.nodeType.response` filter runs. The key is absent when the type has no source, and `stageConfig` still carries `source` as stored. Never send `stageSource` back: every write strips it.
+
+```typescript
+// backend/src/features/stage-library/stage-library.init.ts
+import { serviceRegistry } from '../../config/service.registry.js';
+
+export async function initStageLibrary(): Promise<void> {
+  const structure = serviceRegistry.get('structure');
+  structure.stages.registerSource({
+    moduleId: 'stage-library',
+    name: 'Stage Library',
+    manageHref: '/stage-library',
+  });
+}
+
+// Later, when an admin gives a template to the app-level "project" type
+export async function applyTemplate(adminId: string): Promise<void> {
+  const structure = serviceRegistry.get('structure');
+  const type = await structure.stages.registerTypeStages(
+    'project',
+    adminId,
+    {
+      stages: [
+        { slug: 'open', name: 'Open', ref: 'tpl-7:open' },
+        { slug: 'done', name: 'Done', ref: 'tpl-7:done' },
+      ],
+      defaultStage: 'open',
+      transitions: [{ from: 'open', to: ['done'] }],
+    },
+    {
+      moduleId: 'stage-library',
+      ownerId: null,                          // the app-level row
+      caller: { isAdmin: true },
+      ref: 'tpl-7',
+      version: 3,
+      expected: { ref: 'tpl-7', version: 2 }, // what we wrote last; null on the first write
+    },
+  );
+  // type.stageSource → { moduleId: 'stage-library', name: 'Stage Library', ref: 'tpl-7', version: 3, live: true, manageHref: '/stage-library' }
+
+  // Before moving entries off a stage the new set dropped
+  const usage = await structure.stages.getStageUsage('project', adminId, { ownerId: null, caller: { isAdmin: true } });
+}
+```
+
+A background job with no signed-in admin passes `caller: { isSystem: true }` and a label of your module's as `actorId`. The label is never written onto the row; it appears in the hook payload and the audit line.
+
+### Stage and Owner List Options (v1.40.0+)
+
+`listNodes(userId, query, options?)`, `GET /api/v1/structure/nodes` and the frontend `structureService.listNodes` take two more query keys. With both left out, a list behaves as before, apart from the data-filter fix described below the table.
+
+| Option | Values | Effect |
+|--------|--------|--------|
+| `withoutStage` | `'include'` or `'only'` | Entries with no stage (`stage` null). `'only'` lists just those, and is a `400` when combined with `stage`, `stages` or `stageGroup`. `'include'` adds them to whichever stage filter is set, and keeps a `search` condition beside it; on its own it changes nothing. Any other value is a `400` |
+| `ownerOnly` | `true` (over HTTP, `ownerOnly=true`) | Reads a [shared type](#shared-node-types-read-across-owners-write-owner-only-v13427) only for the caller's own entries, for user and system callers alike, and limits the `includeChildren` preview the same way. It changes nothing on any other type, and a shared type keeps its exemption from space confinement |
+
+Both are applied inside the scan behind `dataFilters` too, and so is the stage filter itself. Before v1.40.0 a stage filter ran after that scan's 5,000-row cap, so a list combining the two could miss entries. Results only differ where the cap was reached. Over HTTP, a list that leaves `ownerOnly` out reaches a `structure.node.listQuery` filter listener with `ownerOnly: false`.
+
 ### Node Type Proposals (v1.16.0+)
 
 Instead of creating node types directly, your module can propose them for admin approval. A pending proposal reserves its slug but stays disabled and invisible to every other node-type query until approved:
@@ -1196,7 +1305,7 @@ Node types can declare `superClasses` — parent type slugs forming an *is-a* DA
 
 If your module introduces its own node type (e.g., a "Task Board" type), seed it during backend initialisation — your module's init function, not per-user request hooks. Two rules make the seed correct:
 
-1. **Seed via `importNodeTypes`, not `createNodeType`.** `createNodeType(userId, config)` pins the new row to the `userId` you pass, making the type invisible to every other user. `importNodeTypes` is the only service path that creates **shared rows** (`userId: null`) that every user can see.
+1. **Seed via `importNodeTypes`, not `createNodeType`.** `createNodeType(userId, config)` pins the new row to the `userId` you pass, making the type invisible to every other user. `importNodeTypes` creates **shared rows** (`userId: null`) that every user can see, and stays the seed path to use. (Since v1.40.0 `createNodeType` can create one too, with `appLevel` — see [App-Level Node Types from createNodeType](#app-level-node-types-from-createnodetype-v1400) below.)
 2. **Guard with an existence check.** The guard is load-bearing: merge-mode import *updates* existing slugs, so an unguarded import would re-clobber admin customisations on every boot.
 
 The actor string passed to both calls is only a visibility filter and audit label — any value sees shared rows, and nothing from it is written onto the row. A module-scoped label like `'tasks-init'` keeps the audit trail readable.
@@ -1256,7 +1365,7 @@ export async function initTasks(): Promise<void> {
 ```
 
 <Aside type="caution" title="Don't seed shared types with createNodeType">
-`createNodeType(userId, config)` writes the `userId` straight onto the row with **no** user-existence check — module schemas carry no foreign key to the user table, so nothing rejects a made-up actor string. Passing a module label creates a row owned by nobody and visible to nobody. It's the right call for user-initiated type creation — never for module seeding.
+Without `appLevel`, `createNodeType(userId, config)` writes the `userId` straight onto the row with **no** user-existence check — module schemas carry no foreign key to the user table, so nothing rejects a made-up actor string. Passing a module label creates a row owned by nobody and visible to nobody. It's the right call for user-initiated type creation — never for module seeding.
 </Aside>
 
 <Aside type="note" title="Two senses of shared">
@@ -1272,6 +1381,24 @@ For a live example, the Cognitive Pipeline module seeds its shared `working-memo
 <Aside type="note" title="moduleId matters">
 Always set `moduleId` to your module's ID when creating node types. This lets the system know which module owns the type, and enables cleanup on module uninstall. Default node types seeded by Structure itself set `moduleId: 'structure'`.
 </Aside>
+
+### App-Level Node Types from createNodeType (v1.40.0+)
+
+`createNodeType(userId, data, options?)` takes `options` as `{ appLevel?, isAdmin?, isSystem? }`. With `appLevel: true` it writes an **app-level** type row (`userId: null`) that is not shared: every user gets the type, and each user's entries stay their own, as for any type that isn't shared. This is what an admin gets from the New type form's "Everyone, each with their own entries" choice. Before v1.40.0, a type built in the form belonged to the admin who built it unless it was shared, so nobody else could use it; only an import, or a proposal approved for the whole app, made an app-level type that wasn't shared.
+
+- **`appLevel` alone is not enough.** It needs `isAdmin: true` or `isSystem: true` in the same options, or the call is a `403`. The service has no role lookup of its own, so it does not trust the flag by itself: otherwise any call made with a person's id could create a type every user sees. `POST /types` takes `appLevel` in its body and passes `isAdmin` from the session role.
+- **The slug must be free.** The create is refused with `400` when another user already owns a type with that slug, because the app-level row would shadow theirs. The check runs inside the create's own transaction.
+- **A shared type is app-level already.** With `primaryScope.global` on, `appLevel` adds nothing, and the form hides the choice.
+- **On the frontend,** `structureService.createNodeType(data, { appLevel: true })` and `useNodeTypeMutations().createNodeType(data, options?)` take it as a separate `CreateNodeTypeOptions` argument, never inside `NodeTypeConfig`. It is sent only when it is `true`.
+
+Without `appLevel`, `createNodeType` behaves as before.
+
+```typescript
+const structure = serviceRegistry.get('structure');
+
+// An app-level type every user can use, each with their own entries
+await structure.createNodeType('my-module-init', config, { appLevel: true, isSystem: true });
+```
 
 ### Namespaced Metadata Writes
 
