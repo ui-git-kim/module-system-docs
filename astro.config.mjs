@@ -188,6 +188,10 @@ export default defineConfig({
                   label: "Data Table",
                   slug: "starter-template/data-table",
                 },
+                {
+                  label: "Import & Export",
+                  slug: "starter-template/config-transfer",
+                },
               ],
             },
             {

@@ -1,0 +1,318 @@
+---
+title: Import & Export (ConfigTransfer)
+description: The one admin import/export every module uses for its configuration — a JSON file with a module and version check, a practice run before anything changes, Add new only / Merge / Replace, items you can leave out, an all-or-nothing write, and a report. Backend helper plus a shadcn-composed dialog.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+**ConfigTransfer** is the standard way for an admin to export a module's configuration to a JSON file and import one back — into the same app or another. A module describes its configuration as **sections**; the template does the rest: the file format, the module and version checks, a practice run that shows exactly what will change, the all-or-nothing write, the report and the audit record. Modules configure it the way they configure the [Data Table](/starter-template/data-table/); they don't build their own.
+
+It has two halves:
+
+- **Backend** — `features/config-transfer`: `createConfigTransferRouter(definition)` gives a module an admin-only `GET /`, `GET /export` and `POST /import`.
+- **Frontend** — `@/components/config-transfer`: `<ConfigTransfer>` renders **Export** and **Import** buttons; Import opens the step-by-step dialog.
+
+Added in **v2.16.0**. The template's own settings are the first user: **Admin → App Settings → Backup and restore** (see [App configuration](#the-templates-own-app-configuration)).
+
+<Aside type="note" title="Why one shared component">
+Before v2.16.0 each module had its own import: structure had a practice run and an all-or-nothing write but showed counts only; ai-core had the best file format and report but no practice run, and a failure halfway left half the file applied; colour applied at once and reviewed afterwards. ConfigTransfer takes the best of each — and checks the file **before** anything changes.
+</Aside>
+
+## How an import works
+
+```
+ Choose file ──► Check ──┬─► Review ──► Import ──► Done
+ (drop, browse    (browser,│   (plan from a       (one         (what changed,
+  or paste)       then a   │    practice run;      transaction)  per part)
+                  dry run) │    nothing changed)       │
+                           │                           └─ failed: "Nothing was changed",
+                           └─ problems: listed here;      the reason, Try again or
+                              choose another file          change how to apply
+```
+
+<Steps>
+
+1. **Choose.** Drop a `.json` file on the drop zone, choose one, or paste JSON on the **Paste JSON** tab.
+
+2. **Check.** The browser checks the file first and explains what's wrong:
+   - empty, not UTF-8 text, or too big (10 MB by default — the API's body limit);
+   - not valid JSON, **with the line and column** ("This isn't valid JSON (line 4, column 32): Expected double-quoted property name.");
+   - not a JSON object, or another module's file ("This file holds "ai-core" configuration, not App configuration.").
+
+   Then the server's **dry run** checks the rest — the format, the version, each part's shape, every item against the module's schema — and lists every problem at once. A file with problems stays on this step. When a write would fail (an item clashes with an existing one, say), **Leave it out and check again** drops that item and plans again.
+
+3. **Review.** Nothing has changed yet. The dialog shows:
+   - **How to apply the file** — [Add new only, Merge or Replace](#the-three-ways-to-apply-a-file) (Merge is the default), only the ways the module allows (the dialog reads them from `GET {mount}/`). Changing it re-runs the plan. With only one way allowed, the dialog says what it does instead of offering a choice.
+   - A sentence ("This import will add 2, update 3 and remove 1. 12 are already up to date.") and **count tiles**: New, Updates, No change, and Removals, Skipped, Problems and Needs review when there are any.
+   - **Every item in a Data Table**, what changes first and "No change" last, with search and **Change**, **Part** and **Needs review** filters. Each row says what will happen and why: "Changes label, colour", "Kept: built-in", "label: Required.", or a module's review note.
+   - **Leave out** (a row action, or a bulk action on ticked rows) drops an item from this import: it is neither written nor removed. **Put back** undoes it. Both re-run the plan.
+   - A warning when items have problems (they won't be imported; the rest still can), and the server's notes about the file.
+   - When Replace would remove anything: a warning, a **Download a backup** button, and the Import button becomes **Import and remove N**, which asks for confirmation.
+
+4. **Import.** One database transaction applies **the plan on screen** — the file, strategy and left-out items it was made from, never a choice made since. While a new plan is on its way (or failed), Import waits. Either everything in the plan happens, or — if any write fails — nothing does, and the dialog says so with the reason ("Couldn't add "Urgent" to markers: it clashes with an existing item…"). **Try again** retries, **Leave it out and check again** drops the failing item, and the strategy is still there to change.
+
+5. **Done.** What changed, as tiles and per part. **Import another file** starts again.
+
+</Steps>
+
+## The three ways to apply a file
+
+| | New items (not here yet) | Changed items | Unchanged items | Items here but **not in the file** |
+|---|---|---|---|---|
+| **Add new only** | added | left as they are (Skipped) | — | kept |
+| **Merge** (default) | added | updated | — | kept |
+| **Replace** | added | updated | — | **removed**, except built-in or in-use items the module protects |
+
+- **Only the parts the file contains are touched.** A file with only `markers` never changes anything else, even under Replace. An empty list (`"markers": []`) is a part the file contains — under Replace it removes every removable marker.
+- **Fields the file leaves out are left as they are.** An item is compared — and updated — only on the fields the file sets. Key order doesn't matter, and `null` and a missing value count as the same.
+- **A single-object part** (settings) is updated field by field under Merge and Replace; there is nothing to remove.
+- **Replace never removes** an item the module protects (`protect`) or an item the reviewer left out, and it **removes nothing at all from a part whose items in the file have problems** (an invalid item, or a key listed twice). A broken item's key can't be trusted — it may be missing, or not yet in the schema's normal form — so what the file "leaves out" isn't known. A note says so; fix the file to remove them.
+- **A module can allow fewer ways** with the definition's `strategies` (the API refuses the others, and the dialog doesn't offer them). A configuration made only of single-object parts should allow just Merge.
+
+## Using it in a module
+
+### Backend: describe the sections, mount the router
+
+```ts
+// backend/src/features/my-module/config.transfer.ts
+import { z } from 'zod';
+import {
+  createConfigTransferRouter,
+  type ConfigListSection,
+  type ConfigTransferDefinition,
+} from '../config-transfer/index.js';
+
+// The PORTABLE form: natural keys, no database ids, no secrets.
+const MarkerSchema = z.object({
+  slug: z.string().min(1).max(100),
+  label: z.string().min(1).max(200),
+  colour: z.string().nullable().optional(),
+});
+type Marker = z.infer<typeof MarkerSchema>;
+
+const markers: ConfigListSection<Marker> = {
+  name: 'markers',            // the file's key — never rename
+  label: 'Markers',
+  schema: MarkerSchema,       // the same schema your admin create route uses
+  key: (m) => m.slug,         // portable key, unique in the section
+  title: (m) => m.label,
+  async load({ tx }) {
+    const rows = await tx.myMarker.findMany({ orderBy: { slug: 'asc' } });
+    return rows.map(({ slug, label, colour }) => ({ slug, label, colour })); // = the schema's shape
+  },
+  async create(m, { tx }) {
+    return (await tx.myMarker.create({ data: m })).id; // optional: the local id, for idOf()
+  },
+  async update(m, _existing, { tx }) {
+    await tx.myMarker.update({ where: { slug: m.slug }, data: m });
+  },
+  async remove(m, { tx }) {
+    await tx.myMarker.delete({ where: { slug: m.slug } });
+  },
+  protect: (m) => (m.slug.startsWith('system-') ? 'built-in' : null),
+};
+
+export const myConfig: ConfigTransferDefinition = {
+  moduleId: 'my-module',
+  title: 'My Module configuration',
+  version: '1',
+  sections: [markers /* referenced parts first */],
+  async afterImport(result, { actorId }) {
+    // clear caches, fire your own change hooks — runs only after a real import commits
+  },
+};
+
+export const myConfigRoutes = createConfigTransferRouter(myConfig);
+```
+
+```ts
+// backend/src/features/my-module/route.registration.ts
+routeRegistry.register({
+  path: '/my-module/admin/config',
+  router: myConfigRoutes,
+  feature: 'my-module',
+  requiresAuth: true,            // requireAdmin runs inside the router
+  // bodyLimit: '20mb',          // only if a file can exceed the 10 MB authenticated default
+});
+```
+
+### Frontend: one component
+
+```tsx
+import { ConfigTransfer } from '@/components/config-transfer';
+
+<ConfigTransfer
+  endpoint="/my-module/admin/config"   // where you mounted the router (API-base relative)
+  moduleId="my-module"                  // the definition's moduleId
+  title="My Module configuration"
+  invalidate={[['my-module']]}          // query keys to refetch after an import
+/>
+```
+
+Put it where the module's admin settings live — a settings `Row` action, a card, or a page header. It renders two outline buttons; the dialog (and the Data Table inside it) loads only when Import is first pressed.
+
+## Sections
+
+A **list section** holds items with a portable key; a **single section** (`kind: 'single'`) holds one object, such as settings.
+
+| Member | List | Single | What it does |
+|--------|:----:|:------:|--------------|
+| `name` | ✓ | ✓ | The part's key in the file (`markers`). Files depend on it: never rename one. It can't be an envelope key (`version`, `sections`, …). |
+| `label` | ✓ | ✓ | Plural display name ("Markers"). |
+| `schema` | ✓ | ✓ | zod schema for one item. Its **output** is what `create` / `update` / `save` receive and what the comparison uses — so `load` must return the same shape. Reuse your admin route's schema. |
+| `key(item)` | ✓ | | The portable key (slug, name — never the database id). Unique within the section. |
+| `title(item)` | ✓ | | What to call the item in the review. Default: the key. |
+| `load(ctx)` | ✓ | ✓ | Every current item (list) or the object or `null` (single), in the portable form. Used by export and import. |
+| `create(item, ctx)` | ✓ | | Add an item. May return its local id. |
+| `update(item, existing, ctx)` | ✓ | | Update an item that differs. May return its local id. |
+| `remove(existing, ctx)` | ✓ | | Remove an item missing from the file (Replace). Without it, Replace keeps them and says so in the notes. |
+| `protect(existing, ctx)` | ✓ | | A reason an item must not be removed ("built-in", "still used by 3 flows") — it is kept and shown as "Kept: …". |
+| `save(item, existing, ctx)` | | ✓ | Write the file's fields; merge them over `existing` yourself. |
+| `review(item, existing, ctx)` | ✓ | ✓ | A note for the reviewer ("Looks like "Urgent" — same name, different key"). The item is still applied; the review shows it with a warning icon and the **Needs review** filter. |
+| `maxItems` | ✓ | | Most items one file may hold for the part. Default 1000. |
+
+The **context** every write gets:
+
+| Field | |
+|-------|---|
+| `tx` | The import's transaction client. **Read and write only through `tx`** — a dry run is rolled back, and a write through the global `prisma` would not be. |
+| `actorId` | The acting admin. |
+| `strategy`, `dryRun` | What this run is. Don't branch writes on `dryRun`: the point of the practice run is that it does exactly what the import will. |
+| `idOf(section, key)` | The local id a `create` / `update` earlier in this import returned — for rewriting references between parts (a flow pointing at a marker). Items the import didn't write aren't here: look those up through `tx`. |
+
+The definition's other members: `accepts` (versions this build reads; default `[version]`), `upgrade(sections, fromVersion)` (bring an older file to the current shape; a throw refuses the file with its message), `strategies` (the ways an import may apply a file; default all three), `afterImport(result, { actorId })` (after a real import commits — clear caches, fire your own hooks; a failure is logged and the import stands) and `transaction` (`{ maxWaitMs, timeoutMs }`; default 10 s and 30 s).
+
+<Aside type="caution" title="Side effects belong in afterImport">
+Everything in `create` / `update` / `remove` / `save` runs during the practice run too, then rolls back. Sending an email, calling another service or firing a hook there would happen on every preview. Do database writes through `tx` in the section; do everything else in `afterImport`.
+</Aside>
+
+A section callback that throws — `load`, `key`, `title`, `review`, `protect` or a write — stops the import (or the practice run) with a 422 that names the item. Throw an `AppError` (for example `BadRequestError`) with a message the admin can act on; anything else is shown as "an unexpected error" and logged.
+
+## The file
+
+```json
+{
+  "format": "config-transfer",
+  "formatVersion": 1,
+  "moduleId": "my-module",
+  "version": "1",
+  "exportedAt": "2026-10-30T04:12:00.000Z",
+  "counts": { "markers": 2 },
+  "sections": {
+    "markers": [
+      { "slug": "urgent", "label": "Urgent", "colour": "red-500" },
+      { "slug": "later", "label": "Later", "colour": null }
+    ]
+  }
+}
+```
+
+- An export is named `<moduleId>-config-YYYY-MM-DD.json`. Exports carry only what each section's `load` returns — never secrets.
+- On import, `moduleId`, `version` and `format` are **checked when present**: another module's file, a version this build doesn't read, or a file from a newer format is refused with every problem listed. A hand-written file may leave them out; one with no `version` is read as the current version, with a note.
+- **Older files.** The sections may sit at the top level instead of under `sections` — the shape ai-core and structure exported before ConfigTransfer — so existing backups still import once a module switches over.
+- A part the module doesn't know is ignored, with a note; so is a `counts` entry that doesn't match the list ("It may have been edited").
+
+## API
+
+| Endpoint | Answer |
+|----------|--------|
+| `GET {mount}/` | `{ moduleId, title, version, accepts, strategies, sections: [{ name, label, kind, removable }], stepUp }` |
+| `GET {mount}/export` | The file, with `Content-Disposition: attachment` and `Cache-Control: no-store` |
+| `POST {mount}/import` | Body `{ file, strategy: 'add' \| 'merge' \| 'replace', dryRun, exclude: [{ section, key }] }`. **`dryRun` defaults to `true`**, so a bare POST never writes. Answers the plan (dry run) or the report: `{ moduleId, title, version, fileVersion, strategy, dryRun, sections: [per-part counts], items: [{ section, key, title, change, fields?, note?, review?, excluded? }], notes }` |
+
+`change` is one of `create`, `update`, `unchanged`, `delete`, `skip` or `invalid`. Refusals are answered directly (they're answers to the admin's input, not server errors):
+
+- **400** `{ error, code: 'config_file_invalid', problems: [...] }` — the file can't be read; every problem is listed.
+- **422** `{ error, code: 'config_import_failed', section, key }` — a write failed, so nothing changed. The reason is the module's own message for an operational `AppError`, a plain explanation for a unique or missing-reference clash, and otherwise "an unexpected error (the details are in the server log)" — never database internals.
+
+All three routes are **admin-only** (`requireAdmin`). A device token never passes.
+
+## Step-up (plumbed, off)
+
+The router can ask for the emailed [step-up code](/starter-template/security-feature/#step-up-re-verification-sensitive-actions) before a **real** import — never before a dry run or an export, so the review always works:
+
+```ts
+createConfigTransferRouter(myConfig, { stepUp: true });
+```
+
+It is **off by default** while email delivery isn't set up in every app; the template's own app configuration leaves it off. When it's on, the frontend's API client already handles the challenge (it asks for the code and retries), so the dialog needs nothing more.
+
+## Audit
+
+Every export and every real import is recorded in the [audit trail](/starter-template/system/) through two core hooks (counts only, never the configuration):
+
+| Hook | Context |
+|------|---------|
+| `config.exported` | `{ moduleId, actorId, version, items }` |
+| `config.imported` | `{ moduleId, actorId, version, fileVersion, strategy, created, updated, deleted, unchanged, skipped, invalid, sections }` |
+
+A dry run records nothing.
+
+## Frontend reference
+
+`<ConfigTransfer>` props:
+
+| Prop | Type | Default | |
+|------|------|---------|---|
+| `endpoint` | `string` | — | Where the module mounted its router, relative to the API base. |
+| `moduleId` | `string` | — | Names the export file; a file for another module is refused before upload. |
+| `title` | `string` | — | The dialog is titled `Import {title}`. |
+| `strategies` | `ConfigImportStrategy[]` | all three | The ways offered. |
+| `defaultStrategy` | `ConfigImportStrategy` | `'merge'` | |
+| `invalidate` | `QueryKey[]` | — | Refetched (prefix match) after a real import. |
+| `onImported` | `(result) => void` | — | After a real import succeeds. |
+| `maxFileSize` | `number` | 10 MB | Bytes. Raise it only together with the route's `bodyLimit`. |
+| `disabled` | `boolean` | `false` | |
+| `className` | `string` | — | Layout classes for the button row. |
+
+Also exported: `ConfigImportDialog` (the dialog alone, controlled with `open` / `onOpenChange`, for your own trigger), `useConfigExport(endpoint, moduleId)`, `useConfigImport(endpoint)`, `parseConfigText`, `configFileName`, `downloadJson`, `STRATEGY_COPY`, `DEFAULT_MAX_CONFIG_FILE_SIZE`, and the wire types.
+
+### Theming hooks
+
+The dialog composes shadcn primitives — Dialog, Tabs, Empty (the drop zone), Item (the picked file), Textarea, RadioGroup with Field choice cards, Alert, AlertDialog, Spinner and the [Data Table](/starter-template/data-table/) — and is structure-only. Style modules can target:
+
+| Hook | On |
+|------|----|
+| `data-slot="config-transfer"` | The button row |
+| `data-config-transfer-part="dialog"` | The dialog content (its own `data-slot="dialog-content"` is kept) |
+| `data-config-transfer-part="steps"`, `"step-marker"` | The step indicator; each `<li>` has `data-state="complete \| current \| upcoming"` |
+| `data-config-transfer-part="drop-zone"` (+ `data-dragging`), `"file"` | The drop zone while empty / dragged over, and the picked file |
+| `data-config-transfer-part="strategy"` | The strategy cards (each Field has `data-strategy`) |
+| `data-config-transfer-part="counts"`, `"count"` (+ `data-change`) | The count tiles. Each number carries `data-slot="admin-stat-value"`, so it matches the admin dashboards' figures |
+| `data-config-transfer-part="review"`, `"problems"`, `"notes"`, `"replace-warning"`, `"invalid-warning"`, `"done"` | The review note in a row, and the alerts |
+
+## Rules for modules
+
+1. **Every admin config import/export is a ConfigTransfer.** Don't build another file input, paste box or merge dialog.
+2. **Portable keys, not ids.** `key` is a slug or name that means the same in another app. Rewrite references between parts with `idOf` or a lookup through `tx`.
+3. **`load` returns exactly the schema's shape.** Otherwise every item reads as changed.
+4. **Write only through `tx`; side effects go in `afterImport`.**
+5. **Protect what mustn't go.** Seeded, built-in and still-referenced items get a `protect` reason, so Replace keeps them and says why.
+6. **Never export secrets.** API keys, tokens and personal data (allowlists, emails) stay out of `load`.
+7. **Order sections roots first.** Imports run in order; Replace's removals run in reverse.
+
+### Moving an existing import/export
+
+| Module today | Maps to |
+|--------------|---------|
+| Top-level arrays (`markers`, `flows`, …) next to `version` / `moduleId` | Sections — older files keep importing as they are |
+| `mode: 'merge' \| 'replace'` | `strategy` (plus the new `add`) |
+| A per-record zod check that skips bad records | `schema` — bad items become `invalid` rows with the reason |
+| "Seeded" / "system" records never deleted, "still referenced" guards | `protect` |
+| Rewriting ids between categories (template ids, model bindings) | `create` / `update` return the id; `idOf` reads it |
+| A `dryRun` flag that rolls a transaction back | Built in — every import is planned first |
+| Cache invalidation and a `*.imported` hook after commit | `afterImport` (and `config.imported` is recorded for you) |
+
+## The template's own app configuration
+
+**Admin → App Settings → Backup and restore** exports and imports the app's own settings (`moduleId: 'app'`, mounted at `/api/v1/admin/config`) as five single parts:
+
+| Part | Holds |
+|------|-------|
+| `settings` — Branding and display | App name, logo (the stored image itself, so it travels between apps), brand display mode, dashboard-in-nav, navigation layout, marketing-pages flag, app theme |
+| `navigation` | Hidden items, order overrides, section labels and visibility |
+| `toolbar` | Hidden header toolbar items |
+| `styleOverrides` — Style switches | Style Registry entries switched on or off (a switch the file doesn't mention keeps its setting) |
+| `dashboard` — Dashboard widgets | Hidden dashboard widgets |
+
+Each part is checked with the same schema as its admin route. Every part is a single object, so the import is **Merge only** (`strategies: ['merge']`): Replace would have nothing to remove, and Add new only would skip the settings that always exist. A logo in the served form (`/api/v1/branding/logo?v=…`) means "leave the logo as it is". **Not included:** the sign-up rule (its allowlist is other people's email addresses) and the email provider settings (they hold a secret). After an import, the settings cache is cleared and the usual `admin.settingsUpdated` / `admin.navigationUpdated` / … hooks fire for each part that changed, so modules reacting to settings changes still do. The import applies from its dialog, separately from the page's **Save Changes**.
