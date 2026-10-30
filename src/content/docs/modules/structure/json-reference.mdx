@@ -16,8 +16,8 @@ Structure's admin page supports full JSON import and export of node type configu
 The **Import Config** and **Export Config** buttons sit at the right of the admin page's top tab row (App Structure). Both are admin-only. Since v1.33.34 they go through a matched pair of `requireAdmin` endpoints — `GET /api/v1/structure/config/export` and the atomic `POST /api/v1/structure/config/import`. Since v1.38.0 a real import also needs a recent identity confirmation (step-up) at the starter's hardened and strict security tiers: if your session has not confirmed recently, the app asks you to confirm it's you and then retries. A **Preview** writes nothing and skips that step. Exports are audit-logged with their counts, and real imports with their per-category results.
 
 - **Export** downloads a single JSON file, `structure-config-YYYY-MM-DD.json`, containing the node types, groups, connection types, and functions visible to you (the app-level ones and your own, disabled ones included), plus the field templates you own (field templates stay owned by the admin who created them)
-- **Configuration only:** a bundle never carries entries, connections, user settings, API keys, component templates, or reference counters
-- **Import** accepts any combination — only the categories present in the JSON are processed; a category you omit is left untouched. A category present as an empty array still counts as present, so in Replace mode it prunes that category. For node types and connection types, an update writes only the keys the row carries (v1.38.0+); field templates, groups, and functions are written whole — see [Merge Mode](#merge-mode)
+- **Configuration only:** a bundle never carries entries, connections, user settings, API keys, component templates, or reference counters. A node type that links a component template carries a copy of that template's settings in `templateSnapshot`, used only where the template is missing (see [Component templates](#component-templates))
+- **Import** accepts any combination — only the categories present in the JSON are processed; a category you omit is left untouched. A category present as an empty array still counts as present, so in Replace mode it prunes that category. In every category an update writes only the keys the row carries (node types and connection types since v1.38.0; field templates, groups, and functions since v1.40.1) — see [Merge Mode](#merge-mode)
 - **Atomic:** the whole bundle is applied in one server-side transaction. If any row is invalid the entire import is rejected and **nothing is written** — you get the rejection reason, not a half-applied import
 - **Import order:** field templates → groups → node types → connection types → functions (so later categories can reference earlier ones)
 - **Two import modes:** Merge (add new, update existing) and Replace (additionally prune stale rows — see below)
@@ -238,7 +238,7 @@ Each node type property explained:
 Two round-trip details for node types:
 
 - **`fields` holds the type's own fields only.** An entry carrying `inheritedFrom` or `fieldTemplateId`, which marks an inherited or attached-template field copied from a resolved read, is dropped on import.
-- **Component templates are not in the bundle.** The four component-template links carry the source environment's ids, so on another install they point at nothing. The type still keeps its look, because the export writes `templateOverrides` with each assigned template's settings already merged in. After an import, though, those settings are the type's own overrides, so later edits to the component template no longer show through for them.
+- **Component templates are not in the bundle.** The export writes the type's own `templateOverrides` and the four links, plus a `templateSnapshot` of each linked template's settings, which an import uses only where the linked template is missing. See [Component templates](#component-templates) below.
 
 **superClasses** — a type can declare multiple parents (the type graph is a DAG):
 
@@ -411,6 +411,35 @@ issues `INC-0031`.
 
 Promoting a config to another environment therefore carries the *format*, not the *position*: the target keeps its own numbering and continues from whatever it has already issued. Two environments importing the same bundle both mint `MAT-2026-…` numbers, and both start from their own next number — so a reference identifies an entry within one environment, not across them.
 </Aside>
+
+### Component templates
+
+A node type links up to four component templates, one per slot: `cardTemplateId` (slot `card`), `listItemTemplateId` (`listItem`), `detailHeaderTemplateId` (`detailHeader`), and `overviewTemplateId` (`overview`). When the type is read, each linked template's settings are merged under the type's own `templateOverrides` for that slot, and the type's own keys win. The component templates themselves are not in the bundle. (v1.40.1+)
+
+**Export** writes:
+
+- `templateOverrides` — the type's **own** stored overrides only, without the templates' settings merged in
+- the four template links, unchanged
+- `templateSnapshot` — the settings of each linked template that exists, keyed by slot. The key is left out when the type links none.
+
+```json
+{
+  "slug": "contact",
+  "name": "Contact",
+  "namePlural": "Contacts",
+  "cardTemplateId": "cm9x1k2p40000abcd",
+  "templateOverrides": { "card": { "showIcon": true } },
+  "templateSnapshot": { "card": { "showDescription": false, "showIcon": false, "showFields": ["phone"] } }
+}
+```
+
+**Import** decides each slot on its own:
+
+- **The linked template is there.** It must exist and be one of your own component templates. Only the row's `templateOverrides` is stored, so the link stays live and later edits to the template keep showing through. Re-importing your own export into the same app stores what is already there and counts as `unchanged`.
+- **The linked template is missing.** Typically the file came from another environment, or the template belongs to another admin. The slot's snapshot is merged under the row's own overrides for that slot and stored, with the same precedence a read uses, so the type keeps its look. The link is still stored as written. If the row leaves out `templateOverrides`, the snapshot is merged under the stored value.
+- A slot with no link, or no snapshot entry, is stored exactly as the row says.
+
+`templateSnapshot` itself is never stored, and it never appears on a read. A file with no `templateSnapshot` imports exactly as before, and so does one where it is `null`. That includes exports from versions before v1.40.1, whose `templateOverrides` already had the templates' settings merged in: those settings are stored as the type's own overrides, as they always were.
 
 ---
 
@@ -727,14 +756,19 @@ This is the safe default for incremental updates.
 
 A row is matched against the app-level rows and your own; field templates match your own only. New rows are owned the same way as rows made in the admin page: a new node type is app-level, while a new field template, group, connection type, or function belongs to you, the importing admin.
 
-Since v1.38.0 a **node-type or connection-type** update writes **only the keys the row carries**: a key you omit keeps its stored value. A partial row such as `{ "slug": "matter", "name": "Matter", "namePlural": "Matters" }` changes the names and keeps the other stored settings (except the nullable keys listed below), and an older export that lacks a newer key (`moduleId`, or a connection type's `contextHints` and `aiFields`) no longer resets it. (Before v1.38.0 updates were whole-row, and an omitted key was written as its empty value.)
+An update in **every category** writes **only the keys the row carries**: a key you omit keeps its stored value. That has applied to node types and connection types since v1.38.0, and to field templates, groups, and functions since v1.40.1. A partial node-type row such as `{ "slug": "matter", "name": "Matter", "namePlural": "Matters" }` changes the names and keeps the other stored settings (except the nullable keys listed below), and an older export that lacks a newer key (`moduleId`, or a connection type's `contextHints` and `aiFields`) no longer resets it. (Before v1.38.0 updates were whole-row, and an omitted key was written as its empty value.)
 
 The exception is a few nullable keys that an export leaves out when they are empty. They are cleared when absent, so that a value cleared in the source environment still travels:
 
 - **Node types:** `description`, `icon`, `color`, `contextHints`, `cardTemplateId`, `listItemTemplateId`, `detailHeaderTemplateId`, `overviewTemplateId`, and `groupSlug`
 - **Connection types:** `description`, `icon`, `color`, `relationClass`, `superProperty`, and `maxConnections`
+- **Field templates:** `description`
+- **Groups:** `icon` and `color`
+- **Functions:** `description` and `category`
 
-**Field templates, groups, and functions are still written whole.** An update sets every column, so a key the row omits goes back to its empty value or default: `description` to empty and `sortOrder` to `0` on a field template, which also loses its `fields` if the row has none; `icon` and `color` to empty and `sortOrder` to `0` on a group; `params` to `[]` and `description` and `category` to empty on a function. Include every key you want to keep.
+Every other key a row leaves out keeps its stored value: a field template's `fields` and `sortOrder`, a group's `sortOrder`, and a function's `params`. A partial row such as `{ "slug": "contact", "name": "Contact info" }` renames the field template and keeps its fields, but clears its description, so include `description` to keep it. These rows refuse `null` (see [Complete Export Format](#complete-export-format)), so leaving the key out is the only way a cleared value travels. (Before v1.40.1, field-template, group and function updates were whole-row, and every omitted key went back to its empty value or default.) A new row still gets the defaults for the keys it leaves out: an empty `description`, `fields` of `[]`, and `sortOrder` of `0` on a field template; an empty `icon` and `color` and `sortOrder` of `0` on a group; `params` of `[]` and an empty `description` and `category` on a function.
+
+As before, `unchanged` compares only the keys the row carries, so a partial row that matches what is stored counts as `unchanged`.
 
 A key you do include is written whole. That matters for [`primaryScope`](#primaryscope): a `primaryScope` without `global`, imported over a type that is currently shared, is an **un-share**, and is refused while other users still hold live entries of that type. Conversely, importing a shared config over an existing **per-user** row promotes that row to app-level (`userId: null`) in the same write, so the flag takes effect rather than sitting inert. For [`referenceConfig`](#referenceconfig), include the key with `enabled` off to stop issuing reference numbers; omitting it leaves the type's numbering as it is (already-issued references are kept either way — they are immutable).
 
