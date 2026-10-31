@@ -577,6 +577,8 @@ Picks one or more nodes from the system. Uses the `NodeSelector` component with 
 |----------|------|---------|-------------|
 | `allowedTypes` | `string[]` | — | Restrict to specific node type slugs. Omit to allow any type |
 | `multiple` | `boolean` | `false` | Allow selecting multiple nodes |
+| `allowGlobalTypes` | `string[]` | every shared type | v1.42.0+. From inside an [isolation section](#inside-an-isolation-section-v1420), which shared types the field may point at. `[]` = none, `['*']` = every one. No effect on an entry in no section |
+| `filter` | condition | — | v1.42.0+. A condition on the **target** entry, in the [`visibleWhen`](#visibility--behaviour) grammar. The picker lists only matching entries, and the server refuses a write that names one that doesn't match. See [Only some entries](#only-some-entries-filter-v1420) |
 
 <Tabs>
   <TabItem label="Single reference">
@@ -613,7 +615,44 @@ Stores an array of node ID strings: `["clu1abc...", "clu2def..."]`.
 
 Renders as a `<NodeSelector>` component — a searchable dropdown that fetches nodes from the API. When `multiple` is true, each selected node appears as its own selector row, and clearing a row removes it. An "Add" button appends an empty slot. In the read-only detail view the field shows each referenced entry's **name**, linked to that entry's detail page, with a multi reference's entries separated by commas (empty slots and repeats left out). The names are read through the same node cache the selector uses: an entry already loaded costs no request, and the rest are fetched in parallel, one request each. While an entry loads, or when it cannot be read (deleted, or not yours to read), its id shows in its place. An entry whose type the node-type registry does not know shows its name without a link.
 
-**Value rules (v1.38.0).** The value must be a node id — letters, digits, `-` and `_`, at most 100 characters — or a list of them; an empty string marks an unset slot. Anything else in a request write is refused with **400** (`must be a node id`). When `allowedTypes` is set, a request write — create, update, duplicate, a connection's fields, or the public API — is also checked against it: each id the write **adds** must be an existing entry (the caller's own, or one of a shared type) whose type is one of `allowedTypes` or a subtype of one, otherwise the write is refused with 400 naming the field. Ids already stored in the field are not looked up again, and one write may add at most 5,000 distinct targets. A field with no `allowedTypes` is not type-checked. Both rules also apply to a `node-reference` sub-field inside field-group rows. A module writing in-process is not refused. A value that is not a node id is dropped from the write with a server warning (from a list, only the entries that are not ids are dropped), and `allowedTypes` is not checked. Unlike `secret`, a `node-reference` field's `required` flag is enforced by the server too.
+#### Only some entries: `filter` (v1.42.0)
+
+`nodeReferenceConfig.filter` is a condition on the entry being pointed at, written like a [`visibleWhen`](#visibility--behaviour) condition. A Matter whose people and children are one `person` type can offer only the children in one field and only the adults in another:
+
+```json
+{
+  "id": "focus_children",
+  "type": "node-reference",
+  "label": "Focus children",
+  "nodeReferenceConfig": {
+    "allowedTypes": ["person"],
+    "multiple": true,
+    "filter": { "field": "person_type", "equals": "child" }
+  }
+}
+```
+
+`other_parents` would use `{ "field": "person_type", "notEquals": "child" }`. The multi-rule form (`logic` with `rules`) works too.
+
+- **What it reads.** The target's data fields, and its built-ins `name`, `description`, `slug`, `stage` and `status` (`active` or `archived`). If the type has its own data field called `stage` or `status`, that field wins. A secret value is never read.
+- **The picker** pushes what it can to the server as data filters, then re-checks every entry it fetched.
+- **The server** refuses a write when any id in the field, stored or new, names an entry that doesn't match: a `400` saying the entry does not match the filter on this field. It binds request writes and in-process module writes; system callers (`isSystem: true`) are exempt.
+- **One evaluator.** The picker and the server run the same generated condition code, so they can't disagree about a match.
+- **In the admin field editor** the control is **Only entries where…**, the same condition builder as Visible When, offering the target types' fields. A field-group sub-field has it too.
+
+#### Inside an isolation section (v1.42.0)
+
+When the app has an [isolated type](/modules/structure/configuration/#the-hard-wall-around-sections-v1420) (a Matter, say), each of its records is a section, and a reference may not cross from one section into another:
+
+- An entry in a section may point only at entries of the same section, or of a shared type the field's `allowGlobalTypes` admits.
+- An entry in no section may point only at entries in no section, or of a shared type.
+- Every id the write carries is checked, stored and new, in top-level fields and field-group sub-fields. A breach is a `400` naming the field.
+- The picker lists only what the entry may point at: on an edit the host is the entry, on a create its parent. A new top-level record of an isolated type opens a new section, so its picker offers only shared types.
+- Request writes and in-process module writes are bound; system callers are exempt.
+
+The admin field editor shows **Global types it may point at** once a type is isolated.
+
+**Value rules (v1.38.0).** The value must be a node id — letters, digits, `-` and `_`, at most 100 characters — or a list of them; an empty string marks an unset slot. Anything else in a request write is refused with **400** (`must be a node id`). When `allowedTypes` is set, a request write — create, update, duplicate, a connection's fields, or the public API — is also checked against it: each id the write **adds** must be an existing entry (the caller's own, or one of a shared type) whose type is one of `allowedTypes` or a subtype of one, otherwise the write is refused with 400 naming the field. Ids already stored in the field are not looked up again, and one write may add at most 5,000 distinct targets. A field with no `allowedTypes` is not type-checked. Both rules also apply to a `node-reference` sub-field inside field-group rows. A module writing in-process is not refused by these two rules (the `filter` and section checks above do bind it, unless it is a system caller). A value that is not a node id is dropped from the write with a server warning (from a list, only the entries that are not ids are dropped), and `allowedTypes` is not checked. Unlike `secret`, a `node-reference` field's `required` flag is enforced by the server too.
 
 ---
 
@@ -749,7 +788,7 @@ Any module can add a field type with `nodeFieldTypeRegistry.register(...)`, or t
 
 ### formula
 
-A **read-only calculated field** (added in v1.33.15). Its value is a safe expression over [merge-field tokens](/modules/structure/merge-fields/), evaluated on the client and configured with `calcConfig`. Like a [merge template](/modules/structure/merge-fields/), the value is client-computed and server-accepted — the raw result (a real number, not a formatted string) is written into the node's `data` so downstream formulas, sorting and exports see a genuine value.
+A **read-only calculated field** (added in v1.33.15). Its value is a safe expression over [merge-field tokens](/modules/structure/merge-fields/), configured with `calcConfig`. The form evaluates it as you edit, and since v1.42.0 the server evaluates it again on every write, with the same code, and recomputes it when a node it reads changes (see **Kept current on the server** below). The raw result (a real number, not a formatted string) is written into the node's `data` so downstream formulas, sorting and exports see a genuine value.
 
 The expression language supports operators (`+ - * / % ^`, comparisons, `&& || !`, and `cond ? a : b` ternary) and **function calls**. It has no member access and no code execution — calls resolve only to registered functions by name — and evaluation is bounded (input length, expression size, call depth, work budget, output size).
 
@@ -779,7 +818,7 @@ The bare identifiers `PI`, `E`, `TAU` and `INFINITY` resolve as numeric constant
 
 The formula's **function library has two tiers**:
 
-1. **Dev-registered functions** — built-in maths (`round`, `min`, `max`, `clamp`, `sqrt`, `pow`, `log`, `sum`, `avg`, `mod`, …), text (`len`, `lower`, `upper`, `trim`, `concat`, `contains`, `replace`, `substr`), logic (`if`, `coalesce`, `number`), **list** (`pluck`, `join`, `first`, `last`, `count`, `reverse`, `unique`, `includes`, `sortBy` — v1.36.0) and **similarity** (`levenshtein`, `stringSimilarity`, `jaccard`, `numericSimilarity`). A module can register more via [`formulaFunctionRegistry`](/modules/structure/registries-guide/). Unlike the field-type registry, registering a name that already exists **replaces** the earlier function.
+1. **Dev-registered functions** — built-in maths (`round`, `min`, `max`, `clamp`, `sqrt`, `pow`, `log`, `sum`, `avg`, `mod`, …), text (`len`, `lower`, `upper`, `trim`, `concat`, `contains`, `replace`, `substr`), logic (`if`, `coalesce`, `number`), **list** (`pluck`, `join`, `first`, `last`, `count`, `reverse`, `unique`, `includes`, `sortBy` — v1.36.0; `highest` — v1.42.0) and **similarity** (`levenshtein`, `stringSimilarity`, `jaccard`, `numericSimilarity`). A module can register more via [`formulaFunctionRegistry`](/modules/structure/registries-guide/). Unlike the field-type registry, registering a name that already exists **replaces** the earlier function.
 2. **Admin-defined functions** — reusable named expressions authored under **App Structure › Functions** (e.g. `discountedPrice(p, d) = p * (1 - d)`), callable from any formula and from other functions. Stored in the `structure_function` table. A function body works only on its own parameters (and the constants). A `{field}` token inside one is an evaluation error, and the call must pass exactly as many arguments as the function declares. When an admin function has the same name as a dev-registered one, the dev-registered function is called.
 
 **Traversal and collections (v1.36.0).** Beyond one node's own fields, a formula can walk the node graph and operate over the results. Five **traversal keywords** resolve related nodes into *node-views* — one record per node, its built-ins (`name`, `nodeType`, `reference`, …) and its data fields flattened onto a single level:
@@ -810,6 +849,27 @@ count(filter(children(), 'status', 'open'))    // how many children are open
 ```
 
 They follow spreadsheet `SUM`/`AVERAGE` rules: a **blank** item — a child missing that field — is ignored (so it never sinks an average or a minimum), while a real `0` counts. Over an empty list `sum` is `0` and `avg`/`min`/`max` are blank.
+
+**List literals and `highest` (v1.42.0).** `[a, b, c]` is a list literal, and `[]` is an empty list. `highest(values, order[, fallback])` returns the entry of `order` (listed lowest first) that ranks highest among `values`. Values not in the order are ignored, and when nothing ranks it returns `fallback`, or blank without one. Values match on their display value, so a node-view matches by its name.
+
+Every node-view carries the built-ins `stage` and `status` (`active` or `archived`) alongside its data fields, so a formula can read them and filter on them. A Matter's `court_involvement` field, the highest stage among its non-archived court proceedings, is one formula:
+
+```
+highest(pluck(filter(children('court_proceeding'), 'status', 'active'), 'stage'), ['none', 'concluded', 'considering', 'preparing', 'active'], 'none')
+```
+
+**Kept current on the server (v1.42.0).** Before v1.42.0 a formula ran only in the browser, so its stored value went stale when a node it reads changed, until someone saved the entry again. Moving a court proceeding to `active` now updates the Matter's `court_involvement` without anyone editing the Matter.
+
+- **One evaluator.** `utils/formula.ts` is generated into the frontend and the backend from one template, so both halves compute identical values.
+- **On every write.** Create, bulk create and update, from a request or a module, compute the entry's own formula fields on the server, replacing what the write carried.
+- **Computed built-ins too.** A computed `name`, `description` or `slug` (a merge template or a formula on the built-in field) is computed the same way, from the entry's own fields as the form does. It is written only when it resolves to a value within the field's limits, and not when an `editableBy` lock bars the caller. A computed name or slug that clashes with another entry doesn't fail the write: the write keeps the value it carried (or the stored one), and the clash is logged.
+- **After a write, the dependants.** The server recomputes the stored formulas that can see the changed node: its parent (`children`), its descendants (`parents`), the nodes of its space (`scope`), the nodes at the other end of its links (`connections`), and the nodes whose reference fields point at it (`nodes()` and `{ref->field}`). It finds them from the formulas' text: the keywords used and their type arguments. Creates, updates (a stage change included), archive, restore, delete, move and connection create, update and delete all trigger it. A reorder recomputes the parent only.
+- **Limits.** At most 200 candidates per dependency and 200 recomputed nodes per write. A recompute that changes a node goes on to that node's own dependants, up to 3 levels deep, and each node is recomputed at most once per write. Bulk archive, delete and restore are batched, so a parent of 20 archived children is recomputed once. Nodes past a cap keep their stored value until they are next saved, and the server logs it.
+- **How it is stored.** Only the formula keys that changed are written, as a system write, and `structure.node.updated` fires with `source: 'formula'`. A recompute that fails is logged and never fails the write that triggered it.
+- **What it can read.** The server reads as the owner without admin rights, so admin-only types are left out (the form leaves them out too, so the two agree). It never sees a secret value, and it keeps to the host's isolation section plus the shared types. In the form, a host in a section is confined the same way.
+- **Functions the server lacks.** A formula calling `semanticSimilarity`, or a function a module registers only in the browser, fails on the server, and the stored value stays as the form wrote it.
+
+A `computedTemplate` on a custom data field is still resolved only in the form.
 
 A node-view is carried **opaquely** — there is still no member-access operator, so a record's fields are only ever read through `{tokens}` inside a `map`/`filter` body, or by name via `pluck` / a 3-arg `filter`, each own-key-guarded. On a brand-new node the structural forms (`children`/`parents`/`scope`/`connections`) return an empty list (there is no id yet); `nodes({refField})` still resolves off the form data, so a name formula works at create time. `map`/`children`/etc. are language keywords dispatched before the function registry, so an admin or module function cannot shadow them.
 
@@ -1042,10 +1102,11 @@ Two consequences for integrators:
   field regardless of who owns the key.
 
 A field with a `computedTemplate` (or a `formula`-type field) renders read-only in every form, but it
-is **not locked server-side**, on create or update — the client resolves the value and submits it,
-and the API accepts it. That is the same client-computes / server-accepts trust model documented for
-the [`formula`](#formula) type, and the backend applies it to the built-in `name` / `description` /
-`slug` fields too (a computed built-in is not locked just for being computed). Since v1.38.0 a computed
+is **not locked server-side**, on create or update, and a computed built-in `name` / `description` /
+`slug` is not locked just for being computed. Since v1.42.0 the server computes `formula`-type fields
+and computed built-ins itself on every write, so a value the client submits for one is replaced (see
+[`formula`](#formula)). A `computedTemplate` on a custom field is still resolved by the client and
+accepted as submitted. Since v1.38.0 a computed
 **custom** field stays unlocked even when it carries `editableBy: 'admin'` or `'system'`: the forms
 auto-submit the computed value, so locking it would refuse every create, and every edit of one of its
 inputs. The built-ins differ: an `editableBy` lock on `name`, `description` or `slug` still holds on

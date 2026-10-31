@@ -300,6 +300,7 @@ Configuration for typed connections between nodes. Controls which node types can
 | `bidirectional` | Boolean | If true, A→B and B→A are the same pair — a `unique` type then allows only one connection per unordered pair, in either direction (default true). Traversal is undirected regardless. |
 | `maxConnections` | Int? | Max connections of this type per node (null = unlimited) |
 | `isUnique` | Boolean | One connection per pair only (default false) |
+| `isolationConfig` | JSON | `{ allowGlobalTypes?: string[] }` (v1.42.0+). From inside an [isolation section](#the-hard-wall-around-sections-v1420), the shared/global types a link of this type may reach. Absent = every shared type, `[]` = none. Default `{}` |
 | `fields` | JSON | `NodeTypeField[]` — data fields on connections (same rich field system as node types) |
 | `fieldTemplateIds` | JSON | `string[]` — attached shared field-template ids (`structure_field_template`) |
 | `contextHints` | String? | Free-text hints for AI context assembly — mirrors the node type column so a relationship can describe itself to AI too |
@@ -541,6 +542,22 @@ Added in v1.34.0. With `isolation` left at its default `'filter'`, scoping is a 
 - Moving a node **out of** an enforced space is rejected unless its type opts in with `rules.allowCrossSpaceMove` (default off, and audited). That covers a move into a *different* space as well as a move to unscoped or scope-exempt territory — the old root is what the guard tests. Filing a node **in** from a non-enforced area is always allowed.
 
 The in-app API takes no scope query parameter — the active space is ambient. The [public REST API](/modules/structure/public-api/) has no session to read it from, so its list and get routes accept an explicit `?scopeRootId=` instead, which must name a node of an enforced primary type.
+
+#### The hard wall around sections (v1.42.0+)
+
+Each top-level record of an enforced type (a Matter, say) is an **isolation section**: the record, everything filed under it, and every row whose `rootNodeId` is that record's id. Since v1.42.0 nothing inside one section may point at or link to anything inside another, even in the same account. The one exception is the [shared types](#shared-types-global-true), such as a legislation library, which belong to every section.
+
+- **References.** Every id in a `node-reference` field, field-group sub-fields included, must name an entry in the host's own section or of a shared type. Ids already stored are checked as well as new ones, so a write can't carry an old crossing reference forward. A field's `nodeReferenceConfig.allowGlobalTypes` narrows which shared types it may point at — see [node-reference](/modules/structure/fields/#node-reference).
+- **Connections.** When either end is in a section, the other end must be in the same section or of a shared type. This closes a gap: before, only two *different* sections were refused, so an entry in no section could be linked into one. A connection type's `allowGlobalTypes` (stored in the `isolationConfig` column) narrows which shared types its links may reach.
+- **The wall is two-way.** Once any type is isolated, an entry in no section may reference, or connect to, only entries in no section or of a shared type.
+- **A shared row is in no section** wherever it is filed, so it can never bridge two sections.
+- **Every write path is checked:** create, bulk create, update, the public API, duplicate, move, restore, and connection create, update and promote, including `bulkCreateConnections`. A breach is a `400` that names the field, or the two entries for a link. A move or restore is held to it too: see [The Section Wall](/modules/structure/integration/#the-section-wall-v1420) for what each path does.
+- **Who it binds.** Request writes and in-process module writes. Trusted system callers (`isSystem: true`) are exempt, because they label sections explicitly.
+- **Reads keep to it as well.** A node-reference picker, and the target picker in the Add Connection dialog, list only what the host may point at (the `withinSectionOf` list parameter, below). Formula traversal and `{ref->field}` read only the host's section plus the shared types.
+
+In the admin forms, a node-reference field (and a field-group sub-field) and a connection type get a **Global types it may point at** control once the app isolates a type. Leave it empty for every shared type.
+
+With no isolated type, nothing here changes behaviour or runs a query.
 
 #### Shared types (`global: true`)
 
@@ -786,7 +803,7 @@ interface NodeTypeField {
 - `boolean` — renders as Yes/No radio buttons (not a toggle switch)
 - `field-group` — repeating field group (repeater). Contains sub-fields defined via the `fields` array (a `NodeTypeField[]` on the field-group field). Each entry adds a row with all sub-fields. Edited in admin via a dedicated sub-fields editor.
 - `node-reference` — supports `multiple: true` via its `nodeReferenceConfig` object (alongside `allowedTypes`), not in `options`, for multi-select node references
-- `formula` — admin-authored calculation field. `calcConfig: { formula, precision?, prefix?, suffix? }`; the expression is evaluated client-side over merge-field tokens against the `formulaFunctionRegistry` (dev-registered code functions) and the admin-defined `structure_function` named-expression library. Like `computedTemplate` the value is client-computed, read-only and server-accepted
+- `formula` — admin-authored calculation field. `calcConfig: { formula, precision?, prefix?, suffix? }`; the expression is evaluated over merge-field tokens (in the form, and since v1.42.0 on the server too, with the same code) against the `formulaFunctionRegistry` (dev-registered code functions) and the admin-defined `structure_function` named-expression library. Read-only in the form. The server computes it on every write and recomputes it when a node it reads changes (see [formula](/modules/structure/fields/#formula))
 
 ### Labels
 
@@ -937,6 +954,8 @@ interface ConnectionTypeConfig {
   bidirectional?: boolean;     // default true
   maxConnections?: number;     // per node (null = unlimited)
   unique?: boolean;            // one per pair only
+  allowGlobalTypes?: string[] | null; // v1.42.0+: from inside an isolation section, the shared
+                               // types a link may reach (absent / null / '*' = every one, [] = none)
   fields?: NodeTypeField[];    // same rich field system as node types
   fieldTemplateIds?: string[]; // attached shared field-template ids (structure_field_template)
   // Server-computed own + attached-template fields (read-only; never persisted)
@@ -981,6 +1000,7 @@ All endpoints are prefixed with `/api/v1/structure`.
 | POST | `/nodes/:id/restore` | Restore an archived or deleted entry |
 | POST | `/nodes/:id/favorite` | Toggle favourite — returns `{ id, isFavorite, isPinned }` |
 | POST | `/nodes/:id/pin` | Toggle pin (the sidebar's **User-pinned** list) — returns `{ id, isFavorite, isPinned }` |
+| GET | `/nodes/:id/section` | The node's isolation section (v1.42.0+) — `{ nodeId, sectionRootId, globalTypes }`, where `sectionRootId` is `null` for a node in no section. `404` if the caller can't read the node |
 | GET | `/nodes/:id/path` | Get ancestor path |
 | GET | `/nodes/:id/children` | Get direct children |
 | GET | `/nodes/:id/descendants` | Get all descendants |
@@ -1197,6 +1217,8 @@ This is the endpoint behind the formula library's `semanticSimilarity()` functio
 | `stageGroup` | Filter to the stages of one stage group — the stages whose `group` is this slug in the type's `stageConfig`. Needs `type` (not `types`), otherwise `400`; a group the type does not define is also a `400`, and a defined group no stage uses yet matches nothing. Combined with `stage` / `stages`, only stages in both are kept |
 | `withoutStage` | v1.40.0+. Entries with no stage. `only` lists just those, and is a `400` with `stage`, `stages` or `stageGroup`. `include` adds them to whichever stage filter is set, and on its own changes nothing |
 | `ownerOnly` | v1.40.0+. `true` reads a [shared type](#shared-types-global-true) only for the caller's own entries. It changes nothing on any other type |
+| `withinSectionOf` | v1.42.0+. A node id: list only what that **host** node may reference under the [section wall](#the-hard-wall-around-sections-v1420) — its section's entries plus the shared types, or, for a host in no section, the entries in no section plus the shared types. It narrows every other filter, and confines nothing when no type is isolated. `404` if the caller can't read the host. This is what a node-reference picker sends |
+| `sectionGlobalTypes` | v1.42.0+. With `withinSectionOf`, a comma-separated list of the shared types that join the section's entries (a field's `allowGlobalTypes`). Present but empty means none; absent means every shared type |
 
 There is deliberately no scope parameter here: when a node type uses `primaryScope.isolation: 'enforced'`, confinement to the active space is **ambient** — resolved server-side from `structure_settings.currentScopeNodeId` on every read. Only the [public REST API](/modules/structure/public-api/), which has no session to read that from, accepts an explicit `?scopeRootId=`.
 

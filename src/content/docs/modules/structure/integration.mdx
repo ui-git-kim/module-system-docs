@@ -396,6 +396,10 @@ A quick-created node is name-only; a type with **required custom fields** the fo
 | `onNodeCreated` | `(node: StructureNode) => void` | — | Fires after the inline quick-create creates a node (which is also auto-selected). Not called on the `onCreateClick` path (v1.36.2) |
 | `variant` | `'popover' \| 'dialog'` | `'popover'` | Render inside a `Dialog` instead of a `Popover` — use when the selector lives inside another dialog/sheet, where a nested popover clips or fights the focus trap (v1.36.2) |
 | `dialogTitle` | `string` | `placeholder` | Heading + accessible title for the dialog variant (v1.36.2) |
+| `withinSectionOf` | `string \| null` | — | List only what this **host** node may reference under the [section wall](#the-section-wall-v1420): its isolation section plus the shared types, or, for a host in no section, the entries in no section plus the shared types. A node-reference field passes the entry it belongs to, or the parent on a create (v1.42.0) |
+| `sectionGlobalTypes` | `string[]` | every shared type | With `withinSectionOf` or `newSection`, only these shared types are offered — a field's `allowGlobalTypes` (v1.42.0) |
+| `newSection` | `boolean` | `false` | The host is a new top-level record of an isolated type, so its section is empty and only shared types are offered (v1.42.0) |
+| `targetFilter` | condition | — | Offer only nodes matching this condition — a field's `nodeReferenceConfig.filter`. Pushed to the list as data filters where it can be, and re-checked on every fetched node with the evaluator the server runs (v1.42.0) |
 
 ### Registering Fields on Node Types
 
@@ -823,7 +827,7 @@ Every hook's `Context` below is a **named, exported interface** in Structure's `
 | Hook | Context | Fires when |
 |------|---------|------------|
 | `structure.node.created` | `{ userId, node, nodeType }` | A node is created |
-| `structure.node.updated` | `{ userId, node, changes }` | A node is updated |
+| `structure.node.updated` | `{ userId, node, changes, source? }` | A node is updated. `source: 'formula'` (v1.42.0+) marks the server recomputing the node's stored formula values after a node they read changed — not a caller's own edit — so a listener can tell these apart and debounce them |
 | `structure.node.deleted` | `{ userId, nodeId, nodeType }` | A node is deleted |
 | `structure.node.moved` | `{ userId, node, oldParentId, newParentId, oldRootNodeId, newRootNodeId }` | A node moves parent (or space — compare `oldRootNodeId`/`newRootNodeId`) |
 | `structure.node.archived` | `{ userId, node }` | A node is archived |
@@ -972,6 +976,7 @@ Structure's write methods learn who is calling from their options. Its HTTP rout
 | The node type on create | Must have a live, enabled type row, otherwise 400 | Not required |
 | Connection `data` | Validated against the connection type's fields like a node's (required, type, pattern, options) | Value shapes only |
 | Node-reference targets | A new id in a field restricted by `allowedTypes` must point at a readable entry of one of those types or a subtype | Not checked |
+| The [section wall](#the-section-wall-v1420) and `nodeReferenceConfig.filter` (v1.42.0+) | Every id in the write's reference fields, stored and new, and both ends of a link | The same, unless the call passes `isSystem: true` |
 | Value shapes | A secret must be text, a node-reference value a node id, and a field group a list of rows — otherwise 400 | Coerced with a logged warning: a number or true/false secret becomes text, a value that is not a node id is dropped from a reference field, and a field group is reshaped (a single row object becomes a one-row list, entries that are not rows are dropped, an empty object or a scalar is dropped) |
 | A value too long to test safely against its validation pattern | 400 | The pattern check is skipped, with a warning |
 | Pending node-type proposals | At most 50 per user | Not capped |
@@ -1147,6 +1152,59 @@ const graph = await structure.expandGraph(userId, [note.id], { scopeRootId: sect
 - **Purging the root:** this takes the labelled records too. A restored labelled record stops the purge.
 - **Moves, merges and copies:** a record keeps its label through moves, merges, duplicates and the module's migrations.
 - **Moving the section root:** a root can't be moved under one of its own records. Moving it under any other parent needs the type's `allowCrossSpaceMove` rule. When it moves, its labelled rows and links follow it to the new root.
+
+### The Section Wall (v1.42.0+)
+
+Since v1.42.0 an isolation section is a hard wall. A node-reference value, a field-group sub-field's reference, or a connection may not cross from one section into another. The only exception is a node of a shared/global type, which belongs to every section. [Configuration](/modules/structure/configuration/#the-hard-wall-around-sections-v1420) states the rule; this section covers what a consuming module needs.
+
+**Caller tiers.** The wall binds request writes and in-process writes alike. A **system** caller (`isSystem: true`) is exempt, because it labels sections explicitly with `scopeRootId` and keeps the S2 rules above. So a module writing on a user's behalf without `isSystem` gets the same `400` a request would. With no isolated type in the app, nothing changes and no extra query runs.
+
+**What it checks.**
+
+- **The host's section.** A node's section is its `rootNodeId` when that names a section root. A create works it out from the parent, or from the `scopeRootId` label. A node of a shared/global type is in no section wherever it is filed.
+- **References.** Every id in the write's node-reference fields, stored as well as new, must name a node of the host's section, or of a shared type the field's `nodeReferenceConfig.allowGlobalTypes` admits (absent or `'*'` means every one, `[]` none). Once any type is isolated, a host in no section may reference only nodes in no section, or of a shared type.
+- **Connections.** When either end is in a section, the other must be in the same section, or of a shared type the connection type's `allowGlobalTypes` admits. An explicit S2 link is held to its label instead.
+
+**Write paths.**
+
+| Path | Behaviour |
+|------|-----------|
+| `createNode`, `bulkCreateNodes`, `updateNode`, the public API | A crossing reference is a `400` naming the field (per row in a bulk create) |
+| `duplicateNode` | References to rows copied in the same duplicate are re-pointed at their copies first. The rest, the child copies and the copied links are checked against the section the copy lands in |
+| `moveNode` | A move that changes a subtree's section (into one, out of one, or between two) is refused with a `400` naming the first reference or link that would then cross: ones the subtree holds, ones pointing into it from outside, and links to the outside. Rows and links in Deleted count too. When the move goes ahead, every link touching the moved rows is re-stamped with the section its endpoints now give it (for every caller, system ones included), so its own fields and the section reads follow its endpoints |
+| `restoreNode`, bulk restore | A crossing reference refuses the restore with a `400`. A crossing link stays in Deleted, with a log note |
+| `mergeNode` | Unchanged: it already refused two sections, or a node in no section into one, for every caller |
+| `createConnection`, `promoteConnection`, `updateConnection` | Create and promote apply the connection rule above. On create and update, the link's own reference fields are held to the link's section |
+| `bulkCreateConnections` | Now takes `isSystem` and `scopeRootId` in its options and passes them to each row's `createConnection`. A row may carry its own `scopeRootId`, which overrides the batch's. Without `isSystem`, the wall applies to every row |
+
+**Reads for pickers and formulas.**
+
+- **`listNodes` with `withinSectionOf: hostId`** (HTTP `?withinSectionOf=`) lists only what that host may reference: its section's nodes plus the shared types, or, for a host in no section, the nodes in no section plus the shared types. `sectionGlobalTypes` (HTTP: comma-separated) narrows the shared types, and `[]` means none. It narrows every other filter, and confines nothing when no type is isolated. A host the caller can't read is a `404`.
+- **`getNodeSection(nodeId, userId, options?)`** (HTTP `GET /nodes/:id/section`) returns `NodeSection` — `{ nodeId, sectionRootId, globalTypes }`, with `sectionRootId` `null` for a node in no section. `options` is `{ isAdmin?, isSystem? }`, and the caller must be able to read the node.
+- **`NodeSelector`** takes `withinSectionOf`, `sectionGlobalTypes`, `newSection` and `targetFilter` (see [Using NodeSelector](#using-nodeselector-to-reference-nodes)); a node-reference field and the Add Connection dialog pass them.
+- **Formulas.** Traversal (`children`, `parents`, `scope`, `connections`, `nodes`) and `{ref->field}` read only the host's section plus the shared types, on the server and, for a host in a section, in the browser.
+
+```typescript
+const structure = serviceRegistry.get('structure');
+
+// What a reference field on `hostId` may point at, narrowed to one shared type
+const { nodes } = await structure.listNodes(userId, {
+  types: ['person', 'legislation'],
+  withinSectionOf: hostId,
+  sectionGlobalTypes: ['legislation'],
+});
+
+// A batch of discovered links, filed into one section by a trusted caller
+await structure.bulkCreateConnections(userId, links, { isSystem: true, scopeRootId: sectionId, skipHooks: true });
+```
+
+### Formula Recompute (v1.42.0+)
+
+The server now computes a node's own formula fields, and its computed `name` / `description` / `slug`, on every create and update, including in-process ones. After each node or connection write it recomputes the stored formulas that can see the change. The details and limits are on [Fields → formula](/modules/structure/fields/#formula). For an integrating module:
+
+- **A write from your module stores current formula values.** For example, a module that moves a child entry to a new stage also updates its parent's formula that reads that stage.
+- **Recomputes fire `structure.node.updated` with `source: 'formula'`.** The payload's `changes.data` holds only the formula keys that changed. If your listener does heavy work on every update (re-embedding, say), skip or debounce these.
+- **A recompute never fails your write.** Errors are logged, and the stored value stays as it was.
 
 ### Stage Sources (v1.40.0+)
 
