@@ -7,64 +7,225 @@ sidebar:
 
 import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
 
-Structure's admin page supports full JSON import and export of node type configurations, connection types, groups, and shared field templates. Use this to back up your configuration, migrate between environments, share setups between applications, or seed a fresh install.
+Structure's admin page supports full JSON import and export of node type configurations, connection types, groups, shared field templates, and formula functions. Use this to back up your configuration, migrate between environments, share setups between applications, or seed a fresh install.
 
 ---
 
 ## Overview
 
-The **Import Config** and **Export Config** buttons sit at the right of the admin page's top tab row (App Structure). Both are admin-only. Since v1.33.34 they go through a matched pair of `requireAdmin` endpoints — `GET /api/v1/structure/config/export` and the atomic `POST /api/v1/structure/config/import`. Since v1.38.0 a real import also needs a recent identity confirmation (step-up) at the starter's hardened and strict security tiers: if your session has not confirmed recently, the app asks you to confirm it's you and then retries. A **Preview** writes nothing and skips that step. Exports are audit-logged with their counts, and real imports with their per-category results.
+The **Export** and **Import** buttons sit at the right of the admin page's top tab row (App Structure). Since v1.41.0 they are the starter's shared [ConfigTransfer](/starter-template/config-transfer/) component: **Export** downloads the file, and **Import** opens its step-by-step dialog — choose or paste a file, a check and a practice run, a review of every item, then one all-or-nothing import. That page describes the dialog, the three ways to apply a file, and the file's envelope; this page covers what is specific to Structure.
 
-- **Export** downloads a single JSON file, `structure-config-YYYY-MM-DD.json`, containing the node types, groups, connection types, and functions visible to you (the app-level ones and your own, disabled ones included), plus the field templates you own (field templates stay owned by the admin who created them)
-- **Configuration only:** a bundle never carries entries, connections, user settings, API keys, component templates, or reference counters. A node type that links a component template carries a copy of that template's settings in `templateSnapshot`, used only where the template is missing (see [Component templates](#component-templates))
-- **Import** accepts any combination — only the categories present in the JSON are processed; a category you omit is left untouched. A category present as an empty array still counts as present, so in Replace mode it prunes that category. In every category an update writes only the keys the row carries (node types and connection types since v1.38.0; field templates, groups, and functions since v1.40.1) — see [Merge Mode](#merge-mode)
-- **Atomic:** the whole bundle is applied in one server-side transaction. If any row is invalid the entire import is rejected and **nothing is written** — you get the rejection reason, not a half-applied import
-- **Import order:** field templates → groups → node types → connection types → functions (so later categories can reference earlier ones)
-- **Two import modes:** Merge (add new, update existing) and Replace (additionally prune stale rows — see below)
-- **Preview first:** the Import Configuration dialog has a **Preview** button beside **Import** — it runs the whole import as a dry run and shows the exact diff without writing anything (see [Dry run (Preview)](#dry-run-preview))
-- **Result summary:** after a successful import the dialog reports **created / updated / unchanged / deleted per category**. A row whose imported values match what is already stored counts as `unchanged`. Only the keys the import writes are compared, and the match is structural, not textual — key order does not matter and a missing value compares equal to a stored `null`. The row is still re-written either way, so the label is informational
+Both buttons are admin-only and go through `/api/v1/structure/admin/config` (see [Over the API](#over-the-api)). A real import also needs a recent identity confirmation (step-up) at the starter's hardened and strict security tiers: if your session has not confirmed recently, the app asks you to confirm it's you and then retries. The practice run and the export never ask. The starter records every export and every real import in the audit trail (`config.exported` and `config.imported`, counts only).
 
-<Aside type="caution" title="Replace mode prunes stale rows in every present category">
-In **Replace** mode, for **each category present in the bundle**, existing rows not in the import are deleted — field templates, groups, node types, connection types, and functions. A category **absent** from the bundle is left completely untouched, so a partial bundle never wipes what it omits. System node types (`isSystem`) and pending proposals are never deleted, and connection types spare `isSystem` rows. An app-level node type that the bundle omits — every type an import creates is app-level, and so is every [shared type](#primaryscope) and every type created with the type form's **Everyone, each with their own entries** toggle — is not pruned while live entries of it exist, whoever owns them: the whole import is rejected instead (v1.38.0+; shared types since v1.34.27). When a node type or connection type is pruned, its entries already in Deleted are permanently removed after the import commits. Replace is useful for full config sync but destructive if a present category's array is incomplete. Use **Merge** mode for incremental updates.
+- **Export** downloads a single JSON file, `structure-config-YYYY-MM-DD.json` (see [The File](#the-file)), containing the node types, groups, connection types, and functions visible to you (the app-level ones and your own, disabled ones included), plus the field templates you own (field templates stay owned by the admin who created them). Pending node-type proposals and other users' own rows are never in it
+- **Configuration only:** a file never carries entries, connections, user settings, API keys, component templates, or reference counters. A node type that links a component template carries a copy of that template's settings in `templateSnapshot`, used only where the template is missing (see [Component templates](#component-templates))
+- **Only the parts a file contains are touched** — a part you leave out is left as it is, even under Replace. A part present as an empty list still counts as present, so Replace removes every removable item in it
+- **An item writes only the keys it carries.** A key the item leaves out keeps its stored value, and an explicit `null` clears it (v1.41.0+) — see [Absent keys and null](#absent-keys-and-null)
+- **A bad item doesn't stop the rest.** An item that fails its shape check is listed as a problem with the reason and is not imported, and the rest of the file still can be. Unknown keys in an item are dropped. (Before v1.41.0 one shape error rejected the whole file.)
+- **All or nothing:** the plan on screen is applied in one server-side transaction. If any write is refused — the secret guard, a slug clash, a sharing guard — the whole import rolls back, **nothing is written**, and the dialog names the item and the reason (see [Validation](#validation))
+- **Import order:** field templates → groups → node types → connection types → functions (so later parts can reference earlier ones); Replace's removals run in reverse
+- **Three ways to apply a file:** Add new only, Merge (the default), and Replace — see [Import Behaviour](#import-behaviour)
+- **Review first:** every import is planned as a practice run before anything changes, and the dialog lists every item with what will happen to it (see [The Review](#the-review))
+- **Result summary:** after a real import the dialog shows what changed, per part. An item whose file values match what is already stored is "No change" and is not written. Only the keys the item carries are compared, and the match is structural, not textual — key order does not matter and a missing value compares equal to `null`
+
+<Aside type="caution" title="Replace removes what the file leaves out, in every part it contains">
+In **Replace** mode, for **each part present in the file**, the items here that are not in the file are removed — field templates, groups, node types, connection types, and functions. A part **absent** from the file is left completely untouched, so a partial file never wipes what it omits. Replace keeps, and says why in the review, built-in (`isSystem`) node types and connection types, an app-level node type that still has live entries (whoever owns them), a node type another type inherits from, and app-level groups, connection types, and functions — see [Replace Mode](#replace-mode). Pending proposals and other users' own rows are never loaded, so they are never removed. When a node type or connection type is removed, its entries already in Deleted are permanently removed after the import commits. Before Replace removes anything, the dialog warns you, offers **Download a backup**, and asks you to confirm. Use **Merge** for incremental updates.
 </Aside>
 
 ---
 
-## Complete Export Format
+## The File
 
-When you click **Export**, the downloaded JSON follows this structure:
+Since v1.41.0 an export is a [ConfigTransfer file](/starter-template/config-transfer/#the-file): an envelope, with Structure's five parts under `sections`. This is a complete export of a small configuration — one field template, one group, a node type and a subtype of it, a connection type, and a function:
 
 ```json
 {
-  "version": "1.0",
-  "exportedAt": "2026-06-24T10:30:00.000Z",
-  "fieldTemplates": [
-    { /* ... shared field-set objects ... */ }
-  ],
-  "groups": [
-    { /* ... Group objects ... */ }
-  ],
-  "nodeTypes": [
-    { /* ... NodeType objects ... */ }
-  ],
-  "connectionTypes": [
-    { /* ... ConnectionType objects ... */ }
-  ],
-  "functions": [
-    { /* ... Function objects (formula named expressions) ... */ }
-  ]
+  "format": "config-transfer",
+  "formatVersion": 1,
+  "moduleId": "structure",
+  "version": "2",
+  "exportedAt": "2026-10-31T02:15:00.000Z",
+  "counts": { "fieldTemplates": 1, "groups": 1, "nodeTypes": 2, "connectionTypes": 1, "functions": 1 },
+  "sections": {
+    "fieldTemplates": [
+      {
+        "slug": "contact-details",
+        "name": "Contact details",
+        "description": null,
+        "fields": [{ "id": "phone", "type": "phone", "label": "Phone" }],
+        "sortOrder": 0
+      }
+    ],
+    "groups": [
+      { "slug": "crm", "name": "CRM", "icon": null, "color": "#8b5cf6", "sortOrder": 10 }
+    ],
+    "nodeTypes": [
+      {
+        "slug": "organisation",
+        "name": "Organisation",
+        "namePlural": "Organisations",
+        "description": "A company or other body",
+        "icon": "Building2",
+        "color": null,
+        "moduleId": "structure",
+        "rules": { "isRoot": true, "allowedChildren": [] },
+        "features": { "description": true, "favorites": true, "archiving": true },
+        "fields": [],
+        "navigation": { "mainNav": { "enabled": true, "order": 10 } },
+        "templateOverrides": {},
+        "cardTemplateId": null,
+        "listItemTemplateId": null,
+        "detailHeaderTemplateId": null,
+        "overviewTemplateId": null,
+        "labels": {},
+        "integrations": {},
+        "stageConfig": {},
+        "builtInFieldConfig": {},
+        "conditionalColor": {},
+        "permissions": {},
+        "contextHints": null,
+        "contextConfig": {},
+        "aiFields": {},
+        "primaryScope": {},
+        "governance": {},
+        "referenceConfig": {},
+        "fieldTemplateIds": ["contact-details"],
+        "superClasses": [],
+        "groupSlug": "crm",
+        "isSystem": false,
+        "isEnabled": true,
+        "sortOrder": 10
+      },
+      {
+        "slug": "client",
+        "name": "Client",
+        "namePlural": "Clients",
+        "description": null,
+        "icon": "Handshake",
+        "color": "#0ea5e9",
+        "moduleId": "structure",
+        "rules": { "isRoot": true, "allowedChildren": [] },
+        "features": { "favorites": true, "archiving": true },
+        "fields": [
+          {
+            "id": "tier",
+            "type": "select",
+            "label": "Tier",
+            "options": [{ "value": "gold", "label": "Gold" }, { "value": "standard", "label": "Standard" }]
+          }
+        ],
+        "navigation": { "mainNav": { "enabled": true, "order": 20, "showCount": true } },
+        "templateOverrides": {},
+        "cardTemplateId": null,
+        "listItemTemplateId": null,
+        "detailHeaderTemplateId": null,
+        "overviewTemplateId": null,
+        "labels": {},
+        "integrations": {},
+        "stageConfig": {},
+        "builtInFieldConfig": {},
+        "conditionalColor": {},
+        "permissions": {},
+        "contextHints": "Tier decides the service level.",
+        "contextConfig": {},
+        "aiFields": {},
+        "primaryScope": {},
+        "governance": {},
+        "referenceConfig": { "enabled": true, "prefix": "CLI", "padding": 4 },
+        "fieldTemplateIds": [],
+        "superClasses": ["organisation"],
+        "groupSlug": "crm",
+        "isSystem": false,
+        "isEnabled": true,
+        "sortOrder": 20
+      }
+    ],
+    "connectionTypes": [
+      {
+        "slug": "works-with",
+        "name": "Works with",
+        "namePlural": "Works with",
+        "description": null,
+        "icon": "Link",
+        "color": null,
+        "moduleId": "structure",
+        "fromTypes": ["client"],
+        "toTypes": ["organisation"],
+        "bidirectional": true,
+        "relationClass": "associative",
+        "superProperty": null,
+        "maxConnections": null,
+        "unique": true,
+        "fields": [],
+        "fieldTemplateIds": [],
+        "contextHints": null,
+        "aiFields": {},
+        "isSystem": false,
+        "isEnabled": true,
+        "sortOrder": 50
+      }
+    ],
+    "functions": [
+      {
+        "name": "with_gst",
+        "params": ["amount"],
+        "expression": "amount * 1.1",
+        "description": null,
+        "category": "finance"
+      }
+    ]
+  }
 }
 ```
 
-A real export contains `version`, `exportedAt` (an ISO timestamp), and the five category arrays: `fieldTemplates`, `groups`, `nodeTypes`, `connectionTypes`, and `functions`. The exporter does not write a top-level `description`. All five arrays are optional on import — you can import a file with only `nodeTypes`, only `functions`, or any combination. The `version` field is `"1.0"` for the current format. The importer does not check `version` or `exportedAt`, and it ignores other top-level keys, so the `examples/` files, which carry a top-level `description`, import as they are.
+- **The envelope.** `format`, `formatVersion`, `moduleId` (always `structure`), `version` (`"2"` for this format), `exportedAt` (an ISO timestamp), and `counts` (items per part). On import, `format`, `formatVersion`, `moduleId`, and `version` are checked when present: another module's file, a newer format, or a version Structure does not read is refused with every problem listed. Structure reads versions `1.0` and `2`. A file with no `version` is read as version `2`, with a note. `exportedAt` is informational, and a `counts` entry that does not match its list only adds a note.
+- **The parts** sit under `sections`, in this order: `fieldTemplates`, `groups`, `nodeTypes`, `connectionTypes`, and `functions`. Every part is optional on import — you can import a file with only `nodeTypes`, only `functions`, or any combination. Each part is a list of at most 1,000 items. A part Structure doesn't know is ignored, with a note.
+- **Keys.** Each item is identified by its slug, except a function, which is identified by its `name`. The key matches an item to the stored one, so a rename by key creates a new item. A key listed twice in a part is a problem, and only the first is used.
+- **Parents first.** An export lists a node type after the types it inherits from, and a version `2` file must keep that order: a node type whose parent comes later in the file is refused (see [Validation](#validation)). A version `1.0` file is put in this order for you.
+- **Every key, every item.** An export writes each item's full set of keys, and an emptied display value as `null` (here the group's `icon` and the field template's `description`). `fieldTemplateIds` name your own field templates by slug — see [Field Template JSON](#field-template-json).
 
-Empty values are left out of an export rather than written as `null`. Keep it that way in a hand-written file: a `null` value on a field template, group, connection type, or function (for example `"description": null`) fails the shape check and rejects the import. The exceptions are a connection type's `relationClass`, `superProperty`, `maxConnections`, and `moduleId`, which may be `null`. Node-type rows accept `null` anywhere.
+The examples further down this page are single items of a part, or a part's contents, not whole files.
+
+### Absent keys and null
+
+In a version `2` file (v1.41.0+):
+
+- **A key an item leaves out keeps** the stored value when the item updates an existing one. A new item gets the default for the keys it leaves out.
+- **An explicit `null` clears** a nullable value. On a node type's JSON or flag key (`rules`, `features`, `isEnabled`, and so on), `null` writes that column's default (`{}`, `[]`, `true` or `false`), as the import always did.
+
+| Part | Keys that accept `null` |
+|------|-------------------------|
+| Field templates | `description` |
+| Groups | `icon`, `color` |
+| Node types | Every key except `slug`, `name`, and `namePlural` |
+| Connection types | `description`, `icon`, `color`, `moduleId`, `relationClass`, `superProperty`, `maxConnections`, `contextHints` |
+| Functions | `description`, `category` |
+
+A `null` on any other key fails that item's shape check. Before v1.41.0 a field template, group, or function refused `null`, and so did a connection type's `description`, `icon`, `color`, and `contextHints`. An export left an emptied value out instead, and the import cleared a few keys when they were absent. A version `1.0` file is still read that way (see below).
+
+### Older files (version 1.0)
+
+Exports made before v1.41.0 are version `1.0`: `version`, `exportedAt`, and the five parts as top-level lists, with no `sections`. They still import, because Structure's definition reads both versions (`accepts: ['1.0', '2']`), and Structure upgrades such a file so it behaves as it did:
+
+- **An absent reset-when-absent key clears.** A `1.0` export left an emptied value out, and its import read the absence as "clear". The upgrade writes these keys as `null` when an item leaves them out:
+  - **Node types:** `description`, `icon`, `color`, `contextHints`, `cardTemplateId`, `listItemTemplateId`, `detailHeaderTemplateId`, `overviewTemplateId`, and `groupSlug`
+  - **Connection types:** `description`, `icon`, `color`, `relationClass`, `superProperty`, and `maxConnections`
+  - **Field templates:** `description`
+  - **Groups:** `icon` and `color`
+  - **Functions:** `description` and `category`
+
+  Every other key an item leaves out keeps its stored value, as it did in `1.0`.
+- **Field-template ids become slugs.** A `1.0` file named attached templates by the source app's ids, with each template's `id` in its `fieldTemplates` part. The upgrade maps those ids in `fieldTemplateIds` to slugs, using the file's own `fieldTemplates`. An id the file doesn't carry stays as it is.
+- **`isUnique` becomes `unique`** on a connection type that carries the column name instead.
+- **Node types are put parents first**, so a `1.0` file that lists a subtype before its parent imports.
+
+A top-level key Structure doesn't know, such as the `description` the `examples/` files carry, is ignored with a note. A hand-written file with **no** `version` is read as version `2`, so a key it leaves out is kept. Give it `"version": "1.0"` if you want the older behaviour.
 
 ---
 
 ## Node Type JSON
 
-A node type object showing the commonly-used fields. Every field except `slug`, `name`, and `namePlural` is optional — omit what you do not need. Several additional feature-bearing keys also round-trip on export/import beyond those shown here; they are listed in the [Field Reference](#field-reference) table below. See also the [Fields](/modules/structure/fields/) and [Type Hierarchy](/modules/structure/type-hierarchy/) pages.
+A node type object — one item of the file's `nodeTypes` part — showing the commonly-used fields. Every field except `slug`, `name`, and `namePlural` is optional — omit what you do not need. Several additional feature-bearing keys also round-trip on export/import beyond those shown here; they are listed in the [Field Reference](#field-reference) table below. See also the [Fields](/modules/structure/fields/) and [Type Hierarchy](/modules/structure/type-hierarchy/) pages.
 
 ```json
 {
@@ -228,17 +389,17 @@ Each node type property explained:
 | `governance` | `object` | Data classification levels and the default level for this type (`classification.levels`, `classification.default`). (v1.25.0+) |
 | `referenceConfig` | `object` | Reference-number format for this type — an immutable, server-assigned handle like `MAT-2026-0147` on every entry. Off unless `enabled` is true; a type with it off stores no reference at all. See [referenceConfig](#referenceconfig) below. (v1.35.0+) |
 | `aiFields` | `object` | AI Core prompt-assembly configuration — storage-only, consumed by ai-core's AI tab. (v1.30.0+) |
-| `fieldTemplateIds` | `string[]` | Attached shared field templates (reusable field sets). Reference by template **slug** or exported id — but only when the *same bundle* also carries that template in its `fieldTemplates` array, because the slug/id map is built solely from the templates being imported. Otherwise use the target app's template **id**. See [Field Template JSON](#field-template-json). (v1.29.0+; slug references v1.33.22+) |
+| `fieldTemplateIds` | `string[]` | Attached shared field templates (reusable field sets). An export names your own templates by **slug** and any other template by its id. An import resolves a slug to your own template with that slug, whether the file creates it or you already have it; any other entry is stored as written. See [Field Template JSON](#field-template-json). (v1.29.0+; slug references v1.33.22+; your existing templates by slug v1.41.0+) |
 | `builtInFieldConfig` | `object` | Computed templates and edit permissions for the built-in `name`, `description`, and `slug` fields (`computedTemplate`, `calcConfig`, `editableBy`). |
 | `conditionalColor` | `object` | Change a node's colour based on a field value (`field`, `rules`, `fallback`). |
 | `permissions` | `object` | Node-level permission overrides for `read`, `create`, `edit`, `archive`, and `delete`. Each is `'anyone'`, `'admin'`, or `'system'`. `read` gates who can *view* entries of this type and is enforced server-side across reads, search, and the public API; `'system'` means only trusted in-process callers (e.g. the cognitive ingest engine) — no user or admin can perform it through the UI or API. |
 
-`labels`, `integrations`, `templateOverrides`, `isSystem`, `isEnabled`, and the four component-template links (`cardTemplateId`, `listItemTemplateId`, `detailHeaderTemplateId`, `overviewTemplateId`) also round-trip on export and import even though they are not shown in the example above (component-template links were added to the export/import in v1.33.34). So does `moduleId`, the module that owns the type (in the export since v1.38.0): an import that omits it keeps the stored value, and a new type without it defaults to `structure`.
+`labels`, `integrations`, `templateOverrides`, `isSystem`, `isEnabled`, and the four component-template links (`cardTemplateId`, `listItemTemplateId`, `detailHeaderTemplateId`, `overviewTemplateId`) also round-trip on export and import even though they are not shown in the example above (component-template links were added to the export/import in v1.33.34). So does `moduleId`, the module that owns the type (in the export since v1.38.0): an import that omits it keeps the stored value, and a new type without it defaults to `structure`. Every node-type key except `slug`, `name`, and `namePlural` also accepts `null` — see [Absent keys and null](#absent-keys-and-null).
 
 Two round-trip details for node types:
 
 - **`fields` holds the type's own fields only.** An entry carrying `inheritedFrom` or `fieldTemplateId`, which marks an inherited or attached-template field copied from a resolved read, is dropped on import.
-- **Component templates are not in the bundle.** The export writes the type's own `templateOverrides` and the four links, plus a `templateSnapshot` of each linked template's settings, which an import uses only where the linked template is missing. See [Component templates](#component-templates) below.
+- **Component templates are not in the file.** The export writes the type's own `templateOverrides` and the four links, plus a `templateSnapshot` of each linked template's settings, which an import uses only where the linked template is missing. See [Component templates](#component-templates) below.
 
 **superClasses** — a type can declare multiple parents (the type graph is a DAG):
 
@@ -251,7 +412,7 @@ Two round-trip details for node types:
 }
 ```
 
-Here `court-order` is-a `legal-document` and is-a `event`, inheriting the fields and features of both. Parents must exist as live types, cycles are rejected, and imports validate the final hierarchy transactionally — see [Type Hierarchy](/modules/structure/type-hierarchy/).
+Here `court-order` is-a `legal-document` and is-a `event`, inheriting the fields and features of both. Parents must exist when the type is written, so a file lists a parent before its subtypes (an export always does), and cycles are rejected — see [Type Hierarchy](/modules/structure/type-hierarchy/).
 
 **rules** — hierarchy and relationship constraints:
 
@@ -302,7 +463,7 @@ Each entry in `stages` takes `slug`, `name`, and optionally `color`, `icon`, `gr
 
 - **Export** leaves `source` out and keeps every stage's `ref`. After a restore, the stage source can recognise its stages by their `ref`s and bind to the set again exactly.
 - **Import** drops any `source` a file carries, for example in a hand-written file. A file whose stages carry `ref`s imports and validates on an install with no stage source, and the stages are then the type's own.
-- **While the source is running,** an import keeps the stored `stageConfig` and `features.stages` of that type and writes the rest of the row. The import is never refused for this. The type is listed in the result's `stagesKept` only when the file's stage set or `features.stages` differs from what is stored; an unchanged round trip is not listed.
+- **While the source is running,** an import keeps the stored `stageConfig` and `features.stages` of that type and writes the rest of the row. The import is never refused for this. When the file's stage set or `features.stages` differs from what is stored, the review flags the type "Keeps its stages: *source name* supplies them while it runs here, so the stages in the file are not applied." and, after a real import, it is listed in `stagesKept` on the `structure.config.imported` hook. An unchanged round trip is not flagged or listed.
 - **Once the source stops,** an imported set that differs is written without `source`, so the stages become the type's own. An imported set equal to the stored one keeps its `source`.
 
 **navigation** — controls where and how the type appears:
@@ -403,18 +564,18 @@ issues `INC-0031`.
 **Import behaviour:**
 
 - **Turning it on backfills.** When an import flips `enabled` from off to on for a type, that type's existing entries are numbered in `createdAt, id` order and the counter is seeded above the highest value assigned. This is the primary way an existing dataset acquires numbers.
-- **Turning it off never renumbers.** To switch references off by import, include `referenceConfig` with `enabled` unset or `false` (`{}` will do). Since v1.38.0 a bundle that **omits** the key leaves the stored format as it is; before that, omitting it switched references off. Entries already numbered keep their references — nothing can change an issued reference — the type simply stops issuing new ones. Re-enabling later numbers only the entries created in the gap.
+- **Turning it off never renumbers.** To switch references off by import, include `referenceConfig` with `enabled` unset or `false` (`{}` or `null` will do). Since v1.38.0 a file that **omits** the key leaves the stored format as it is; before that, omitting it switched references off. Entries already numbered keep their references — nothing can change an issued reference — the type simply stops issuing new ones. Re-enabling later numbers only the entries created in the gap.
 - **Editing the format does not reissue.** Changing `prefix`, `padding`, or the year keys on a type that already has references on affects new entries only.
 
-<Aside type="caution" title="The counter does not travel with the bundle">
-`referenceConfig` is configuration and round-trips on export and import like every other node-type key. The **counter** — the highest number issued so far — is runtime state in its own table (`structure_reference_counter`, keyed by user, node type, and period) and is deliberately kept out of the config bundle, so promoting a config never carries one environment's high-water mark into another.
+<Aside type="caution" title="The counter does not travel with the file">
+`referenceConfig` is configuration and round-trips on export and import like every other node-type key. The **counter** — the highest number issued so far — is runtime state in its own table (`structure_reference_counter`, keyed by user, node type, and period) and is deliberately kept out of the config file, so promoting a config never carries one environment's high-water mark into another.
 
-Promoting a config to another environment therefore carries the *format*, not the *position*: the target keeps its own numbering and continues from whatever it has already issued. Two environments importing the same bundle both mint `MAT-2026-…` numbers, and both start from their own next number — so a reference identifies an entry within one environment, not across them.
+Promoting a config to another environment therefore carries the *format*, not the *position*: the target keeps its own numbering and continues from whatever it has already issued. Two environments importing the same file both mint `MAT-2026-…` numbers, and both start from their own next number — so a reference identifies an entry within one environment, not across them.
 </Aside>
 
 ### Component templates
 
-A node type links up to four component templates, one per slot: `cardTemplateId` (slot `card`), `listItemTemplateId` (`listItem`), `detailHeaderTemplateId` (`detailHeader`), and `overviewTemplateId` (`overview`). When the type is read, each linked template's settings are merged under the type's own `templateOverrides` for that slot, and the type's own keys win. The component templates themselves are not in the bundle. (v1.40.1+)
+A node type links up to four component templates, one per slot: `cardTemplateId` (slot `card`), `listItemTemplateId` (`listItem`), `detailHeaderTemplateId` (`detailHeader`), and `overviewTemplateId` (`overview`). When the type is read, each linked template's settings are merged under the type's own `templateOverrides` for that slot, and the type's own keys win. The component templates themselves are not in the file. (v1.40.1+)
 
 **Export** writes:
 
@@ -445,7 +606,7 @@ A node type links up to four component templates, one per slot: `cardTemplateId`
 
 ## Connection Type JSON
 
-A connection type object showing the commonly-used fields. The Field Reference table below lists every key.
+A connection type object — one item of the file's `connectionTypes` part — showing the commonly-used fields. The Field Reference table below lists every key.
 
 ```json
 {
@@ -483,26 +644,26 @@ A connection type object showing the commonly-used fields. The Field Reference t
 | `slug` | `string` | -- | **Required.** Unique identifier (e.g., `related`, `depends-on`). The admin form accepts lowercase letters, digits, and hyphens; an import also accepts underscores (v1.38.0+), so slugs that other modules create directly, such as `related_to`, re-import. Up to 100 characters. |
 | `name` | `string` | -- | **Required.** Singular display name. |
 | `namePlural` | `string` | -- | **Required.** Plural form. |
-| `description` | `string` | -- | Optional description. |
-| `icon` | `string` | -- | Lucide icon name. |
-| `color` | `string` | -- | Hex colour. |
+| `description` | `string \| null` | `null` | Optional description. |
+| `icon` | `string \| null` | `null` | Lucide icon name. |
+| `color` | `string \| null` | `null` | Hex colour. |
 | `fromTypes` | `string[]` | `[]` | Allowed source node types. An empty array (the default) means any type, and `"*"` also means any type (v1.18.0+). Listed types admit their subtypes — see [Type Hierarchy](/modules/structure/type-hierarchy/). |
 | `toTypes` | `string[]` | `[]` | Allowed target node types. Same rules as `fromTypes`. |
 | `bidirectional` | `boolean` | `true` | If true, A→B and B→A are the same pair — a `unique` type then allows one connection per unordered pair (either direction). Traversal is undirected regardless. |
 | `relationClass` | `string \| null` | `null` | What kind of relationship this is: `associative`, `sequential`, `hierarchical`, or `descriptive`. Any other value rejects the import. |
 | `superProperty` | `string \| null` | `null` | The slug of a broader connection type this one specialises (same slug rules as `slug`). |
 | `maxConnections` | `number \| null` | `null` | Maximum connections of this type per node: a whole number, at least 1. Null = unlimited. |
-| `unique` | `boolean` | `false` | Only one connection of this type between any two nodes. |
+| `unique` | `boolean` | `false` | Only one connection of this type between any two nodes. (A version `1.0` file's `isUnique` is read as `unique`.) |
 | `fields` | `NodeTypeField[]` | `[]` | Data fields on connections — the **full** node field shape (see below). |
-| `fieldTemplateIds` | `string[]` | `[]` | Attached shared field templates (reusable field sets) — the same mechanism as on node types, with the same caveat: a **slug** reference only resolves when the same bundle also includes that template in `fieldTemplates`; otherwise use the target app's template id. See [Field Template JSON](#field-template-json). |
-| `contextHints` | `string` | -- | Free-text hints for AI context assembly (max 5000 characters) — mirrors the node type's key of the same name. |
+| `fieldTemplateIds` | `string[]` | `[]` | Attached shared field templates (reusable field sets) — the same mechanism as on node types: your own templates by **slug**, any other template by its id. See [Field Template JSON](#field-template-json). |
+| `contextHints` | `string \| null` | `null` | Free-text hints for AI context assembly (max 5000 characters) — mirrors the node type's key of the same name. |
 | `aiFields` | `object` | `{}` | AI Core prompt-assembly configuration — storage-only, consumed by ai-core's AI tab. |
 | `sortOrder` | `number` | `50` | Display order for this connection type (integer, min 0). Round-tripped on export. |
 
-`moduleId`, `isSystem`, and `isEnabled` are advanced/internal keys that also round-trip — leave them unset unless you know you need them. `moduleId` is only written when the import creates the connection type (default `structure`); an update keeps the stored value. A field id of `origin` is reserved for connection provenance and rejects the import.
+`moduleId`, `isSystem`, and `isEnabled` are advanced/internal keys that also round-trip — leave them unset unless you know you need them. A new connection type without `moduleId` gets `structure`. Since v1.41.0 an update also writes `moduleId` when the item carries it (`null` means `structure`); an item that leaves it out keeps the stored value. A field id of `origin` is reserved for connection provenance and refuses the import.
 
 <Aside type="note" title="contextHints and aiFields round-trip (v1.38.0+)">
-`/config/export` includes both keys for connection types, and an import that omits either one leaves the stored value as it is. Before v1.38.0 the export left them out and the import cleared them, so an export followed by an import wiped a connection type's AI context. Re-importing an older export no longer does. (Node types always round-tripped their `contextHints` and `aiFields`.)
+An export includes both keys for connection types, and an import that omits either one leaves the stored value as it is. Before v1.38.0 the export left them out and the import cleared them, so an export followed by an import wiped a connection type's AI context. Re-importing an older export no longer does. (Node types always round-tripped their `contextHints` and `aiFields`.)
 </Aside>
 
 <Aside type="tip">
@@ -513,7 +674,7 @@ Connection type fields use the **full** node field shape — every property from
 
 ## Group JSON
 
-Groups organise node types under collapsible sidebar section headers. They are purely presentational — groups do not contain nodes.
+Groups organise node types under collapsible sidebar section headers. They are purely presentational — groups do not contain nodes. A group is one item of the file's `groups` part:
 
 ```json
 {
@@ -529,8 +690,8 @@ Groups organise node types under collapsible sidebar section headers. They are p
 |----------|------|---------|-------------|
 | `slug` | `string` | -- | **Required.** Unique identifier (lowercase letters, digits, and hyphens; up to 100 characters). |
 | `name` | `string` | -- | **Required.** Display name (shown as sidebar section header). |
-| `icon` | `string` | -- | Lucide icon name. Stored and round-tripped for compatibility, but not rendered: the host sidebar section has no icon slot, and the admin **Groups** editor no longer offers an icon picker (v1.38.0). |
-| `color` | `string` | -- | Optional hex colour for the group. |
+| `icon` | `string \| null` | `null` | Lucide icon name. Stored and round-tripped for compatibility, but not rendered: the host sidebar section has no icon slot, and the admin **Groups** editor no longer offers an icon picker (v1.38.0). |
+| `color` | `string \| null` | `null` | Optional hex colour for the group. |
 | `sortOrder` | `number` | `0` | Display order. |
 
 To assign a node type to a group, set the `groupSlug` property on the node type to match the group's `slug`.
@@ -539,7 +700,7 @@ To assign a node type to a group, set the `groupSlug` property on the node type 
 
 ## Field Template JSON
 
-Field templates are **reusable field sets** — define a group of fields once, then attach it to many node types or connection types via `fieldTemplateIds` (see [shared field templates](/modules/structure/fields/)). Including them in the config makes the import self-contained.
+Field templates are **reusable field sets** — define a group of fields once, then attach it to many node types or connection types via `fieldTemplateIds` (see [shared field templates](/modules/structure/fields/)). Including them in the file's `fieldTemplates` part makes the import self-contained. A field template is one item of that part:
 
 ```json
 {
@@ -558,42 +719,47 @@ Field templates are **reusable field sets** — define a group of fields once, t
 |----------|------|---------|-------------|
 | `slug` | `string` | -- | **Required.** Unique identifier (lowercase letters, digits, and hyphens; up to 100 characters). Used to match on import and to reference the template. |
 | `name` | `string` | -- | **Required.** Display name. |
-| `description` | `string` | -- | Optional description. |
+| `description` | `string \| null` | `null` | Optional description. |
 | `fields` | `Field[]` | `[]` | The shared field set — same [Fields Array Format](#fields-array-format) as a node type's `fields` (including `requiredWhen`, `visibleWhen`, etc.). |
 | `sortOrder` | `number` | `0` | Display order in the Field Templates admin tab. |
 
-**Referencing a template** — set `fieldTemplateIds` on a node type or connection type. In a hand-authored config you can reference a template **by its `slug`** instead of the generated id, but only when **the same bundle also carries that template in its `fieldTemplates` array**: the importer builds its slug/id map solely from the templates it is importing. An exported id is resolved the same way, so round-tripped configs keep working.
+Since v1.41.0 a field template carries no `id`: it is matched and referenced by its `slug`. In a version `1.0` file, a template's `id` is read only to turn the file's `fieldTemplateIds` into slugs (see [Older files](#older-files-version-10)).
 
-A slug reference in a bundle that omits `fieldTemplates` is left exactly as written and will **not** resolve — even if a template with that slug already exists in the target app. In that case, reference the target app's template **id**. A reference that resolves to nothing is tolerated either way: the type still imports, and the template's fields simply don't appear until the reference is valid.
+**Referencing a template** — set `fieldTemplateIds` on a node type or connection type. An import resolves each entry in turn:
+
+1. **Your own template with that slug** — one the file's `fieldTemplates` part creates or updates, or, since v1.41.0, one you already have, even when the file has no `fieldTemplates` part.
+2. **Anything else is stored as written**, so a template id from the app you are importing into works too.
+
+A reference that resolves to nothing is tolerated: the type still imports, and the template's fields simply don't appear until the reference is valid. An export names each of your own templates by slug and any other template, such as another admin's, by its id, so that template stays attached through an export and an import into the same app.
 
 ```json
 {
-  "fieldTemplates": [
-    {
-      "slug": "audit-metadata",
-      "name": "Audit metadata",
-      "fields": [{ "id": "reviewed_at", "type": "date", "label": "Reviewed at" }]
-    }
-  ],
-  "nodeTypes": [
-    { "slug": "matter", "name": "Matter", "namePlural": "Matters", "fieldTemplateIds": ["audit-metadata"] }
-  ]
+  "moduleId": "structure",
+  "version": "2",
+  "sections": {
+    "fieldTemplates": [
+      {
+        "slug": "audit-metadata",
+        "name": "Audit metadata",
+        "fields": [{ "id": "reviewed_at", "type": "date", "label": "Reviewed at" }]
+      }
+    ],
+    "nodeTypes": [
+      { "slug": "matter", "name": "Matter", "namePlural": "Matters", "fieldTemplateIds": ["audit-metadata"] }
+    ]
+  }
 }
 ```
 
-<Aside type="note">
-The legacy `POST /types/import` endpoint (paired with `GET /types/export`, which returns `version`, `exportedAt`, and `nodeTypes` only) imports node types only and performs no remapping at all — whatever is in `fieldTemplateIds` is stored verbatim. It always asks for step-up, has no dry run, and returns `created`, `updated`, `deleted`, `unchanged`, and `stagesKept` for node types. Since v1.38.0 it refuses (400) a file that also carries non-empty `connectionTypes`, `fieldTemplates`, `groups`, or `functions`, pointing you at `POST /config/import`, rather than silently dropping them. Use the bundle importer if you want slug resolution or any category besides node types.
-</Aside>
-
 <Aside type="note" title="When a template's owner account is erased">
-Field templates belong to the admin who created them. If that admin's account is erased, every remaining node type and connection type that attached one of their templates gets the template's fields copied into its own `fields`, each marked `"templateLocal": true`, and the template id is removed from its `fieldTemplateIds` — so the type keeps the same fields, with the same secret sealing, edit locks, and validation (v1.38.0+). Like the template fields they replace, `templateLocal` fields are **not inherited by subtypes**. They appear in exports; keep the flag if you edit the JSON by hand. Deleting a template yourself, or pruning it with a Replace import, detaches it instead: the types that attached it lose its fields.
+Field templates belong to the admin who created them. If that admin's account is erased, every remaining node type and connection type that attached one of their templates gets the template's fields copied into its own `fields`, each marked `"templateLocal": true`, and the template id is removed from its `fieldTemplateIds` — so the type keeps the same fields, with the same secret sealing, edit locks, and validation (v1.38.0+). Like the template fields they replace, `templateLocal` fields are **not inherited by subtypes**. They appear in exports; keep the flag if you edit the JSON by hand. Deleting a template yourself, or removing it with a Replace import, detaches it instead: the types that attached it lose its fields.
 </Aside>
 
 ---
 
 ## Function JSON
 
-Functions are **admin-defined named expressions** (tier 2 of the [formula field](/modules/structure/fields/)'s function library) — reusable calculations a formula field can call by name. Including them in the bundle keeps a config self-contained: a node type whose formula field calls `budgetVariance(...)` needs that function to exist in the target environment (functions round-trip in the config bundle since v1.33.34).
+Functions are **admin-defined named expressions** (tier 2 of the [formula field](/modules/structure/fields/)'s function library) — reusable calculations a formula field can call by name. Including them in the file's `functions` part keeps a config self-contained: a node type whose formula field calls `budgetVariance(...)` needs that function to exist in the target environment (functions round-trip in the config file since v1.33.34). A function is one item of that part:
 
 ```json
 {
@@ -610,8 +776,8 @@ Functions are **admin-defined named expressions** (tier 2 of the [formula field]
 | `name` | `string` | -- | **Required.** Unique identifier: letters, digits, and underscores, not starting with a digit, up to 100 characters (so `budget_variance` works but `budget-variance` does not). Functions key on `name`, not a slug — a rename creates a new function. |
 | `params` | `string[]` | `[]` | Parameter names (each a valid identifier, max 20). |
 | `expression` | `string` | -- | **Required.** The formula expression body (max 4000 characters). |
-| `description` | `string` | -- | Optional description (max 2000 characters). |
-| `category` | `string` | -- | Optional grouping label for the Functions admin tab (max 100 characters). |
+| `description` | `string \| null` | `null` | Optional description (max 2000 characters). |
+| `category` | `string \| null` | `null` | Optional grouping label for the Functions admin tab (max 100 characters). |
 
 ---
 
@@ -664,7 +830,7 @@ Both node types and connection types use the same field format. Each field in th
 
 ### Validation patterns
 
-`validation.pattern` runs on the server against every value users and API keys submit, so since v1.38.0 Structure checks a pattern before it stores it — on the node-type form, field templates, connection types, both import endpoints, and node-type proposals (and again when a proposal is approved). A pattern is refused with a 400 that names the field when it:
+`validation.pattern` runs on the server against every value users and API keys submit, so since v1.38.0 Structure checks a pattern before it stores it — on the node-type form, field templates, connection types, the configuration import, `importNodeTypes`, and node-type proposals (and again when a proposal is approved). A pattern is refused with a 400 that names the field (on the configuration import, a 422 that names the item) when it:
 
 - is longer than 500 characters, or is not a valid JavaScript regular expression
 - repeats a group whose body can match the same text in more than one way, or chains repeats or optional parts so that a failing match could take runaway time
@@ -746,70 +912,126 @@ Either action only changes the editor's field list; nothing is stored until you 
 
 ## Import Behaviour
 
+An import runs in the starter's step-by-step dialog — see [How an import works](/starter-template/config-transfer/#how-an-import-works). How you choose to apply the file decides what happens to the items already here:
+
+| | New items (not here yet) | Items here that differ | Items here but **not in the file** |
+|---|---|---|---|
+| **Add new only** | added | left as they are (Skipped) | kept |
+| **Merge** (default) | added | updated | kept |
+| **Replace** | added | updated | **removed**, except what [Replace keeps](#replace-mode) |
+
+Each way touches only the parts the file contains, and an item you leave out in the review is neither written nor removed. (Before v1.41.0 there were two modes, Merge and Replace.)
+
 ### Merge Mode
 
-- **New items** (slug not found — `name` for functions) are created
-- **Existing items** (slug matches) are updated with the imported values
-- **Missing items** (in the database but not in the import) are left untouched
+- **New items** (key not found — the slug, or `name` for functions) are created
+- **Existing items** (key matches) are updated with the keys the item carries
+- **Missing items** (here but not in the file) are left untouched
 
 This is the safe default for incremental updates.
 
-A row is matched against the app-level rows and your own; field templates match your own only. New rows are owned the same way as rows made in the admin page: a new node type is app-level, while a new field template, group, connection type, or function belongs to you, the importing admin.
+An item is matched against the app-level rows and your own; field templates match your own only. New rows are owned the same way as rows made in the admin page: a new node type is app-level, while a new field template, group, connection type, or function belongs to you, the importing admin.
 
-An update in **every category** writes **only the keys the row carries**: a key you omit keeps its stored value. That has applied to node types and connection types since v1.38.0, and to field templates, groups, and functions since v1.40.1. A partial node-type row such as `{ "slug": "matter", "name": "Matter", "namePlural": "Matters" }` changes the names and keeps the other stored settings (except the nullable keys listed below), and an older export that lacks a newer key (`moduleId`, or a connection type's `contextHints` and `aiFields`) no longer resets it. (Before v1.38.0 updates were whole-row, and an omitted key was written as its empty value.)
+An update in **every part** writes **only the keys the item carries**: a key you leave out keeps its stored value, and an explicit `null` clears it (see [Absent keys and null](#absent-keys-and-null)). A partial node-type item such as `{ "slug": "matter", "name": "Matter", "namePlural": "Matters" }` changes the names and keeps every other stored setting, and a partial field-template item such as `{ "slug": "contact", "name": "Contact info" }` renames the template and keeps its description and fields. Before v1.41.0 a few nullable keys were cleared when an item left them out, and a version `1.0` file is still read that way (see [Older files](#older-files-version-10)). A new item still gets the defaults for the keys it leaves out: an empty `description`, `fields` of `[]`, and `sortOrder` of `0` on a field template; an empty `icon` and `color` and `sortOrder` of `0` on a group; `params` of `[]` and an empty `description` and `category` on a function.
 
-The exception is a few nullable keys that an export leaves out when they are empty. They are cleared when absent, so that a value cleared in the source environment still travels:
-
-- **Node types:** `description`, `icon`, `color`, `contextHints`, `cardTemplateId`, `listItemTemplateId`, `detailHeaderTemplateId`, `overviewTemplateId`, and `groupSlug`
-- **Connection types:** `description`, `icon`, `color`, `relationClass`, `superProperty`, and `maxConnections`
-- **Field templates:** `description`
-- **Groups:** `icon` and `color`
-- **Functions:** `description` and `category`
-
-Every other key a row leaves out keeps its stored value: a field template's `fields` and `sortOrder`, a group's `sortOrder`, and a function's `params`. A partial row such as `{ "slug": "contact", "name": "Contact info" }` renames the field template and keeps its fields, but clears its description, so include `description` to keep it. These rows refuse `null` (see [Complete Export Format](#complete-export-format)), so leaving the key out is the only way a cleared value travels. (Before v1.40.1, field-template, group and function updates were whole-row, and every omitted key went back to its empty value or default.) A new row still gets the defaults for the keys it leaves out: an empty `description`, `fields` of `[]`, and `sortOrder` of `0` on a field template; an empty `icon` and `color` and `sortOrder` of `0` on a group; `params` of `[]` and an empty `description` and `category` on a function.
-
-As before, `unchanged` compares only the keys the row carries, so a partial row that matches what is stored counts as `unchanged`.
+"No change" compares only the keys the item carries, so a partial item that matches what is stored is not written.
 
 A key you do include is written whole. That matters for [`primaryScope`](#primaryscope): a `primaryScope` without `global`, imported over a type that is currently shared, is an **un-share**, and is refused while other users still hold live entries of that type. Conversely, importing a shared config over an existing **per-user** row promotes that row to app-level (`userId: null`) in the same write, so the flag takes effect rather than sitting inert. For [`referenceConfig`](#referenceconfig), include the key with `enabled` off to stop issuing reference numbers; omitting it leaves the type's numbering as it is (already-issued references are kept either way — they are immutable).
 
+### Add New Only
+
+Creates the items that aren't here yet and leaves every existing item as it is, even one the file would change: the review lists it as Skipped, with the keys that differ. Nothing is removed, and no existing type is shared or un-shared. Use it to add a set of types to an app without touching the ones its admins have customised. (v1.41.0+)
+
 ### Replace Mode
 
-Replace mode applies to **every category present in the bundle** (since v1.33.34):
+- **New items** (key not found) are created
+- **Existing items** (key matches) are updated
+- **Missing items** (here but not in the file) are removed, except the ones Replace keeps (below)
 
-- **New rows** (key not found) are created
-- **Existing rows** (key matches) are updated
-- **Missing rows** (in the database but not in the import) are deleted
+Removal is scoped per part to what the import loads: node types remove app-level rows and your own; connection types, groups, functions, and field templates remove only your own. Pending node-type proposals and other users' own rows are never loaded, so Replace never removes them. A part **absent** from the file is skipped entirely, so a partial file in Replace mode does not wipe what it omits. A part present as an **empty list** is not absent: `"functions": []` in Replace mode removes every function the import can remove. Removals run in reverse part order, and node types subtypes first, so a parent and its subtypes that the file both leaves out are both removed.
 
-The delete is scoped per category: node types prune app-level rows and the importer's own, never another user's own types, and spare `isSystem` types and pending proposals; connection types delete only the importer's own rows and spare `isSystem` ones; field templates, groups, and functions delete the importer's own stale rows. A category **absent** from the bundle is skipped entirely — its rows are never touched, so a partial bundle in Replace mode does not wipe what it omits. A category present as an **empty array** is not absent: `"functions": []` in Replace mode deletes every function the import can prune. When a node type or connection type is deleted, its entries (or connections) already in Deleted are permanently removed once the import commits, except any that still have live entries nested under them; a Preview removes nothing.
+**What Replace keeps.** An item the file leaves out is kept, with the reason shown in the review, when it is:
 
-**App-level node types are never pruned out from under live entries** (v1.38.0+; shared types since v1.34.27). An app-level row — every type an import creates, and every [shared type](#primaryscope) — is the configuration every user's entries of that slug render and validate against, so sweeping it away would strand them. If the bundle omits an app-level type that still has live (not deleted) entries — counted **across all owners**, your own included — the import is **rejected** rather than applied, naming the slug and the entry count. Include the type in the bundle, or delete or migrate those entries first. An `isSystem` type or a pending proposal is not pruned anyway, so it never blocks.
+| Item | The review says |
+|------|-----------------|
+| A built-in (`isSystem`) node type or connection type | "Kept: built-in" |
+| An app-level node type with live (not deleted) entries, counted **across all owners**, your own included | "Kept: still has *N* entries" |
+| A node type another type inherits from, whoever owns the subtype | "Kept: "*slug*" inherits from it" (up to three slugs, then "and *N* more") |
+| An app-level group, connection type, or function | "Kept: it is app-level, and Replace removes only your own groups" (or connection types, or functions) |
 
-<Aside type="caution" title="Deleting types that still have data">
-The guard above covers app-level node types only. A node type that belongs to your own account rather than the app — for example a type created in the admin form with **Everyone, each with their own entries** off — is pruned without checking for entries: there is no foreign-key constraint linking a node to its type, so any live entries keep an orphaned `nodeType` slug. Pruned connection types are not checked for live connections either. Reassign or delete those entries yourself if you do not want them orphaned.
+An app-level node type — every type an import creates, every [shared type](#primaryscope), and every type created with the type form's **Everyone, each with their own entries** toggle — is the configuration every user's entries of that slug render and validate against, so it is never removed out from under live entries. Before v1.41.0 such a type made Replace refuse the whole import (v1.38.0+; shared types since v1.34.27); now it is kept and the rest of the file is applied. To remove it, delete or migrate its entries first.
+
+Replace also removes nothing from a part whose items in the file have problems, because it can't tell which items the file leaves out; a note says so.
+
+When a node type or connection type is removed, its entries (or connections) already in Deleted are permanently removed once the import commits, except any that still have live entries nested under them; a practice run removes nothing. Before Replace removes anything, the dialog warns you, offers **Download a backup**, and its button becomes **Import and remove *N***, which asks for confirmation.
+
+<Aside type="caution" title="Removing types that still have data">
+The entries check above covers app-level node types only. A node type that belongs to your own account rather than the app — for example a type created in the admin form with **Everyone, each with their own entries** off — is removed without checking for entries: there is no foreign-key constraint linking a node to its type, so any live entries keep an orphaned `nodeType` slug. Removed connection types are not checked for live connections either. Reassign or delete those entries yourself if you do not want them orphaned.
 </Aside>
 
-### Dry Run (Preview)
+### The Review
 
-The Import Configuration dialog has a **Preview** button beside **Import**. It POSTs the same bundle to `/config/import` with `"dryRun": true`:
+Every import is planned before anything changes. Once the browser has checked the file, the dialog runs the import as a practice run (`dryRun: true`): the server runs the **same** writes and guards in a transaction and then rolls it back, so the plan is exactly what a real import would do.
 
-- The server runs the **identical** transaction and computes the exact per-category diff — `created`, `updated`, `unchanged`, `deleted` — then deliberately aborts it, so the whole thing rolls back
-- **Nothing is written**, the node-type config cache is not invalidated, no deleted entries are purged, and the `structure.config.imported` action hook does **not** fire
-- A Preview needs no step-up confirmation; only the real import does
-- The preview panel reads "Preview (*mode* mode) — nothing has been changed yet:" and shows each category as "N to create · N to update · N unchanged · N to delete"
-- A bundle that would be rejected surfaces its rejection reason in the preview panel rather than at commit time
-- When the import would keep a type's [sourced stage set](/modules/structure/configuration/#sourced-stage-sets-v1400) (v1.40.0+), the panel adds "Stages will be kept for *slug*: another module supplies them. Change them there." After a real import the line reads "Stages kept for …"
-- The response echoes `mode` and `dryRun: true` alongside the per-category stats
+- **Nothing is written**, the node-type config cache is not cleared, no deleted entries are purged, and no hook fires — neither `structure.config.imported` nor the starter's audit record
+- A practice run needs no step-up confirmation; only the real import does
+- The review lists **every item** with what will happen to it — new, an update with the keys that change, "No change", "Kept: …", or a problem with its reason — with count tiles, search, and filters for change, part, and **Needs review**
+- **Leave out** drops an item from this import, and changing how to apply the file plans again
+- An import that would be refused shows the refusal here, naming the item, rather than at import time
+- **Import** applies the plan on screen in one transaction
 
-Because the preview runs the real transaction, it reflects the mode you have selected — previewing in **Replace** mode shows exactly which rows would be pruned.
+Structure adds a review note to a node type (and, for the field-template note, a connection type) when its write does more than set the file's values, or leaves something out. The item is still applied, and the note puts it under **Needs review**:
+
+| Review note | When |
+|-------------|------|
+| "Keeps its stages: \"*source name*\" supplies them while it runs here, so the stages in the file are not applied." | A running [stage source](/modules/structure/configuration/#sourced-stage-sets-v1400) supplies the type's stage set, and the file's set or `features.stages` differs (v1.40.0+). After a real import the type is listed in `stagesKept` |
+| "Becomes shared with every user." | The write turns [sharing](#primaryscope) on, or creates a shared type |
+| "Stops being shared with every user." | The write turns sharing off, which is refused while other users hold live entries of the type |
+| "Field template \"*slug*\" is not in this import or among your field templates, so it is not attached." | A `fieldTemplateIds` entry names a template that this import doesn't write and you don't have. The slug is stored as written, and a later import that brings the template in (or creating it in the admin page and importing again) attaches it: the review then shows the type as an update of `fieldTemplateIds` |
+| "Its linked card template is not one of yours in this app, so the look saved in the file is kept." | A linked component template (card, list item, detail header or overview) isn't one of yours here, so its saved settings from `templateSnapshot` are merged into the type. Such a type shows as an update on every re-import, because the merged look can't be split back into the file's two parts. The stored row doesn't change |
+
+This review replaces the Import Configuration dialog's **Preview** button and per-category counts (v1.34.2 to v1.40.1).
 
 ### Over the API
 
-Both bundle endpoints sit under `/api/v1/structure` and need an admin. `GET /config/export` returns the bundle described above. `POST /config/import` takes the bundle as its body, plus two optional keys:
+The export and import are the starter's ConfigTransfer router, mounted under `/api/v1/structure/admin/config`. All three routes are admin-only, and a device token never passes:
 
-- `mode`: `"merge"` (the default) or `"replace"`. Any other value is a 400.
-- `dryRun`: `true` for a Preview. It defaults to `false`, and only a real import asks for step-up.
+| Method | Path | Answer |
+|--------|------|--------|
+| GET | `/admin/config` | What the dialog needs first: `{ moduleId: 'structure', title: 'Structure configuration', version: '2', accepts: ['1.0', '2'], strategies, sections, stepUp: true }` |
+| GET | `/admin/config/export` | [The file](#the-file), as an attachment named `structure-config-YYYY-MM-DD.json` |
+| POST | `/admin/config/import` | Body `{ file, strategy, dryRun, exclude }`. `strategy` is `add`, `merge` (the default), or `replace`. `dryRun` **defaults to `true`**, so a bare POST never writes, and only `dryRun: false` asks for step-up. `exclude` lists `{ section, key }` items to leave out |
 
-The dialog always sends both from its own controls, so a `mode` or `dryRun` written in the file is overridden there. The response has the same shape for a real import and a Preview:
+Paths are relative to `/api/v1/structure`. The import answers a practice run with the plan and a real import with the report, in the same shape (the [starter's API reference](/starter-template/config-transfer/#api) describes every field):
+
+```json
+{
+  "moduleId": "structure",
+  "title": "Structure configuration",
+  "version": "2",
+  "fileVersion": "2",
+  "strategy": "replace",
+  "dryRun": true,
+  "sections": [
+    { "name": "nodeTypes", "label": "Node types", "kind": "list", "create": 1, "update": 1, "unchanged": 0, "delete": 0, "skip": 1, "invalid": 0, "review": 1 }
+  ],
+  "items": [
+    { "section": "nodeTypes", "key": "matter", "title": "Matter", "change": "create" },
+    { "section": "nodeTypes", "key": "client", "title": "Client", "change": "update", "fields": ["primaryScope"], "review": "Becomes shared with every user." },
+    { "section": "nodeTypes", "key": "case", "title": "Case", "change": "skip", "note": "Kept: still has 12 entries" }
+  ],
+  "notes": []
+}
+```
+
+Refusals are answered directly:
+
+- **400** `{ error, code: 'config_file_invalid', problems }` — the file can't be read, with every problem listed (see [Validation](#validation))
+- **422** `{ error, code: 'config_import_failed', section, key }` — a write was refused, so nothing changed. `error` names the item and gives Structure's reason
+
+The import's transaction may run for up to 45 seconds (and waits up to 10 seconds to start), so it always finishes, or fails with nothing changed, inside the import dialog's 60-second limit. A re-import of an unchanged export takes well under a second, but each node-type write runs the guards an admin save runs, so a very large file (around 1,000 new node types with computed fields) can run past the limit. It then fails with nothing changed, and you split it into smaller files. A module seeding its types with `importNodeTypes` while a long admin import runs waits for it, and can time out with nothing changed.
+
+After a real import commits, one action hook fires for the whole file: `structure.config.imported` with `userId`, `result`, `mode`, and `stagesKept`. `result` holds the counts per part (zeros for a part the file left out):
 
 ```json
 {
@@ -824,34 +1046,55 @@ The dialog always sends both from its own controls, so a `mode` or `dryRun` writ
 }
 ```
 
-A rejected import returns a 400 with the reason. A shape error lists every problem with its path, such as `connectionTypes.0.maxConnections`.
+`mode` is `add`, `merge`, or `replace` (`add` since v1.41.0), and `dryRun` is always `false`, because a practice run fires nothing. An import does not fire the per-row hooks, such as `structure.nodeType.created` or `structure.connectionType.updated`. It does fire `structure.nodeType.sharingChanged` for each type it starts or stops sharing. The starter records the export and the import in its audit trail as well (`config.exported`, `config.imported`). See [Integration](/modules/structure/integration/) for the payloads.
 
-After a real import commits, one action hook fires for the whole bundle: `structure.config.imported` with `userId`, `result` (the response above), `mode`, and `stagesKept`. The legacy endpoint fires `structure.nodeType.imported` instead. An import does not fire the per-row hooks, such as `structure.nodeType.created` or `structure.connectionType.updated`. It does fire `structure.nodeType.sharingChanged` for each type it starts or stops sharing. See [Integration](/modules/structure/integration/) for the payloads.
+<Aside type="caution" title="The old endpoints are gone (v1.41.0)">
+`GET /types/export`, `POST /types/import`, `GET /config/export`, and `POST /config/import` were removed with no aliases, along with the backend service's `exportConfigBundle`, `importConfigBundle`, and `exportNodeTypes`, the frontend client's import and export methods, and the `useImportNodeTypes` and `useImportConfigBundle` hooks. Script an import against `/admin/config/import` instead. A module that seeds its own node types calls `structureService.importNodeTypes` in process, which is unchanged — see [Integration](/modules/structure/integration/#registering-node-types-from-your-module).
+</Aside>
 
 ### Processing Order
 
-Import processes categories in this order, all inside one transaction:
+Import processes the parts in this order, all inside one transaction:
 
-1. **Field templates** — so node and connection types can reference them via `fieldTemplateIds` (a reference is resolved by slug or exported id only for templates carried in this same bundle)
+1. **Field templates** — so node and connection types can reference them by slug in `fieldTemplateIds`
 2. **Groups** — so that node types can reference them via `groupSlug`
-3. **Node types** — so that connection types can reference them via `fromTypes` / `toTypes`
+3. **Node types** — in the file's order, so a parent must come before its subtypes; and before connection types, which reference them via `fromTypes` / `toTypes`
 4. **Connection types**
 5. **Functions**
 
+In Replace mode the removals then run in reverse: functions, connection types, node types (subtypes first), groups, and field templates.
+
 ### Validation
 
-The import is **atomic**: the whole bundle is validated and applied in one transaction. Unknown keys are ignored, but any of these **rejects the entire import**:
+What can go wrong falls into three kinds.
 
-- **A shape error** — a missing required key, a bad field-template / group / connection-type / function shape (including a `null` where these rows expect text, an unknown `relationClass`, a `maxConnections` below 1, or a function name that is not an identifier), an unknown `mode`, or a category array with more than 1,000 entries (v1.38.0+)
-- **A slug in the wrong format** — node-type and connection-type slugs (and a connection type's `superProperty`) may use lowercase letters, digits, hyphens, and underscores, up to 100 characters (v1.38.0+: node-type slugs were not format-checked before, and connection-type slugs did not allow underscores); field-template and group slugs may use lowercase letters, digits, and hyphens
+**The file can't be read.** A `400` lists every problem, and the dialog shows them at its Check step; nothing is planned:
+
+- the file is empty or is not a JSON object
+- it is another module's file (`moduleId` is not `structure`), its `format` is not `config-transfer`, or its `formatVersion` is newer than this app reads
+- its `version` is not `1.0` or `2`
+- a part is not a list, or holds more than 1,000 items
+- it holds nothing Structure can import
+
+**An item fails its shape check.** The item becomes a problem row with the reason (the current one, if any, is kept), and the rest of the file can still be imported:
+
+- a missing required key (`slug`, `name`, and `namePlural`; `name` and `expression` on a function), or a value of the wrong type — including a `null` on a key that doesn't accept it
+- a slug in the wrong format — node-type and connection-type slugs (and a connection type's `superProperty`) may use lowercase letters, digits, hyphens, and underscores, up to 100 characters; field-template and group slugs may use lowercase letters, digits, and hyphens
+- an unknown `relationClass`, a `maxConnections` below 1, or a function name that is not an identifier
+- a key listed twice in a part (only the first is used)
+
+Under Replace, a part with a problem item removes nothing. (Before v1.41.0 any shape error rejected the whole file.)
+
+**A write is refused.** A `422` names the part and the item; the whole import rolls back and nothing is written. The practice run meets the same refusal, so the dialog shows it at the review, where you can leave the item out and check again:
+
 - **A new node type whose slug another user already owns** as their own type (v1.38.0+) — the imported type would be app-level and shadow theirs. Rename or remove the conflicting type first
-- **A broken hierarchy or reserved field** — a `superClass` cycle or orphan, or a reserved `origin` connection field
+- **A broken hierarchy** — a node type whose parent is neither here nor earlier in the file ("Put "*parent*" in the file ahead of "*type*", or take it out of superClasses"), or a `superClasses` cycle
+- **A reserved field** — a connection-type field with the id `origin`
 - **An unsafe `validation.pattern`** (v1.38.0+) — see [Validation patterns](#validation-patterns)
-- **A computed field that would read a secret** — a formula or computed template that references a secret-typed field, checked against the resolved field set (own, attached-template, and inherited fields). Types outside the bundle are checked too when they inherit from an imported type or attach an imported field template
+- **A computed field that would read a secret** — a formula or computed template that references a secret-typed field, checked against the resolved field set (own, attached-template, and inherited fields). Types outside the file are checked too when they inherit from an imported type or attach an imported field template
 - **The [shared-type](#primaryscope) guards** — a slug clash when a type becomes shared, or an un-share that would strand another user's live entries
-- **In Replace mode, an app-level node type the bundle omits** while live entries of it exist
 
-Nothing is written, and the dialog shows the reason. This replaces the old client-orchestrated flow that could half-apply an import and report "N items failed" without saying which. Beyond the slug format, node-type shape validation stays lenient: it only requires `name` and `namePlural` (up to 255 characters each).
+Beyond the slug format, node-type shape validation stays lenient: it only requires `name` and `namePlural` (up to 255 characters each).
 
 ---
 
@@ -865,7 +1108,7 @@ The module repository includes example JSON configurations in the `examples/` di
 | `starter-legal-matter.json` | Clients, Matters, Folders, and Tags with legal stages, party connections, and precedent tracking |
 | `starter-minimal.json` | A single "Space" root type with Folders — the simplest starting point |
 
-Use these as a starting point: import one via the admin panel, then customise to fit your application.
+Use these as a starting point: import one via the admin panel, then customise to fit your application. They are version `1.0` files, with their parts at the top level and a top-level `description`; they import as they are (see [Older files](#older-files-version-10)), and the `description` is ignored with a note.
 
 <Aside type="tip" title="Blank template">
 A blank template with all possible fields is available on the [Structure Module overview page](/modules/structure/#import-json-template). Copy it, fill in your values, and import.
