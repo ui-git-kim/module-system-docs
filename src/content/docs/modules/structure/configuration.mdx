@@ -132,8 +132,8 @@ The universal entity table — every node is stored here.
 | `settings` | JSON | Node-specific settings |
 | `metadata` | JSON | Module extensibility data |
 | `embedding` | vector? | Embedding vector (opt-in — only when embeddings enabled) |
-| `embeddingText` | String? | Exact text that was embedded, used for staleness checks (opt-in — only when embeddings enabled) |
-| `embeddingModel` | String? | Model that produced the embedding; `null` means the node needs embedding (opt-in — only when embeddings enabled) |
+| `embeddingText` | String? | Exact text that was embedded, used for staleness checks (opt-in — only when embeddings enabled). It can hold a secret field's plain text, so since v1.45.0 no node read and no write's answer returns it: it reads `null` on every row, the owner's own included, and a `{ref->column}` token never reads it |
+| `embeddingModel` | String? | Model that produced the embedding; `null` means the node needs embedding (opt-in — only when embeddings enabled). Like `embeddingText`, it reads `null` on every row a read or a write returns (v1.45.0) |
 | `searchVector` | tsvector? | Always-on full-text search vector over name + description + data values; trigger-maintained and GIN-indexed (created by the module migration, not opt-in) |
 | `createdAt` | DateTime | Creation timestamp |
 | `updatedAt` | DateTime | Last update timestamp |
@@ -543,7 +543,7 @@ Added in v1.34.0. With `isolation` left at its default `'filter'`, scoping is a 
 
 - The server resolves the caller's **active space** from `structure_settings.currentScopeNodeId` and confines reads to nodes whose `rootNodeId` matches it — lists, tree, keyword search, connections and the neighbourhood reads (children / descendants / path) all go through the same guard. Since v1.43.0 the caller's own [unassigned records](#unassigned-records-v1430) are read beside it.
 - The **embeddings retrieval arm** (`semanticSearch*` / `lexicalSearch*` / `hybridSearch*` / `findSimilarNodes`) is *not* ambiently scoped. It lives in a separately generated service that cannot see the scope helpers, so it confines results only when the calling consumer passes `scopeRootId` explicitly — an opt-in contract for cognitive-pipeline / AI Core, not a server-side guarantee. Making it ambient is a deferred, coordinated change.
-- It is **fail-closed**: an enforced type with no valid active space resolves to `deny` rather than falling back to unscoped results. A stale setting simply yields nothing; an explicitly supplied invalid scope is a `400`. A deleted record is never the active space (v1.43.0): deleting the open one leaves no space, and the app clears the setting. With no valid space a list still shows the shared types and the caller's unassigned records.
+- It is **fail-closed**: an enforced type with no valid active space resolves to `deny` rather than falling back to unscoped results. A stale setting simply yields nothing; an explicitly supplied invalid scope is a `400`. Since v1.45.0 a module calling in-process is held to the same rule: a `scopeRootId` other than a non-empty string, `null` or nothing (an object or an empty string, say) is the `400` `Invalid scope for this request`, before anything is read, on every read that takes one (see [Integration](/modules/structure/integration/#scoping-and-read-permissions-for-consuming-modules-v1342)). A deleted record is never the active space (v1.43.0): deleting the open one leaves no space, and the app clears the setting. With no valid space a list still shows the shared types and the caller's unassigned records.
 - Instances of the enforced primary type itself are never confined, so the space list stays cross-space and users can still switch spaces.
 - Trusted in-process (system) callers bypass the guard; end-user calls never can.
 - Moving a node **out of** an enforced space is rejected unless its type opts in with `rules.allowCrossSpaceMove` (default off, and audited). That covers a move into a *different* space as well as a move to unscoped or scope-exempt territory — the old root is what the guard tests. Filing a node **in** from a non-enforced area is always allowed.
@@ -598,6 +598,18 @@ Before v1.43.0 such a row was simply invisible under an enforced space, which is
 
 A move of an unassigned record to a parent inside a live section assigns it too. It goes where it is moved, under the hierarchy rules, with the same wall check and the same removal of references to rows left in a deleted section. Unlike the assign, a move doesn't bring the linked unassigned records with it, so a reference to one of them refuses the move. What the user sees is on [Usage](/modules/structure/usage/#unassigned-entries).
 
+#### One per section (v1.45.0+)
+
+A yes/no field can be kept to one entry per section: a "This is me" box that only one Person in each Matter may have ticked, say. Turn on **Only one per Matter** in the field editor (the switch takes the isolated type's own name), or set `uniqueInScope: "section"` on the field in JSON.
+
+- **What happens.** Ticking the box on one entry unticks it on the entry that had it in the same Matter. Both changes are part of the same save, so if the save is refused, nothing changes.
+- **Which entries count.** Live entries of the type, and of its subtypes that inherit the field, filed in the same Matter. Archived entries count; entries in Deleted don't. Shared types never count.
+- **Unassigned entries are left out.** An entry that isn't in any Matter yet doesn't count and is never unticked, so two unassigned entries can both be ticked. When one is assigned to a Matter, or moved into one, it counts there: if it is ticked, the entry that had it in that Matter is unticked.
+- **Where it is offered.** Only on a top-level yes/no field (`boolean` or `toggle`) of a type whose entries live in sections. It can't be combined with **Set automatically** on the same field, nor with a reference field's write-back (`syncTargetField`) to that field, and a connection type's fields never take it.
+- **Every write keeps to it,** from the app, the public API, another module or a system caller. Each entry it unticks fires `structure.node.updated`.
+
+The full rules, including which entry wins on a bulk create, a merge, a restore and a duplicate, are on [Field Types](/modules/structure/fields/#one-per-section-uniqueinscope).
+
 #### Shared types (`global: true`)
 
 Added in v1.34.27. Setting `primaryScope.global: true` makes a node type **read-shared**: every user reads the same entries instead of each user having their own, and the type is **space-exempt** — its nodes stay visible inside any enforced space and are a valid connection target from any space. Use it for reference data the whole app draws on. The toggle is **Shared across all users**, in the same **Scope** section as the primary-scope toggle.
@@ -605,8 +617,8 @@ Added in v1.34.27. Setting `primaryScope.global: true` makes a node type **read-
 Sharing is a **read** widening only:
 
 - **Writes are never widened.** A user can only ever modify entries they created — edit, archive, restore, delete, duplicate, favourite, move, add-child and every bulk operation — at **any** permission tier, with **no admin bypass**. The `permissions` tiers on a shared type only narrow who may create their own entries; they never widen who may change someone else's. A non-owner gets a read-only view: the detail header shows a lock and a **Read-only** marker, and every write control is hidden.
-- **A non-owner's row is sanitised** on every surface it can reach (detail, list, tree, search, children, descendants, connection endpoints, and semantic / lexical / hybrid results): `secret`-typed values are stripped (the keys are absent, not blanked), `embeddingText` is stripped, `settings` and `metadata` are blanked, and `isFavorite` is forced `false`. Favourites belong to the creator — the Favourites filter returns owned rows only, and a reader cannot favourite someone else's shared entry.
-- **Chunks and embeddings.** `embeddingText` is never returned to a non-owner. Chunks of a shared node have their `metadata` blanked, and are **omitted entirely when the source type declares any `secret` field**, because chunk prose can embed a secret. Resolution fails closed: a type or field-definition set that cannot be read yields no chunks.
+- **A non-owner's row is sanitised** on every surface it can reach (detail, list, tree, search, children, descendants, connection endpoints, and semantic / lexical / hybrid results): `secret`-typed values are stripped (the keys are absent, not blanked), `settings` and `metadata` are blanked, and `isFavorite` and `isPinned` are forced `false`. Favourites and pins belong to the creator — the Favourites filter returns owned rows only, and a reader cannot favourite someone else's shared entry.
+- **Chunks and embeddings.** Since v1.45.0 `embeddingText` and `embeddingModel` read `null` on every row any read or write returns, the owner's own included (before, only a non-owner's `embeddingText` was blanked). Chunks of a shared node have their `metadata` blanked, and are **omitted entirely when the source type declares any `secret` field**, because chunk prose can embed a secret. Resolution fails closed: a type or field-definition set that cannot be read yields no chunks.
 - **Edges are never shared.** Connections stay per-user rows — on a shared node you see only your own edges, and may create, promote, restore and delete your own. Deleting or restoring a shared node deliberately sweeps referencing edges **across owners**, so delete and restore stay symmetric.
 
 <Aside type="caution" title="Sharing requires an app-level type row">
@@ -833,8 +845,28 @@ interface NodeTypeField {
   order?: number;
   section?: string;
   width?: 'full' | 'half';
+  // v1.45.0 — see Showing, setting and one per section on Field Types
+  showOnCreate?: boolean;   // default true: false leaves it off the create form
+  showOnDetail?: boolean;   // default true: false leaves it off the detail page and edit form
+  setWhen?: Array<{ when: VisibleWhenCondition; value: unknown }>; // value rules, at most 20
+  uniqueInScope?: 'section'; // yes/no fields: one entry per section has it on
+  nodeReferenceConfig?: {
+    allowedTypes?: string[];
+    excludeTypes?: string[];
+    multiple?: boolean;
+    maxItems?: number;       // v1.45.0, 1 to 1000, with multiple
+    filter?: VisibleWhenCondition;
+    allowGlobalTypes?: string[];
+    allowCreate?: boolean;
+    createTypes?: string[];
+    allowEdit?: boolean;     // v1.45.0
+    allowDelete?: boolean;   // v1.45.0
+    syncTargetField?: string;
+  };
 }
 ```
+
+`VisibleWhenCondition` stands for the `visibleWhen` condition shape. The interface lists the keys most types need; every field setting is on the [Field Types Reference](/modules/structure/fields/#field-settings), and every `nodeReferenceConfig` key is in [one table there](/modules/structure/fields/#node-reference).
 
 **Built-in field types (22):** text, textarea, number, date, datetime, time, select, multiselect, chained-select, toggle, boolean, url, email, phone, address, name-field, secret, hidden, section-break, node-reference, field-group, formula. See the [Field Types Reference](/modules/structure/fields/) for the full list with configuration and examples.
 
@@ -1131,12 +1163,51 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 | PATCH | `/types/:slug` | Update type (admin only) |
 | DELETE | `/types/:slug` | Delete type (admin only, step-up). Fails while live entries exist — counted **across all owners** for an app-level type. Entries of the type already in **Deleted** are then permanently removed |
 | POST | `/types/reorder` | Batch `sortOrder` update — body `{ items: [{ slug, sortOrder }] }`, one transaction (admin only) |
+| GET | `/types/:slug/recompute` | v1.45.0+. How many existing entries an update of their stored computed values would work through: `{ entries }` (admin only). See [Updating existing entries](#updating-existing-entries-v1450) |
+| POST | `/types/:slug/recompute` | v1.45.0+. Work the existing entries' stored computed values out again, one batch per call — body `{ fields?, after? }`, answer `{ updated, unchanged, failed, remaining, next }` (admin only). See [Updating existing entries](#updating-existing-entries-v1450) |
 
 "Step-up" means the request also needs a fresh identity confirmation at the starter's hardened and strict security tiers (at the standard tier the guard lets the request through): the starter answers `403` with code `step_up_required`, and its API client opens the "Confirm it's you" dialog and retries. A device token is always refused (`web_session_required`). The same guard covers deleting connection types, field templates and functions, creating API keys, purging deleted entries, and a real configuration import.
 
 Node types are exported and imported with the rest of the configuration — see [Configuration Export / Import](#configuration-export--import) below. The node-types-only `GET /types/export` and `POST /types/import` were removed in v1.41.0.
 
 Since v1.18.0, the list and get responses include two additive keys: `superClasses` (the raw parent slugs) and a read-only `resolved` block (`fields`, `features`, `ancestors`) with inheritance applied. See [Type Hierarchy](/modules/structure/type-hierarchy/).
+
+#### Updating existing entries (v1.45.0+)
+
+A computed value is stored on each entry when the entry is saved: a computed name, description or slug, a data field's merge template, or a formula field. Changing how the type works one out doesn't rewrite the values already stored. An admin chooses whether to update the existing entries, in two places (what each one looks like is on [Usage](/modules/structure/usage/#updating-existing-entries-v1450)):
+
+- **When the type is saved.** If the save changes how a stored value is worked out and the type has at least one entry, the save asks first. Its one checkbox, **Also update the existing … (N entries)**, is **unticked** by default, so only new entries, and entries edited later, get the new values. Ticked, the changed fields (and the values on the same entry that read them) are updated straight after the save. When the slug's definition changed, the dialog warns that the entries' web addresses change, now if ticked or each one when it's next edited if not, so old links stop working. If the number of entries can't be read, the save goes ahead without asking.
+- **Update entries.** A button on the type page's header, while the type is being edited, works out **every** computed value of every existing entry again, using the type as it is saved. It asks first, with the number of entries, and warns when the type computes its slug.
+
+**What the save counts as a change:**
+
+- the computed Name, Description or Slug: its merge template or, without one, its formula, with its precision, prefix and suffix;
+- a data field's merge template (not on a formula, field-group, secret or node-reference field);
+- a formula field's formula, `evaluate`, precision, prefix or suffix;
+- a new computed field.
+
+A field-group sub-field is listed as "Group > Sub". Not listed: a removed definition (the values already stored stay as they are), a built-in locked by **Editable By** (it is never recomputed), attaching or detaching a field template, and a change to a parent type. **Update entries** covers the last two, and it also refreshes values stored before v1.45.0 that read a column a reference no longer reads (see [Node reference dereference](/modules/structure/merge-fields/#node-reference-dereference)): run it once per type that reads through a reference. A change to only a data formula field's precision, prefix or suffix opens the dialog too, although no stored value changes; those entries come back unchanged.
+
+**Which entries.** Every entry of the type and of its subtypes that isn't in Deleted, archived and unassigned ones included.
+
+- An **app-level** type: every owner's entries of it and of its app-level subtypes, plus each owner's own entries of that owner's personal subtypes of it.
+- A **personal** type: its owner's own entries, of it and its subtypes.
+
+Each entry is worked out as its owner would see it: the owner's read permissions and the entry's own isolation section.
+
+**How it writes.**
+
+- Only the values that change are written, as a system write, so field locks and permission tiers don't apply.
+- A data field's merge template is worked out on the server, giving the text the form gives. (On an ordinary save the form still works it out.) A field hidden on create is worked out too. A template that now works out blank writes nothing, as in the form, so that field keeps its stored text.
+- Each entry gets up to three rounds of templates and formulas, so a template that reads the new computed name, or a formula that reads a new template value, comes out current.
+- A built-in locked by **Editable By** is never recomputed.
+- A computed name that clashes with a sibling's isn't stored: that entry keeps its name, and counts as **failed**, or as **updated** when its other values changed. A computed slug that another live entry holds takes `-2`, `-3` and so on, as on any write.
+- Each changed entry fires `structure.node.updated` with `source: 'formula'`, and after each batch the formulas that read the changed entries are recomputed once.
+- Value rules (`setWhen`) and one per section (`uniqueInScope`) aren't run: neither reads a computed value.
+
+**Limits.** Entries are read in id order, 200 at a time, and one call works through at most 5,000 of them and starts no new batch after 20 seconds. The app calls again with the last id until none are left. A field-group whose rows changed while the update ran keeps its rows, and the entry counts as unchanged.
+
+**Over the API.** Both routes are admin only, and in process the caller must be an admin or the system. The routes are in the table above; the service methods are on [Integration](/modules/structure/integration/#updating-existing-entries-v1450).
 
 #### Shared-type failure conditions
 
@@ -1266,7 +1337,7 @@ This is the endpoint behind the formula library's `semanticSimilarity()` functio
 |-------|-------------|
 | `type` | Filter by node type slug |
 | `types` | Comma-separated list of type slugs |
-| `includeSubtypes` | `true` to expand the `type`/`types` filter to each type plus all of its subtypes (v1.18.0+) — see [Type Hierarchy](/modules/structure/type-hierarchy/) |
+| `includeSubtypes` | `true` to expand the `type`/`types` filter to each type plus all of its subtypes (v1.18.0+) — see [Type Hierarchy](/modules/structure/type-hierarchy/). Since v1.45.0 the list keeps to the active space when any type in that expanded set is scoped, so a scoped subtype confines the list, as `queryNodes` decides it. With both `type` and `types`, the decision reads `types`, as the type filter does |
 | `parentId` | Filter by parent (use `null` for roots) |
 | `status` | `active` (default), `archived`, `deleted`, or `all`. `all` means every status **except** `deleted`; deleted entries are listed only with an explicit `deleted`, which returns the caller's own deleted entries (the list page's **Deleted** filter) |
 | `isFavorite` | `true` or `false` |
@@ -1287,7 +1358,7 @@ This is the endpoint behind the formula library's `semanticSimilarity()` functio
 | `stageGroup` | Filter to the stages of one stage group — the stages whose `group` is this slug in the type's `stageConfig`. Needs `type` (not `types`), otherwise `400`; a group the type does not define is also a `400`, and a defined group no stage uses yet matches nothing. Combined with `stage` / `stages`, only stages in both are kept |
 | `withoutStage` | v1.40.0+. Entries with no stage. `only` lists just those, and is a `400` with `stage`, `stages` or `stageGroup`. `include` adds them to whichever stage filter is set, and on its own changes nothing |
 | `ownerOnly` | v1.40.0+. `true` reads a [shared type](#shared-types-global-true) only for the caller's own entries. It changes nothing on any other type |
-| `withinSectionOf` | v1.42.0+. A node id: list only what that **host** node may reference under the [section wall](#the-hard-wall-around-sections-v1420) — its section's entries plus the shared types, or, for a host in no section, the entries in no section plus the shared types. It narrows every other filter, and confines nothing when no type is isolated. `404` if the caller can't read the host. This is what a node-reference picker sends |
+| `withinSectionOf` | v1.42.0+. A node id: list only what that **host** node may reference under the [section wall](#the-hard-wall-around-sections-v1420) — its section's entries plus the shared types, or, for a host in no section, the entries in no section plus the shared types. It narrows every other filter, and confines nothing when no type is isolated. `404` if the caller can't read the host. Since v1.45.0 an in-process call that passes an explicit `scopeRootId` reads the host under it, as `getNode` does: a host of a space-bound type outside that section, or an unassigned host, is a `404` (a system caller skips this check, as on `getNode`). This is what a node-reference picker sends |
 | `sectionGlobalTypes` | v1.42.0+. With `withinSectionOf`, a comma-separated list of the shared types that join the section's entries (a field's `allowGlobalTypes`). Present but empty means none; absent means every shared type |
 | `unassigned` | v1.43.0+. `true` lists only the caller's [unassigned records](#unassigned-records-v1430) (the list page's **Unassigned** button). It lists nothing when no type is scoped. `false`, or leaving it out, changes nothing |
 
@@ -1341,6 +1412,7 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 | `createConnectionSchema` | POST `/connections` | `fromNodeId`, `toNodeId`, `connectionType` required; optional `origin` (lowercase-kebab) and `status` (`active` or `pending`) |
 | `createNodeTypeSchema` | POST `/types` | `slug` regex validated, `name`/`namePlural` required |
 | `updateNodeTypeSchema` | PATCH `/types/:slug` | All fields optional |
+| `recomputeTypeValuesSchema` | POST `/types/:slug/recompute` | v1.45.0. Optional `fields` (at most 200 ids, each up to 100 characters: built-ins `name`, `description` or `slug`, or top-level field ids, a field-group for its sub-fields) and optional `after` (an entry id, the previous call's `next`) |
 | `proposeNodeTypeSchema` | POST `/types/proposals` | Everything in `createNodeTypeSchema`, plus required `proposal.proposedBy` (kebab-case) |
 | `approveNodeTypeProposalSchema` | POST `/types/proposals/:slug/approve` | Optional `scope` — `user` (default) or `system` |
 | `createTemplateSchema` | POST `/templates` | `name`, `type` required, `slug` regex validated |
@@ -1350,7 +1422,9 @@ Request schemas type the `data` blob as an open bag, so there is a **second vali
 
 Its scope is deliberately narrow: top-level fields only (`field-group` sub-fields are not walked); the `formula`, `section-break`, `hidden`, `field-group` and `secret` types, and computed fields, are skipped; only *unconditional* `required` is enforced, so a field carrying `visibleWhen` is exempt; and data keys with no matching field definition are ignored. On update only the supplied keys are value-checked — a value left exactly as stored is not re-checked — though a required field cannot be cleared to empty.
 
-A few value **shapes** are checked on top, `field-group` rows included: a `secret` value must be text, a `node-reference` value must be a node id (or a list of them), and a `field-group` value must be a list of rows. On request writes (the in-app and public APIs) two more rules apply:
+Before that layer runs, the type's [value rules](/modules/structure/fields/#set-automatically-setwhen) (`setWhen`, v1.45.0) set their values, for every caller, so the value a rule sets is the one checked.
+
+A few value **shapes** are checked on top, `field-group` rows included: a `secret` value must be text, a `node-reference` value must be a node id (or a list of them), and a `field-group` value must be a list of rows. Since v1.45.0 a multiple `node-reference` field with `maxItems` takes at most that many entries (`Field "x" takes at most N entries`), for every caller. On request writes (the in-app and public APIs) two more rules apply:
 
 - A `node-reference` field restricted by `allowedTypes` must point at a readable entry of one of those types, or of a subtype.
 - A field locked by `editableBy` cannot be set by a caller who may not edit it. On create such a field may be left empty — the server then fills in its default, if it has one — or sent at exactly its default; computed and formula fields are exempt.

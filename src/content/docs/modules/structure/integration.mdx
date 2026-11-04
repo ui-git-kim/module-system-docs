@@ -76,6 +76,7 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 | Customise UI labels per type | ✅ | — | `getLabel()` utility |
 | Access Structure data at runtime | — | ✅ | `serviceRegistry.get('structure')` |
 | Work out templates, formulas and conditions, and find records by condition (v1.44.0+) | — | ✅ | `structureService` record reads and `structureService.formulas` |
+| Update a type's existing entries after its computed values change (v1.45.0+) | ✅ | ✅ | `structureService.recomputeTypeValues`, `POST /types/:slug/recompute`, `useTypeRecompute()` |
 | Semantic search / embeddings (opt-in) | — | ✅ | `serviceRegistry.get('structureEmbeddings')` |
 | Transform Structure data (filters) | — | ✅ | `filterRegistry` |
 | React to Structure events (actions) | — | ✅ | `actionRegistry` |
@@ -828,7 +829,7 @@ Every hook's `Context` below is a **named, exported interface** in Structure's `
 | Hook | Context | Fires when |
 |------|---------|------------|
 | `structure.node.created` | `{ userId, node, nodeType }` | A node is created |
-| `structure.node.updated` | `{ userId, node, changes, source? }` | A node is updated. `source: 'formula'` (v1.42.0+) marks the server recomputing the node's stored formula values after a node they read changed — not a caller's own edit — so a listener can tell these apart and debounce them |
+| `structure.node.updated` | `{ userId, node, changes, source? }` | A node is updated. `source: 'formula'` (v1.42.0+) marks the server recomputing the node's stored formula values after a node they read changed — not a caller's own edit — so a listener can tell these apart and debounce them. Updating a type's existing entries (v1.45.0+) fires it with `source: 'formula'` for each entry it changes, up to 5,000 per call. Two system writes fire it with no `source`: the reference write-back (`syncTargetField`) for each entry it flags, and one per section (v1.45.0+) for each entry it turns off. Their `changes.data` holds the field written plus anything that entry's own value rules set |
 | `structure.node.deleted` | `{ userId, nodeId, nodeType }` | A node is deleted |
 | `structure.node.moved` | `{ userId, node, oldParentId, newParentId, oldRootNodeId, newRootNodeId }` | A node moves parent (or space — compare `oldRootNodeId`/`newRootNodeId`) |
 | `structure.node.archived` | `{ userId, node }` | A node is archived |
@@ -887,6 +888,8 @@ Every hook's `Context` below is a **named, exported interface** in Structure's `
 
 <Aside type="note" title="No plaintext secrets in hook payloads">
 Listeners never receive a secret field's plaintext. Node rows on a payload carry only sealed values, `structure.node.updated` carries `changes.data` with secret values removed, and the connection hooks (`created`, `proposed`, `promoted`, `updated`) carry `connection.data` with every secret-typed connection field removed. The service method's own caller still gets the unsealed connection back. On `updated` and `promoted` payloads, an endpoint node whose type the acting user may not read is left out.
+
+One exception, on an embeddings install: a node row on a payload is the row as stored, so it still carries `embeddingText`, the text prepared for search, which can hold a secret field's plain text, and `embeddingModel`. No read or write answer returns either since v1.45.0, but hooks do. Don't store or forward them from a listener.
 </Aside>
 
 ### Transforming Structure Data (Filter Hooks)
@@ -982,6 +985,9 @@ Structure's write methods learn who is calling from their options. Its HTTP rout
 | Value shapes | A secret must be text, a node-reference value a node id, and a field group a list of rows — otherwise 400 | Coerced with a logged warning: a number or true/false secret becomes text, a value that is not a node id is dropped from a reference field, and a field group is reshaped (a single row object becomes a one-row list, entries that are not rows are dropped, an empty object or a scalar is dropped) |
 | A value too long to test safely against its validation pattern | 400 | The pattern check is skipped, with a warning |
 | Pending node-type proposals | At most 50 per user | Not capped |
+| [Value rules](/modules/structure/fields/#set-automatically-setwhen) (`setWhen`, v1.45.0+) | Applied: a rule's value replaces what the write sends, with no error | The same, `isSystem: true` included |
+| [One per section](/modules/structure/fields/#one-per-section-uniqueinscope) (`uniqueInScope`, v1.45.0+) | Applied: turning the field on turns it off for the section's other entries | The same, `isSystem: true` included |
+| A multiple reference field's `maxItems` (v1.45.0+) | More entries than the limit is a 400 | The same, `isSystem: true` included |
 
 Node field validation (required fields, types, patterns, options) runs for every caller, and on an update a value left exactly as stored is not re-checked or coerced, so a read-modify-write that round-trips old data is unaffected.
 
@@ -1023,6 +1029,10 @@ Then pass that array as `excludeNodeTypes` on every retrieval call:
 
 `scopeRootId` is the second half of the contract. When the app uses **enforced spaces**, results must be confined to the active space: pass that space's root node id (`structure_node.rootNodeId`) as `scopeRootId`. Your module resolves and validates the active space; Structure only applies the filter, and rows with a null `rootNodeId` are excluded when it's set. When `expandGraph` is not given `scopeRootId`, it anchors traversal on the seed nodes' own space; since v1.39.0 you can pass one to choose the section explicitly (see [Isolation Sections](#isolation-sections-v1390)).
 
+**`scopeRootId` must be a string (v1.45.0+).** Every read that takes a `scopeRootId` accepts a non-empty string, `null` or `undefined`. `undefined` means no scope, and `null` means what it meant before: on most reads no scope, and "outside every section" on `semanticSearchNodes`, `findSimilarNodes` and `expandGraph`, and on `listNodes` for a system caller (see [Isolation Sections](#isolation-sections-v1390)). Anything else, an empty string or an object such as `{ not: '' }`, is the `400` `Invalid scope for this request`, before anything is read, for every caller, system ones included. Before v1.45.0 an object passed in-process reached the database as a filter, and `{ not: '' }` widened a list to every section. The check covers `listNodes`, `getNode`, `getTree`, `getNodeContext`, `listConnections`, `getActiveScope`, `expandGraph` and `searchNodes`, the path, children and descendants reads, the [record reads](#record-reads-and-the-formula-engine-v1440), and the six `structureEmbeddings` searches: `semanticSearchNodes`, `findSimilarNodes`, `semanticSearchChunks`, `lexicalSearchChunks`, `hybridSearchNodes` and `hybridSearchChunks`. Web requests were already checked; the public API still reads an empty `?scopeRootId=` as absent.
+
+**`listNodes` with subtypes (v1.45.0+).** With `includeSubtypes`, `listNodes` decides whether to confine the list to the active space on the expanded set of types, as `queryNodes` does. A scoped subtype therefore confines the whole list, and the unscoped type's own rows outside the space drop out too, as they would in an explicit mixed list. Before, the decision was made on the requested types alone, so an unscoped type listed with its scoped subtypes returned every section's rows. With both `type` and `types`, the decision reads `types`, as the type filter does. The node-reference picker sends the expanded `types` itself, so mostly in-process callers see the change.
+
 <Aside type="caution" title="Omitting these leaks data">
 `excludeNodeTypes` and `scopeRootId` both default to "no filtering". A consumer that forgets them will happily surface admin-only node types, and content from spaces the user isn't in, inside its own results. Structure cannot catch this for you.
 </Aside>
@@ -1060,9 +1070,10 @@ if (!isOwner) {
 | Field | What a non-owner receives |
 |-------|---------------------------|
 | `data` | Secret-typed field values are **removed** — the keys are absent, not blanked. Probe with `'fieldId' in node.data`, never for `''` |
-| `embeddingText` | `null` |
+| `embeddingText`, `embeddingModel` | `null`. Since v1.45.0 they are `null` on **every** row a read or a write returns, the owner's own included |
 | `settings`, `metadata` | `{}` |
 | `isFavorite` | `false` — favourites are the creator's, and the Favourites filter returns owned rows only |
+| `isPinned` | `false` — pins are the creator's too |
 
 Sanitisation happens inside the service, *before* the `structure.node.response` filter runs — so anything your filter hook adds back onto a node is **not** sanitised. Gate the enrichment on ownership if it carries per-user data.
 
@@ -1076,7 +1087,7 @@ Sanitisation happens inside the service, *before* the `structure.node.response` 
 | `setNodeEmbedding`, `clearNodeEmbedding`, `replaceNodeChunks`, `setChunkEmbedding`, `deleteNodeChunks` | Owner-scoped writes — they don't match a node the caller doesn't own |
 | `getNodeChunks`, `lexicalSearchChunks`, `semanticSearchChunks`, `hybridSearchChunks` | Widen on the **source node's** type. A non-owner's chunk has `metadata` blanked, and the chunk is **omitted entirely** when the source type declares any secret field — chunk `content` is prose, and a secret can sit inside it. Fails closed when the type or its field definitions can't be resolved |
 
-So a shared type that declares secret fields contributes node-level retrieval results but no chunk-level ones, and `embeddingText` is never available for another user's row. Build context bundles from what comes back, not from what you expect to come back.
+So a shared type that declares secret fields contributes node-level retrieval results but no chunk-level ones, and `embeddingText` is never available for another user's row (since v1.45.0, for anyone's row). Build context bundles from what comes back, not from what you expect to come back.
 
 <Aside type="note" title="Guards and known limits">
 Structure **refuses** to un-share a type while any other user holds a live node of it (`BadRequestError` naming the slug and the count), counts a shared type's nodes across owners in `deleteNodeType`, and **fails** a replace-mode `importNodeTypes` rather than sweeping a shared type away under other users' rows (the admin configuration import keeps such a type instead, as "Kept: still has *N* entries", and applies the rest of the file). Surface those errors to the operator instead of retrying — each names what has to be migrated first. Two limits worth knowing: `dataFilters` and `dataSortField` run against the raw `data` column *before* sanitisation, so `listNodes` refuses (400) a filter or sort on a secret-typed field, or on a field group holding one, for every caller except `isSystem`; and the shared-slug list is cached for 15s per process — bounded safe in both directions, because newly sharing is purely additive and un-sharing is refused while other users hold nodes.
@@ -1181,7 +1192,7 @@ Since v1.42.0 an isolation section is a hard wall. A node-reference value, a fie
 
 **Reads for pickers and formulas.**
 
-- **`listNodes` with `withinSectionOf: hostId`** (HTTP `?withinSectionOf=`) lists only what that host may reference: its section's nodes plus the shared types, or, for a host in no section, the nodes in no section plus the shared types. `sectionGlobalTypes` (HTTP: comma-separated) narrows the shared types, and `[]` means none. It narrows every other filter, and confines nothing when no type is isolated. A host the caller can't read is a `404`.
+- **`listNodes` with `withinSectionOf: hostId`** (HTTP `?withinSectionOf=`) lists only what that host may reference: its section's nodes plus the shared types, or, for a host in no section, the nodes in no section plus the shared types. `sectionGlobalTypes` (HTTP: comma-separated) narrows the shared types, and `[]` means none. It narrows every other filter, and confines nothing when no type is isolated. A host the caller can't read is a `404`. Since v1.45.0 the host is read under the call's explicit `scopeRootId`, as `getNode` reads it: a host of a space-bound type outside that section is a `404`, and so is an unassigned host, whatever the saved active space. With no saved space, a host in the named section is now read (before, a `404`). For this host read `null` counts as no scope, and without a `scopeRootId` the saved active space decides, as before. A system caller skips the host's space check, as on `getNode`.
 - **`getNodeSection(nodeId, userId, options?)`** (HTTP `GET /nodes/:id/section`) returns `NodeSection` — `{ nodeId, sectionRootId, globalTypes }`, with `sectionRootId` `null` for a node in no section. `options` is `{ isAdmin?, isSystem? }`, and the caller must be able to read the node.
 - **`NodeSelector`** takes `withinSectionOf`, `sectionGlobalTypes`, `newSection` and `targetFilter` (see [Using NodeSelector](#using-nodeselector-to-reference-nodes)); a node-reference field and the Add Connection dialog pass them.
 - **Formulas.** Traversal (`children`, `parents`, `scope`, `connections`, `nodes`) and `{ref->field}` read only the host's section plus the shared types, on the server and, for a host in a section, in the browser.
@@ -1243,6 +1254,57 @@ The server now computes a node's own formula fields, and its computed `name` / `
 - **A recompute never fails your write.** Errors are logged, and the stored value stays as it was.
 - **Computed slugs are made URL-safe and free (v1.43.0).** A computed slug is slugified on every write and recompute, and when another live entry holds it, it is stored as `base-2`, `base-3` and so on. The suffix drops again once no other entry, live, archived or Deleted, holds the base. Don't key anything on a computed slug; use the node's `id` or its [reference number](/modules/structure/configuration/#reference-numbers).
 - **A formula reads another formula's value from the same write (v1.43.0),** whatever the field order.
+- **A reference reads only some columns (v1.45.0).** Through a reference, a stored value (a computed name, description or slug, a data field's merge template, a formula field) reads the referenced record's data field first and, when that is empty, only `id`, `name`, `description`, `slug`, `reference`, `nodeType`, `parentId`, `rootNodeId`, `depth`, `status`, `stage`, `createdAt` and `updatedAt`, on the form and the server alike. Before v1.45.0 it could also read columns such as `embeddingText`, the owner's `userId` and the favourite and pin flags. A value stored before keeps its text until the entry is saved again or its type's entries are updated (below); a data field's merge template that now works out blank altogether writes nothing, so it keeps its text even then.
+
+### Updating Existing Entries (v1.45.0+)
+
+When an admin changes how a type works out a stored computed value, the existing entries keep their old values until they are recomputed. The admin page asks whether to update them when the type is saved, and its **Update entries** button updates every computed value. Both call the same admin-only service method, one batch at a time. What counts, which entries, and how it writes are on [Configuration](/modules/structure/configuration/#updating-existing-entries-v1450).
+
+| Method | What it does |
+|--------|--------------|
+| `countRecomputeEntries(slug, actorId, { caller })` | How many entries an update works through. HTTP: `GET /types/:slug/recompute` → `{ entries }` |
+| `recomputeTypeValues(slug, actorId, { fields?, after?, maxEntries?, caller })` | Works out the stored computed values of the next batch of entries again and writes those that differ. HTTP: `POST /types/:slug/recompute` with `{ fields?, after? }` |
+
+```ts
+interface RecomputeCaller { isAdmin?: boolean; isSystem?: boolean }
+interface RecomputeTypeValuesResult {
+  updated: number;      // entries whose stored computed values changed (written, hooks fired)
+  unchanged: number;    // entries already current
+  failed: number;       // entries that couldn't be updated (an error, or a name or slug clash with nothing else to write)
+  remaining: number;    // entries after this call's last one, still to do
+  next: string | null;  // pass as `after` to the next call; null when nothing remains
+}
+```
+
+- **Who may call it.** `caller` must be `{ isAdmin: true }` or `{ isSystem: true }`; anything else is a `403` `ForbiddenError`, `Only an admin or the system can update the existing entries of a node type`. An unknown type is a `404` `Node type not found`. Both routes are `requireAdmin`.
+- **`fields`.** The built-ins (`name`, `description`, `slug`) or top-level field ids to write, a field-group for its sub-fields, plus the values on the same entry that read them. Leave it out to write every computed value; an empty list writes nothing. HTTP takes at most 200 ids.
+- **Batches.** Entries are read in id order, 200 at a time. One call works through at most 5,000 (`maxEntries`, an in-process option, is capped at 5,000; a fraction is rounded down and anything below 1 counts as 1) and starts no new batch after 20 seconds. Call again with `after: next` until `remaining` is 0.
+- **Whose entries.** Every entry of the type and its subtypes that isn't in Deleted, archived and unassigned ones included: for an app-level type every owner's (each owner's own subtypes of it too), for a personal type its owner's. Each is computed as its owner would see it, under the owner's read gates and isolation section.
+- **How it writes.** A system write of only the values that change. A built-in locked by `editableBy` is never recomputed; a computed name that clashes with a sibling isn't stored; a clashing computed slug takes the next free `-2`, `-3`. Value rules and one per section aren't run.
+- **Hooks.** Each changed entry fires `structure.node.updated` with `source: 'formula'` and only the changed keys in `changes`, so one call can fire up to 5,000. After each batch, the formulas that read the changed entries are recomputed once, firing their own `source: 'formula'` updates. A listener that does heavy work per update should skip or debounce these.
+- **Logs** carry counts only.
+
+```typescript
+const structure = serviceRegistry.get('structure');
+
+// Every computed value of every existing 'person' entry, worked out again
+let after: string | undefined;
+for (;;) {
+  const { remaining, next } = await structure.recomputeTypeValues('person', adminId, { after, caller: { isAdmin: true } });
+  if (remaining === 0 || !next) break;
+  after = next;
+}
+```
+
+In the browser, `useTypeRecompute()` runs the same loop with a progress toast, and `structureService.countRecomputeEntries(slug)` and `recomputeTypeValues(slug, { fields?, after? })` call the routes (see [Admin Data Hooks](/modules/structure/usage/#admin-data-hooks)).
+
+### Value Rules, One per Section and Reference Limits on Writes (v1.45.0+)
+
+Three field settings change what a write stores, for every caller. A module writing in-process gets the same results as a form, so code that writes a field directly should expect them. The settings are on [Field Types](/modules/structure/fields/#showing-setting-and-one-per-section-v1450).
+
+- **Value rules (`setWhen`).** When a rule's condition holds over the entry as it will be (the stored data with your write over it), the rule's value is stored in place of what you sent, with no error. That holds for every caller, `isSystem: true` included, and over an `editableBy` lock. A rule whose value no longer fits the field is skipped with a warning. Rules run on create, bulk create, new entries made in a reference field, update, a duplicate's overrides and a merge's backfill, and on the system writes that change another entry: the reference write-back, one per section's turn-off, and the reference strips of an assign, a move and a delete-and-keep. The value your write returns, and the hook's `changes`, hold what was stored.
+- **One per section (`uniqueInScope: 'section'`).** Turning such a field on for an entry turns it off, in the same transaction, for the other entries of its live section. Each of those fires `structure.node.updated` after the commit, with no `source`, and its formulas are recomputed. Entries in no section are left out. A bulk create's later row wins; a new entry made in a reference field loses to the entry it belongs to.
+- **`maxItems` on a multiple reference.** A write that changes the value to more non-empty ids (new-entry placeholders counted) than `maxItems` is a `400` `Field "x" takes at most N entries`.
 
 ### Record Reads and the Formula Engine (v1.44.0+)
 
