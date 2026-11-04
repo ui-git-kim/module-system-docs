@@ -108,8 +108,8 @@ The universal entity table — every node is stored here.
 | `id` | String | CUID primary key |
 | `userId` | String | Owner |
 | `nodeType` | String | References node type slug |
-| `name` | String | Display name |
-| `slug` | String? | URL-safe identifier |
+| `name` | String | Display name. Unique among a parent's **live** children (top-level names can repeat) — see [Raw SQL access notes](#raw-sql-access-notes) |
+| `slug` | String? | URL-safe identifier, unique among the user's **live** entries. A blank slug is stored as `NULL` (v1.43.0) |
 | `reference` | String? | Immutable, server-assigned reference number (e.g. `MAT-2026-0147`). `NULL` unless the node's type opts in via `referenceConfig` — see [Reference numbers](#reference-numbers). Issued from `structure_reference_counter` inside the same transaction as the create, and unique per user via `@@unique([userId, reference])`; no create, update, public-API, bulk or metadata path can change it afterwards |
 | `description` | String? | Rich text description |
 | `data` | JSON | Custom field values |
@@ -358,10 +358,12 @@ If your code queries these tables directly (outside of Prisma), note two things:
 
 - **Pluralised table names.** Prisma models are singular (`structure_node`) but `@@map` pluralises them in the database (`structure_nodes`, `structure_node_types`, `structure_node_type_groups`, `structure_connection_types`, `structure_templates`, `structure_field_templates`, `structure_api_keys`, `structure_functions`, `structure_reference_counters`, `structure_chunks`). Use the plural names in raw SQL.
 - **`@map`-ed columns.** Two Prisma fields map to differently-named database columns (kept for historical reasons, no data move): `structure_node.stage` → column `workflowState`, and `structure_node_type.stageConfig` → column `workflowConfig`. Raw SQL must use the `workflowState` / `workflowConfig` column names.
-- **Unique constraints on `structure_node`.** Beyond the primary key there are three compound uniques. The first two are client-supplied, and a create, update, move or duplicate that breaks one gets a `409 Conflict` naming the clash ("An entry with this slug already exists", "An entry with this name already exists here"); a bulk-create row reports the same text in its `errors` entry:
-  - `@@unique([userId, slug])` — a user can't have two nodes with the same slug
-  - `@@unique([userId, parentId, name])` — a user can't have two siblings with the same name under the same parent. The index is not partial, so an entry in **Deleted** still holds its name until it is restored or permanently deleted
+- **Unique keys on `structure_node`.** Beyond the primary key there are three. The first two hold client-supplied values, and a create, update, move or duplicate that breaks one gets a `409 Conflict` naming the clash ("An entry with this slug already exists", "An entry with this name already exists here"); a bulk-create row reports the same text in its `errors` entry, and a restore says which one it hit ("another entry now has its slug", "another entry in the same place now has its name"):
+  - `structure_nodes_userId_slug_live_key` on `("userId", "slug")` — a user can't have two **live** entries with the same slug
+  - `structure_nodes_userId_parentId_name_live_key` on `("userId", "parentId", "name")` — a user can't have two **live** siblings with the same name under one parent. Top-level names can repeat, because Postgres counts each `NULL` parent as distinct
   - `@@unique([userId, reference])` — reference numbers are unique per user when present. Server-assigned rather than submitted, so it is not normally reachable from a request; Postgres allows any number of `NULL`s in a unique index, so types with references disabled are unaffected and the constraint is safe to add to a populated table
+
+  **Since v1.43.0 the first two are partial unique indexes** (`WHERE "status" <> 'deleted'`), built by the `1.43.0__live-unique-keys.sql` migration. An entry in **Deleted** holds neither its slug nor its name, so a deleted entry can be added again. Before, both were `@@unique` over every row, so a deleted person kept their name under the Matter, and re-adding them was "already exists". Prisma can't declare a partial unique index, so the schema now carries plain `@@index([userId, slug])` and `@@index([userId, parentId, name])`. That means there is no `userId_slug` compound key for `findUnique` or `upsert` (use `findFirst` with `status: { not: 'deleted' }`), and a raw `INSERT … ON CONFLICT` must repeat the `WHERE "status" <> 'deleted'` predicate to match the index. A blank slug (`''`, or only spaces) is stored as `NULL`, so two entries with no slug never clash.
 
 ---
 
@@ -504,6 +506,8 @@ interface NodeTypeRules {
 <Aside type="note">
 **Enforced server-side since v1.24.0.** Node create (single and bulk), move, and a duplicate into another parent (`targetParentId`) validate these rules — an in-place duplicate is not re-checked — a type with `isRoot: false` requires a parent, `allowedParents`/`allowedChildren` gate placement, and `maxChildren`/`maxDepth` are honoured. Each rule is **opt-in**: an unset field imposes no constraint, so a type with no rules configured behaves exactly as before. `allowedParents`/`allowedChildren` compare type **slugs**; `maxDepth` is 0-based (root = 0). On `POST /nodes/bulk` a violation fails only that row, reported in `errors`.
 
+Since v1.43.0, two more paths place a row by these rules: [assigning an unassigned record](#unassigned-records-v1430) and [a delete that keeps its contents](#deleting-a-record-that-contains-records-v1430). The keep is the one exception to `isRoot: false`: a kept row of a scoped type that fits neither the top level nor the deleted record's parent, and would end up in no section, is parked at the top level, unassigned, until it is assigned to a section where its type may go.
+
 `isHierarchical` and `allowMultipleParents` are **not rules**: nothing in Structure reads them, so setting them changes no behaviour. They stay in the type only so existing configs and imports that set them keep working.
 </Aside>
 
@@ -519,6 +523,7 @@ primaryScope?: {
   isPrimary?: boolean;      // This type is the primary scope; adds the header picker
   scopedTypes?: string[];   // Which type slugs the selection filters.
                             // empty or ['*'] = every type; a list = only those types
+                            // and the types based on them (v1.43.0)
   isolation?: 'filter' | 'enforced';
                             // 'filter' (default) = client-side list scoping via
                             // pathPrefix; 'enforced' = server-side, fail-closed
@@ -528,15 +533,17 @@ primaryScope?: {
 };
 ```
 
-The selected instance's id is stored per user in `structure_settings` (`currentScopeNodeId`) via the `useCurrentScope()` store, and `NodeListPage` scopes matching lists by injecting `pathPrefix` (the selected node's materialised-path prefix). **`scopedTypes` is an admin choice:** leave it empty (or use `'*'`) to scope the whole app to the primary node, or list specific slugs to scope only those and leave global/reference types (e.g. legislation) unscoped. The primary type's own list is never filtered by its own selection. Built for one primary scope now, shaped so multiple/secondary scopes can be added later.
+The selected instance's id is stored per user in `structure_settings` (`currentScopeNodeId`) via the `useCurrentScope()` store, and in `'filter'` mode `NodeListPage` scopes matching lists by injecting `pathPrefix` (the selected node's materialised-path prefix). Under an enforced space it sends no prefix (v1.43.0): the server confines the list, and a prefix would hide the space's labelled top-level rows and the [unassigned records](#unassigned-records-v1430). **`scopedTypes` is an admin choice:** leave it empty (or use `'*'`) to scope the whole app to the primary node, or list specific slugs to scope only those and leave global/reference types (e.g. legislation) unscoped. The primary type's own list is never filtered by its own selection. Built for one primary scope now, shaped so multiple/secondary scopes can be added later.
+
+**Subtypes are scoped too (v1.43.0).** A type based on a listed type, directly or through others (`superClasses`), is scoped like it. With `person` listed, a `child` type based on `person` is confined to the active space as a Person is. This holds wherever scoping is read: the list page, the server's read confinement, the section wall and the unassigned rule. Before, a subtype had to be listed itself.
 
 #### Enforced spaces (`isolation: 'enforced'`)
 
 Added in v1.34.0. With `isolation` left at its default `'filter'`, scoping is a client-side convenience: the list page injects `pathPrefix` and nothing is enforced server-side. Setting `isolation: 'enforced'` promotes the primary type to a **space** and moves the confinement into the API:
 
-- The server resolves the caller's **active space** from `structure_settings.currentScopeNodeId` and confines reads to nodes whose `rootNodeId` matches it — lists, tree, keyword search, connections and the neighbourhood reads (children / descendants / path) all go through the same guard.
+- The server resolves the caller's **active space** from `structure_settings.currentScopeNodeId` and confines reads to nodes whose `rootNodeId` matches it — lists, tree, keyword search, connections and the neighbourhood reads (children / descendants / path) all go through the same guard. Since v1.43.0 the caller's own [unassigned records](#unassigned-records-v1430) are read beside it.
 - The **embeddings retrieval arm** (`semanticSearch*` / `lexicalSearch*` / `hybridSearch*` / `findSimilarNodes`) is *not* ambiently scoped. It lives in a separately generated service that cannot see the scope helpers, so it confines results only when the calling consumer passes `scopeRootId` explicitly — an opt-in contract for cognitive-pipeline / AI Core, not a server-side guarantee. Making it ambient is a deferred, coordinated change.
-- It is **fail-closed**: an enforced type with no valid active space resolves to `deny` rather than falling back to unscoped results. A stale setting simply yields nothing; an explicitly supplied invalid scope is a `400`.
+- It is **fail-closed**: an enforced type with no valid active space resolves to `deny` rather than falling back to unscoped results. A stale setting simply yields nothing; an explicitly supplied invalid scope is a `400`. A deleted record is never the active space (v1.43.0): deleting the open one leaves no space, and the app clears the setting. With no valid space a list still shows the shared types and the caller's unassigned records.
 - Instances of the enforced primary type itself are never confined, so the space list stays cross-space and users can still switch spaces.
 - Trusted in-process (system) callers bypass the guard; end-user calls never can.
 - Moving a node **out of** an enforced space is rejected unless its type opts in with `rules.allowCrossSpaceMove` (default off, and audited). That covers a move into a *different* space as well as a move to unscoped or scope-exempt territory — the old root is what the guard tests. Filing a node **in** from a non-enforced area is always allowed.
@@ -558,6 +565,38 @@ Each top-level record of an enforced type (a Matter, say) is an **isolation sect
 In the admin forms, a node-reference field (and a field-group sub-field) and a connection type get a **Global types it may point at** control once the app isolates a type. Leave it empty for every shared type.
 
 With no isolated type, nothing here changes behaviour or runs a query.
+
+#### Unassigned records (v1.43.0+)
+
+An **unassigned** record is a row of a scoped type that is in no live section. Its `rootNodeId` is `null`, names no live top-level, unlabelled record of an isolated type (that record was deleted, say), or is its own id. A type is scoped when an isolated type's `scopedTypes` lists it or one of its supertypes, or is empty or `'*'`. Shared types, isolated types and connections are never unassigned.
+
+A row becomes unassigned when:
+
+- a delete keeps the contents of a section root (see [Deleting a record that contains records](#deleting-a-record-that-contains-records-v1430));
+- it is restored after its section was deleted;
+- it is created at the top level, for example from its type's list page. With `scopedTypes` empty or `'*'`, every top-level row of a type that isn't isolated or shared is unassigned.
+
+Before v1.43.0 such a row was simply invisible under an enforced space, which is why a person whose Matter was gone couldn't be found.
+
+**Reads.** The owner sees their unassigned records beside the active space: in lists, `getNode`, the neighbourhood reads (children, descendants, path), the tree and keyword search. With no active space, a list shows them instead of nothing. They carry `unassigned: true` on `getNode` and `listNodes` rows, and `?unassigned=true` lists only them. Two reads stay confined to one section: a picker inside a section (`withinSectionOf`, so the wall is unchanged) and a read with an explicit `scopeRootId` (the public API).
+
+**Writes.** An unassigned record is read-only until it is assigned, for request callers and for in-process callers without `isSystem`. Each refusal is a `400` naming the isolated type, for example `"Sam Smith" isn't in a Matter yet. Assign it to one before editing it.`
+
+- **Refused:** any update (fields, name, stage, metadata); a move, except one into a live section, which assigns it; a reorder that includes it; a merge, from either side; a duplicate of it; creating, bulk-creating, copying or moving anything under it; a connection from it, and, for a two-way (`bidirectional`) connection type, a connection to it from either end.
+- **Still allowed:** archive, delete, restore, favourite and pin, and a one-way connection to it from another entry.
+- **System callers** (`isSystem: true`) are exempt.
+
+**Assigning.** `POST /nodes/:id/assign` with `{ sectionRootId }` (the service's `assignToSection`) files the record into a section, which makes it editable again.
+
+- **The section root** must be the caller's own live, top-level, unlabelled record of an isolated type, of a type they may read. A root that isn't found, can't be read, is deleted or is someone else's is a `404`; one that isn't a section root is a `400`. The root's type must scope the record's type, or it is a `400`.
+- **Placement.** Under the root when the hierarchy allows the record's type there, otherwise at the top level, labelled into the section. When neither is allowed, it is a `400` naming the type. The record's subtree goes with it.
+- **Linked records go with it.** The unassigned records linked to it, by a reference either way or a live connection, are filed in the same assign, and so are the ones linked to those (up to 50 subtrees and 5,000 rows). Otherwise a reference between them would cross the wall. A linked record nested under another filed record stays under it.
+- **The move wall applies.** Every reference and link must fit the section, or it is a `400` starting `Cannot assign`. The links touching the filed records are re-stamped.
+- **Out of a deleted section.** A record restored out of a deleted section loses its references to the rows still in Deleted there, and they lose theirs to it, in the same transaction. A live record left in that section that still references it (one of a type that isn't scoped, so it can be edited) refuses the assign until that reference is removed.
+- **Refused** for a record in Deleted (`Restore "…" before assigning it`), or one already in a section (`"…" is already in a section. Move it instead.`).
+- It needs edit permission on each filed record's type, fires `structure.node.moved` for each filed record, and then recomputes the formulas that can see them.
+
+A move of an unassigned record to a parent inside a live section assigns it too. It goes where it is moved, under the hierarchy rules, with the same wall check and the same removal of references to rows left in a deleted section. Unlike the assign, a move doesn't bring the linked unassigned records with it, so a reference to one of them refuses the move. What the user sees is on [Usage](/modules/structure/usage/#unassigned-entries).
 
 #### Shared types (`global: true`)
 
@@ -611,7 +650,7 @@ Classification levels are **per node type** and are **not** inherited through `s
 
 Issue every entry of a node type an **immutable, server-assigned, human-readable reference** — `MAT-2026-0147` — that a person can quote in an email, a letter or an invoice. **Off by default, opt-in per type:** a type that leaves it off stores `NULL` and behaves exactly as it does today. Added in v1.35.0. The controls sit in the **Reference numbers** section of the admin **Basic** tab, next to **Scope**, because a reference is part of how an entry is *identified*.
 
-A derived name cannot carry identity. Two unrelated matters can both compute to "Schulz & Schulz", and adding a party silently changes a name something else already cited. `id` is a cuid — stable but opaque. `slug` is client-supplied, `@@unique([userId, slug])`, with no de-dup helper, so a computed slug collides. The reference is the citable handle: the server assigns it, nothing can change it, and the name is then free to be computed.
+A derived name cannot carry identity. Two unrelated matters can both compute to "Schulz & Schulz", and adding a party silently changes a name something else already cited. `id` is a cuid — stable but opaque. `slug` is editable, and a computed one changes with its inputs; since v1.43.0 a computed slug that another live entry holds is stored with a `-2`, `-3`… suffix instead of failing the write, so it can't be relied on either. The reference is the citable handle: the server assigns it, nothing can change it, and the name is then free to be computed.
 
 ```typescript
 // On NodeTypeConfig:
@@ -988,11 +1027,14 @@ All endpoints are prefixed with `/api/v1/structure`.
 | GET | `/nodes/:id` | Get single node |
 | POST | `/nodes` | Create node |
 | PATCH | `/nodes/:id` | Update node |
-| DELETE | `/nodes/:id` | Soft delete — moves the entry and everything nested under it to **Deleted** (returns 204) |
+| DELETE | `/nodes/:id` | Soft delete — moves the entry and everything nested under it to **Deleted** (returns 204). `?keepContents=true` deletes the entry alone and keeps what it contains (v1.43.0); any other value than `true` or `false` is a `400`. See [Deleting a record that contains records](#deleting-a-record-that-contains-records-v1430) |
+| GET | `/nodes/:id/delete-impact` | What a delete would take with it (v1.43.0) — `{ descendants, labelled, byType, sectionRoot }` |
+| POST | `/nodes/delete-impact` | The same, summed for a selection (v1.43.0) — body `{ ids: string[] }` (min 1, max 500) |
+| POST | `/nodes/:id/assign` | File an [unassigned record](#unassigned-records-v1430) into a section (v1.43.0) — body `{ sectionRootId }`, returns the node |
 | POST | `/nodes/:id/move` | Move to different parent |
 | POST | `/nodes/bulk` | Bulk create nodes — also the module's **import** door, so a row may carry an explicit `reference` (per-row atomic, partial success — see the notes below) |
 | POST | `/nodes/bulk-archive` | Bulk archive — body `{ ids: string[] }` (min 1, max 500); partial success |
-| POST | `/nodes/bulk-delete` | Bulk soft-delete — same body; partial success. Needs a web session (a device token gets `403`) |
+| POST | `/nodes/bulk-delete` | Bulk soft-delete — same body, plus an optional `keepContents` boolean (v1.43.0); partial success. Needs a web session (a device token gets `403`) |
 | POST | `/nodes/bulk-restore` | Bulk restore from Archived or Deleted — same body; partial success |
 | POST | `/nodes/purge` | Permanently delete entries in **Deleted** — body `{ ids?: string[] }` (max 500), returns `{ purged, skipped }`. Needs a web session and a step-up confirmation |
 | POST | `/nodes/:id/duplicate` | Duplicate node (subtree copy, up to 5,000 nested entries) |
@@ -1009,7 +1051,7 @@ All endpoints are prefixed with `/api/v1/structure`.
 
 The three bulk status endpoints run each id through the single-node method (so cascades and per-node hooks are preserved), collect failures per id instead of aborting the batch, and return `{ succeeded: string[], errors: Array<{ id, error }> }`. When at least one id succeeds they fire one summary action hook — `structure.nodes.bulkArchived`, `structure.nodes.bulkDeleted` or `structure.nodes.bulkRestored` — carrying `{ userId, nodeIds }` for the ids that succeeded.
 
-**Deleted, restore and purge.** A delete is reversible: the entry and its subtree get `status: 'deleted'` and appear under the list page's **Deleted** filter (`?status=deleted`). Restore works on archived and deleted entries, but revives only the entry itself — nested entries are restored separately. It needs the permission that put the entry away: `delete` for a deleted entry, `archive` for an archived one. `POST /nodes/purge` removes entries permanently (deleting a node type also clears that type's deleted entries). It acts only on the caller's own deleted entries — the listed ones and their deleted descendants, or with no `ids` every deleted entry the caller owns. It removes the rows, any connections touching them and their chunk rows, and skips (and counts) any entry that still has a live entry under it. It fires `structure.node.purged`.
+**Deleted, restore and purge.** A delete is reversible: the entry and its subtree get `status: 'deleted'` and appear under the list page's **Deleted** filter (`?status=deleted`). Restore works on archived and deleted entries, but revives only the entry itself — nested entries are restored separately. It needs the permission that put the entry away: `delete` for a deleted entry, `archive` for an archived one. Since a Deleted entry no longer holds its slug or name (v1.43.0), another live entry may have taken one of them meanwhile: the restore is then a `409` that says which, and you rename or change one of them first. `POST /nodes/purge` removes entries permanently (deleting a node type also clears that type's deleted entries). It acts only on the caller's own deleted entries — the listed ones and their deleted descendants, or with no `ids` every deleted entry the caller owns. It removes the rows, any connections touching them and their chunk rows, and skips (and counts) any entry that still has a live entry under it. It fires `structure.node.purged`.
 
 **Connections are not nodes.** A node create (single or bulk) that names `nodeType: 'connection'` or carries `fromNodeId` / `toNodeId` / `connectionType`, and a request to update or duplicate a connection row through the node endpoints, is refused with a `400` pointing at the [connections endpoints](#connections) — create and edit connections there.
 
@@ -1028,6 +1070,34 @@ calling, or delete the created ids on a non-empty `errors` array.
 </Aside>
 
 A node's [reference number](#reference-numbers) is server-assigned and immutable, so no request body may carry one: `createNodeSchema` strips the key on `POST /nodes`, and the [public REST API](/modules/structure/public-api/) validates with its own body schemas, which never carry it — so neither surface can set one. No update schema carries it either — `PATCH /nodes/:id`, `PATCH /nodes/:id/metadata` and the bulk status endpoints leave it untouched. The single exception is `POST /nodes/bulk`, the module's node-import door: each row may carry an optional `reference` (1–100 characters, `^[A-Za-z0-9][A-Za-z0-9._/-]*$`) so a migration keeps its existing numbers. It is accepted only from an **admin session or an in-process system caller**; any other caller is rejected, as is a row whose node type has references disabled — as a per-row entry in `errors`, since bulk create collects failures per row. An accepted value pushes that type's counter past itself, so a later assignment cannot reissue it.
+
+#### Deleting a record that contains records (v1.43.0+)
+
+A delete cascades: the record's live descendants go to **Deleted** with it, and for an isolation-section root, so do the rows labelled into its section. Since v1.43.0 the app can say what a delete would take, and a delete can keep the contents instead.
+
+**The impact.** `GET /nodes/:id/delete-impact` (the service's `getDeleteImpact`) returns:
+
+| Key | What it holds |
+|-----|---------------|
+| `descendants` | The live rows nested under the record |
+| `labelled` | For an isolation-section root, the live rows labelled into its section |
+| `byType` | The same rows by type, most first: `{ nodeType, label, count }`, where `label` is the type's singular or plural name to match the count |
+| `sectionRoot` | Whether the record is an isolation-section root, whose kept contents become unassigned |
+
+It is a `404` for a record that isn't the caller's, is of a type they may not read, or is a connection. `POST /nodes/delete-impact` with `{ ids }` (`getBulkDeleteImpact`) sums the impact of up to 500 of the caller's own, readable records. A selected record nested under another selected one counts once, as content.
+
+**Keeping the contents.** `DELETE /nodes/:id?keepContents=true` deletes the record alone, and `POST /nodes/bulk-delete` takes `keepContents` in its body (each row's error is reported in `errors`, as before). Without it the delete is the cascade, unchanged. With it:
+
+- **The record** moves to Deleted, its own links are swept, and the flags its references set on other entries ([`syncTargetField`](/modules/structure/fields/#node-reference)) are cleared, as on any delete.
+- **Each live direct child** becomes a top-level row when its type may be at the top level, labelled into the live section the record was in, if there is one. Otherwise it moves under the record's parent, if the hierarchy allows it there. Otherwise a child of a scoped type that would end up in no section is parked at the top level, unassigned, whatever its type's `isRoot` says; assigning it later files it where its type may go. Anything else is a `400` naming the type, and nothing is written.
+- **A name clash is checked first.** A child moving under the parent may not take the name of a live record already there: `Cannot keep the contents of "F": a record named "Same" is already under "W". Rename one of them first, or delete the records inside it too.` It may take the deleted record's own name.
+- **Subtrees follow,** with their paths, depth and section re-stamped. A section root's labelled rows lose the label. The links touching the kept rows are re-stamped from their endpoints, and a link filed explicitly in the deleted section ends up in no section.
+- **For a section root,** the references between the kept rows and the rows that stay in Deleted with it are removed both ways, so restoring either side never meets a reference across the wall.
+- **Permissions:** delete on the record, and edit on the kept rows' types. At most 5,000 rows can be kept in one delete.
+- **Hooks:** `structure.node.deleted` for the record, and `structure.node.moved` for each kept row that moved.
+- **Restoring the record later doesn't bring the kept rows back** under it. They stay where the delete put them.
+
+The kept contents of a section root are [unassigned](#unassigned-records-v1430) until each is assigned to a section. The kept contents of a record inside a live section stay in that section, and those of a record in no section are kept at the top level or under its parent. The delete dialog that asks the question is described under [Deleted entries](/modules/structure/usage/#deleted-entries).
 
 ### Connections
 
@@ -1219,8 +1289,9 @@ This is the endpoint behind the formula library's `semanticSimilarity()` functio
 | `ownerOnly` | v1.40.0+. `true` reads a [shared type](#shared-types-global-true) only for the caller's own entries. It changes nothing on any other type |
 | `withinSectionOf` | v1.42.0+. A node id: list only what that **host** node may reference under the [section wall](#the-hard-wall-around-sections-v1420) — its section's entries plus the shared types, or, for a host in no section, the entries in no section plus the shared types. It narrows every other filter, and confines nothing when no type is isolated. `404` if the caller can't read the host. This is what a node-reference picker sends |
 | `sectionGlobalTypes` | v1.42.0+. With `withinSectionOf`, a comma-separated list of the shared types that join the section's entries (a field's `allowGlobalTypes`). Present but empty means none; absent means every shared type |
+| `unassigned` | v1.43.0+. `true` lists only the caller's [unassigned records](#unassigned-records-v1430) (the list page's **Unassigned** button). It lists nothing when no type is scoped. `false`, or leaving it out, changes nothing |
 
-There is deliberately no scope parameter here: when a node type uses `primaryScope.isolation: 'enforced'`, confinement to the active space is **ambient** — resolved server-side from `structure_settings.currentScopeNodeId` on every read. Only the [public REST API](/modules/structure/public-api/), which has no session to read that from, accepts an explicit `?scopeRootId=`.
+There is deliberately no scope parameter here: when a node type uses `primaryScope.isolation: 'enforced'`, confinement to the active space is **ambient** — resolved server-side from `structure_settings.currentScopeNodeId` on every read. The caller's unassigned records are listed beside the active space, and instead of nothing when there is none. Only the [public REST API](/modules/structure/public-api/), which has no session to read that from, accepts an explicit `?scopeRootId=`.
 
 ### Data Filters
 
@@ -1264,6 +1335,8 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 | `updateNodeSchema` | PATCH `/nodes/:id` | All fields optional, max lengths |
 | `importNodeSchema` | POST `/nodes/bulk` (each row) | Everything in `createNodeSchema`, plus an optional `reference` — 1–100 chars, `^[A-Za-z0-9][A-Za-z0-9._/-]*$`; the service then accepts it only from an admin/system caller |
 | `moveNodeSchema` | POST `/nodes/:id/move` | `newParentId` required (nullable) |
+| `bulkDeleteNodesSchema` | POST `/nodes/bulk-delete` | `ids` (min 1, max 500), plus an optional `keepContents` boolean (v1.43.0) |
+| `assignNodeSchema` | POST `/nodes/:id/assign` | `sectionRootId` required, a node id (v1.43.0) |
 | `reorderNodesSchema` | POST `/reorder` | `parentId` required (nullable), `nodeIds` array required (min 1, max 500) |
 | `createConnectionSchema` | POST `/connections` | `fromNodeId`, `toNodeId`, `connectionType` required; optional `origin` (lowercase-kebab) and `status` (`active` or `pending`) |
 | `createNodeTypeSchema` | POST `/types` | `slug` regex validated, `name`/`namePlural` required |
@@ -1318,7 +1391,7 @@ Complete list of subcommands exposed by `npx structure <command>`.
 
 ### Module SQL migrations
 
-Structure ships six raw-SQL migrations, applied once per database (checksummed and append-only) by `init`, `update` and `migrate-db`. They run *after* `prisma migrate` and *before* the lifecycle hooks. Every one runs on every install — none is gated on an install answer — because each block self-guards on the table or column it touches and is exception-safe, so it can never fail an install.
+Structure ships nine raw-SQL migrations, applied once per database (checksummed and append-only) by `init`, `update` and `migrate-db`. They run *after* `prisma migrate` and *before* the lifecycle hooks. Every one runs on every install — none is gated on an install answer — and each block self-guards on the table or column it touches. The first six are also exception-safe, so they can never fail an install. The last three (`1.35.0`, `1.39.0` and `1.43.0`) deliberately are not: an applied migration never runs again, so a failure stops the run and the runner retries it next time rather than leaving the work undone.
 
 | Migration | What it provisions |
 |-----------|--------------------|
@@ -1328,6 +1401,9 @@ Structure ships six raw-SQL migrations, applied once per database (checksummed a
 | `1.33.0__search-vectors.sql` | Trigger-maintained `tsvector` columns for always-on keyword search, the GIN baseline, and feature-detected Lakebase `bm25`/`ann` indexes on embeddings installs |
 | `1.33.17__stage-rename.sql` | Rewrites the JSON keys the workflow → stage rename touched inside `structure_node_types` (`states` → `stages`, `defaultState` → `defaultStage`, `workflowStates` → `stages`). A no-op on fresh installs |
 | `1.34.0__root-node-id-backfill.sql` | Backfills `structure_nodes.rootNodeId` from the materialised path for enforced scoping. A no-op once every row is stamped |
+| `1.35.0__reference-numbers.sql` | Numbers the existing entries of a type whose `referenceConfig` was already enabled, and seeds the counters above them. Enabling a type later numbers its entries at runtime instead (see [Reference numbers](#reference-numbers)) |
+| `1.39.0__descendant-path-repair.sql` | Rebuilds `path`, `depth` and `rootNodeId` from the `parentId` chain for nested rows an earlier build wrote wrongly. A no-op once they match |
+| `1.43.0__live-unique-keys.sql` | Makes a slug, and a name under one parent, unique among **live** rows only. In order: blank slugs become `NULL`; live duplicates written while no key held them get a free suffix (the oldest row keeps its value, each other gets the first free `-2`, `-3`… slug, cut to fit 255 characters, or ` (2)`, ` (3)`… sibling name, with a `NOTICE` giving the count; Deleted rows are left alone); the partial unique indexes `structure_nodes_userId_slug_live_key` and `structure_nodes_userId_parentId_name_live_key` are created `WHERE "status" <> 'deleted'`; and the old full indexes are dropped if they are still there. Idempotent. The suffix step exists because `update` drops the old keys in its schema step before it runs module migrations, so an app still running the old code meanwhile could write a duplicate |
 
 <Aside type="caution" title="Module migrations need a reachable database">
 Both `init` and `update` apply these migrations, so they need a reachable database — set `DIRECT_DATABASE_URL` (or `DATABASE_URL`) in `backend/.env` before running either command. If a database has drifted (a table, column or index the module expects is missing), run `npx structure migrate-db --repair` for an additive-only heal rather than resetting.

@@ -977,6 +977,7 @@ Structure's write methods learn who is calling from their options. Its HTTP rout
 | Connection `data` | Validated against the connection type's fields like a node's (required, type, pattern, options) | Value shapes only |
 | Node-reference targets | A new id in a field restricted by `allowedTypes` must point at a readable entry of one of those types or a subtype | Not checked |
 | The [section wall](#the-section-wall-v1420) and `nodeReferenceConfig.filter` (v1.42.0+) | Every id in the write's reference fields, stored and new, and both ends of a link | The same, unless the call passes `isSystem: true` |
+| [Unassigned rows](#deleting-keeping-and-assigning-v1430) are read-only (v1.43.0+) | An update, move, reorder, merge or duplicate of one, anything added, copied or moved under one, or a connection from one is a `400` | The same, unless the call passes `isSystem: true`. `updateNodeMetadata` is refused for a request only |
 | Value shapes | A secret must be text, a node-reference value a node id, and a field group a list of rows — otherwise 400 | Coerced with a logged warning: a number or true/false secret becomes text, a value that is not a node id is dropped from a reference field, and a field group is reshaped (a single row object becomes a one-row list, entries that are not rows are dropped, an empty object or a scalar is dropped) |
 | A value too long to test safely against its validation pattern | 400 | The pattern check is skipped, with a warning |
 | Pending node-type proposals | At most 50 per user | Not capped |
@@ -1171,7 +1172,7 @@ Since v1.42.0 an isolation section is a hard wall. A node-reference value, a fie
 |------|-----------|
 | `createNode`, `bulkCreateNodes`, `updateNode`, the public API | A crossing reference is a `400` naming the field (per row in a bulk create) |
 | `duplicateNode` | References to rows copied in the same duplicate are re-pointed at their copies first. The rest, the child copies and the copied links are checked against the section the copy lands in |
-| `moveNode` | A move that changes a subtree's section (into one, out of one, or between two) is refused with a `400` naming the first reference or link that would then cross: ones the subtree holds, ones pointing into it from outside, and links to the outside. Rows and links in Deleted count too. When the move goes ahead, every link touching the moved rows is re-stamped with the section its endpoints now give it (for every caller, system ones included), so its own fields and the section reads follow its endpoints |
+| `moveNode` | A move that changes a subtree's section (into one, out of one, or between two) is refused with a `400` naming the first reference or link that would then cross: ones the subtree holds, ones pointing into it from outside, and links to the outside. Rows and links in Deleted count too. When the move goes ahead, every link touching the moved rows is re-stamped with the section its endpoints now give it (for every caller, system ones included), so its own fields and the section reads follow its endpoints. Since v1.43.0 an unassigned row moves only into a live section, which assigns it: rows still in Deleted in a deleted section it came out of don't count, and the references between them and it are removed in the same transaction |
 | `restoreNode`, bulk restore | A crossing reference refuses the restore with a `400`. A crossing link stays in Deleted, with a log note |
 | `mergeNode` | Unchanged: it already refused two sections, or a node in no section into one, for every caller |
 | `createConnection`, `promoteConnection`, `updateConnection` | Create and promote apply the connection rule above. On create and update, the link's own reference fields are held to the link's section |
@@ -1198,6 +1199,40 @@ const { nodes } = await structure.listNodes(userId, {
 await structure.bulkCreateConnections(userId, links, { isSystem: true, scopeRootId: sectionId, skipHooks: true });
 ```
 
+### Deleting, Keeping and Assigning (v1.43.0+)
+
+Since v1.43.0 a delete can keep what a record contains, and a row of a scoped type that ends up in no live section is **unassigned**: its owner can see it, but it is read-only until it is assigned to a section. [Configuration](/modules/structure/configuration/#unassigned-records-v1430) states the rules, and [Deleting a record that contains records](/modules/structure/configuration/#deleting-a-record-that-contains-records-v1430) covers the keep. This section covers what a consuming module calls and gets.
+
+| Method | What it does |
+|--------|--------------|
+| `getDeleteImpact(nodeId, userId, { isAdmin?, isSystem? })` | What deleting the node would take with it, as a `DeleteImpact`: `{ descendants, labelled, byType: [{ nodeType, label, count }], sectionRoot }`. `NotFoundError` for a node that isn't the caller's, is of a type they may not read, or is a connection. HTTP: `GET /nodes/:id/delete-impact` |
+| `getBulkDeleteImpact(ids, userId, opts)` | The summed impact of at most 500 of the caller's own, readable ids. A node nested under another one of them counts once, as content. HTTP: `POST /nodes/delete-impact` |
+| `deleteNode(id, userId, { …, keepContents? })` | `keepContents: true` deletes the node alone and keeps its contents. The default, `false`, is the cascade, unchanged. Fires `structure.node.deleted` for the node and `structure.node.moved` for each kept row that moved. HTTP: `DELETE /nodes/:id?keepContents=true` |
+| `bulkDeleteNodes(ids, userId, { keepContents? })` | The same for each id, with an error per row in `errors` |
+| `assignToSection(nodeId, sectionRootId, userId, { isAdmin?, isSystem? })` | Files an unassigned row, and the unassigned rows linked to it, into the section of `sectionRootId`, and returns the row (`StructureNode`). HTTP: `POST /nodes/:id/assign` with `{ sectionRootId }` |
+| `listNodes(userId, { unassigned: true })` | Only the caller's unassigned rows (HTTP `?unassigned=true`). Any unassigned row that `getNode` or `listNodes` returns carries `unassigned: true` |
+
+**Caller tiers for `assignToSection`.**
+
+- **Request callers, and in-process callers without `isSystem`,** are held to the strict move wall: the references and links the filed rows hold, and those pointing into them, must fit the section, or it is a `400` starting `Cannot assign`. They need edit permission on each filed row's type.
+- **System callers** (`isSystem: true`) skip the wall and pass the permission tiers. The rest still holds: the row must be unassigned and not deleted, the root must be the owner's live section root of an isolated type that scopes the row's type, and the placement rules apply.
+- **Every caller:** a row or root of a type the caller may not read is a `404`, as on `getNode`. It fires `structure.node.moved` for each record it files (not for the rows nested under them), then recomputes formulas. A row restored out of a deleted section loses its references to the rows still in Deleted there, and they lose theirs to it, in the same transaction.
+
+**The write refusals.** An unassigned row is read-only for request callers and for in-process callers without `isSystem`. Each refusal is a `400`, `"<name>" isn't in a <isolated type> yet. Assign it to one before editing it.`, where the type is the label of the isolated type that scopes the row (a Matter, say):
+
+- `updateNode` of any kind (data, name, stage, metadata);
+- `moveNode`, except into a live section, which assigns it; and moving anything under one;
+- `reorderNodes` with one in the list, `mergeNode` with one on either side, and `duplicateNode` of one;
+- `createNode` and `bulkCreateNodes` under one, and a `duplicateNode` that would copy under one (its target parent, or an in-place copy beside one of its children);
+- `createConnection` and `promoteConnection` from one, and, for a two-way (`bidirectional`) connection type, to one from either end. A one-way connection to it is allowed;
+- `updateNodeMetadata`, for an HTTP request only. An in-process namespaced metadata write still goes through.
+
+Archive, delete, restore, favourite and pin stay open for the owner.
+
+**What this means for your module.** A top-level row of a scoped type is unassigned. With `scopedTypes` empty or `'*'`, that is every top-level row of a type that isn't isolated or shared. A module that creates such rows at the top level and writes to them later without `isSystem` now gets the `400`. File the rows in a section (create them under a record in the section, or label them with `scopeRootId` as a system caller), or pass `isSystem: true` for the engine's own writes.
+
+**In the browser** the same calls are `structureService.getDeleteImpact(id)`, `getBulkDeleteImpact(ids)` and `assignNode(id, sectionRootId)`, and `useNodeMutations()` gains `assignNode`, `isAssigning`, and `keepContents` on `deleteNode(id, { keepContents })` and `bulkDeleteNodes(ids, { keepContents })`. A module that offers its own delete action can call `useNodeDeleteConfirm()`, so it asks the same question as Structure's own delete — see [Confirm hooks](/modules/structure/usage/#confirm-hooks).
+
 ### Formula Recompute (v1.42.0+)
 
 The server now computes a node's own formula fields, and its computed `name` / `description` / `slug`, on every create and update, including in-process ones. After each node or connection write it recomputes the stored formulas that can see the change. The details and limits are on [Fields → formula](/modules/structure/fields/#formula). For an integrating module:
@@ -1205,6 +1240,8 @@ The server now computes a node's own formula fields, and its computed `name` / `
 - **A write from your module stores current formula values.** For example, a module that moves a child entry to a new stage also updates its parent's formula that reads that stage.
 - **Recomputes fire `structure.node.updated` with `source: 'formula'`.** The payload's `changes.data` holds only the formula keys that changed. If your listener does heavy work on every update (re-embedding, say), skip or debounce these.
 - **A recompute never fails your write.** Errors are logged, and the stored value stays as it was.
+- **Computed slugs are made URL-safe and free (v1.43.0).** A computed slug is slugified on every write and recompute, and when another live entry holds it, it is stored as `base-2`, `base-3` and so on. The suffix drops again once no other entry, live, archived or Deleted, holds the base. Don't key anything on a computed slug; use the node's `id` or its [reference number](/modules/structure/configuration/#reference-numbers).
+- **A formula reads another formula's value from the same write (v1.43.0),** whatever the field order.
 
 ### Stage Sources (v1.40.0+)
 
