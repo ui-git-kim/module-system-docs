@@ -30,7 +30,7 @@ The module that needs something writes down exactly what it will code against, a
 - what must stay the same;
 - the tests that would prove it.
 
-The request is the contract's first draft, and it lives with the consumer. For example, the cognitive-db engine's isolation-sections design lists items S1–S7, and the stage-source request lists S1–S9.
+The request is the contract's first draft, and it lives with the consumer. For example, the cognitive-db engine's isolation-sections design lists items S1–S7, the stage-source request lists S1–S9, and AI Core's [Requests to Structure](/modules/ai-core/structure-requests/) list S1–S5.
 
 ### 2. Structure builds it to fixed rules
 
@@ -111,6 +111,325 @@ The veradai app models each legal matter as a **Matter**: an isolated node type 
 | Formulas that stay current (item 3) | The server computes formula fields on every write and recomputes dependants after it; list literals, `highest`, and `stage` / `status` on node-views. `court_involvement` is one formula | v1.42.0 | [formula](/modules/structure/fields/#formula), [Formula Recompute](/modules/structure/integration/#formula-recompute-v1420) |
 
 Items 4–6 and the known gaps are on the roadmap under [Matter requests P2/P3](/modules/structure/roadmap/#matter-requests-p2p3).
+
+### AI Core: record reads and the formula engine
+
+AI Core builds prompt text that depends on a record, worked out in code rather than by the model. For example, a variable names the person's lawyer when the matter has one, and otherwise points to free help near them, found in a directory of records and placed as citable material. Its [request](/modules/ai-core/structure-requests/) asked for five server-side reads, S1–S5. Kim, the owner, added the engine itself, E1–E6, so that AI Core, and any other module, works out formulas, templates and conditions with Structure's own syntax, functions and limits instead of writing its own. Both shipped in v1.44.0. Nothing in them names AI Core or its domain.
+
+| Area | What AI Core relies on | Since | Reference |
+|------|------------------------|-------|-----------|
+| Record reads | S1–S5: `resolveTemplate`, `evaluateFormula`, `matchesCondition`, `queryNodes` and `getMergeFieldSchema` | v1.44.0 | [Record reads (S1-S5)](#record-reads-s1-s5) |
+| The formula engine | E1–E6: `structureService.formulas.evaluate`, `check`, `functions`, `fillTemplate`, `matches` and `format`, over values the caller supplies | v1.44.0 | [The formula engine](#the-formula-engine-structureserviceformulas) |
+| Types | `VisibleWhen`, `RecordReadOptions`, `TemplateResolution`, `FormulaResult`, `FormulaCheck`, `FormulaFunctionInfo`, `FormulaFormat`, `QueryNodesQuery`, `QueryNodesRow`, `QueryNodesResult`, `MergeFieldToken` and `MergeFieldSource`, from `structure.types` | v1.44.0 | [Signatures](#signatures) |
+| What they rest on | `getNode`'s read gate, the section wall, the secret guard, the shared condition evaluator and `utils/formula.ts`, all unchanged in behaviour (v1.44.0 only adds to the last two) | v1.42.0 onwards | [Rules for every call](#rules-for-every-call) |
+
+What is still open is on the roadmap: two [decisions](/modules/structure/roadmap/#decisions-needed), and the hardening planned for [v1.45.0](/modules/structure/roadmap/#now--next).
+
+#### Signatures
+
+All eleven are in-process methods on `serviceRegistry.get('structure')`. There are no HTTP routes.
+
+```ts
+// Record reads (S1–S5)
+resolveTemplate(nodeId: string, template: string, userId: string, options?: RecordReadOptions): Promise<TemplateResolution>;
+evaluateFormula(nodeId: string, expression: string, userId: string, options?: RecordReadOptions): Promise<FormulaResult>;
+matchesCondition(nodeId: string, condition: VisibleWhen, userId: string, options?: RecordReadOptions): Promise<boolean>;
+queryNodes(userId: string, query: QueryNodesQuery, options?: RecordReadOptions): Promise<QueryNodesResult>;
+getMergeFieldSchema(nodeType: string, userId: string, options?: { isAdmin?: boolean }): Promise<MergeFieldToken[]>;
+
+// The formula engine (E1–E6), over values the caller supplies
+formulas.evaluate(expression: string, values: Record<string, unknown>, options?: { userId?: string }): Promise<FormulaResult>;
+formulas.check(expression: string, options?: { userId?: string }): Promise<FormulaCheck>;
+formulas.functions(options?: { userId?: string }): Promise<FormulaFunctionInfo[]>;
+formulas.fillTemplate(template: string, values: Record<string, unknown>, options?: { nodeType?: string; userId?: string }): Promise<TemplateResolution>;
+formulas.matches(condition: VisibleWhen, values: Record<string, unknown>): Promise<boolean>;
+formulas.format(value: unknown, format?: FormulaFormat): string;
+
+// From structure.types
+interface RecordReadOptions {
+  isAdmin?: boolean;    // counts only when exactly true
+  scopeRootId?: string; // a non-empty string; undefined or null is none
+}
+type VisibleWhen = FieldConditionShape;
+interface FieldConditionShape {
+  logic?: 'and' | 'or';
+  field?: string;
+  equals?: string;
+  notEquals?: string;
+  in?: string[];
+  isNotEmpty?: boolean;
+  isEmpty?: boolean;
+  contains?: string;
+  greaterThan?: string;
+  lessThan?: string;
+  rules?: Array<{ field: string; operator: string; value?: string | string[] }>;
+}
+interface TemplateResolution { text: string; empty: string[] }
+interface FormulaResult { value: unknown; text: string }
+type FormulaCheck =
+  | { ok: true; reads: string[]; functions: string[]; needsRecord: boolean }
+  | { ok: false; error: string };
+interface FormulaFunctionInfo {
+  name: string;
+  kind: 'built-in' | 'registered' | 'admin';
+  signature?: string;
+  description?: string;
+  category?: string;
+  arity?: { min: number; max: number | null }; // max null: any number
+}
+interface FormulaFormat { precision?: number; prefix?: string; suffix?: string }
+interface QueryNodesQuery {
+  types: string[];                                        // subtypes included
+  where?: VisibleWhen;
+  hostNodeId?: string;
+  orderBy?: { field: string; direction: 'asc' | 'desc' }; // default name, ascending
+  limit?: number;                                         // default 20, at most 100
+}
+interface QueryNodesRow { id: string; nodeType: string; name: string; data: Record<string, unknown> }
+interface QueryNodesResult { nodes: QueryNodesRow[]; truncated: boolean }
+```
+
+`MergeFieldToken` is the shape described on [Merge Fields](/modules/structure/merge-fields/#the-token-schema--getmergefieldschema). A condition's values may also be numbers or `true` / `false`; they compare as text.
+
+#### Rules for every call
+
+**Read only.** No record is written, and no action hook or event fires; tests check both. One side effect that every request read already has remains: with no `scopeRootId`, the active-space read that `getNode` and `listNodes` make creates the user's empty settings row when they have none. Passing `scopeRootId` avoids it.
+
+**Errors.** The starter's `NotFoundError` (404) and `BadRequestError` (400).
+- A 400 message starts with the method's prefix: `template-invalid: `, `formula-error: `, `condition-invalid: ` or `query-invalid: `. The one exception is `getNode`'s `Invalid scope for this request`, which has no prefix.
+- A 404 is `Node not found` for a record and `Node type not found` for a type.
+- Each call checks its input's shape first, so a bad template, expression or condition is a 400 before anything is read. It never says whether a record exists.
+- While a template, formula or condition is worked out, only an evaluator error and a read limit become a 400. Anything else, such as a database failure or a fault in a module's own formula function, is thrown as it is.
+
+**`userId`** is the person the call is for. Everything is read as that user, with each type's read permission applied.
+
+**`isAdmin`** counts only when it is exactly `true`. It opens only what the call names, as `getNode`'s `isAdmin` does: the record (S1–S3), the host and the queried types (S4), or the type (S5). What a template, formula or condition reads **through** the record (a `{ref->field}`, a traversal, `nodes()`) is read as `userId` without admin rights, as a stored formula and the form read it. So a token that reaches into an admin-only type reads as blank, even for an admin. Whether that should change is an open [decision](/modules/structure/roadmap/#decisions-needed).
+
+**`scopeRootId`** is a non-empty string, or absent (`undefined` and `null` both mean none). Anything else is the 400 `Invalid scope for this request`, checked after the input's shape and before anything is read. Otherwise it means what it means on `getNode`. For S1–S3 it decides only whether the record itself may be read; `queryNodes` reads its host the same way and also confines its candidates with it (see S4):
+- **With it,** a record of a space-bound type must be in that section, or the answer is a 404. Where the read is confined like this, a `scopeRootId` that isn't one of the user's live section roots is the 400 `Invalid scope for this request`.
+- **Without it,** a record of a space-bound type reads only when it is in the user's saved active space or is one of the owner's unassigned records (`getNode`'s ambient scope). Otherwise it is a 404, and so is every record in a section when no active space is saved.
+- A record of a type no space scopes, or of a shared type, reads either way.
+- The gate doesn't look at `status`: an archived record, or one in Deleted, reads like any other. `queryNodes` lists active records only.
+
+**A caller with no request** (a background job) that reads a record in a section passes that section's root as `scopeRootId` (for `queryNodes`, the section it searches, such as the host's). That is the record's `rootNodeId` when the caller already holds the record, or `(await getNodeSection(nodeId, userId, { isSystem: true })).sectionRootId`. Without `isSystem`, `getNodeSection` is held to the saved active space too. A record in no section needs none (`getNodeSection` gives `null`, which counts as none).
+
+**What a record can read follows the record's own section,** not the caller's space. Once any type is isolated:
+- a record in a section reads that section plus the shared types;
+- a record in no section reads only rows in no section, plus shared records;
+- a record of a shared type is in no section wherever it is filed, so another user's shared record reads none of the reader's sections.
+
+A dereference, traversal or `nodes()` that would leave the section reads as nothing (blank, `[]` or `0`), and the row outside is never returned by any query.
+
+**`{ref->column}`.** A token through a reference reads the referenced record's data field of that name first. When that field holds no value, it reads only these columns: `id`, `name`, `description`, `slug`, `reference`, `nodeType`, `parentId`, `rootNodeId`, `depth`, `status`, `stage`, `createdAt` and `updatedAt` (dates as ISO text). Every other column reads as blank, the owner's own flags included: for example `embeddingText` (the text prepared for search, which can hold a secret's plain text), `embeddingModel`, `isFavorite`, `isPinned`, `publishedSlug`, `userId`, `path`, `sortOrder`, `settings` and `metadata`.
+
+**Secrets are never read.**
+- The record's own secret fields read as blank. (The form holds the owner's own secrets opened; a read for another module never does.)
+- A referenced or traversed record has its secret values removed before any token reads it, and a node-view never carries one.
+- In a condition's value, a secret token reads as blank.
+- `matchesCondition` and `queryNodes` refuse a condition that tests a secret field, a field-group that holds one, or a group's secret sub-field written `group.sub`. `queryNodes` refuses an `orderBy` on one too.
+- `queryNodes` rows have their secret values removed: the keys are absent.
+- `getMergeFieldSchema` lists no secret token.
+
+**Read limits.**
+- A template, or one condition's `{tokens}`, reads at most **200** records. Each dereference counts, a repeated one too. Past that, the 400 is `template-invalid: the template's {tokens} read more than 200 records`, `condition-invalid: the condition's {tokens} read more than 200 records`, or, for `queryNodes`' host tokens, `query-invalid: the where {tokens} read more than 200 records`.
+- A formula keeps the evaluator's own bounds: 2,000 characters, 500 parsed nodes, a call depth of 32, 100,000 steps, a 100,000-character string, and 200 record fetches (`formula-error: Formula traversal is too expensive (too many nodes fetched)`). A longer list that a traversal, `nodes()`, `map` or `filter` gets is cut to its first 1,000 items, without an error.
+- `queryNodes` tests at most **5,000** candidate records per call, or **500** when its `where` tests an on-read formula field, because each candidate's on-read values are worked out to test it. When the cap stops the scan before every candidate was tested, `truncated` is `true`: more may match.
+
+**Templates.** `resolveTemplate` and `formulas.fillTemplate` run the template resolver of `utils/formula.ts`, one template generated into both halves, so they read every token form the form reads and give the same text. A 34-row table checks each form through `resolveTemplate` on the server and through the browser's copy.
+- The forms: `{field}`; `{group.sub}` (the first row); `{group[0].sub}` (a row by index); `{group[sub=value].target}`; `{ref->field}`; `{group[sub=value].ref->field}` and `{group[0].ref->field}`; a part (`{full_name.last}`, `{ref->full_name.first}`); a format (`{date|long}`, `{kind|label}`, `{full_name|surnameFirst}`, `{home|locality}`); and `{stage}`, `{status}` and `{reference}`. See [Merge Fields](/modules/structure/merge-fields/#template-syntax).
+- **An index is written `{group[0].sub}`.** `{group.0.sub}` is no token form: it reads as blank, on the server and in the form.
+- **A plain `{select}` gives the stored value** (`syd`), as the form shows it. `{select|label}` gives the option's label (`Sydney`).
+- A list (a multiselect, or a token through a multiple reference) is joined with `, `, with blank entries left out.
+- `empty` lists each token that came out blank, as written without its braces (`lead->first_name`, `kind|label`), once each, in template order. A token that comes out as only spaces counts as blank.
+
+**Conditions.** `matchesCondition`, `queryNodes`' `where` and `formulas.matches` run the shared evaluator a form uses to show a field (`visibleWhen`), with these rules.
+- **The grammar.** Either the single-condition form, `{ field, equals, notEquals, in, isEmpty, isNotEmpty, contains, greaterThan, lessThan }`, where every test given must hold; or `{ logic: 'and' | 'or', rules: [{ field, operator, value? }] }`, with the operators `equals`, `notEquals`, `in`, `notIn`, `isEmpty`, `isNotEmpty`, `contains`, `greaterThan` and `lessThan`. `notIn` is a rule operator only. A condition holds at most 100 rules.
+- **What it reads.** The record's top-level data fields, without secrets, plus its `name`, `description` and `slug` (these columns win over a data field with the same name), and its `stage` and `status` where no data field has that name. `formulas.matches` reads the values as given.
+- **How it compares.** As text, case-sensitively. A list compares as its items joined with `,` (`a,b`). `false` is the text `false`, which isn't empty. `greaterThan` and `lessThan` compare numbers, so they can't compare dates.
+- **A field the record lacks reads as blank.** Against a value that isn't blank, `equals`, `in`, `contains` and `isNotEmpty` are false, and `isEmpty`, `notEquals` and `notIn` are true. `greaterThan` and `lessThan` compare blank as 0, so `lessThan 5` and `greaterThan -1` hold, and `greaterThan 0` doesn't.
+- **An empty condition holds.** `{}`, `{ rules: [] }` or a `logic` alone is `true` for `matchesCondition` and `formulas.matches`, and no filter for `queryNodes`, as a form reads it.
+- **`{tokens}` in a value.** A value that is exactly one `{token}` resolves to the **stored** value a formula reads: a select's option value, a number, or a multi-value field's list, which is spread into `in` and `notIn`. A value with text around its tokens resolves as a template does. `{x|label}` gives the label, which won't match a stored value; in `formulas.matches`, which has no type to take labels from, it reads as blank. The tokens read the record (`matchesCondition`), the host (`queryNodes`) or the values (`formulas.matches`), kept to the record's section. A secret token, or one through a reference outside the section, reads as blank.
+- **A blank token compares as blank.** `registry equals {registry}` matches every record with no registry when the host has none. Add an `isNotEmpty` rule on the field when that matters. A rule that `contains` a blank value holds for every record.
+- **A single-condition `contains`, `greaterThan` or `lessThan` with a `{token}` is refused** (`the greaterThan test on "score" holds a {token}: use rules for a {token} value`, after the method's prefix). The evaluator skips such a test when its value is blank, so a token that came out blank would make the condition hold for every record. Write it as a rule instead: a rule compares a blank value as a form does, so `greaterThan` blank is `greaterThan 0`. A token in `equals`, `notEquals` or `in` is fine in either form.
+
+**Formula results.** `value` is the result as a stored formula holds it: plain JSON, with blank, NaN and Infinity as `null`. `text` is the value written out by `formatFormulaValue` with no format: blank is `''`, `true` and `false` are text, a node-view shows its name, and a list's items are joined with `, ` **blank items included**. So a list of two blanks writes out as `, `. To test for "blank", test `value`, not `text === ''`.
+
+**What must not change.** `getNode`, `listNodes` and every other existing read, the form's template resolver and field visibility, and stored formula fields and their recompute. All are unchanged. Tests pin the template resolver's text, the condition evaluator, the browser's merge-field token list and `listNodes`' results. These eleven names, their signatures and their meanings are the contract: removing one, or changing what it means, is a breaking change (see [Changing a contract later](#5-changing-a-contract-later)).
+
+#### Record reads (S1-S5)
+
+##### S1. `resolveTemplate`: a merge template for one record
+
+**Meaning.** Resolves `template` against the record `nodeId`, as `userId`, the way the record's form shows it (see **Templates** above), and returns `{ text, empty }`.
+
+**Refuses.**
+- **400** `template-invalid: the template must be text`.
+- **400** `template-invalid: the template is longer than 2000 characters` (2,000 itself is fine).
+- **400** `template-invalid: the {token} at character N is not closed`, for a `{` with no `}` before the next `{` or the end.
+- **400** `Invalid scope for this request`, for `scopeRootId` (above).
+- **404** `Node not found`, from `getNode`'s gate: the record doesn't exist, isn't the user's and isn't shared, is of a type they may not read without `isAdmin`, is outside the space, or is a connection row.
+- **400** `template-invalid: the template's {tokens} read more than 200 records`.
+
+**Differs from the request.**
+- `{group.0.sub}` isn't a token form. It never was one, and adding it would change what the form shows and stores. Write `{group[0].sub}`.
+- "A select field (as the form shows it)" is the stored value: a plain `{select}` gives the stored value in the form too. `{select|label}` gives the label.
+- The record's own secret fields read as blank, as well as a referenced record's.
+- A `{ref->column}` reads only the columns listed above. The review found that `embeddingText` can carry a secret's plain text.
+- A record in no section reads only rows in no section plus shared records. The request covered only a record in a section.
+- Added refusals: a template that isn't text, the 200-record read limit, `getNode`'s `Invalid scope for this request`, and a connection row as the record.
+
+##### S2. `evaluateFormula`: a formula for one record
+
+**Meaning.** Evaluates `expression` against the record, as `userId`, with the evaluator a stored formula field uses: its bounds, the registered functions, and the admin-defined functions `listFunctions(userId)` gives that user. A keyword, built-in or registered function wins over an admin function of the same name. The record's tokens read its data plus `name`, `description` and `slug`, as a form's formula does. Traversals (`children`, `parents`, `scope`, `connections`, `nodes`) and `{ref->field}` keep to the record's section. It returns `{ value, text }` (see **Formula results** above). A blank expression gives `{ value: null, text: '' }`.
+
+**Refuses.**
+- **400** `formula-error: the expression must be text`.
+- **400** `formula-error: ` followed by the evaluator's message. A parse error is refused before the record is read: `Unclosed { in formula`, `Unexpected token in expression`, `Formula is too long` or `Formula is too complex`. While it evaluates: `Unknown function: nope`, `round expects 1-2 argument(s)`, or a bound exceeded, such as `Formula traversal is too expensive (too many nodes fetched)`.
+- **400** `Invalid scope for this request` and **404** `Node not found`, as for S1.
+
+**Differs from the request.**
+- **The text of a list of blanks.** `pluck(nodes({refs}), 'aSecret')` with two references gives `value: [null, null]` and `text: ', '`, because `text` follows `formatFormulaValue`, as asked, and that keeps blank items. With one reference it gives `[null]` and `''`.
+- `value` is the stored form: NaN and Infinity are `null`.
+- The record's own secret fields read as blank too.
+- A parse error is a 400 even for a record that doesn't exist.
+
+##### S3. `matchesCondition`: a condition for one record
+
+**Meaning.** Whether `condition` holds for the record, as `userId`, by the rules under **Conditions** above. `{tokens}` in its values read the record, as stored values.
+
+**Refuses.**
+- **400** `condition-invalid: ` and the problem, before the record is read, for a condition the evaluator would misread:
+  - not an object; an unknown key (`unknown key "x"`); a single-condition `notIn` (`notIn is a rule operator, not a single-condition test: use rules`); a `logic` other than `and` or `or`;
+  - `rules` that isn't a list, holds more than 100 rules, or comes beside a single condition (`give rules or a single condition (a field and its tests), not both`);
+  - a rule that isn't an object, names no field, has an unknown key or operator, or has no value (`in` and `notIn` take a list of text, numbers or `true` / `false`);
+  - a single condition with no field or no test, an `isEmpty` or `isNotEmpty` other than `true` or `false`, or a `contains`, `greaterThan` or `lessThan` of `''`, `0` or `false`, which the evaluator would skip (`would be skipped for a blank value: use rules for it`);
+  - a single-condition `contains`, `greaterThan` or `lessThan` with a `{token}` (above);
+  - a `{` with no `}` in a value.
+- **400** `Invalid scope for this request` and **404** `Node not found`, as for S1.
+- **400** `condition-invalid: rule 1 tests "api_key", a secret field` (or `the condition tests …`, or `… which holds a secret field` for a field-group): a tested field is a secret of the record's type. This check comes after the gate, so it only ever names a field of a type the caller may read.
+- **400** `condition-invalid: the condition's {tokens} read more than 200 records`.
+
+**Differs from the request.**
+- **A field the record lacks isn't always false.** It reads as blank, by the form's rules: `isEmpty`, `notEquals`, `notIn` and `lessThan 5` are true (see **Conditions**).
+- **Tokens resolve to stored values,** not to S1's display text. Comparing a select's label with another select's stored value would never match, so a select's token gives its option value. `{x|label}` asks for the label.
+- **An empty condition holds** (`true`), as in a form, rather than being refused.
+- **More refusals:** rules beside a single condition; a single-condition `notIn`; an `isEmpty` or `isNotEmpty` other than `true` or `false`; a single-condition `contains`, `greaterThan` or `lessThan` that is blank, `0` or `false`, or that holds a `{token}`; unknown keys; values that aren't text, numbers or `true` / `false`; more than 100 rules; an unclosed `{` in a value; a field-group holding a secret, and a secret written `group.sub`; and the read limit.
+- It reads `stage` and `status` too, which a form's `visibleWhen` doesn't.
+
+##### S4. `queryNodes`: records by type and condition
+
+**Meaning.** The records of `types`, subtypes included, that `userId` may read and whose data matches `where`, ordered by `orderBy`, at most `limit` of them, with secret values removed.
+- **Candidates.** Active records only, not archived ones or those in Deleted: the user's own records, and the shared types' records. When any queried type or subtype is space-bound, they are confined as `listNodes` confines a list, the shared types' records always kept: with `scopeRootId`, to that section; without it, to the saved active space with the owner's unassigned records beside it, or, with no active space saved, to the shared and unassigned records.
+- **Types.** A type that doesn't exist, that the user may not read without `isAdmin`, or `connection`, is left out without an error. With none left, the answer is `{ nodes: [], truncated: false }`.
+- **`hostNodeId`.** The host is read through `getNode`'s gate, with the same options. The results keep to what the host may reference (the `withinSectionOf` rule): the host's section plus the shared types, or, for a host in no section or of a shared type, the rows in no section plus the shared types. `{tokens}` in `where` values read the host, as stored values, once. They can't read a candidate's fields.
+- **Order.** `name` (the default, ascending), `createdAt`, `updatedAt`, `sortOrder`, `description` and `slug` sort by the record's own column, and a record with no description or slug sorts last. Any other name is a data field, sorted as `listNodes`' `dataSortField` sorts it: a number field as numbers, a date field as dates, a name field by surname then first name, anything else as text, with blank values last in either direction. Ties break by id. As in `listNodes`, a data-field sort takes the candidates in id order up to the cap and sorts those, so with more candidates than the cap the order covers only the first ones by id, and `truncated` is `true`.
+- **Rows.** `{ id, nodeType, name, data }`. `data` has the secret fields taken out (the keys are absent, where a `listNodes` row keeps them sealed) and the on-read formula values filled in, as a `listNodes` row has them. A `where` may test an on-read field.
+- **The scan.** Candidates are read in order and tested in batches of 200 with the shared evaluator, until `limit + 1` match, up to the cap (see **Read limits**). `truncated` is `true` when more than `limit` matched, or when the cap stopped the scan.
+- It doesn't run the `structure.node.listQuery` filter. That filter shapes a list page's query (paging, search, parent, stage), which `queryNodes` doesn't take, and `getNode` and the searches don't run it either.
+
+**Refuses.**
+- **400** `query-invalid: ` and the problem, before anything is read: `the query must be an object`; `types must name at least one node type` (not a list, empty, or a blank name); `at most 100 types`; `limit must be a whole number from 1 to 100`; `orderBy needs a field and a direction of "asc" or "desc"` (the field is 1 to 100 characters); a malformed `where`, as for S3; `hostNodeId must be a node id`; `a {token} in a where value needs hostNodeId`.
+- **400** `Invalid scope for this request`, as for S1.
+- **400** `query-invalid: field "pin" is a secret field and cannot be used to filter or sort`, when a `where` field or the `orderBy` field is a secret on any queried type, a field-group holding one, or a secret sub-field written `group.sub`.
+- **404** `Node not found` for the host, as for S1.
+- **400** `query-invalid: the where {tokens} read more than 200 records`.
+
+**Differs from the request.**
+- **Secrets can't be searched or sorted by** (the refusal above), so `queryNodes` can't be used to read a secret out by testing for it.
+- **The scan cap,** and `truncated` when it stops the scan.
+- **Unknown and unreadable types are left out,** not refused.
+- **More refusals:** a query that isn't an object; more than 100 types; a limit under 1 or not a whole number; a malformed `orderBy`; a `hostNodeId` that isn't an id; a `{token}` with no host; and the read limit.
+- `description` and `slug` in `orderBy` are the record's own columns, the same values `where` reads.
+- **Small differences from `listNodes`.** It decides space confinement on the types with their subtypes (`listNodes` decides before adding them: H3, planned for v1.45.0), it applies `scopeRootId` when it reads the host (`withinSectionOf` drops it: H4, also planned for v1.45.0), it breaks name ties by id, it can filter by on-read fields, and its rows carry no `unassigned` flag.
+
+##### S5. `getMergeFieldSchema`: the tokens of a type
+
+**Meaning.** The tokens the browser's field pickers list for `nodeType`, with every secret left out. It runs `flattenMergeFields`, which is now one shared file rendered into both halves. Built-ins come first (`name`, `description`, `slug`), then each field in the type's order (own, field-template and inherited): a field's own token, a field-group's `{group.sub}` tokens in its place, and a reference's one-hop `{ref->field}` tokens straight after its own. A disabled type still lists its tokens, as the admin editor shows them.
+- **Left out, beyond the browser's list:**
+  - every secret token: a secret field, and every path the secret guard counts (own, field-template and inherited secrets, `{group.secret}`, `{ref->secret}`, and a target's secret field called `name`, `description` or `slug`);
+  - every `{ref->x}` into a type `userId` can't read without admin rights, for an admin too;
+  - every dereference of a reference that can point only at such types, `{ref->name}` included, since each would always read as blank.
+- **Not on the server:** fields a frontend module registers, and node types defined only in frontend code.
+- **Order.** Types with the same `sortOrder` come in database order, so the tokens an unrestricted reference offers can come in a different order between two reads. The set is always the same.
+- Like the browser's list, it has no parameterised forms (`[0]`, `[k=v]`), parts or formats, and no `{stage}`, `{status}` or `{reference}`.
+- It reads the type list through `listNodeTypes`, so the `structure.nodeType.response` filter runs, as it does for the browser's type list.
+
+**Refuses.** **404** `Node type not found` when `userId` has no type with that slug (another user's private type counts as none), or the type's read permission is `admin` or `system` and `isAdmin` isn't exactly `true`.
+
+**Differs from the request.** The tokens left out above. `isAdmin` opens only the type itself: tokens into admin-only types aren't offered to an admin either, because the reads would give them as blank.
+
+#### The formula engine (`structureService.formulas.*`)
+
+This wasn't in AI Core's request. Kim added it so that a module can compute with Structure's syntax, functions and bounds over its own values, with no record. `values` is a plain object that `{field}` tokens read the way a record's data is read: a part (`{home.city}`), the first row (`{rows.x}`), a row by index (`{rows[0].x}`) or by value (`{rows[k=v].x}`), and formats (`{full|surnameFirst}`). Nothing is read from the database except the user's admin-defined functions when a `userId` is given (cached with the type config), and, for `fillTemplate` with a `nodeType`, that type's read check and its labels. Nothing is written, and no hook fires.
+
+**Record-only features.** A traversal (`children()`, `parents()`, `scope()`, `connections()`), `nodes()` and a `{ref->field}` need a record.
+- `evaluate` refuses them wherever they stand, even in a branch that wouldn't run, or inside an admin function's body: `formula-error: children() needs a record; use evaluateFormula`, with `parents()`, `scope()`, `connections()`, `nodes()` or the token (such as `{lead->name}`) in its place.
+- `check` reports them as `needsRecord: true`.
+- `fillTemplate` and `matches` read a `{ref->field}` as blank, and `fillTemplate` lists it in `empty`. The one exception is a new-entry placeholder in the values, `{ $new: { nodeType, name, data } }`: both read it where it is, so `{newbie->name}` gives its name.
+
+##### E1. `formulas.evaluate`
+
+Evaluates `expression` over `values` and returns `{ value, text }`, as `evaluateFormula` does. The registered functions are always there. The admin-defined ones are there only with a `userId`: the ones `listFunctions(userId)` gives that user, with a keyword, built-in or registered function of the same name winning. A blank expression gives `{ value: null, text: '' }`.
+
+**Refuses.** **400** `formula-error: the expression must be text`; `formula-error: values must be an object`; `formula-error: … needs a record; use evaluateFormula`; and `formula-error: ` followed by the evaluator's message, as for `evaluateFormula`.
+
+##### E2. `formulas.check`
+
+Parses and analyses an expression without evaluating it, for an editor. It never throws for a bad expression.
+- **`{ ok: true, reads, functions, needsRecord }`.**
+  - `reads`: the field paths its tokens read, each once, first use first. Row selectors and formats are dropped: `{rows[0].x}` and `{rows[k=v].x}` are both `rows.x`, `{kind|label}` is `kind`, and `{lead->name}` stays as it is. The tokens in a `map` or `filter` body count; `{_}` and `{it}`, the item itself, don't.
+  - `functions`: every function called by name, keywords too, each once, first use first. An admin function's body isn't read.
+  - `needsRecord`: `true` when it uses a traversal, `nodes()` or a `{ref->field}`, inside an admin function's body too.
+- **`{ ok: false, error }`**, with the evaluator's message: `The expression must be text`, a parse error (`Unexpected token in expression`, `Unclosed { in formula`, `Formula is too long`), or `Unknown function: nope`. An admin function counts only with a `userId`.
+- A blank expression is `{ ok: true, reads: [], functions: [], needsRecord: false }`.
+- It doesn't evaluate, so a wrong number of arguments only shows when the formula runs.
+
+##### E3. `formulas.functions`
+
+The catalogue an editor offers, as `FormulaFunctionInfo[]`, in this order:
+1. the seven keywords (`children`, `parents`, `scope`, `connections`, `nodes`, `map` and `filter`), `kind: 'built-in'`, each with its `signature`, such as `children([type])`;
+2. the server's registered functions, by name: the built-in library (50 functions today, `kind: 'built-in'`) and any function another module registered on the server (`kind: 'registered'`), each with the `description`, `category` and `arity` it was registered with, and no `signature`, because a registered function stores no parameter names;
+3. with a `userId`, the admin-defined functions (`kind: 'admin'`), each with a `signature` built from its parameters (`double(x)`), its `arity`, and its `description` and `category` when set.
+
+Constants (`PI`, `E`, `TAU`, `INFINITY`) aren't listed. Nor is an admin function that a keyword or registered function shadows (it is never reached), or a function the server doesn't have, such as `semanticSimilarity`. An `arity.max` of `null` means any number.
+
+##### E4. `formulas.fillTemplate`
+
+A merge template over `values`, returning `{ text, empty }` as `resolveTemplate` does. With a `nodeType` and a `userId`, `{x|label}` shows that type's option labels as that user sees them. Without a `nodeType`, `{x|label}` reads as blank.
+
+**Refuses.**
+- **400** `template-invalid: `, as for `resolveTemplate` (not text, over 2,000 characters, an unclosed `{`).
+- **400** `template-invalid: values must be an object`, `template-invalid: nodeType must be a node type slug` and `template-invalid: nodeType needs a userId`.
+- **404** `Node type not found` when the type doesn't exist or `userId` may not read it. There's no `isAdmin` here, so an admin-only type is a 404.
+
+##### E5. `formulas.matches`
+
+A condition over `values`, by the rules under **Conditions** above, returning `Promise<boolean>`. `{tokens}` in a value read the values, as stored values. There is no type, so `{x|label}` reads as blank.
+
+**Refuses.** **400** `condition-invalid: `, for the shape problems `matchesCondition` refuses, and `condition-invalid: values must be an object`. No field is refused for being a secret, because values a caller supplies hold none.
+
+##### E6. `formulas.format`
+
+A value written out as a formula field shows it (`formatFormulaValue`): a number is rounded to `precision` decimal places, and the text is wrapped in `prefix` and `suffix`. Blank, NaN and Infinity give `''`, with no prefix or suffix; a list gives `a, b`, a node-view its name, and `true` and `false` their text. It is synchronous: it returns a string, and throws its `BadRequestError` straight away.
+
+**Refuses.** **400** `formula-error: the format must be an object`, `formula-error: precision must be a whole number from 0 to 100` and `formula-error: prefix and suffix must be text`.
+
+**Differs from the engine's first design.**
+- `matches` returns a promise, because tokens in values are read asynchronously.
+- `functions` entries also carry `category` and `arity`, and `signature` is given for keywords and admin functions only.
+- `check`'s message for an expression that isn't text is `The expression must be text`.
+- In a result, `value` is the stored form, with NaN and Infinity as `null`.
+
+#### Not done as asked
+
+- **`{group.0.sub}`** isn't supported, as above.
+- **A rule on a field the record lacks** isn't always false. It follows the form's rules, so the server and the form agree (see S3).
+- **`isAdmin` doesn't reach through the record.** A pinned record read with `isAdmin` gives its own fields, but anything it references in an admin-only type reads as blank. Changing that is a small engine change, and it is an open [decision](/modules/structure/roadmap/#decisions-needed) for Kim.
+- **No public way to add a server-side formula function.** Today a module can add one only by importing Structure's backend `utils/formula.js` directly, which breaks the rule against [importing across module boundaries](/modules/structure/integration/#accessing-structure-data-via-service-registry). A function a module registers only in the browser is `Unknown function` on the server. This is also an open decision.
+- **Small differences from the form, documented but not fixed,** because fixing them would change values the form shows or has stored:
+  - `{x|label}` on a select field that only a frontend module registers reads as blank on the server;
+  - `today()` and `age()` use the server's date (UTC unless the server sets a time zone), so they can be a day apart from the browser's;
+  - for a record in no section, the browser's `{ref->x}` also applies the active space and the response filter, and the server's reads don't.
 
 ### Every module
 

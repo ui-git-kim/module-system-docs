@@ -85,6 +85,8 @@ Accesses a specific row in a repeater by its zero-based index.
 
 Returns the `email` field from the first row of the `contacts` field-group.
 
+The index always goes in square brackets. `{contacts.0.email}` is not a token form: it reads as blank, in the form and on the server.
+
 #### First item of a group
 
 ```
@@ -386,7 +388,9 @@ interface MergeFieldToken {
 
 The token set emits the resolver's **canonical, statically-enumerable token forms**: built-in `name` / `description` / `slug`; every top-level field; each `field-group` subfield as a first-item token (`{group.sub}`); and one-hop node-reference deref targets. For **every** `node-reference` field, the three built-in deref tokens `{ref->name}`, `{ref->description}`, and `{ref->slug}` are emitted (independent of the reference's `allowedTypes`), plus one `{ref->field}` token per value field of each allowed referenced type. A reference with no `allowedTypes` (the admin form's default) can point at any type, so it gets deref tokens for every referenced type supplied — in the app, every node type the user can see, including the type itself. If a referenced type has a real field called `name`, `description` or `slug`, that field's token replaces the built-in deref token, because a dereference reads node data before the built-in property; and when two referenced types share a field id, a `secret` type wins, so the [secret check](#computed-values-never-copy-secrets) never loses it. It includes own, attached field-template, inherited (Type Hierarchy) and module-registered fields. The resolver's parameterised forms — filtered lookups (`[sub=val]`), index access (`[0]`), and combined repeater + deref — are resolvable at runtime but are **not** surfaced as static tokens, since they depend on runtime data values. The v1.43.0 part and [format](#formats-v1430) forms, and `{stage}`, `{status}` and `{reference}`, aren't surfaced either: [Build it](#build-it-v1430) offers them. A computed field's token has `computed: true` and a label ending in " (formula)". Pass `{ includeBuiltins: false }` to omit the built-ins — used by the connection-type field editor, where a connection has no `name` / `description` / `slug`. The node create/edit form and the node detail view merge `name` / `description` / `slug` into the resolution bag before resolving, so a custom field's `computedTemplate` can bind `{name}`, `{description}` and `{slug}`; the node-type admin form therefore passes `includeBuiltins: true`.
 
-The pure core, `flattenMergeFields(fields, refFieldsBySlug, options)`, is exported too — call it directly when you already have field descriptors and a map of referenced-type fields (e.g. a payload from the schema endpoint below).
+The pure core, `flattenMergeFields(fields, refFieldsBySlug, options)`, is exported too — call it directly when you already have field descriptors and a map of referenced-type fields (e.g. a payload from the schema endpoint below). Since v1.44.0 it lives in its own React-free file, `utils/merge-field-tokens.ts`, which is generated from the same source as the server's copy; `utils/merge-fields.ts` re-exports it, so existing imports keep working.
+
+The server has its own `getMergeFieldSchema(nodeType, userId, options?)` (v1.44.0), where `options` is `{ isAdmin? }`, for another module's **Insert field** picker. It runs the same flattener over the same type list, and gives the same list less every secret token, the dereferences the server would read as blank, and the fields and types that only frontend code adds. See [On the server, for other modules](#on-the-server-for-other-modules-v1440).
 
 ### The public schema endpoint
 
@@ -420,6 +424,24 @@ const title = await resolveMergeFields('{matter_number} — {assigned_client->na
 ```
 
 `resolveMergeFields` also reads `{stage}`, `{status}` and `{reference}` off the node it is given (v1.43.0), so pass them on the node when the template uses them. `resolveTemplateAsync(template, data, cache?, fetchNode?, onFailClosed?, options?)` is the lower-level primitive; `options` (v1.43.0) is `{ host?, labels? }`, the node the data bag belongs to (for `{stage}`, `{status}` and `{reference}`) and where `|label` finds a field's options. Its `fetchNode` is injectable — supply your own node fetcher for a non-app runtime; it defaults to a query-cache-backed wrapper around `structureService.getNode` (keyed `['structure', 'node', id]` with a 30s `staleTime`, so repeated dereferences of the same node collapse into one request). Whichever fetcher you supply, each fetched node passes through the exported `withoutSecretValues` before a token reads it; that function looks up the node's secret fields in the client type registry. A node whose type the registry does not know reads as its built-in properties only and is not kept in `cache`. The optional `onFailClosed(nodeType)` callback hears of each such node, so a caller that saves the result can skip the write and resolve again later. `resolveMergeFields` does not take this callback.
+
+### On the server, for other modules (v1.44.0)
+
+Since v1.44.0 a backend module can resolve the same templates on the server, through `serviceRegistry.get('structure')`, instead of writing its own resolver:
+
+- **`resolveTemplate(nodeId, template, userId, options?)`** resolves a template against one record, as `userId`, with every token form on this page. It returns `{ text, empty }`: the text, and the tokens that came out blank, so the caller can tell when a value is incomplete.
+- **`formulas.fillTemplate(template, values, options?)`** resolves one over values the module supplies, with no record behind them. A `{ref->field}` reads as blank there, unless the reference holds a new-entry placeholder (`{ $new: { nodeType, name, data } }`), which is read where it is. With a `nodeType` and a `userId`, `{x|label}` shows that type's labels.
+- **`getMergeFieldSchema(nodeType, userId, options?)`** lists a type's tokens (see [The token schema](#the-token-schema--getmergefieldschema)), with every secret left out.
+
+The server gives the same text as the form for each token form; a test checks 34 of them on both halves. The ones to know:
+
+- A plain `{select}` gives the stored value and `{select|label}` the label, as in the form.
+- An index is written `{group[0].sub}`. `{group.0.sub}` reads as blank.
+- The record's own secret fields read as blank on the server, though the form shows the owner's own.
+- A `{ref->column}` token reads a record's built-ins and dates only (`name`, `description`, `slug`, `reference`, `stage`, `status`, `createdAt` and the like), never the text prepared for search or anyone's favourite and pin marks.
+- What a template reads through a record keeps to the record's own section, plus the shared types. A record in no section reads only the rows in no section, plus the shared types.
+
+The full rules, with every refusal and limit, are in [Contracts](/modules/structure/contracts/#ai-core-record-reads-and-the-formula-engine).
 
 ### Merge-field-driven cards
 
@@ -623,6 +645,10 @@ The following operators are available in the multi-rule format. All except `notI
 | `contains` | Field value contains the substring | Yes |
 | `greaterThan` | Numeric comparison — field value is greater | Yes |
 | `lessThan` | Numeric comparison — field value is less | Yes |
+
+A field with no value compares as blank: against a value that isn't blank, `equals`, `in`, `contains` and `isNotEmpty` are false and `isEmpty`, `notEquals` and `notIn` are true, and `greaterThan` and `lessThan` compare blank as 0. Text comparisons are case-sensitive, and a list compares as its items joined with `,`.
+
+**On the server (v1.44.0).** Another module can test the same conditions with the same evaluator: `matchesCondition` for one record, and `structureService.formulas.matches` for values it supplies. There, a value may hold a `{token}`, so one field can be compared with another, and a condition a form would misread is refused rather than guessed at. See [Contracts](/modules/structure/contracts/#ai-core-record-reads-and-the-formula-engine).
 
 ### Conditional Required (`requiredWhen`)
 

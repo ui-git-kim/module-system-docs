@@ -9,7 +9,7 @@ import { Steps, Tabs, TabItem, Aside, Card, CardGrid } from '@astrojs/starlight/
 
 Structure is the organisational backbone of every app built on the starter template. It defines the "things" users work with — Clients, Projects, Properties, Matters — and provides a universal system for organising, displaying, and navigating them. **Almost every module you build will integrate with Structure.**
 
-This page is the definitive guide for module developers who need to extend, reference, or react to Structure nodes. For the contracts agreed with particular modules (the cognitive-db engine and Tasks), and how a module asks for one, see [Contracts](/modules/structure/contracts/).
+This page is the definitive guide for module developers who need to extend, reference, or react to Structure nodes. For the contracts agreed with particular modules (the cognitive-db engine, Tasks and AI Core), and how a module asks for one, see [Contracts](/modules/structure/contracts/).
 
 ---
 
@@ -75,6 +75,7 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 | Reference nodes (NodeSelector) | ✅ | — | Component import |
 | Customise UI labels per type | ✅ | — | `getLabel()` utility |
 | Access Structure data at runtime | — | ✅ | `serviceRegistry.get('structure')` |
+| Work out templates, formulas and conditions, and find records by condition (v1.44.0+) | — | ✅ | `structureService` record reads and `structureService.formulas` |
 | Semantic search / embeddings (opt-in) | — | ✅ | `serviceRegistry.get('structureEmbeddings')` |
 | Transform Structure data (filters) | — | ✅ | `filterRegistry` |
 | React to Structure events (actions) | — | ✅ | `actionRegistry` |
@@ -1242,6 +1243,60 @@ The server now computes a node's own formula fields, and its computed `name` / `
 - **A recompute never fails your write.** Errors are logged, and the stored value stays as it was.
 - **Computed slugs are made URL-safe and free (v1.43.0).** A computed slug is slugified on every write and recompute, and when another live entry holds it, it is stored as `base-2`, `base-3` and so on. The suffix drops again once no other entry, live, archived or Deleted, holds the base. Don't key anything on a computed slug; use the node's `id` or its [reference number](/modules/structure/configuration/#reference-numbers).
 - **A formula reads another formula's value from the same write (v1.43.0),** whatever the field order.
+
+### Record Reads and the Formula Engine (v1.44.0+)
+
+A module can work out Structure's merge templates, formulas and conditions on the server, with the same code the forms and stored formula fields run, instead of writing its own. These are in-process methods on `serviceRegistry.get('structure')`, with no HTTP routes. They only read: no record is written, and no hook or event fires. The full contract, with every refusal, limit and guarantee, is [AI Core: record reads and the formula engine](/modules/structure/contracts/#ai-core-record-reads-and-the-formula-engine).
+
+| Method | What it does |
+|--------|--------------|
+| `resolveTemplate(nodeId, template, userId, options?)` | A merge template for one record, as `{ text, empty }`: the text, and the tokens that came out blank |
+| `evaluateFormula(nodeId, expression, userId, options?)` | A formula for one record, as `{ value, text }` |
+| `matchesCondition(nodeId, condition, userId, options?)` | Whether a condition in the `visibleWhen` grammar holds for one record. A value in it may hold `{tokens}` read from the record, so one field can be compared with another |
+| `queryNodes(userId, query, options?)` | Up to 100 records of some types (subtypes included) whose data matches a condition, as `{ nodes, truncated }`. `query` is `{ types, where?, hostNodeId?, orderBy?, limit? }`. With `hostNodeId`, the results keep to what that record may reference, and `{tokens}` in `where` read it |
+| `getMergeFieldSchema(nodeType, userId, options?)` | A type's merge-field tokens, for an editor's **Insert field**, with every secret left out |
+| `formulas.evaluate(expression, values, options?)` | A formula over values you supply, with no record |
+| `formulas.check(expression, options?)` | What a formula reads and calls, and whether it needs a record, without running it: `{ ok: true, reads, functions, needsRecord }` or `{ ok: false, error }` |
+| `formulas.functions(options?)` | The functions a formula may call, with their signatures and metadata |
+| `formulas.fillTemplate(template, values, options?)` | A merge template over values you supply |
+| `formulas.matches(condition, values)` | A condition over values you supply |
+| `formulas.format(value, format?)` | A value written out as a formula field shows it (`precision`, `prefix`, `suffix`) |
+
+On the record reads, `options` is `RecordReadOptions`, `{ isAdmin?, scopeRootId? }`; `getMergeFieldSchema` takes `{ isAdmin? }` alone. `formulas.evaluate`, `check` and `functions` take `{ userId? }`, which brings in that user's admin-defined functions. `formulas.fillTemplate` takes `{ nodeType?, userId? }`: with both, `{x|label}` shows that type's labels. `formulas.matches` and `formulas.format` take no options. The types are exported from `structure.types`.
+
+- **Who it reads as.** As `userId`, with each type's read permission. `isAdmin`, when exactly `true`, opens only the record itself (for `queryNodes`, the host and the queried types; for `getMergeFieldSchema`, the type). What is read through the record is read without admin rights, as a stored formula reads it.
+- **Which section.** The record is read through `getNode`'s gate, so `scopeRootId` means what it means there. What a template, formula or condition reads through the record keeps to the record's own section plus the shared types (for a record in no section, the rows in no section plus the shared types). A job with no request passes the record's section root as `scopeRootId`: its `rootNodeId`, or `(await getNodeSection(nodeId, userId, { isSystem: true })).sectionRootId`.
+- **Secrets** are never read, the record's own included, and a condition, search or sort that names a secret field is refused.
+- **Refusals** are a `400` whose message starts `template-invalid: `, `formula-error: `, `condition-invalid: ` or `query-invalid: `, `getNode`'s `400` `Invalid scope for this request`, or a `404`.
+- **Formulas need a record for some things.** In `formulas.evaluate`, a traversal, `nodes()` or a `{ref->field}` is refused with `formula-error: … needs a record; use evaluateFormula`.
+
+```typescript
+const structure = serviceRegistry.get('structure');
+const options = { scopeRootId: caseRootId }; // the record's section; leave it out for a record in no section
+
+// One record's template, formula and condition
+const { text, empty } = await structure.resolveTemplate(caseId, 'Handled by {lead->name} at {office|label}', userId, options);
+const { value } = await structure.evaluateFormula(caseId, "count(children('task'))", userId, options);
+const urgent = await structure.matchesCondition(caseId, { rules: [{ field: 'priority', operator: 'equals', value: 'high' }] }, userId, options);
+
+// Records whose office matches the case's own, inside what the case may reference
+const { nodes, truncated } = await structure.queryNodes(userId, {
+  types: ['contact'],
+  hostNodeId: caseId,
+  where: {
+    rules: [
+      { field: 'office', operator: 'equals', value: '{office}' },
+      { field: 'office', operator: 'isNotEmpty' }, // a blank {office} would match every contact with none
+    ],
+  },
+  limit: 10,
+}, options);
+
+// The engine over your own values
+const { value: total } = await structure.formulas.evaluate('round({price} * {qty}, 2)', { price: 9.95, qty: 3 }); // 29.85
+```
+
+A module can't add a server-side formula function through the service yet: only by importing Structure's backend `utils/formula.js`, which this page's import rule forbids. Whether to add a public way is an open decision on the [roadmap](/modules/structure/roadmap/#decisions-needed).
 
 ### Stage Sources (v1.40.0+)
 
