@@ -77,6 +77,7 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 | Access Structure data at runtime | — | ✅ | `serviceRegistry.get('structure')` |
 | Work out templates, formulas and conditions, and find records by condition (v1.44.0+) | — | ✅ | `structureService` record reads and `structureService.formulas` |
 | Update a type's existing entries after its computed values change (v1.45.0+) | ✅ | ✅ | `structureService.recomputeTypeValues`, `POST /types/:slug/recompute`, `useTypeRecompute()` |
+| Connect the entries a reference field picks (v1.46.0+) | ✅ | ✅ | `nodeReferenceConfig.connect`, `structureService.syncReferenceConnections`, `POST /types/:slug/reference-connections`, `useReferenceConnectionsSync()` |
 | Semantic search / embeddings (opt-in) | — | ✅ | `serviceRegistry.get('structureEmbeddings')` |
 | Transform Structure data (filters) | — | ✅ | `filterRegistry` |
 | React to Structure events (actions) | — | ✅ | `actionRegistry` |
@@ -855,8 +856,8 @@ Every hook's `Context` below is a **named, exported interface** in Structure's `
 | `structure.connection.created` | `{ userId, connection }` | A connection goes live — created with status `active`, or promoted from pending |
 | `structure.connection.proposed` | `{ userId, connection }` | A connection is created with status `pending` (awaiting promotion) |
 | `structure.connection.promoted` | `{ userId, connection }` | A pending connection is promoted to active (fires after `created`) |
-| `structure.connection.updated` | `{ userId, connection }` | A connection's `data` or `metadata` is updated (`updateConnection`, or an in-process `updateNode` on a connection row) |
-| `structure.connection.deleted` | `{ userId, connectionId }` | A connection is deleted |
+| `structure.connection.updated` | `{ userId, connection }` | A connection's `data` or `metadata` is updated (`updateConnection`, or an in-process `updateNode` on a connection row). Since v1.46.0 also when a field-made connection moves to another reference field that still holds the pair (its type, direction and marker change) |
+| `structure.connection.deleted` | `{ userId, connectionId }` | A connection is deleted. Since v1.46.0 also when a reference field's last reference between two entries goes, or a field's connection type is deleted with its field-made links |
 | `structure.connections.bulkCreated` | `{ userId, count, connectionIds }` | Multiple connections are created with `skipHooks: true` — **mutually exclusive** with the per-connection `structure.connection.created` / `.proposed` hooks, which the default (`skipHooks: false`) fires instead |
 | `structure.nodeType.created` | `{ userId, nodeType }` | A node type goes live — created directly, or a proposal is approved |
 | `structure.nodeType.proposed` | `{ userId, proposal }` | A node type proposal is created (awaiting admin approval) |
@@ -870,8 +871,8 @@ Every hook's `Context` below is a **named, exported interface** in Structure's `
 | `structure.nodeTypeGroup.created` | `{ userId, nodeTypeGroup }` | A node type group is created |
 | `structure.nodeTypeGroup.updated` | `{ userId, slug, changes }` | A node type group is updated |
 | `structure.nodeTypeGroup.deleted` | `{ userId, slug }` | A node type group is deleted |
-| `structure.connectionType.created` | `{ userId, connectionType }` | A connection type is created |
-| `structure.connectionType.updated` | `{ userId, slug, changes }` | A connection type is updated |
+| `structure.connectionType.created` | `{ userId, connectionType }` | A connection type is created, including one Structure makes for a reference field that connects (v1.46.0+) |
+| `structure.connectionType.updated` | `{ userId, slug, changes }` | A connection type is updated, including a reference field's type kept in step with the field's label or allowed types (v1.46.0+) |
 | `structure.connectionType.deleted` | `{ userId, slug }` | A connection type is deleted |
 | `structure.template.created` | `{ userId, template }` | A template is created |
 | `structure.template.updated` | `{ userId, templateId, changes }` | A template is updated |
@@ -1114,6 +1115,8 @@ The `NodeConnection` wire type now includes `status` and `origin` (legacy rows r
 
 **Direction.** `createConnectionType` (and the config import) default `bidirectional` to `true`. Send `bidirectional: false` for a directional relationship.
 
+**Connections a reference field made (v1.46.0+)** carry `metadata['structure:referenceField']` and are kept by their field. `deleteConnection`, and `deleteNode` or `archiveNode` on the connection row, refuse them for every caller but the system, with a `400` naming the field; an in-process `updateConnection` still works and keeps the marker. See [Reference Field Connections](#reference-field-connections-v1460).
+
 **Linking extracted records to their source.** Structure has no built-in "space" — a space is just a node type an admin configures with `primaryScope` isolation. A module that creates records from a source (for example the cognitive-db engine extracting people and organisations from a document) should connect each record to the entry it came from with a connection, rather than placing it under that entry or a space root. That keeps the `(userId, parentId, name)` uniqueness and the type's hierarchy rules out of the way.
 
 ### Storage Usage (v1.38.2+)
@@ -1297,6 +1300,68 @@ for (;;) {
 ```
 
 In the browser, `useTypeRecompute()` runs the same loop with a progress toast, and `structureService.countRecomputeEntries(slug)` and `recomputeTypeValues(slug, { fields?, after? })` call the routes (see [Admin Data Hooks](/modules/structure/usage/#admin-data-hooks)).
+
+### Reference Field Connections (v1.46.0+)
+
+A `node-reference` field with `nodeReferenceConfig.connect: true` also connects each entry it picks, with a connection type Structure makes for the field. The rules for the connections are on [Field Types](/modules/structure/fields/#connecting-the-chosen-entries-v1460) and the connection type on [Configuration](/modules/structure/configuration/#connection-types-made-for-reference-fields-v1460). This is what a module writing in-process sees. With `connect` off, or absent, nothing here runs and nothing changes.
+
+**On a write.** `createNode`, `updateNode`, `bulkCreateNodes` (with the entries a `{ "$new": … }` value creates), `duplicateNode` (the copies) and `mergeNode` (the references the canonical gains) connect what the write adds and read again what it drops, in the write's own transaction. A create, update, bulk-create row or duplicate that connects runs with a 30-second transaction budget (`timeout: 30000`, `maxWait: 10000`); a merge already had 30 seconds. `restoreNode` from Deleted reads the entry's own references, and the field-made links it revived, again in a transaction of its own just after the restore: an error there is logged and never fails the restore. After the commit, each link made fires `structure.connection.created`, each one moved to another field `structure.connection.updated`, and each one removed `structure.connection.deleted`, and the formulas of both ends are recomputed. A `bulkCreateNodes` with `skipHooks: true` fires none of those hooks. A link the rules refuse is skipped with a warning (`Reference connection skipped`) and never fails the write: a system write's link between two sections is one, and so is a link the connection type refuses after an admin narrowed its `allowGlobalTypes`, changed its From or To types or gave it a maximum.
+
+**The marker.** A field-made link carries `metadata['structure:referenceField'] = { nodeType, field }`: the type that declares the field (the attaching type for a field-template field, the parent type for an inherited one) and the field's path (`group.sub` for a sub-field). Only Structure sets it. `createConnection` drops a marker from any caller but the system, and `updateConnection` keeps a connection's stored marker, neither adding nor removing one, for any caller but the system. A module's own metadata lives under its kebab-case module id, which never holds a colon, so the two never meet.
+
+**The lock.** A field-made link is changed through its field. These calls refuse it with a `400`, `This connection comes from the "People" field of "Smith & Jones". Change that field to remove it.` (the connection type's name, which is the field's label, and the entry that holds the reference):
+
+| Call | Refused for |
+|------|-------------|
+| `deleteConnection` | Every caller but the system |
+| `deleteNode` on the connection row, with or without `keepContents` | Every caller but the system |
+| `archiveNode` on the connection row | Every caller but the system |
+| `bulkDeleteNodes`, `bulkArchiveNodes` | As above, as a per-row entry in `errors` |
+| `updateConnection` | Requests only (`viaHttp`). In-process it still works, for example the cognitive engine's read-modify-write of `data`, and the marker stays |
+| `updateNodeMetadata` | Requests only (`viaHttp`) |
+
+A system caller (`isSystem: true`) may delete, archive or edit one. While the reference remains, the next sync below makes the link again.
+
+**Bringing existing entries in step.** Turning the switch on or off through the API changes no existing links by itself. The admin page then calls the sync, and so can a module:
+
+| Method | What it does |
+|--------|--------------|
+| `syncReferenceConnections(slug, actorId, { caller, after?, next?, maxEntries? })` | Brings the next batch of the type's existing entries in step with its connecting fields: connects what they hold, and removes the field-made links no connecting field holds any more (or moves them to the field that does). `next` is accepted as an alias of `after`. HTTP: `POST /types/:slug/reference-connections` with `{ after? }` |
+
+```ts
+interface SyncReferenceConnectionsResult {
+  created: number;      // connections made for a reference field (hooks fired)
+  removed: number;      // field-made connections no reference field holds any more, removed
+  unchanged: number;    // entries whose connections were already in step
+  failed: number;       // entries a link was refused for (logged), or that hit an error
+  remaining: number;    // entries after this call's last one, still to do
+  next: string | null;  // pass as `after` to the next call; null when nothing remains
+}
+```
+
+- **Who may call it.** As for `recomputeTypeValues`: `caller` must be `{ isAdmin: true }` or `{ isSystem: true }`, otherwise a `403` `Only an admin or the system can update the existing entries of a node type`; the route is `requireAdmin`.
+- **Which entries.** The ones `recomputeTypeValues` works through: the type and its subtypes, not in Deleted, archived and unassigned included, across every owner for an app-level type. Each owner's links are made in that owner's own name, under that owner's section wall and shared types.
+- **Batches.** Entries are read in id order, 200 at a time, and worked in runs of up to 50 consecutive entries of one owner, each run in transactions of at most 200 pairs. One call works through at most 5,000 entries (`maxEntries`, in-process only, is capped there) and stops once 20 seconds have passed, checked after every run. A failed batch is retried entry by entry. Call again with `after: next` until `remaining` is 0.
+- **First** it clears the type-config cache, so a save another process made is read, and makes or puts back the fields' connection types.
+
+```typescript
+const structure = serviceRegistry.get('structure');
+
+let after: string | undefined;
+for (;;) {
+  const { remaining, next } = await structure.syncReferenceConnections('matter', adminId, { after, caller: { isAdmin: true } });
+  if (remaining === 0 || !next) break;
+  after = next;
+}
+```
+
+**Imports.** `importNodeTypes` makes the connection types of the imported types' connecting fields in its own transaction, then, after the commit, starts the sync in the background as the system for each imported type whose fields connect or that still has field-made links (a switch turned off). It doesn't wait: its result carries `connectionSync: string[]`, the slugs being synced, only when there are some, so a seed without connecting fields gets the result it always had. The admin configuration import does the same for the node types it wrote and the types attaching a field template it wrote. A background sync that fails is logged and stops that type only. `referenceConnectionSyncsSettled()`, exported from `structure.service.ts`, resolves once every background sync started so far has finished, for tests and a graceful shutdown.
+
+**Graph reads.** A field-made link is an ordinary connection row, so `expandGraph`, `getNodeConnections`, `getConnectionsForNodes` and a formula's `connections()` see it once, like any link. The reference itself stays in the field's data, so code that follows both references and connections reaches the same entry twice.
+
+**Cost.** However many pairs a write touches, the work is a fixed handful of statements: one advisory-lock statement per thousand pairs, reads with `IN` lists of at most 500 ids, one `createMany` per thousand new links, and removals in chunks of 500.
+
+In the browser, `useReferenceConnectionsSync()` runs the loop with a progress toast, and `structureService.syncReferenceConnections(slug, { after? })` calls the route (see [Admin Data Hooks](/modules/structure/usage/#admin-data-hooks)).
 
 ### Value Rules, One per Section and Reference Limits on Writes (v1.45.0+)
 
@@ -1518,6 +1583,9 @@ Node types can declare `superClasses` — parent type slugs forming an *is-a* DA
 If your module introduces its own node type (e.g., a "Task Board" type), seed it during backend initialisation — your module's init function, not per-user request hooks. Two rules make the seed correct:
 
 1. **Seed via `importNodeTypes`, not `createNodeType`.** `createNodeType(userId, config)` pins the new row to the `userId` you pass, making the type invisible to every other user. `importNodeTypes` creates **shared rows** (`userId: null`) that every user can see, and stays the seed path to use. (Since v1.40.0 `createNodeType` can create one too, with `appLevel` — see [App-Level Node Types from createNodeType](#app-level-node-types-from-createnodetype-v1400) below.) `structureService.importNodeTypes(userId, { nodeTypes }, mode)` is the in-process way to seed types, and v1.41.0 left it unchanged: same signature and result, an update that leaves out a nullable key such as `description` still clears it, and it still fires `structure.nodeType.imported`. It is separate from the admin configuration import, which moved to the starter's ConfigTransfer in v1.41.0; there is no longer an HTTP endpoint for importing node types alone (`POST /types/import` was removed).
+
+   Since v1.46.0, when an imported type has a reference field that connects the entries it picks (`nodeReferenceConfig.connect`), the import also makes that field's connection type, and the result carries `connectionSync`, the types whose existing entries it brings in step in the background (see [Reference Field Connections](#reference-field-connections-v1460)). A seed without such fields gets the result it always had.
+
 2. **Guard with an existence check.** The guard is load-bearing: merge-mode import *updates* existing slugs, so an unguarded import would re-clobber admin customisations on every boot.
 
 The actor string passed to both calls is only a visibility filter and audit label — any value sees shared rows, and nothing from it is written onto the row. A module-scoped label like `'tasks-init'` keeps the audit trail readable.
@@ -1637,6 +1705,8 @@ The API endpoint is `PATCH /api/v1/structure/nodes/:id/metadata` with body `{ mo
 `updateNodeMetadata` takes an optional fifth argument, `{ isAdmin?, isSystem?, viaHttp? }`. The HTTP route passes `viaHttp: true`, which checks the node type's `edit` permission first, as a node update does. The four-argument in-process call shown above is not gated, so a module's bookkeeping on an admin-only-edit type still lands.
 
 On a [shared type](#shared-node-types-read-across-owners-write-owner-only-v13427), the metadata of another user's entry is blanked to `{}` on read and cannot be written, so namespace state you attach this way is always per-owner.
+
+The key `structure:referenceField` on a connection row is Structure's own: it marks a [connection a reference field made](#reference-field-connections-v1460). The HTTP route takes only a kebab-case `moduleId`, so it can't name it, and since v1.46.0 the route refuses any write to a field-made connection's metadata with a `400`.
 
 <Aside type="tip" title="Metadata vs custom fields">
 Use **custom fields** (defined in node type config or via module field registration) for data that users see and edit. Use **metadata** for internal module state that drives logic but isn't directly user-facing — like sync status, cached counts, or external IDs.

@@ -292,7 +292,7 @@ Configuration for typed connections between nodes. Controls which node types can
 | `name` | String | Display name |
 | `namePlural` | String | Plural form |
 | `description` | String? | Type description |
-| `moduleId` | String? | Owning module ID |
+| `moduleId` | String? | Owning module ID. A connection type Structure made for a reference field holds `structure:reference-field:` followed by the declaring type and the field's path (v1.46.0+, see [Connection types made for reference fields](#connection-types-made-for-reference-fields-v1460)) |
 | `icon` | String? | Default Lucide icon |
 | `color` | String? | Default colour |
 | `fromTypes` | JSON | `string[]` — allowed source node types. Empty = any, `'*'` = any, and listed types admit their subtypes — see [Type Hierarchy](/modules/structure/type-hierarchy/) |
@@ -1045,6 +1045,29 @@ interface ConnectionTypeConfig {
 type ConnectionTypeField = NodeTypeField;
 ```
 
+### Connection types made for reference fields (v1.46.0+)
+
+A reference field with **Also connect the chosen entries** (`nodeReferenceConfig.connect: true`) connects each entry it picks with a connection type of its own, and Structure makes that type when the node type is saved. What the connections do is on [Field Types](/modules/structure/fields/#connecting-the-chosen-entries-v1460); this is what the connection type looks like.
+
+| Setting | Value |
+|---------|-------|
+| Name and plural | The field's label, kept in step when the label changes |
+| From types | `[<declaring type>]`: the type that declares the field (its subtypes pass) |
+| To types | The field's `allowedTypes`, or `["*"]` when it has none, kept in step |
+| Two-way | Off (`bidirectional: false`) |
+| One per pair | On (`isUnique: true`) |
+| Most per entry | None (`maxConnections: null`) |
+| Owner | Like the declaring type: app-level for an app-level type, the owner's for a personal type |
+| `moduleId` | `structure:reference-field:<declaring type>:<path>`, for example `structure:reference-field:matter:people`. A field-group sub-field's path is `group.sub` |
+
+- **Found by its `moduleId`, never by its slug.** The `moduleId` records the field the type was made for, and that is how the field finds it, so no two fields ever share one.
+- **The slug** is chosen once, when the type is made. It is `ref-<type>-<field>`, with `<group>-<sub>` for a sub-field (`ref-matter-people`, `ref-event-staff-list`), when every part is only lowercase letters and digits and the whole fits in 100 characters. Otherwise it is that form cut to fit, then `--` and an 8-digit hex hash of the type and the field: a field called `staff_list`, or a type called `big-event`, gives something like `ref-matter-staff-list--1a2b3c4d`. The hashed form is also used when another connection type already holds the plain slug. If both slugs are held, the field gets no connection type and connects nothing, and the server logs it.
+- **Kept in step on every save,** idempotently: a save that changes none of its name, plural, From or To types writes nothing and fires no hook. A save that makes or changes one fires `structure.connectionType.created` or `structure.connectionType.updated`. Concurrent saves take advisory locks per field and per slug, so a field's type is never made twice. The name, plural, From and To types follow the field, so an edit to them on the **Connection Types** tab is put back by the node type's next save or the next update of its entries' connections. The other settings, such as the icon, colour, maximum and `allowGlobalTypes`, stay as an admin sets them, and a link they refuse is skipped.
+- **A field turned off, or deleted,** leaves its type in place.
+- **In the admin list** the type carries a **From a field** badge. It isn't offered when someone adds a connection by hand: the **Add Connection** dialog leaves it out, and its group on the Connections tab has no **Add** button.
+- **Deleting it** is refused while the field still connects: `Turn off "Also connect the chosen entries" on the "People" field first.` (the type's name, which is the field's label). Once the switch is off, deleting the type also removes its field-made links for good, firing `structure.connection.deleted` for each. A connection of the type added by hand still blocks the delete, as for every type.
+- **The configuration export** carries these types, `moduleId` included, in its connection-types part, and the import makes any a connecting field lacks.
+
 ---
 
 ## API Endpoints
@@ -1146,6 +1169,8 @@ The kept contents of a section root are [unassigned](#unassigned-records-v1430) 
 
 Connection `origin`/`status` semantics, pending connections, and promotion are covered in [Cognitive Foundations](/modules/structure/cognitive/).
 
+**Connections made by a reference field (v1.46.0+)** are changed through the field. `DELETE /connections/:id`, `PATCH /connections/:id`, `PATCH /nodes/:id/metadata`, and a delete or archive of the connection row (bulk delete and bulk archive included, as a per-row error) answer `400` with `This connection comes from the "People" field of "Smith & Jones". Change that field to remove it.` A request can't set or remove the field-made marker on any connection either. See [Connecting the chosen entries](/modules/structure/fields/#connecting-the-chosen-entries-v1460).
+
 ### Tree
 
 | Method | Path | Description |
@@ -1165,6 +1190,7 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 | POST | `/types/reorder` | Batch `sortOrder` update — body `{ items: [{ slug, sortOrder }] }`, one transaction (admin only) |
 | GET | `/types/:slug/recompute` | v1.45.0+. How many existing entries an update of their stored computed values would work through: `{ entries }` (admin only). See [Updating existing entries](#updating-existing-entries-v1450) |
 | POST | `/types/:slug/recompute` | v1.45.0+. Work the existing entries' stored computed values out again, one batch per call — body `{ fields?, after? }`, answer `{ updated, unchanged, failed, remaining, next }` (admin only). See [Updating existing entries](#updating-existing-entries-v1450) |
+| POST | `/types/:slug/reference-connections` | v1.46.0+. Bring the existing entries' connections in step with their reference fields' **Also connect the chosen entries**, one batch per call — body `{ after? }`, answer `{ created, removed, unchanged, failed, remaining, next }` (admin only). See [Updating existing entries' connections](#updating-existing-entries-connections-v1460) |
 
 "Step-up" means the request also needs a fresh identity confirmation at the starter's hardened and strict security tiers (at the standard tier the guard lets the request through): the starter answers `403` with code `step_up_required`, and its API client opens the "Confirm it's you" dialog and retries. A device token is always refused (`web_session_required`). The same guard covers deleting connection types, field templates and functions, creating API keys, purging deleted entries, and a real configuration import.
 
@@ -1208,6 +1234,23 @@ Each entry is worked out as its owner would see it: the owner's read permissions
 **Limits.** Entries are read in id order, 200 at a time, and one call works through at most 5,000 of them and starts no new batch after 20 seconds. The app calls again with the last id until none are left. A field-group whose rows changed while the update ran keeps its rows, and the entry counts as unchanged.
 
 **Over the API.** Both routes are admin only, and in process the caller must be an admin or the system. The routes are in the table above; the service methods are on [Integration](/modules/structure/integration/#updating-existing-entries-v1450).
+
+#### Updating existing entries' connections (v1.46.0+)
+
+A reference field's [connections](/modules/structure/fields/#connecting-the-chosen-entries-v1460) are made and removed as entries are saved. When the switch itself is turned on or off, the entries already saved are brought in step by `syncReferenceConnections` (`POST /types/:slug/reference-connections`). It runs:
+
+- **after a type save** in the admin page that turns any field's **Also connect the chosen entries** on or off (a new type that has one counts), with no question, since the switch says what to do;
+- **after a field template save** that turns one on or off, for every type that attaches the template;
+- **from Update entries**, after the computed values, for a type with any reference field. Its question then adds "It also updates the connections its reference fields make." when a field connects;
+- **in the background after a configuration import** or a module's `importNodeTypes`, for the types written whose fields connect, or that still have field-made links (a switch turned off). There is no progress message for these.
+
+**What it does.** For each entry, it connects each entry its connecting fields hold that isn't connected yet, and reads again each field-made link touching the entry: one that no connecting field still holds is removed (or moved to the field that now holds it). Connections added by hand are left alone. The rules are the ones a save uses, so the result is the same as saving every entry again: one connection per pair, the owner's section wall and shared types, and the hooks.
+
+**Which entries.** The same as [Updating existing entries](#updating-existing-entries-v1450): every entry of the type and its subtypes that isn't in Deleted, archived and unassigned ones included, across every owner for an app-level type and the owner's own for a personal type. Each owner's links are made in that owner's own name.
+
+**Limits.** Entries are read in id order, 200 at a time, and worked in runs of up to 50 entries of one owner, in transactions of at most 200 pairs, so a save touching one of those pairs never waits long. One call works through at most 5,000 entries and stops after 20 seconds, checked after every run; the app calls again with the last id until none are left. A batch that fails is worked again entry by entry, so one bad entry fails alone. The type's connection types are made or put back first.
+
+**The answer.** `{ created, removed, unchanged, failed, remaining, next }`: `created` and `removed` count connections; `unchanged` and `failed` count entries (`failed`: a link the rules refused, or an error). Only an admin can call it; in process the caller must be an admin or the system.
 
 #### Shared-type failure conditions
 
@@ -1256,7 +1299,7 @@ When more than one user has a proposal pending under the same slug, approve and 
 | GET | `/connection-types/:slug` | Get connection type config |
 | POST | `/connection-types` | Create connection type (admin only) |
 | PATCH | `/connection-types/:slug` | Update connection type (admin only) |
-| DELETE | `/connection-types/:slug` | Delete connection type (admin only, step-up). Fails while live connections use it — counted across all owners for an app-level type; its connections already in **Deleted** are then permanently removed |
+| DELETE | `/connection-types/:slug` | Delete connection type (admin only, step-up). Fails while live connections use it — counted across all owners for an app-level type; its connections already in **Deleted** are then permanently removed. A type made for a reference field (v1.46.0+) is refused while the field still connects, and once the field is off its field-made links go with it — see [Connection types made for reference fields](#connection-types-made-for-reference-fields-v1460) |
 
 ### API Keys
 
