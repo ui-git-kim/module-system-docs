@@ -1,0 +1,130 @@
+---
+title: Requests to Structure
+description: What AI Core asks Structure to add so prompt variables can choose their words by a record's fields, and a Context builder can look records up for citation — the request, item by item.
+lastUpdated: 2026-11-04
+sidebar:
+  order: 9.9
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This page is AI Core's request to Structure, written the way [Structure's contracts](/modules/structure/contracts/) ask: numbered items, each with its names and signatures, who may call it, what it refuses, what must not change, and the tests that prove it. It lives with AI Core, the consumer. Structure answers it with a release.
+
+<Aside type="note" title="Status">
+Requested 2026-11-04. Waiting on Structure. AI Core builds its side once Structure replies with the version and any changes to these names.
+</Aside>
+
+## Why
+
+An admin wants prompt text that depends on a record, worked out in code, not by the model. For example, one variable fills **who the person can ask for advice**:
+
+1. If the matter has a lawyer (full or unbundled), it names that lawyer from the matter: *your lawyer, Sarah*, or *Sarah, your unbundled lawyer*.
+2. Otherwise it points to the free help near them: the duty lawyer at their registry, Legal Aid in their state, a community legal centre.
+
+The help in point 2 comes from a directory of records. Those records are placed as **citable material**, so the model writes *the duty lawyer at your registry [3]*, and the phone number and address ride in the citation, not in the answer.
+
+AI Core needs three things from Structure for this: work out a merge template, a formula and a condition for one record, as a given user; and look records up by type and condition. Structure already has all of it in its own forms (merge templates, `formula` fields, `visibleWhen`); this asks for it on the server, for other modules. Nothing here names AI Core or its domain: each item is a general method any module could use.
+
+## The items
+
+All five are **in-process** methods on `serviceRegistry.get('structure')`. They read only; none writes or fires an event. Each takes the `userId` of the person the call is for, and an explicit `isAdmin` only when AI Core reads a node an admin pinned (read as that admin, as AI Core's Structure-field variables already do). `scopeRootId` keeps reads inside one space, as `getNode` does today.
+
+### S1. `resolveTemplate` — a merge template for one record
+
+```ts
+resolveTemplate(
+  nodeId: string,
+  template: string,
+  userId: string,
+  options?: { isAdmin?: boolean; scopeRootId?: string },
+): Promise<{ text: string; empty: string[] }>
+```
+
+- **Meaning.** Resolves a merge template against the node, exactly as the form's `resolveTemplateAsync` does: `{field}`, `{group[sub=value].target}`, `{group.0.sub}`, `{group.sub}`, `{ref->field}` and the repeater-plus-dereference forms. A `->` dereference fetches the referenced node as `userId`, kept to the node's section plus the shared types, and its secret values are removed before any token reads it. `empty` lists the tokens that resolved to nothing, so the caller can say a value is incomplete.
+- **Refuses.** `404` when the node does not exist or `userId` may not read it. `400` with a message starting `template-invalid:` for a template over 2,000 characters or with an unclosed token.
+- **Must not change.** `getNode` and every existing read; the form's resolver.
+- **Tests.** A field; a select field (as the form shows it); a repeater lookup; a dereference inside the section; a dereference to a node in another section (blank, never read); a secret token (blank); an unreadable node (`404`).
+
+### S2. `evaluateFormula` — a formula for one record
+
+```ts
+evaluateFormula(
+  nodeId: string,
+  expression: string,
+  userId: string,
+  options?: { isAdmin?: boolean; scopeRootId?: string },
+): Promise<{ value: unknown; text: string }>
+```
+
+- **Meaning.** Evaluates an expression with the server copy of the formula evaluator — the same bounds, the dev-registered functions and the admin-defined ones — against the node, as `userId`. Traversal (`children`, `parents`, `scope`, `connections`, `nodes`) and `{ref->field}` keep to the node's section plus the shared types; secret values never reach it. `text` is the value written out (`formatFormulaValue` with no prefix or precision); blank is `''`.
+- **Refuses.** `404` as S1. `400` with a message starting `formula-error:` (then the evaluator's own message) for a parse or evaluation error, or a bound exceeded.
+- **Must not change.** Stored formula fields and their recompute.
+- **Tests.** Arithmetic; a ternary over a select field; `coalesce`; `count(children('type'))`; `nodes({ref})`; an admin-defined function; `pluck(nodes({refs}), 'aSecret')` (blank); a bound exceeded (`400`).
+
+### S3. `matchesCondition` — a condition for one record
+
+```ts
+matchesCondition(
+  nodeId: string,
+  condition: VisibleWhen,
+  userId: string,
+  options?: { isAdmin?: boolean; scopeRootId?: string },
+): Promise<boolean>
+```
+
+- **Meaning.** Tests a condition in the `visibleWhen` grammar — the single-condition shorthand, or `{ logic: 'and' | 'or', rules: [{ field, operator, value? }] }` with every operator (`equals`, `notEquals`, `in`, `notIn`, `isEmpty`, `isNotEmpty`, `contains`, `greaterThan`, `lessThan`) — against the node's data, by the same rules a form uses to show a field. A rule's `value` may hold `{tokens}`, resolved against the same node by S1's rules first, so one field can be compared with another.
+- **Refuses.** `404` as S1. `400` with a message starting `condition-invalid:` for an unknown operator, a missing value, or a rule that names a secret field.
+- **Must not change.** Field visibility in forms.
+- **Tests.** Each operator; `and` and `or`; a token value; a rule on a field the node lacks (false); a secret field (`400`).
+
+### S4. `queryNodes` — records by type and condition
+
+```ts
+queryNodes(
+  userId: string,
+  query: {
+    types: string[];
+    where?: VisibleWhen;
+    hostNodeId?: string;
+    orderBy?: { field: string; direction: 'asc' | 'desc' };
+    limit?: number;
+  },
+  options?: { isAdmin?: boolean; scopeRootId?: string },
+): Promise<{
+  nodes: Array<{ id: string; nodeType: string; name: string; data: Record<string, unknown> }>;
+  truncated: boolean;
+}>
+```
+
+- **Meaning.** Lists the nodes of `types` (subtypes included) that `userId` may read and whose data matches `where` (S3's grammar), with secret values removed. With `hostNodeId`, the results keep to what that node may reference — its section plus the shared types, the `withinSectionOf` rule — and `{tokens}` in `where` values are resolved against the host first, so *records of type `resource` whose `registry` equals the matter's `{registry}`* is one call. `limit` defaults to 20 and may be at most 100; `truncated` says more matched. Ordered by `orderBy`, else by name.
+- **Refuses.** `400` with a message starting `query-invalid:` for no types, an unknown operator or a limit over 100. `404` when `hostNodeId` does not exist or `userId` may not read it.
+- **Must not change.** `listNodes` and every existing list.
+- **Tests.** An `equals` filter; a token value from the host; the section wall (a node in another section left out, a shared type kept); a type the user may not read left out; secret values removed; `limit` and `truncated`; `orderBy`.
+
+### S5. `getMergeFieldSchema` — the tokens of a type, on the server
+
+```ts
+getMergeFieldSchema(
+  nodeType: string,
+  userId: string,
+  options?: { isAdmin?: boolean },
+): Promise<MergeFieldToken[]>
+```
+
+- **Meaning.** The tokens `flattenMergeFields` gives for a node type the caller may read, secret fields left out — so AI Core's admin can offer **Insert field** in its rule builder.
+- **Refuses.** `404` when the type does not exist or the caller may not read it.
+- **Tests.** Built-in, field, repeater and dereference tokens; secrets left out.
+
+## What AI Core builds on them
+
+| AI Core piece | Uses |
+|---|---|
+| A **conditional variable**: rules in order (*if a field is… then this text*, with merge fields), a fallback, or one formula instead | S3 for each rule, S1 for the text, S2 for a formula, S5 in the editor |
+| A **query variable**: records found by type and condition, written into the text (names only) | S4, then S1 for each record |
+| A Context builder **Structure query** block: records found by type and condition, placed as citable material, with the fields the admin picks (a phone number, a website, an address) carried in each record's citation | S4, then S1 for each record |
+
+A variable's value reads the node the call is about (`RunOptions.nodeId`) or a node the admin pinned. Values that hold text a user wrote are fenced as material, as AI Core's Structure-field variables are today.
+
+## The reply AI Core needs
+
+The Structure version that ships these items; any change to a name, a signature or a meaning; and anything not done as asked, with the reason.
