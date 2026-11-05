@@ -129,6 +129,7 @@ The universal entity table — every node is stored here.
 | `isFavorite` | Boolean | Marked as favourite |
 | `isPublished` | Boolean | Publishing workflow state |
 | `publishedSlug` | String? | Public URL slug |
+| `linkedUserId` | String? | v1.50.0+. The user account a [profile type](#profile-types-v1500)'s entry is linked to ("This is me"), independent of the owner (`userId`), so one admin's directory can link each entry to a different user. A plain id, no `@relation` (the user table is the starter's). Set only by the link API and a create's `linkToMe`, never by create or update data; deleting the entry clears it. Indexed as `@@index([linkedUserId, nodeType])`. Added by the schema step of `npx structure update` (no SQL migration, nothing to backfill) |
 | `settings` | JSON | Node-specific settings |
 | `metadata` | JSON | Module extensibility data |
 | `embedding` | vector? | Embedding vector (opt-in — only when embeddings enabled) |
@@ -745,10 +746,34 @@ interface NodeTypeFeatures {
   publicApi?: { enabled?: boolean };
   // Opt entries of this type into cognitive processing (embeddings, ingest)
   cognitiveIngest?: { enabled?: boolean };
+  // v1.50.0+: Record or Profile, and the link of entries to user accounts
+  profile?: {
+    kind?: 'record' | 'profile';     // default 'record'
+    linkUsers?: boolean;             // a Profile only
+    linkScope?: 'app' | 'section';   // default 'app'
+    syncField?: string;              // a yes/no field kept in step
+    switchLabel?: string;            // default "This is me", at most 80 characters
+  };
 }
 ```
 
 `cognitiveIngest` appears as the "Cognitive Processing" toggle on the node type Properties tab and controls which types the embeddings service targets by default — see [Cognitive Foundations](/modules/structure/cognitive/).
+
+### Profile types (v1.50.0+)
+
+`features.profile` makes a type a **Profile** and, with `linkUsers`, lets each of its entries be linked to one user account (`structure_node.linkedUserId`). The keys and what a save refuses are in [`features.profile`](/modules/structure/json-reference/#featuresprofile-v1500); the admin section is under [Basic Tab](/modules/structure/usage/#basic-tab). The server's rules:
+
+- **The family.** The type that sets the profile config, and its subtypes that inherit it, share one link: a subtype with its own `profile` heads its own family.
+- **One link per user per scope.** Each account has at most one linked entry of a family in each scope: the whole app (`linkScope: 'app'`), or each isolation section (`'section'`: the entry's live section; entries in no section share one scope). Linking an account to an entry unlinks its other entry in the same scope, in the same transaction, under a transaction-scoped advisory lock per account, family and scope, so the later link wins. For an app-level type every owner's entries count; for a type that belongs to one user, only that owner's.
+- **Who may link.** A user links **themselves** (no `targetUserId`) to an entry they own, with the type's edit permission, that isn't [unassigned](#unassigned-records-v1430) and isn't linked to someone else. An admin, or an in-process system caller, links any account (`targetUserId`) to an entry they can read, replacing another account's link. Every caller reads the entry under `getNode`'s rules first, so one they can't read is a `404`.
+- **Who may unlink.** A user unlinks their own link from any entry they can read that isn't unassigned; an admin or a system caller unlinks anyone's.
+- **What a link change writes.** Each link and unlink re-applies the entry's value rules (a rule may read [`linked`](/modules/structure/fields/#the-link-as-a-condition-v1500)) and ticks or unticks the type's `syncField` as a system write in the same transaction, with [one per section](#one-per-section-v1450) applied to a ticked sync field. A link that moves re-applies the rules of both entries. After the commit come `structure.node.userLinked` / `structure.node.userUnlinked`, `structure.node.updated` for the data written, and the formula recompute.
+- **Never through data.** No create or update data sets `linkedUserId`. For a type whose entries can be linked, a `linked` key in a write's data is dropped unless the type defines a field called `linked`.
+- **`linkToMe` on create.** `POST /nodes` with `linkToMe: true`, or a reference field's `{ "$new": { …, "linkToMe": true } }`, links the new entry to its creator in the create's transaction, so its own value rules read `linked` as true. It needs the type's edit permission and is ignored for a type whose entries can't be linked. The public REST API, `POST /nodes/bulk` and imports never link.
+- **Deletes, merges and erasure.** Deleting an entry (with or without its contents), merging a duplicate into another entry (either retire mode) and erasing an account clear the links involved, with the rules re-applied, the sync field unticked and `userUnlinked` fired (reason `'deleted'`, `'merged'` or `'erased'`). On erasure, other owners' entries linked to the erased account are unlinked; the account's own entries are deleted. Restoring an entry doesn't bring its link back. A duplicate is never linked.
+- **Moves and assigns.** Moving or assigning a linked entry of a per-section type into a section where its account already has a linked entry unlinks that other entry: the moved row wins. A kept row of a delete-and-keep keeps its link in the scope it lands in.
+- **Reads.** Every row a read or write returns carries `linked` (linked to anyone) and `linkedToMe` (linked to the reader). `linkedUserId` stays on a row only when it is the reader's own id, or on an admin's `getNode` and `listNodes`; another user's id never reaches a non-admin. With linking off, or the type a Record, reads say not linked and the stored links are kept.
+- **Changing the scope.** Turning linking on, or `linkScope` from `'section'` to `'app'`, can leave an account with more than one linked entry in one scope. Nothing is unlinked by the save itself. The admin form counts them first (`GET /types/:slug/link-conflicts?scope=`) and can then keep each account's most recently updated entry and unlink the others (`POST /types/:slug/link-conflicts/resolve`).
 
 ### Navigation
 
@@ -1097,6 +1122,8 @@ All endpoints are prefixed with `/api/v1/structure`.
 | GET | `/nodes/:id/delete-impact` | What a delete would take with it (v1.43.0) — `{ descendants, labelled, byType, sectionRoot }` |
 | POST | `/nodes/delete-impact` | The same, summed for a selection (v1.43.0) — body `{ ids: string[] }` (min 1, max 500) |
 | POST | `/nodes/:id/assign` | File an [unassigned record](#unassigned-records-v1430) into a section (v1.43.0) — body `{ sectionRootId }`, returns the node |
+| POST | `/nodes/:id/link-user` | v1.50.0. Link a user account to an entry of a [profile type](#profile-types-v1500) — body `{ targetUserId? }`: none links the caller themselves; another account is for an admin (`403` otherwise). Returns the entry as `GET /nodes/:id` reads it |
+| DELETE | `/nodes/:id/link-user` | v1.50.0. Unlink the entry: the caller's own link, or anyone's for an admin. Returns the entry; an entry that isn't linked comes back unchanged |
 | POST | `/nodes/:id/move` | Move to different parent |
 | POST | `/nodes/bulk` | Bulk create nodes — also the module's **import** door, so a row may carry an explicit `reference` (per-row atomic, partial success — see the notes below) |
 | POST | `/nodes/bulk-archive` | Bulk archive — body `{ ids: string[] }` (min 1, max 500); partial success |
@@ -1199,6 +1226,9 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 | PATCH | `/types/:slug` | Update type (admin only) |
 | DELETE | `/types/:slug` | Delete type (admin only, step-up). Fails while live entries exist — counted **across all owners** for an app-level type. Entries of the type already in **Deleted** are then permanently removed |
 | POST | `/types/reorder` | Batch `sortOrder` update — body `{ items: [{ slug, sortOrder }] }`, one transaction (admin only) |
+| GET | `/types/:slug/linked-entry` | v1.50.0. The caller's linked entry of a [profile type](#profile-types-v1500) and its subtypes: `{ entry }`, `null` when there is none, the caller can't read it, or the type's entries can't be linked (now). For a per-section type, `?scopeRootId=` names the section, `?nodeId=` asks for the scope an entry is in, and `?parentId=` for the scope a new child of an entry would be in; with none, the one in no section. A type whose link is one in the whole app needs none |
+| GET | `/types/:slug/link-conflicts` | v1.50.0. The user accounts with more than one linked entry of the type's family in one scope: `{ accounts, entries }` (`entries`: the ones beyond each account's first). `?scope=app\|section` counts as if the type had that scope, as a save is about to set it (admin only) |
+| POST | `/types/:slug/link-conflicts/resolve` | v1.50.0. Each such account keeps its most recently updated entry; the others are unlinked as the link API unlinks: `{ unlinked }` (admin only) |
 | GET | `/types/:slug/recompute` | v1.45.0+. How many existing entries an update of their stored computed values would work through: `{ entries }` (admin only). See [Updating existing entries](#updating-existing-entries-v1450) |
 | POST | `/types/:slug/recompute` | v1.45.0+. Work the existing entries' stored computed values out again, one batch per call — body `{ fields?, after? }`, answer `{ updated, unchanged, failed, remaining, next }` (admin only). See [Updating existing entries](#updating-existing-entries-v1450) |
 | POST | `/types/:slug/reference-connections` | v1.46.0+. Bring the existing entries' connections in step with their reference fields' **Also connect the chosen entries**, one batch per call — body `{ after? }`, answer `{ created, removed, unchanged, failed, remaining, next }` (admin only). See [Updating existing entries' connections](#updating-existing-entries-connections-v1460) |
@@ -1457,12 +1487,15 @@ All POST and PATCH endpoints validate request bodies using Zod schemas. Invalid 
 
 | Schema | Used by | Key validations |
 |--------|---------|----------------|
-| `createNodeSchema` | POST `/nodes` | `nodeType` and `name` required, max lengths |
+| `createNodeSchema` | POST `/nodes` | `nodeType` and `name` required, max lengths. Optional `linkToMe` boolean (v1.50.0) |
 | `updateNodeSchema` | PATCH `/nodes/:id` | All fields optional, max lengths |
-| `importNodeSchema` | POST `/nodes/bulk` (each row) | Everything in `createNodeSchema`, plus an optional `reference` — 1–100 chars, `^[A-Za-z0-9][A-Za-z0-9._/-]*$`; the service then accepts it only from an admin/system caller |
+| `importNodeSchema` | POST `/nodes/bulk` (each row) | Everything in `createNodeSchema` except `linkToMe` (v1.50.0), plus an optional `reference` — 1–100 chars, `^[A-Za-z0-9][A-Za-z0-9._/-]*$`; the service then accepts it only from an admin/system caller |
 | `moveNodeSchema` | POST `/nodes/:id/move` | `newParentId` required (nullable) |
 | `bulkDeleteNodesSchema` | POST `/nodes/bulk-delete` | `ids` (min 1, max 500), plus an optional `keepContents` boolean (v1.43.0) |
 | `assignNodeSchema` | POST `/nodes/:id/assign` | `sectionRootId` required, a node id (v1.43.0) |
+| `linkUserSchema` | POST `/nodes/:id/link-user` | Optional `targetUserId`, a non-empty id (v1.50.0) |
+| `linkedEntryQuerySchema` | GET `/types/:slug/linked-entry` | Optional `scopeRootId`, `nodeId` and `parentId`, each a non-empty id (v1.50.0) |
+| `linkConflictsQuerySchema` | GET `/types/:slug/link-conflicts` | Optional `scope`, `app` or `section` (v1.50.0) |
 | `reorderNodesSchema` | POST `/reorder` | `parentId` required (nullable), `nodeIds` array required (min 1, max 500) |
 | `createConnectionSchema` | POST `/connections` | `fromNodeId`, `toNodeId`, `connectionType` required; optional `origin` (lowercase-kebab) and `status` (`active` or `pending`) |
 | `createNodeTypeSchema` | POST `/types` | `slug` regex validated, `name`/`namePlural` required |
