@@ -483,6 +483,8 @@ Each entry in `stages` takes `slug`, `name`, and optionally `color`, `icon`, `gr
 | `pageNav.defaultTab` | Tab ID to show by default. |
 | `listPage.defaultView` | `'grid'`, `'list'`, `'table'`, or `'tree'` (v1.33.26+). |
 | `listPage.showSearch` | Show search bar on the list page. |
+| `fieldOrder` | v1.49.0+. The type's own order of every field its entries have (its own, its shared templates', its parents' and other modules'), as a list of field ids. See [Field order and page layout](#field-order-and-page-layout-v1490). |
+| `pageLayout` | v1.49.0+. The detail page as tabs of cards. See [Field order and page layout](#field-order-and-page-layout-v1490). |
 
 `sidebarNav` also accepts `parentType`, `maxDepth`, `showEmpty`, `collapsible`, and `defaultExpanded`, and they round-trip, but Structure does not read them yet — they are kept for config compatibility and have no effect. Older exports may carry `collapsible: true`, which the admin form used to add to every type it saved; it is harmless. (The `maxDepth` that is enforced is the one under `rules`.)
 
@@ -498,6 +500,129 @@ Each entry in `stages` takes `slug`, `name`, and optionally `color`, `icon`, `gr
 | `includeChildCounts` | `boolean` | `false` | Include counts of child nodes by type. |
 
 **groupSlug** — assigns this node type to a sidebar navigation group (must match a group's `slug`).
+
+### Field order and page layout (v1.49.0)
+
+Both live under `navigation`, and both are optional: without them the forms and the detail page are as they always were. The admin sets them on the **Fields** tab ([Field order](/modules/structure/usage/#field-order-v1490)) and the **Pages** tab ([Page layout](/modules/structure/usage/#page-layout-v1490)).
+
+**`navigation.fieldOrder`** is a list of field ids, at most 1,000, each a non-empty string of up to 200 characters. The create and edit forms, the Info tab and the table's default columns show the fields it lists first, in its order, then every other field in the order it had. An id that isn't one of the type's fields is ignored, and an id listed twice counts once. Lists the admin orders by hand (`listPage.columns`, a card's `showFields`, a layout's fields card) keep their own order.
+
+**`navigation.pageLayout`** has this shape:
+
+```typescript
+interface PageLayout {
+  enabled?: boolean;          // false keeps the layout but shows the page as it always was
+  replaceOverview?: boolean;  // the layout's tabs take the Overview tab's place too
+  tabs: Array<{
+    id: string;               // not overview, info, children, connections or settings
+    label: string;
+    cards: PageLayoutCard[];  // in the grid's reading order
+  }>;
+}
+
+type PageLayoutCard =
+  | { kind: 'fields'; id: string; title?: string; width?: 1 | 2 | 3; fields: string[] }
+  | {
+      kind: 'featured'; id: string; title?: string;
+      width?: 1 | 2 | 3;                              // each entry's card
+      source: { children: string } | { field: string };
+      show?: { titleTemplate?: string; lines?: string[] };
+      allowAdd?: boolean;
+    }
+  | {
+      kind: 'table'; id: string; title?: string; width?: 1 | 2 | 3;
+      source:
+        | { children: string }                        // this entry's children of a type
+        | { field: string }                           // the entries a link field of this type holds
+        | { referencedBy: { type: string; field: string } } // entries of a type whose link field holds this one
+        | { connections: string };                    // entries connected by a connection type
+      columns: Array<{ id: string; label: string; template?: string; formula?: string }>;
+      pageSize?: number;                              // default 5
+    }
+  | { kind: 'widget'; id: string; title?: string; width?: 1 | 2 | 3; widgetId: string };
+```
+
+- **The grid** is three columns wide from the `md` breakpoint and one below it. `width` is how many columns a card takes: `1` (one third, the default), `2` or `3`.
+- **A fields card** lists any of the type's field ids, in the order to show them. They show and edit as on the Info tab.
+- **A featured card** shows one card per entry, up to 24. `show.titleTemplate` is a merge template (the entry's name when empty), and `show.lines` holds up to two lines, each a merge template, or a bare field id that is read as `{id}` (anything else shows as plain text). The two lines are fixed slots, so `["", "{date_of_birth|long}"]` keeps the second line in its place. `allowAdd: true` ends the cards with "Add a …" (see [Page layouts](/modules/structure/usage/#page-layouts-v1490)).
+- **A table card** reads up to 100 entries and pages them `pageSize` at a time (1 to 50). Each column is a merge `template` or a `formula` worked out per row; when both are set, the template wins. A column whose template is exactly one field of the rows' type, or exactly `{name}`, `{reference}`, `{stage}` or `{status}`, shows as the table view shows it.
+- **A widget card** places an overview widget another module registered (`nodeWidgetRegistry`, location `node-overview`) by its id.
+- **A source** has exactly one key.
+- **Templates in cards** can read the entry's parent: `{parent->field}`, with parts and formats. See [The entry's parent](/modules/structure/merge-fields/#the-entrys-parent-v1490).
+- **The page.** Without a layout, with `enabled: false`, or with no usable tab, the page is as it always was. With one, its tabs take the Info tab's place (and the Overview tab's, with `replaceOverview`), every other tab stays, and the layout's tabs sit where `pageNav.tabOrder` lists `info` unless it lists them. A `pageNav.defaultTab` of `info` (or of `overview`, when replaced) opens the layout's first tab.
+
+**Limits.** At most 12 tabs, 24 cards on a tab, 100 fields on a fields card, 12 columns on a table card and 2 lines on a featured card. A tab's name, a card's title and a column's heading are up to 80 characters, and each template or formula up to 2,000. Tab, card and column ids start with a letter or digit, then letters, digits, `_` and `-`, up to 64 characters. Card ids are unique across the whole layout, and column ids within their card.
+
+**What a save checks.**
+
+- **The shape, always:** the kinds, widths, ids and limits above, the reserved tab ids, a fields card with no fields, a table card with no columns, a column with neither a template nor a formula, a template or formula that can't be worked out, and a page size outside 1 to 50. Each refusal names the tab or card, such as `Page layout: the card "Hearings": the column "Court" does not say what it shows.`
+- **What it names, on an admin create or update:** a fields card's fields (the type's own, its templates', its parents', and other modules' fields listed under `integrations.fields`), a link field a card reads, a child type the **Hierarchy** rules let it contain, another type's link field that can point at this type, and a connection type. The admin form also checks what only the browser knows: other modules' fields, the widgets, and whether another module's tab already uses a tab's id. These are checked only when the save brings them in, compared with the stored layout, and not at all while `enabled` is `false`. So something that went away underneath a saved layout never blocks an unrelated save: the admin form lists it with **Remove them**, and the page leaves it out.
+- **`allowAdd`** on a link field source needs the field's `nodeReferenceConfig.allowCreate`.
+- **An import checks the shape only** (the config import and the in-process `importNodeTypes` alike), because the types, connection types and fields a card names may come later in the file. A card naming something missing shows nothing.
+
+The admin form records another module's field, or another module's link field, that a card uses under `integrations.fields` as `{ "enabled": true }`, so the server's check knows it. Such an entry changes nothing else.
+
+**A worked example.** A case type whose page leads with its parties, one card each, then a table of its hearings with the case's court in a column, then the case's details:
+
+```json
+{
+  "slug": "case",
+  "name": "Case",
+  "namePlural": "Cases",
+  "rules": { "allowedChildren": ["party", "hearing"] },
+  "fields": [
+    { "id": "case_number", "type": "text", "label": "Case number" },
+    { "id": "court", "type": "text", "label": "Court" },
+    { "id": "opened_on", "type": "date", "label": "Opened on" },
+    { "id": "summary", "type": "textarea", "label": "Summary" }
+  ],
+  "navigation": {
+    "fieldOrder": ["court", "case_number"],
+    "pageNav": { "style": "tabs", "defaultTab": "info" },
+    "pageLayout": {
+      "tabs": [
+        {
+          "id": "case-page",
+          "label": "Case",
+          "cards": [
+            {
+              "kind": "featured",
+              "id": "parties",
+              "title": "Parties",
+              "width": 1,
+              "source": { "children": "party" },
+              "show": { "lines": ["{role|label}", "{date_of_birth|long}"] },
+              "allowAdd": true
+            },
+            {
+              "kind": "table",
+              "id": "hearings",
+              "title": "Hearings",
+              "width": 2,
+              "source": { "children": "hearing" },
+              "columns": [
+                { "id": "date", "label": "Date", "template": "{hearing_date}" },
+                { "id": "name", "label": "Hearing", "template": "{name}" },
+                { "id": "court", "label": "Court", "template": "{parent->court}" }
+              ],
+              "pageSize": 5
+            },
+            {
+              "kind": "fields",
+              "id": "details",
+              "title": "Details",
+              "width": 1,
+              "fields": ["case_number", "court", "opened_on", "summary"]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+The `party` and `hearing` types need `hearing_date` and `role` fields of their own. The `fieldOrder` puts **Court** first on the forms, then **Case number**, then the other fields as they were. The featured cards fill a row of one-third cards and end with **Add a party**. The **Date** column shows and sorts as the `hearing_date` field, **Hearing** shows each hearing's name as a link and sorts by it, and **Court** reads each hearing's parent, the case, so it shows the case's court on every row. The page opens on **Case**, because the default tab was Info.
 
 ### primaryScope
 
@@ -1225,6 +1350,7 @@ Under Replace, a part with a problem item removes nothing. (Before v1.41.0 any s
 - **An unsafe `validation.pattern`** (v1.38.0+) — see [Validation patterns](#validation-patterns)
 - **A field setting that doesn't hold** (v1.45.0+) — a `showOnCreate` or `showOnDetail` that isn't `true` or `false`, a malformed `setWhen`, a `uniqueInScope` that isn't `"section"` or sits on the wrong field, `setWhen` or `uniqueInScope` on a connection type's field, or a reference's `allowEdit`, `allowDelete` or `maxItems` out of shape. See [Show, set and one per section](#show-set-and-one-per-section-v1450)
 - **A reference `connect` that doesn't hold** (v1.46.0+) — a `connect` that isn't `true` or `false`, or `connect: true` on a connection type's field (`Connection type "slug": Field "x": the reference fields of a connection type cannot connect the entries they pick (connect)`). See [Connecting the chosen entries](#connecting-the-chosen-entries-v1460)
+- **A field order or page layout that isn't well formed** (v1.49.0+) — a `navigation.fieldOrder` that isn't a list of field ids, or a `navigation.pageLayout` whose shape fails (`Node type "slug": Page layout: …`). Only the shape is checked here; what a card names may come later in the file. See [Field order and page layout](#field-order-and-page-layout-v1490)
 - **One per section with the reference write-back** (v1.45.0+) — a field that is `uniqueInScope: "section"` while a reference that can point at its type names it as `syncTargetField`. Every type the file touches is checked, either side of the pair
 - **A computed field that would read a secret** — a formula or computed template that references a secret-typed field, checked against the resolved field set (own, attached-template, and inherited fields). Types outside the file are checked too when they inherit from an imported type or attach an imported field template
 - **The [shared-type](#primaryscope) guards** — a slug clash when a type becomes shared, or an un-share that would strand another user's live entries
