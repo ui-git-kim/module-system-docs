@@ -78,6 +78,8 @@ Without action hooks, modules are islands — they can display UI on nodes but c
 | Work out templates, formulas and conditions, and find records by condition (v1.44.0+) | — | ✅ | `structureService` record reads and `structureService.formulas` |
 | Update a type's existing entries after its computed values change (v1.45.0+) | ✅ | ✅ | `structureService.recomputeTypeValues`, `POST /types/:slug/recompute`, `useTypeRecompute()` |
 | Find a user's linked profile entry, link and unlink user accounts (v1.50.0+) | ✅ | ✅ | `structureService.getLinkedEntry`, `linkUser`, `unlinkUser`, `useLinkedEntry()`, `useLinkUserMutations()`. See [Profile Types](#profile-types-v1500) |
+| Show a type's badge beside an entry's name, worked out for the reader (v1.54.0+) | ✅ | ✅ | `badges: true` on `listNodes`, `getNode`, `getNodeNames`, `getTree`, `searchNodes`; `NodeBadge`. See [Badges on Reads](#badges-on-reads-v1540) |
+| Read a select's picks of records, and the values already entered in a text field (v1.55.0+) | ✅ | ✅ | `recordLinkId`, `structureService.getFieldValues`, `GET /types/:slug/field-values`. See [Option Sources and Values Already Entered](#option-sources-and-values-already-entered-v1550) |
 | Connect the entries a reference field picks (v1.46.0+) | ✅ | ✅ | `nodeReferenceConfig.connect`, `structureService.syncReferenceConnections`, `POST /types/:slug/reference-connections`, `useReferenceConnectionsSync()` |
 | Semantic search / embeddings (opt-in) | — | ✅ | `serviceRegistry.get('structureEmbeddings')` |
 | Transform Structure data (filters) | — | ✅ | `filterRegistry` |
@@ -219,6 +221,8 @@ nodeCardExtensionRegistry.register({
   render: (node) => <TaskCountBadge node={node} />,
 });
 ```
+
+A module's card badges sit beside a type's own [badge](#badges-on-reads-v1540) (v1.54.0), the one an admin sets on the type and the server works out for the reader. That one needs no registration: the cards, rows, table, tree, header and pickers show it through `NodeBadge`.
 
 ### Adding Action Buttons to Nodes
 
@@ -1385,7 +1389,7 @@ In the browser, `useTypeRecompute()` runs the same loop with a progress toast, a
 
 ### Reference Field Connections (v1.46.0+)
 
-A `node-reference` field with `nodeReferenceConfig.connect: true` also connects each entry it picks, with a connection type Structure makes for the field. The rules for the connections are on [Field Types](/modules/structure/fields/#connecting-the-chosen-entries-v1460) and the connection type on [Configuration](/modules/structure/configuration/#connection-types-made-for-reference-fields-v1460). This is what a module writing in-process sees. With `connect` off, or absent, nothing here runs and nothing changes.
+A `node-reference` field with `nodeReferenceConfig.connect: true` also connects each entry it picks, with a connection type Structure makes for the field. Since v1.55.0 a select or multiselect whose [records sources](#option-sources-and-values-already-entered-v1550) store links connects its picks the same way, unless they say `connect: false`: the same connection types, sync and rules, reading the `node:` links. The rules for the connections are on [Field Types](/modules/structure/fields/#connecting-the-chosen-entries-v1460) and the connection type on [Configuration](/modules/structure/configuration/#connection-types-made-for-reference-fields-v1460). This is what a module writing in-process sees. With `connect` off, or absent, nothing here runs and nothing changes.
 
 **On a write.** `createNode`, `updateNode`, `bulkCreateNodes` (with the entries a `{ "$new": … }` value creates), `duplicateNode` (the copies) and `mergeNode` (the references the canonical gains) connect what the write adds and read again what it drops, in the write's own transaction. A create, update, bulk-create row or duplicate that connects runs with a 30-second transaction budget (`timeout: 30000`, `maxWait: 10000`); a merge already had 30 seconds. `restoreNode` from Deleted reads the entry's own references, and the field-made links it revived, again in a transaction of its own just after the restore: an error there is logged and never fails the restore. After the commit, each link made fires `structure.connection.created`, each one moved to another field `structure.connection.updated`, and each one removed `structure.connection.deleted`, and the formulas of both ends are recomputed. A `bulkCreateNodes` with `skipHooks: true` fires none of those hooks. A link the rules refuse is skipped with a warning (`Reference connection skipped`) and never fails the write: a system write's link between two sections is one, and so is a link the connection type refuses after an admin narrowed its `allowGlobalTypes`, changed its From or To types or gave it a maximum.
 
@@ -1454,15 +1458,18 @@ const structureService = serviceRegistry.get('structure');
 
 // [{ id, name, nodeType }] for the ids the caller may read, in the order asked
 const names = await structureService.getNodeNames(ids, userId, { isAdmin });
+
+// v1.54.0: each with its type's badge for userId, when one shows
+const withBadges = await structureService.getNodeNames(ids, userId, { isAdmin, badges: true });
 ```
 
 - **The read rules are `getNode`'s.** The caller's own rows and the shared types' rows. For a non-admin, no row of a type whose read permission shuts them out. A row of a space-bound type only in the active space, or one of the owner's unassigned rows. Never a connection row.
-- **What comes back.** `NodeNameRecord[]`, `{ id, name, nodeType }` each, in the order asked, a repeated id once. Nothing of the entry's data comes back, so never a secret.
+- **What comes back.** `NodeNameRecord[]`, `{ id, name, nodeType }` each, in the order asked, a repeated id once. Nothing of the entry's data comes back, so never a secret. With `badges: true` (v1.54.0, as the route passes), a record of a type with a badge also carries `badge` when one shows (see [Badges on Reads](#badges-on-reads-v1540)).
 - **Left out, not refused.** A missing id, or one the caller may not read, is left out, with no error, and nothing says whether it exists.
 - **Limits.** At most 500 distinct ids a call (more is a `400`). An empty list returns `[]`. It costs a few queries whatever the number of ids: the rows, the active space once per type, and one unassigned check.
-- **HTTP.** `POST /api/v1/structure/nodes/names` with `{ ids }` (1 to 500 ids). An admin session reads as `isAdmin`.
+- **HTTP.** `POST /api/v1/structure/nodes/names` with `{ ids }` (1 to 500 ids). An admin session reads as `isAdmin`, and since v1.54.0 the route asks for badges.
 
-In the browser, `structureService.getNodeNames(ids)` calls the route, and `useNodeNames(ids)` batches into it: the ids every component asks for in the same tick go out as one request, in chunks of 500, and each name is cached per id (see [Node Data Hooks](/modules/structure/usage/#node-data-hooks)). The batching is `createBatchReader` in `utils/batch-reads.ts`, which a module can use for its own one-key reads.
+In the browser, `structureService.getNodeNames(ids)` calls the route, and `useNodeNames(ids)` batches into it: the ids every component asks for in the same tick go out as one request, in chunks of 500, and each name is cached per id (see [Node Data Hooks](/modules/structure/usage/#node-data-hooks)). Since v1.54.0 each entry also carries the `badge` the route sent. The batching is `createBatchReader` in `utils/batch-reads.ts`, which a module can use for its own one-key reads.
 
 ### Profile Types (v1.50.0+)
 
@@ -1486,7 +1493,74 @@ await structureService.unlinkUser(nodeId, actorId, { caller: { isSystem: true } 
 - **Reading the link.** Every `StructureNode` a read or a write returns carries `linked?: boolean` (to anyone) and `linkedToMe?: boolean` (to the reader). `linkedUserId?: string | null` is on a hook payload's row (the row as stored); a read or write answer has it only when it is the reader's own id, or on `getNode` and `listNodes` called with `isAdmin`. Never pass another user's id to a non-admin.
 - **Hooks.** `structure.node.userLinked` and `structure.node.userUnlinked` (`NodeUserLinkedPayload`, `NodeUserUnlinkedPayload`), with the `reason` for an unlink. See the [hooks table](#reacting-to-structure-events-action-hooks).
 - **The condition.** `linked` is a built-in condition target (`CONDITION_LINKED_KEY`), and `withLinkedConditionValue(record, linked, fields)` sets it over a condition record. Only a field the type defines called `linked` wins over it. `matchesCondition` reads it from the record as `getNode` gives it. See [The link as a condition](/modules/structure/fields/#the-link-as-a-condition-v1500).
-- **In the browser.** `structureService.linkUser(id, targetUserId?)`, `unlinkUser(id)`, `getLinkedEntry(typeSlug, scope?)`, `getLinkConflicts(typeSlug, scope?)` and `resolveLinkConflicts(typeSlug)`. Hooks (`hooks/useProfileLink.ts`, in the hooks barrel): `useLinkedEntry(typeSlug, scope, enabled?)`, `useLinkUserMutations()` (`linkUser`, `unlinkUser`, `isLinking`; each refreshes the entries), `useLinkConflicts()`, and for admins `useAdminUserSearch(search, enabled)` and `useAdminUserName(userId, enabled)` over the starter's `GET /api/v1/admin/users`. Components (`components/node`): `LinkSwitch`, `ThisIsMeBadge`, `NodeLinkControls` and `AdminUserLink`. Utilities (`utils`): `profileLinkSettings`, `profileConfigOf`, `formLinkedValue`, `storedLinkedValue`, `linkConditionOptions`, `withLinkConditionField`, `showsLinkBadge`, `linkBadgeLabel` and `DEFAULT_LINK_SWITCH_LABEL`. Types: `NodeTypeProfileConfig`, `ProfileLinkSettings` and `LinkScopeOf` (`{ nodeId?, parentId? }`).
+- **In the browser.** `structureService.linkUser(id, targetUserId?)`, `unlinkUser(id)`, `getLinkedEntry(typeSlug, scope?)`, `getLinkConflicts(typeSlug, scope?)` and `resolveLinkConflicts(typeSlug)`. Hooks (`hooks/useProfileLink.ts`, in the hooks barrel): `useLinkedEntry(typeSlug, scope, enabled?)`, `useLinkUserMutations()` (`linkUser`, `unlinkUser`, `isLinking`; each refreshes the entries), `useLinkConflicts()`, and for admins `useAdminUserSearch(search, enabled)` and `useAdminUserName(userId, enabled)` over the starter's `GET /api/v1/admin/users`. Components (`components/node`): `LinkSwitch`, `ThisIsMeBadge`, `NodeLinkControls` and `AdminUserLink`. Utilities (`utils`): `profileLinkSettings`, `profileConfigOf`, `formLinkedValue`, `storedLinkedValue`, `linkConditionOptions`, `withLinkConditionField`, `showsLinkBadge`, `linkBadgeLabel` and `DEFAULT_LINK_SWITCH_LABEL`. Since v1.54.0 `showsLinkBadge` is false, and `ThisIsMeBadge` shows nothing, for a type with a [badge](#badges-on-reads-v1540) of its own; pass the type with its `builtInFieldConfig`. Types: `NodeTypeProfileConfig`, `ProfileLinkSettings` and `LinkScopeOf` (`{ nodeId?, parentId? }`).
+
+### Badges on Reads (v1.54.0+)
+
+A type's badge (`builtInFieldConfig.badge`, see [`builtInFieldConfig.badge`](/modules/structure/json-reference/#builtinfieldconfigbadge-v1540)) is a short label beside an entry's name, worked out for the person reading and never stored. The server works it out on the reads whose caller asks for it:
+
+```typescript
+const structureService = serviceRegistry.get('structure');
+
+// Each row of a type with a badge carries badge: { text, colour? } when one shows
+const { nodes } = await structureService.listNodes(userId, { type: 'contact' }, { isAdmin, badges: true });
+const node = await structureService.getNode(nodeId, userId, { isAdmin, badges: true });
+const names = await structureService.getNodeNames(ids, userId, { isAdmin, badges: true });
+const tree = await structureService.getTree(userId, 'contact', { isAdmin, badges: true });
+const hits = await structureService.searchNodes(userId, 'smith', { badges: true });
+```
+
+- **Ask, or get none.** `badges?: boolean` on the options of `listNodes`, `getNode`, `getNodeNames`, `getTree` and `searchNodes` (`KeywordSearchOptions.badges`). Without it, the rows are exactly as before. The four session routes ask: `GET /nodes`, `GET /nodes/:id`, `POST /nodes/names` and `GET /tree`. The public REST API and AI Core's record reads never do. Ask only when a person will see the result, and pass that person's id as `userId`: "Linked to me" and "Created by me" are worked out for them.
+- **What comes back.** `badge?: NodeBadge` (`{ text: string; colour?: string }`) on `StructureNode`, on `NodeNameRecord`, on a tree item's `node` (`NodeTreeNode` picks `'badge'`) and on a search result's `node`. Absent when the type has no badge or none shows for that entry. The text is already finished: spaces collapsed, at most 40 characters. `colour` is one of the 12 swatch hex values.
+- **Reads, never writes.** A badge is not stored, so no write, hook payload or write answer carries one, and no filter or sort reads it.
+- **How it is worked out.** The rules, the reader's confined reads, the 200-record budget and the 5,000-row cap are under [Badges](/modules/structure/configuration/#badges-v1540). A badge never fails a read: one that can't be worked out is left off.
+- **The response filter.** `getNode` attaches the badge before `structure.node.response` runs, so a filter sees it.
+- **Saving a type.** `createNodeType`, `updateNodeType` and the imports check the badge (`assertBadgeConfigSave`); a field condition anywhere that tests `linkedToMe` or `ownedByMe` is refused (`assertNoViewerConditionTargets`). The messages are on [Field Types](/modules/structure/fields/#the-badge-v1540).
+
+**In the browser.** The pages read through the session routes, so `node.badge` is there; show it with `NodeBadge`:
+
+```tsx
+import { NodeBadge } from '@/features/structure/components/node';
+
+<span className="flex min-w-0 items-center gap-2">
+  <span className="truncate">{node.name}</span>
+  <NodeBadge badge={node.badge} />
+</span>
+```
+
+- **`NodeBadge`** (`components/node/NodeBadge.tsx`) takes `{ badge?, className? }` and renders nothing without a badge. It is a small shadcn `Badge`, truncated first on a narrow row, with the full text as its tooltip; a colour is its border and a dot, and the text keeps the normal foreground colour.
+- **`useNodeNames(ids)`** entries carry `badge`, as the batch names route sends it.
+- **`BadgeEditor`** (`components/admin/BadgeEditor.tsx`) is the type form's editor, with `BADGE_HELP_TEXT`. Its props: `value` and `onChange` (the `NodeBadgeConfig`, or `undefined` for none), `type` (for its profile link), `fields` (what a condition reads), `builderFields` (Build it's fields for a text), `builderPreview` (`{ typeSlug?, typeLabel? }`) and `mergeTokens` (the **Advanced** picker's tokens). `RulesTab` takes `onBadgeChange` and `badgeBuilderFields` to show it in **Worked-out values**.
+- **The rules in the browser.** `utils/node-badge.ts` is the same source as the server's `structure.badge.ts`, so `workOutBadge`, `badgeConditionRecord` and `badgeConfigProblem` give the server's answer for a record you hold. The helpers are listed under [Badges](/modules/structure/usage/#badges-v1540) on the Usage page. The types `NodeBadge`, `NodeBadgeConfig`, `NodeBadgeRule` and `NodeBadgeOtherwise` are exported with Structure's other types, in both halves.
+
+### Option Sources and Values Already Entered (v1.55.0+)
+
+A select or multiselect field can draw options from other records and from values already entered (`optionSources`), and a text field can suggest values already entered (`suggestFrom`). The rules are on [Field Types](/modules/structure/fields/#options-from-other-records-and-values-already-entered-v1550) and the server's side under [Option sources](/modules/structure/configuration/#option-sources-v1550). What a module needs to know:
+
+```typescript
+import { recordLinkId, recordLinkIdsIn, recordLinkValue } from '../structure/structure.option-sources.js';
+
+const structureService = serviceRegistry.get('structure');
+
+// A pick of a record is stored as text: "node:" and the record's id
+const node = await structureService.getNode(nodeId, userId, { isAdmin });
+const supplierId = recordLinkId(node.data.supplier);           // the id, or null for a typed value or text
+const ids = recordLinkIdsIn(node.data.suppliers);              // a multiselect's linked ids
+await structureService.updateNode(nodeId, userId, { data: { supplier: recordLinkValue(otherId) } });
+
+// "Values already entered" of a text field, for a person editing an entry
+const { values } = await structureService.getFieldValues('supplier', userId, {
+  field: 'region', q: 'no', scope: 'any', entryId: nodeId,
+}, { isAdmin });
+```
+
+- **Reading a value.** Every read returns a link as stored: `getNode`, `listNodes`, `queryNodes`, the record reads, hook payloads and the public REST API. Use `recordLinkId` to tell a link from a typed value or text, and `getNodeNames` (with `badges: true` for a person's view) to show names. In a merge template `{field}` gives the name and `{field->x}` reads through the pick; in a formula a bare `{field}` stays the link, so `nodes({field})` reads the records (see [A select's picks of records](/modules/structure/merge-fields/#a-selects-picks-of-records-v1550)).
+- **Writing a value.** An in-process write is checked as a form's is: a link must name a record the writer can read, of a source's types, matching its filter and scope, inside the section wall. Only the values a write changes are checked. A system write (`isSystem: true`) skips the record checks but is still held to what the field's sources can give at all, and to 100 picks a field.
+- **`getFieldValues(slug, userId, { field, q?, scope?, entryId?, parentId?, newSection? }, { isAdmin? })`** returns `{ values: Array<{ value: string; count: number }> }`, at most 200, the most used first, read under the caller's rights, the section wall, the active space and the scope. `400` for a field that isn't a top-level text field of the type (a secret never is); `404` for a type or host the caller can't read. HTTP: `GET /types/:slug/field-values`.
+- **Deleting, moving and copying.** A link is a reference to the delete-and-keep and assign strips, the move wall, the duplicate's remap and the formula recompute, so a module needs nothing of its own for them. With **Also connect the chosen entries**, the connections come from the same machinery as a reference field's: see [Reference Field Connections](#reference-field-connections-v1460).
+- **The shared rules.** `structure.option-sources.ts` on the server and `utils/option-sources.ts` in the browser are one source: `recordLinkValue`, `recordLinkId`, `recordLinkIdsIn`, `isRecordLinkValue`, `withoutRecordLinks`, `remapRecordLinks`, `selectValueItems`, `optionSourcesOf`, `hasOptionSources`, `holdsRecordLinks`, `recordLinkTypes`, `connectsRecordLinks`, `optionListEntries`, `splitOptionList`, `optionSourcesProblem`, `suggestFromProblem`, `optionSourceFieldsProblem`, `optionScopeLabel` and `optionSourceSummary`, with `RECORD_LINK_PREFIX` (`'node:'`), `MAX_OPTION_SOURCES`, `USED_VALUES_LIMIT`, `RECORD_SOURCE_PAGE` and `SUGGESTION_FIELD_TYPES`. The browser's `@/features/structure/utils` re-exports the most used of them.
+
+**In the browser.** `structureService.getFieldValues(slug, query, { signal })` calls the route. The components are in `components/fields/FieldOptions.tsx`: `SourcedOptionsInput` (the searchable picker, `{ field, value, onChange, disabled?, host }`), `SuggestingTextInput` (a text input with suggestions, same props) and `SelectedOptionsValue` (`{ field, value }`: typed values as badges, links by name through `useNodeNames`, `UNSEEN_ENTRY_TEXT` for one the viewer can't read). `host` is an `OptionSourceHost`: `{ entryId?, parentId?, nodeType?, sectionHostId?, newSection? }`. `NodeFieldRenderer` picks these for a field with sources or suggestions. The editors are in `components/admin/OptionEditors.tsx`: `SelectOptionsEditor` (`{ options, onChange(options, optionSources), optionSources?, sourcesAllowed?, conditionEditor? }`), `SuggestFromEditor` (`{ value, onChange }`) and `optionSourceSaveProblem(fields, self?)`, the admin save's check of the types and fields named. Types: `OptionSource`, `RecordsOptionSource`, `UsedValuesOptionSource`, `OptionSourceScope` and `SuggestFromConfig`, and `NodeTypeField.optionSources` and `suggestFrom`.
 
 ### Value Rules, One per Section and Reference Limits on Writes (v1.45.0+)
 
@@ -1715,7 +1789,7 @@ if (caps.embeddings.enabled) {
 }
 ```
 
-Node keyword search is always-on and lives on the **main** service: `structureService.searchNodes(userId, query, options?)` filters candidates with Postgres full-text `websearch_to_tsquery` and ranks them with Lakebase BM25 when the BM25 index is present, otherwise `ts_rank_cd` — the `score` is a rank (higher is better, not a `0..1` similarity), and no embeddings opt-in is required.
+Node keyword search is always-on and lives on the **main** service: `structureService.searchNodes(userId, query, options?)` filters candidates with Postgres full-text `websearch_to_tsquery` and ranks them with Lakebase BM25 when the BM25 index is present, otherwise `ts_rank_cd` — the `score` is a rank (higher is better, not a `0..1` similarity), and no embeddings opt-in is required. Since v1.54.0, `badges: true` in its options gives each result's node its type's badge for `userId` (see [Badges on Reads](#badges-on-reads-v1540)); it is off by default, because a search for another module has nobody looking.
 
 The `structureEmbeddings` service (registered only when the app opted into embeddings) provides `setNodeEmbedding`, `clearNodeEmbedding`, `listNodesNeedingEmbedding`, `semanticSearchNodes`, `semanticSearchChunks`, and `findSimilarNodes`, plus (v1.32.0+) the chunk-keyword method `lexicalSearchChunks` and the hybrid methods `hybridSearchNodes` and `hybridSearchChunks`. It also carries the chunk write/read path an ingest module needs — `replaceNodeChunks`, `setChunkEmbedding`, `listChunksNeedingEmbedding`, `getNodeChunks`, `deleteNodeChunks` — and the pairwise `nodeSimilarity`. `lexicalSearchChunks` ranks the same way as `searchNodes` (BM25, else `ts_rank_cd`); the hybrid methods fuse the keyword and semantic arms with reciprocal rank fusion in SQL, and the caller supplies **both** the query text and its embedding. Structure owns storage only — it never calls an LLM or embedder, so callers always supply the vectors and query text. It is an in-process API only — there are no HTTP routes for embeddings or search. See the [Cognitive guide](/modules/structure/cognitive/) for full signatures, the `features.cognitiveIngest` flag, and install/opt-in details.
 

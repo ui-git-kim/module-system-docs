@@ -183,7 +183,7 @@ Configuration for each node type.
 | `superClasses` | JSON | `string[]` of parent type slugs for is-a inheritance (default `[]`) — see [Type Hierarchy](/modules/structure/type-hierarchy/) |
 | `features` | JSON | Enabled features |
 | `fields` | JSON | Custom field definitions |
-| `builtInFieldConfig` | JSON | Merge templates, formulas (`calcConfig`, v1.36.0) and `editableBy` for built-in name, description, and slug fields |
+| `builtInFieldConfig` | JSON | Merge templates, formulas (`calcConfig`, v1.36.0) and `editableBy` for built-in name, description, and slug fields, and since v1.54.0 the type's `badge` (see [Badges](#badges-v1540)) |
 | `conditionalColor` | JSON | Colour rules based on a field value |
 | `permissions` | JSON | Node-level read / create / edit / archive / delete overrides — each `anyone` \| `admin` \| `system` |
 | `primaryScope` | JSON | Scope — `{ isPrimary?, scopedTypes?, isolation?, global? }`. `isPrimary` adds the header scope selector and `isolation: 'enforced'` turns it into a server-side, fail-closed space; `global: true` makes the type **read-shared across all users** and space-exempt, and is honoured only on an app-level row (`userId` `null`) |
@@ -396,6 +396,12 @@ interface NodeTypeConfig {
     name?: { computedTemplate?: string; calcConfig?: { formula: string; precision?: number; prefix?: string; suffix?: string }; editableBy?: 'anyone' | 'admin' | 'system' };
     description?: { computedTemplate?: string; calcConfig?: { formula: string; precision?: number; prefix?: string; suffix?: string }; editableBy?: 'anyone' | 'admin' | 'system' };
     slug?: { computedTemplate?: string; calcConfig?: { formula: string; precision?: number; prefix?: string; suffix?: string }; editableBy?: 'anyone' | 'admin' | 'system' };
+    // v1.54.0: a short label next to each entry's name, worked out for the
+    // person reading (never stored). The first rule whose condition holds wins.
+    badge?: {
+      rules?: Array<{ when: VisibleWhenCondition; text: string; colour?: string }>;  // at most 20
+      otherwise?: { text: string; colour?: string };
+    };
   };
   // Colour the node based on a field value
   conditionalColor?: {
@@ -773,7 +779,40 @@ interface NodeTypeFeatures {
 - **Deletes, merges and erasure.** Deleting an entry (with or without its contents), merging a duplicate into another entry (either retire mode) and erasing an account clear the links involved, with the rules re-applied, the sync field unticked and `userUnlinked` fired (reason `'deleted'`, `'merged'` or `'erased'`). On erasure, other owners' entries linked to the erased account are unlinked; the account's own entries are deleted. Restoring an entry doesn't bring its link back. A duplicate is never linked.
 - **Moves and assigns.** Moving or assigning a linked entry of a per-section type into a section where its account already has a linked entry unlinks that other entry: the moved row wins. A kept row of a delete-and-keep keeps its link in the scope it lands in.
 - **Reads.** Every row a read or write returns carries `linked` (linked to anyone) and `linkedToMe` (linked to the reader). `linkedUserId` stays on a row only when it is the reader's own id, or on an admin's `getNode` and `listNodes`; another user's id never reaches a non-admin. With linking off, or the type a Record, reads say not linked and the stored links are kept.
+- **The badge.** On a type with a [badge](#badges-v1540) of its own, the "This is me" mark doesn't show (`showsLinkBadge` is false); the badge does, and a rule on `linkedToMe` can say "You".
 - **Changing the scope.** Turning linking on, or `linkScope` from `'section'` to `'app'`, can leave an account with more than one linked entry in one scope. Nothing is unlinked by the save itself. The admin form counts them first (`GET /types/:slug/link-conflicts?scope=`) and can then keep each account's most recently updated entry and unlink the others (`POST /types/:slug/link-conflicts/resolve`).
+
+### Badges (v1.54.0+)
+
+`builtInFieldConfig.badge` gives a type a short label next to each entry's name: rules of `{ when, text, colour? }`, the first that holds winning, and an `otherwise`. The keys are in [`builtInFieldConfig.badge`](/modules/structure/json-reference/#builtinfieldconfigbadge-v1540), how a badge comes out and every refusal on [Field Types](/modules/structure/fields/#the-badge-v1540), and the admin's editor under [Badge](/modules/structure/usage/#badge-v1540). The server's rules:
+
+- **Worked out per reader, never stored.** No column holds a badge. A read whose caller asks (`badges: true`) attaches `badge: { text, colour? }` to each row of a type with a badge, worked out for the reader, and leaves it off when none shows. `listNodes`, `getNode`, `getNodeNames`, `getTree` and `searchNodes` take the option. A write's answer never carries one.
+- **Who asks.** Only the four session routes: `GET /nodes`, `GET /nodes/:id`, `POST /nodes/names` and `GET /tree`. The [public REST API](/modules/structure/public-api/), AI Core's record reads, the other routes and in-process callers that don't pass the option get no badges: a badge belongs to a person looking. `searchNodes` has no route; an in-process caller passes `badges: true` itself (see [Badges on Reads](/modules/structure/integration/#badges-on-reads-v1540)).
+- **The viewer's targets.** Each row's condition record carries `linkedToMe` (the row's `linkedToMe` flag: linked to the reader, on a type whose entries can be linked) and `ownedByMe` (`row.userId` is the reader), unless the type defines a field of that id.
+- **Under the reader's rules.** The conditions read the row's stored data less its secrets and on-read formula values, so a list, the detail page, the names read and the tree agree. A `{token}` reads the row's own data first. A record is read only for a token that needs one (`{ref->x}`, `{parent->x}`), through the reader's confined reads: the reader's section by the wall's two-way rule, the reader's readable types as a non-admin, secrets removed.
+- **Bounded.** Only the rows the read returns are worked out, at most 5,000, and only those of a type with a badge. The rows of one read share their record reads: one wall per type and section root, one record cache per section, and at most 200 distinct records (`MAX_BADGE_RECORD_READS`; a record read again is free). Past the budget, a row that needs a new record shows no badge. The types' badges are cached with the type config.
+- **Lighter reads.** The names read loads the badge columns of the rows of a type with a badge by id, with `data` only when one of those badges reads a data field (`badgeReadsData`): a badge on "Linked to me" reads only the owner and the link. The tree read selects the extra columns a badge reads (`description`, `stage`, `linkedUserId`) when asked, and takes them out of its rows again.
+- **Never fails a read.** A row whose badge throws, comes out blank or runs past the budget gets none; anything else that goes wrong leaves the rows as they were, with a warning in the log.
+- **Saves.** Every save of a type checks the badge's shape; the configuration import and proposals check only that. An admin create or update that brings the badge in or changes it (compared with the stored one) also checks each condition's field against the type's fields (own, field templates', inherited, and `integrations.fields`), the built-ins, `linked`, `linkedToMe` and `ownedByMe`, and refuses a badge that reads an on-read formula. The secret guard reads the badge's texts, the fields its conditions test and their `{token}` values, directly, through a reference and through the parent.
+- **The viewer targets elsewhere.** On every path that saves fields (node types, field templates, connection types, proposals and imports), a `setWhen` rule, `visibleWhen`, `requiredWhen` or `nodeReferenceConfig.filter` that tests `linkedToMe` or `ownedByMe` is a `400`, unless a field of that id answers it: on a node type's admin save, any field the type has; in a reference filter, a field of a type it may point at; on other saves, the fields saved. Field-group sub-fields are checked too.
+
+### Option sources (v1.55.0+)
+
+A top-level `select` or `multiselect` field of a node type or field template can draw options from other records and from values already entered (`optionSources`), and a top-level text field can suggest values already entered (`suggestFrom`). The keys are in [Option sources and suggestions](/modules/structure/json-reference/#option-sources-and-suggestions-v1550), and every rule and refusal is on [Field Types](/modules/structure/fields/#options-from-other-records-and-values-already-entered-v1550). The server's rules:
+
+- **Link values.** A pick of a record stored as a link is the text `node:` and the record's id. No column changes: a select's value stays text and a multiselect's a list of texts. Reads return it as stored, `getNode`, `listNodes`, `queryNodes`, AI Core's record reads and the [public REST API](/modules/structure/public-api/) included. Data filters and conditions compare the stored text.
+- **The rows a source reads** (`optionSourceSql`): the reader's own rows and the shared types', live, of the source's types and their subtypes (less the types the reader may not read), inside the host entry's wall (its section and the shared types; the rows in no section and the shared types when it is in none; only the shared types for a new entry that opens a section), then the scope. A shared type's entry is in no section, wherever it is filed.
+- **Writes.** `validateNodeData` holds every caller to what a field's sources can give, at most 100 picks a field (`MAX_PICKS_PER_FIELD`). For a write that isn't the system's, the values it changes are checked against the rows above (`assertSourcedOptionValues`): links in one read for the write, a source's names or values in one statement each. Create, update, bulk create, a duplicate's overrides and the entries a reference field creates are checked.
+- **Links as references.** In a top-level select or multiselect, a `node:` value is a link to the strips of a delete-and-keep, an assign and a restore, the section wall on create, update, duplicate, restore and move, the duplicate's remap and the formula recompute, whatever the field's sources say now. With **Also connect the chosen entries**, the reference-field connection machinery makes and removes the connections ([Connection types made for reference fields](#connection-types-made-for-reference-fields-v1460)).
+- **Saves.** Every path that saves fields checks the shape; an import checks only that. The admin saves of node types, proposals and field templates also check the types and fields named, and the secret guard reads a records source's label.
+
+#### Values already entered (v1.55.0+)
+
+`GET /types/:slug/field-values` (`structureService.getFieldValues`) answers a "Values already entered" source and a text field's suggestions: `{ values: [{ value, count }] }`.
+
+- **What it reads.** The field's text values (a trimmed string, blanks left out) on the rows above for the type and its subtypes whose field of that id is the same kind of text field, confined to the active space as a list is, with the owner's unassigned rows. With `q`, only values starting with it (capitals ignored), before the bound. It counts the 5,000 most recently changed matching rows (`MAX_USED_VALUES_SCAN`) and returns at most 200 values (`USED_VALUES_LIMIT`), the most used first, then A to Z.
+- **The host.** At most one of `entryId` (the entry being edited: its parent and section), `parentId` (a new entry's parent: its section) or `newSection=true` (a new top-level entry of an isolated type: only shared types). With none, a new top-level entry in no section. More than one is a `400` (`Give one of entryId, parentId or newSection`).
+- **Refusals.** A type the caller can't read, a connection, or a host the caller can't read: `404`. A field that isn't a top-level field of the type (`"x" is not a field of this type`), or isn't a text field or is a secret (`Values already entered are read from a text field only: "x" is not one`): `400`. A `q` over 200 characters, or a `scope` that isn't one of the four: `400`.
 
 ### Navigation
 
@@ -874,6 +913,15 @@ interface NodeTypeField {
   required?: boolean;
   options?: Array<{ label: string; value: string; description?: string; source?: string; link?: string }>; // rich content v1.53.0
   chainedSelectConfig?: { placeholder?: string; options: ChainedOption[] }; // v1.53.0 tree; an older { levels, options } is still read
+  // v1.55.0, top-level select / multiselect: options drawn from records or values already entered,
+  // each placed among the typed options by its position (at most 10)
+  optionSources?: Array<
+    | { id: string; kind: 'records'; position?: number; nodeTypes: string[]; filter?: VisibleWhenCondition;
+        scope: OptionSourceScope; label?: string; store?: 'link' | 'text'; connect?: boolean }
+    | { id: string; kind: 'used-values'; position?: number; nodeType: string; field: string; scope: OptionSourceScope }
+  >;
+  // v1.55.0, top-level text-like field: "Suggest values already entered"
+  suggestFrom?: { nodeType?: string; field?: string; scope?: OptionSourceScope };
   validation?: {
     min?: number;
     max?: number;
@@ -907,7 +955,7 @@ interface NodeTypeField {
 }
 ```
 
-`VisibleWhenCondition` stands for the `visibleWhen` condition shape. The interface lists the keys most types need; every field setting is on the [Field Types Reference](/modules/structure/fields/#field-settings), and every `nodeReferenceConfig` key is in [one table there](/modules/structure/fields/#node-reference).
+`VisibleWhenCondition` stands for the `visibleWhen` condition shape, and `OptionSourceScope` for `'section' | 'siblings' | 'children' | 'any'` (see [Options from other records](/modules/structure/fields/#options-from-other-records-and-values-already-entered-v1550)). The interface lists the keys most types need; every field setting is on the [Field Types Reference](/modules/structure/fields/#field-settings), and every `nodeReferenceConfig` key is in [one table there](/modules/structure/fields/#node-reference).
 
 **Built-in field types (22):** text, textarea, number, date, datetime, time, select, multiselect, chained-select, toggle, boolean, url, email, phone, address, name-field, secret, hidden, section-break, node-reference, field-group, formula. See the [Field Types Reference](/modules/structure/fields/) for the full list with configuration and examples.
 
@@ -1119,9 +1167,9 @@ All endpoints are prefixed with `/api/v1/structure`.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/nodes` | List nodes (with filters) |
-| GET | `/nodes/:id` | Get single node |
-| POST | `/nodes/names` | Several entries' names in one read (v1.48.0) — body `{ ids: string[] }` (min 1, max 500); returns `[{ id, name, nodeType }]` for the ids the caller may read under `GET /nodes/:id`'s rules, in the order asked, and leaves the rest out. Never any data. See [Batch Name Reads](/modules/structure/integration/#batch-name-reads-v1480) |
+| GET | `/nodes` | List nodes (with filters). Since v1.54.0 each row of a type with a [badge](#badges-v1540) carries `badge` when one shows |
+| GET | `/nodes/:id` | Get single node, with its `badge` (v1.54.0) when one shows |
+| POST | `/nodes/names` | Several entries' names in one read (v1.48.0) — body `{ ids: string[] }` (min 1, max 500); returns `[{ id, name, nodeType, badge? }]` (`badge` since v1.54.0) for the ids the caller may read under `GET /nodes/:id`'s rules, in the order asked, and leaves the rest out. Never any data. See [Batch Name Reads](/modules/structure/integration/#batch-name-reads-v1480) |
 | POST | `/nodes` | Create node |
 | PATCH | `/nodes/:id` | Update node |
 | DELETE | `/nodes/:id` | Soft delete — moves the entry and everything nested under it to **Deleted** (returns 204). `?keepContents=true` deletes the entry alone and keeps what it contains (v1.43.0); any other value than `true` or `false` is a `400`. See [Deleting a record that contains records](#deleting-a-record-that-contains-records-v1430) |
@@ -1221,7 +1269,7 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/tree` | Get tree structure (optional `?type=` filter) |
+| GET | `/tree` | Get tree structure (optional `?type=` filter). Since v1.54.0 each item's `node` carries `badge` when one shows |
 | POST | `/reorder` | Batch reorder nodes within a parent |
 
 ### Node Types
@@ -1236,6 +1284,7 @@ Connection `origin`/`status` semantics, pending connections, and promotion are c
 | POST | `/types/reorder` | Batch `sortOrder` update — body `{ items: [{ slug, sortOrder }] }`, one transaction (admin only) |
 | GET | `/types/:slug/linked-entry` | v1.50.0. The caller's linked entry of a [profile type](#profile-types-v1500) and its subtypes: `{ entry }`, `null` when there is none, the caller can't read it, or the type's entries can't be linked (now). For a per-section type, `?scopeRootId=` names the section, `?nodeId=` asks for the scope an entry is in, and `?parentId=` for the scope a new child of an entry would be in; with none, the one in no section. A type whose link is one in the whole app needs none |
 | GET | `/types/:slug/link-conflicts` | v1.50.0. The user accounts with more than one linked entry of the type's family in one scope: `{ accounts, entries }` (`entries`: the ones beyond each account's first). `?scope=app\|section` counts as if the type had that scope, as a save is about to set it (admin only) |
+| GET | `/types/:slug/field-values` | v1.55.0. "Values already entered": the distinct values of a top-level text field of the type, `{ values: [{ value, count }] }`, the most used first, at most 200. `?field=` (required), `?q=` (a prefix, up to 200 characters, capitals ignored), `?scope=section\|siblings\|children\|any` and at most one host: `?entryId=` (the entry being edited), `?parentId=` (a new entry's parent) or `?newSection=true` (a new entry that opens an isolation section). See [Values already entered](#values-already-entered-v1550) |
 | POST | `/types/:slug/link-conflicts/resolve` | v1.50.0. Each such account keeps its most recently updated entry; the others are unlinked as the link API unlinks: `{ unlinked }` (admin only) |
 | GET | `/types/:slug/recompute` | v1.45.0+. How many existing entries an update of their stored computed values would work through: `{ entries }` (admin only). See [Updating existing entries](#updating-existing-entries-v1450) |
 | POST | `/types/:slug/recompute` | v1.45.0+. Work the existing entries' stored computed values out again, one batch per call — body `{ fields?, after? }`, answer `{ updated, unchanged, failed, remaining, next }` (admin only). See [Updating existing entries](#updating-existing-entries-v1450) |
