@@ -1492,9 +1492,40 @@ await structureService.unlinkUser(nodeId, actorId, { caller: { isSystem: true } 
 
 Three field settings change what a write stores, for every caller. A module writing in-process gets the same results as a form, so code that writes a field directly should expect them. The settings are on [Field Types](/modules/structure/fields/#showing-setting-and-one-per-section-v1450).
 
-- **Value rules (`setWhen`).** When a rule's condition holds over the entry as it will be (the stored data with your write over it), the rule's value is stored in place of what you sent, with no error. That holds for every caller, `isSystem: true` included, and over an `editableBy` lock. A rule whose value no longer fits the field is skipped with a warning. Rules run on create, bulk create, new entries made in a reference field, update, a duplicate's overrides and a merge's backfill, and on the system writes that change another entry: the reference write-back, one per section's turn-off, and the reference strips of an assign, a move and a delete-and-keep. The value your write returns, and the hook's `changes`, hold what was stored.
+- **Value rules (`setWhen`).** When a rule's condition holds over the entry as it will be (the stored data with your write over it), the rule's value is stored in place of what you sent, with no error. That holds for every caller, `isSystem: true` included, and over an `editableBy` lock. A rule whose value no longer fits the field is skipped with a warning. Rules run on create, bulk create, new entries made in a reference field, update, a duplicate's overrides and a merge's backfill, and on the system writes that change another entry: the reference write-back, one per section's turn-off, and the reference strips of an assign, a move and a delete-and-keep. The value your write returns, and the hook's `changes`, hold what was stored. Since v1.52.0 a rule can also copy another field or put a value together, and end in an Otherwise: see [Copies, Builds and Ask First](#copies-builds-and-ask-first-v1520).
 - **One per section (`uniqueInScope: 'section'`).** Turning such a field on for an entry turns it off, in the same transaction, for the other entries of its live section. Each of those fires `structure.node.updated` after the commit, with no `source`, and its formulas are recomputed. Entries in no section are left out. A bulk create's later row wins; a new entry made in a reference field loses to the entry it belongs to.
 - **`maxItems` on a multiple reference.** A write that changes the value to more non-empty ids (new-entry placeholders counted) than `maxItems` is a `400` `Field "x" takes at most N entries`.
+
+### Copies, Builds and Ask First (v1.52.0+)
+
+Since v1.52.0 a value rule's value can be a copy of another field (`{ copy: 'field' | 'link->field' | 'parent->field' }`) or a value put together (`{ build }`, a merge template, or `{ build, formula: true }`), a field's rules can end in `setOtherwise`, and `setSync` says what happens when a copied source changes. The rules are on [Field Types](/modules/structure/fields/#a-value-a-copy-or-a-value-put-together-v1520). What a module writing in-process sees:
+
+- **Your own writes.** On `createNode`, `bulkCreateNodes`, the new entries a reference field makes, and `updateNode`, every rule applies, whatever its `setSync`: fixed values and copies of the entry's own fields as before, and copies through a link or the parent, and builds, worked out by the formula engine before the entry's formulas, with the entry's confined reads (its section and the shared types, the owner's readable types, secrets removed). What they set is stored in place of what you sent, with no error, and is in the write's result and the hook's `changes`.
+- **A required field a copy fills.** A create doesn't refuse a required field that a copy or build will fill; if it is still empty once worked out, the create is a `400` with the field's own required message. An update never empties a required field through a copy.
+- **Kept up to date** (`setSync` absent or `'automatic'`). When a record such a rule reads changes, through your write or anyone's, the entries whose rules read it are recomputed after the commit with the formula recompute's bounds, firing `structure.node.updated` with `source: 'formula'`. A system write, a duplicate or a merge applies the fixed values and own-field copies in the write, and the kept-up-to-date copies and builds in that recompute.
+- **Ask first** (`'prompted'`) and **Set it once** (`'initial'`) values that read another record are only worked out on the entry's own writes; a system write, a duplicate or a merge leaves them for the entry's next one. A change to the source of an **Ask first** value isn't copied until someone answers yes, through the calls below.
+- **Set it once** applies when its rule first holds (the branch that holds isn't the one that held over the stored entry, or the entry is new). A value your write changes for the field is a hand edit, and stays; on a create, a value equal to the field's default isn't.
+
+| Method | What it does |
+|--------|--------------|
+| `previewRuleUpdates(nodeId, userId, { isAdmin? })` | After `userId` saved `nodeId`: the entries whose **Ask first** rules read it and would now change, as `RuleUpdatePreview`, `{ items: RuleUpdateItem[] }`. Nothing is written. HTTP: `GET /nodes/:id/rule-updates` |
+| `applyRuleUpdates(nodeId, userId, ids, { isAdmin? })` | Of the entries the preview lists now, works out again and stores the ones in `ids` (at most 500 read), and returns `{ updated: string[] }`. HTTP: `POST /nodes/:id/rule-updates` with `{ ids }` |
+
+```ts
+interface RuleUpdateItem {
+  id: string;
+  name: string;
+  nodeType: string;
+  typeName: string;                          // the type's display name
+  fields: Array<{ id: string; label: string }>; // the fields that would change, never their values
+}
+interface RuleUpdatePreview { items: RuleUpdateItem[] }
+```
+
+- **The record.** It is read through `getNode`'s gate (a `404` for one the caller may not read, or a connection row), and the caller needs edit permission on its type (otherwise a `400`, `Not permitted to edit nodes of type "carer"`).
+- **Which entries.** The caller's own live rows, found as a formula's dependants are, at most 200: of a type the caller may read and edit, in the caller's active space, and not unassigned. Only those whose changed rule reads through the saved record: a direct child reading `parent->`, or an entry whose link field holds the record's id. A formula build with no `{link->x}` (a traversal such as `children()`) counts, since it can't be told apart.
+- **Applying.** The rights and the list are worked out again; an id not in the list now is left out. Each chosen entry gets a system write of those fields alone, fires `structure.node.updated` with `source: 'formula'`, and then what reads it is recomputed.
+- **In the browser.** `structureService.previewRuleUpdates(id)` and `applyRuleUpdates(id, ids)` call the routes. Structure's own saves call `promptRuleUpdates(nodeId)` (`components/common/RuleUpdatesPrompt.tsx`), which asks only when some type has an **Ask first** rule that reads another record, and shows the question in `RuleUpdatesHost`, registered once in `shellInitRegistry` as `structure-rule-updates`. A module with its own edit form can call `promptRuleUpdates(nodeId)` after a successful save; with no host mounted it does nothing.
 
 ### Record Reads and the Formula Engine (v1.44.0+)
 
