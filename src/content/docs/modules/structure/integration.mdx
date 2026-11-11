@@ -1802,6 +1802,45 @@ export async function applyTemplate(adminId: string): Promise<void> {
 
 A background job with no signed-in admin passes `caller: { isSystem: true }` and a label of your module's as `actorId`. The label is never written onto the row; it appears in the hook payload and the audit line.
 
+### Field Sources (v1.82.0+)
+
+A module can give chosen node types fields of its own, which Structure then treats as real fields: validated on write, read by formulas, merge fields and conditions, shown in forms, on the page, in lists and in exports. It registers as a **field source** and writes each type's set through Structure, as a stage source does. The set is stored apart from the type's own fields, so an admin's save can never race with it or overwrite it, and while the module runs an admin can place the fields but not change them.
+
+With no field source registered, nothing changes: the same results, response shapes and SQL as v1.81.0.
+
+| Method on `structureService.fields` | What it does |
+|---|---|
+| `registerSource({ moduleId, name, manageHref?, order? })` | Registers your module as a field source in this process; its sets are **live** while the registration stands. Same rules as `stages.registerSource`: a duplicate is refused and the first stays, an invalid registration is skipped with a warning, and a `manageHref` that isn't an app path or an http(s) URL is dropped. `moduleId` must match `[a-z0-9][a-z0-9_-]*` (at most 100 characters), because it starts each field's data key. A module may be both a stage source and a field source; the two registries are separate (`fieldSourceRegistry`, also exported from the barrel) |
+| `unregisterSource(moduleId)` | Stops being a field source. The sets stay, no longer live |
+| `registerTypeFields(slug, actorId, fields, { moduleId, ownerId, caller, ref?, version?, expected? })` | Replaces your module's whole set on that type. Row choice, caller tier, lock and `expected` compare-and-set are exactly those of `stages.registerTypeStages` |
+| `releaseTypeFields(slug, actorId, { moduleId, ownerId, caller, keep })` | `keep: true` hands the fields to the type as its own (same data keys, so values stay attached; `editableBy: 'source'` becomes `'system'`). `keep: false` removes the definitions and leaves the stored values in each entry's `data`. A type with no set from your module is returned unchanged |
+| `releaseStoppedSource(slug, actorId, moduleId, { keep, isAdmin })` | The type editor's "Make them this type's own" / "Remove them" for a source that is **not** running, also at `POST /api/v1/structure/types/:slug/field-sources/:moduleId/release` (admin only). `409` while the source runs |
+
+**Data keys.** A sourced field's `id` is the part after the dot (`[a-z0-9_]+`); its data key is `<moduleId>.<id>`, for example `tasks.size`. Values already stored under that key become the field's values with no migration. Merge tokens (`{tasks.size}`, `{ref->tasks.size}`), formulas and conditions read the key whole when the type has that field, and read a field group's sub-field as before otherwise.
+
+**What a sourced field may be.** A `NodeTypeField` of type text, textarea, number, date, datetime, time, select, multiselect, toggle, boolean, url, email, phone or node-reference, at most 100 per set. Refused in this first version: `computedTemplate`, `calcConfig`, `setWhen`, `setOtherwise`, `notes`, `optionSources`, `uniqueInScope`, `perSection`, and `nodeReferenceConfig.connect` / `syncTargetField`; also `required` together with `editableBy: 'source'` and no `defaultValue`.
+
+**Refusals of `registerTypeFields`:**
+
+| Status | When |
+|---|---|
+| `400` | The module isn't a live field source; the set fails its shape checks (duplicate id, unknown or refused type, a select with no options, a node-reference with no `allowedTypes`, a bad id, no label, a refused key) |
+| `403` | The wrong caller for the row |
+| `404` | No such row |
+| `409` | A data key equals one of the type's own, template or inherited field ids; the module id equals one of those ids, or a subtype's; the personal row is shadowed by an app-level row; `expected` doesn't match |
+
+**Writing values as the source.** A sourced field may carry `editableBy: 'source'`: nobody edits it through a form or the HTTP API, admins included. Your module writes it with the caller option `asSource: moduleId` on `createNode`, `updateNode` and `bulkCreateNodes`. Nothing else about the call changes: stage rules, hierarchy, the section wall, permissions and `viaHttp` all apply as without it. `asSource` from HTTP, or naming a module that isn't a live field source, is a `400`.
+
+**What admins see.** The type editor lists the set under "Fields from other modules", read-only, with "From *name*" and a link to `manageHref`. Admins can move the fields between sections and order them, and switch them off or relabel them on the Integrations tab (a switched-off field is never required). A type update or import never changes a live set: an import lists the type in `fieldsKept`. An export writes the fields as the type's own fields under their data keys, so a host without your module gets them. A browser `structureRegistry` field registration with the same key is ignored. Once your source stops, the fields stay, with a line saying their module isn't running, and an admin can make them the type's own or remove them.
+
+**Responses.** Type responses carry `sourcedFields`, `{ [moduleId]: { source: { moduleId, name, ref?, version?, live, manageHref? }, fields } }` (stored in `navigation.sourcedFields`; `name` is your current registration's while live), absent when there are none. In `resolved.fields` each appears as `{ ...field, id: "<moduleId>.<id>", sourcedFrom }`, and subtypes inherit them. Never send `sourcedFields` back: every other write strips it.
+
+**After a write**, `structure.nodeType.updated` fires with `changes: { navigation, sourcedFields }` and an audit line is written, as for stages.
+
+**Type kinds in process.** `structureService.typeKindOf(slug, userId)` returns `'record' | 'profile' | 'task'`, inherited kinds included, and `listNodeTypes(userId, includeDisabled, { kind })` lists the types of one kind. `structure.nodeType.updated` fires with `features` in `changes` when a type's kind changes. In the browser, `typeKindOf` and `nodePath` are exported from `@/features/structure`.
+
+**Widgets by type kind.** A `NodeWidgetRegistration` can set `typeKinds` (offered and shown only on types of those kinds) and `placement: 'placed'` (shown only where an admin adds it in the page designer, never on the Overview tab by itself). The default is `'auto'`, today's behaviour.
+
 ### Stage and Owner List Options (v1.40.0+)
 
 `listNodes(userId, query, options?)`, `GET /api/v1/structure/nodes` and the frontend `structureService.listNodes` take two more query keys. With both left out, a list behaves as before, apart from the data-filter fix described below the table.
