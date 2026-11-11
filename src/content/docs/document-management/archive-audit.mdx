@@ -38,6 +38,110 @@ At the end of a session you want to archive, run the archive-readiness prompt (b
 
 ---
 
+## 2026-11-11 — A standard upload for AI Chat, `.json` and cancelled-upload fixes, scaffold v1.32.3 (v1.18.3)
+
+**Verdict:** ✅ Safe to archive **once pushed**. This docs pass and its pointer are the final steps. There is no schema change. veradai is on **1.18.2** and needs `npx document-management update --skip-schema`.
+
+**Shipped this session:** v1.18.3 (**patch**). Module commits:
+- `598a293` docs pointer sync (the docs submodule was 222 commits behind)
+- `51def45` the scaffold updater's self-update, `a157fcc` the scaffold merge (1.31.19 → 1.32.3)
+- `287ceca` chore: adopt scaffold v1.32.3 (test harness, conformance wrapper retired)
+- `055f8be` feat: the upload contract and the three upload fixes
+- `bc1db77` fix: review fixes
+- the release, lock sync and docs pointer follow
+
+All module gates are green: build, type-check, `check:templates`, `check:template-syntax` (59 strings), parity, `conformance:check` (now passing without a wrapper) and `npm test`.
+
+**Why:** kim asked for three things, then sent two links mid-session:
+1. AI Chat is ready and needs Document Management's standard upload. Some uploads may later go through Cognitive Pipeline.
+2. Put short share links on the roadmap, with [Sink](https://sink.cool/) as the candidate.
+3. Check the scaffold, which needed an update.
+4. Whether to take anything from [Better Upload](https://better-upload.com/) and [file-vault](https://github.com/ManishBisht777/file-vault).
+
+**What AI Chat needs, read from its code in veradai (v1.30.0):**
+- Its backend keeps attachment references, `{ documentId, fileName? }`, on each message and resolves them with `getDocument(documentId, userId)`. That already worked.
+- Its composer was not wired to upload anything.
+- It treats Document Management as optional, so its frontend can't import this module's components. The contract therefore had to be plain HTTP.
+
+**What shipped for it:**
+- `reference: true` on `uploadToDefault` (`?reference=true` over HTTP): the upload always returns a `documentId`.
+- `getUploadCapability(userId)` and `GET /upload/capability`: can this user upload now, why not, where the file would land, and the limits.
+- `?mimeType=` on the upload routes.
+- The Integration page section [Uploading from another module's UI](/document-management/integration/#uploading-from-another-modules-ui-v1183), with a copyable uploader.
+
+**Bugs found while checking readiness, all older than this session:**
+1. **`.json` files were stored empty.** The host parses every `application/json` request body after auth. The upload screens sent each file under its own content type, so a `.json` file was read by that parser first and the route stored 0 bytes with a `201`. Reproduced against the real express version before fixing. The screens now send `application/octet-stream` with `?mimeType=`, and the route stores a body the host has already read.
+2. **A cancelled upload never ended on the server.** `pipe()` forwards neither an error nor an early close, so the storage write waited forever with the partial file open.
+3. **A very low upload limit could crash the host.** An over-limit upload with no declared length tripped the size limiter before the service had attached to it. That is an unhandled `error` event. Reproduced at a 1 KB limit.
+
+Bugs 2 and 3 were found by the mutation check, when one mutant made the test run hang.
+
+**Decisions & ideas:**
+- **Manual stream handling, not `stream.pipeline`.** `pipeline` fixes the cancel case, but on a failure Node detaches the socket from the request object, and host middleware may read the client address after the response. The route adds its own `error` and early-`close` listeners and leaves the request alone.
+- **The capability probe never contacts storage.** A Local Connect folder is judged by its last recorded status. The probe and the upload share one target-resolution function, so they can't disagree.
+- **`reference` is opt-in.** The default keeps today's behaviour, where an upload to the user's own provider creates no reference.
+- **The docs teach one form:** `application/octet-stream` plus `?mimeType=`. Storing an already-read body is a safety net; a `.json` that isn't strict JSON, or is over 10 MB, still fails at the host's parser when sent as `application/json`.
+- **Ported from the scaffold's advisory diff:** admin and settings pages register with `React.lazy`, and the barrel no longer re-exports `DocumentBrowserPage`.
+- **From Better Upload and file-vault, on the roadmap and not built:** per-consumer upload profiles enforced by the server, direct-to-bucket uploads with presigned URLs, a headless multi-file uploader with per-file cancel and retry, paste-to-upload and client-side image shrinking.
+- **Sink** is on the long-term table: self-hosted on Cloudflare, AGPL-3.0, with an HTTP API. The shortener hook probably belongs in the starter, because other modules will want short links too.
+- **Patch:** additive options and fixes, no schema change.
+
+**Testing:**
+- The scaffold's test harness is adopted, so tests now live in the repo: `tests/upload-contract.test.ts`, 31 tests against the generated service and controller. The route tests run a real `express.json` parser in front of the upload route, as a host does.
+- 29 mutants were run against those tests and 27 were killed. The two survivors are redundant layers: the known-length fast path, and a second way of detecting a client that has gone.
+- Two mutants survived at first and showed weak tests. One test sent a body large enough that the server noticed the dropped client only late; a small first chunk fixed it. The other needed a direct test of the collision branch.
+- **Verified in the host:** an isolated copy of veradai was updated to this build, and again after the review fixes. The update ran all nine steps and no migrations. Host `tsc` reported **0 errors before and after**, backend and frontend. A production `vite build` succeeded, with the admin page, the settings page and the browser page each in its own chunk.
+
+**Review:** an independent adversarial review of `055f8be` covered security, the stream lifecycle, regressions, template and type correctness, and the tests. It found no security hole and no crash path. Its findings were fixed in `bc1db77`, each with a test:
+- **The Local adapter's cleanup could delete a file the upload never wrote**: one a failed open had not touched, or one a second upload to the same path had finished in the meantime. It now writes to a temporary file and renames it into place.
+- **A client that dropped before the route had started reading still left the write waiting.** The request had closed before the route's listeners existed. The route now checks for that.
+- **Reconnecting could delete an offline-staged reference** when the same file already sat in the folder under another reference. That path is older, but `reference: true` makes it reachable for a consumer that keeps the id. The moved file now gets its own name, and the reconnect step never deletes a staged reference.
+- **The capability probe said yes** for an offline Local Connect default when the shared default was read-only.
+- **`?mimeType=` with parameters** fell back to `application/octet-stream`.
+- **The admin page registration** now passes `preload`, which raises the host floor from starter v2.13.0 to v2.13.1.
+
+Two findings became documentation and roadmap items instead of code:
+- **Uploading to the same path replaces the file and returns the same `documentId`.** Two pasted images named `image.png` would collide. The Integration page now tells a consumer to give every upload its own folder, and its example does. A server-side "never replace" option is on the roadmap.
+- **On S3 and WebDAV a cancelled upload is not cleaned up as fully as on Local storage.** The route stops at once, but the S3 request stays open until the endpoint drops the idle connection, and a WebDAV server may keep a partial file.
+
+**Unfinished / WIP:** none.
+
+**Loose ends & follow-ups:** on the roadmap under [Uploads for other modules: follow-ups (v1.18.3)](/document-management/roadmap/#uploads-for-other-modules-follow-ups-v1183):
+- upload profiles per consumer;
+- direct-to-bucket uploads;
+- a headless multi-file uploader, paste and image shrinking;
+- an embeddable upload slot through the starter's `componentRegistry`;
+- porting earlier releases' throwaway tests to the in-repo harness;
+- a "never replace" upload option;
+- stopping the storage request on S3 and WebDAV when an upload is cancelled;
+- a moderate `minimatch` advisory in `archiver` and `webdav`, which hosts install for this module.
+
+"Deleting a reference leaves shared-storage bytes" (storage-usage follow-ups) matters more now: a chat attachment the user removes is exactly that case.
+
+Two items were logged on [Module Starter → Upstream Issues](/module-starter/upstream-issues/): `scaffold:update` left a duplicate `overrides` key in `package.json`, and the test harness needs the host's runtime packages installed by hand.
+
+**Process lessons:**
+- **The scratchpad was wiped again**, and its path changed. The host-verify script and the old test harnesses were gone. Tests now live in the repo for that reason.
+- **Shell escaping halves backslashes** in an inline script: a regex and a mutant list both arrived with too few. Check the bytes, or write the file with the editor.
+- **Don't touch templates while a mutation run is patching them.** The run edits and restores template files; docs work is safe in the meantime.
+- **`scaffold:check` commits.** It self-updates the updater script and commits that, even in preview, and it needs a clean tree first. A moved docs pointer counts as dirty.
+
+**Recorded where:**
+- changelog v1.18.3;
+- Integration: the new section, the upload contract's `documentId` paragraph, the service interface block, the methods table and the `DocumentUpload` props;
+- Developer Workflow: integration tests, conformance without the wrapper, CI gates;
+- Usage: the barrel exports;
+- the roadmap: the follow-up list and the share-links row;
+- memory;
+- this entry.
+
+**Open items for next session:**
+1. **Hand the contract to the AI Chat session.** A drafted note was given to kim. The point it must not miss: a new folder for every upload.
+2. **veradai → 1.18.3** (it is on 1.18.2). `.json` files uploaded before the update should be uploaded again.
+3. **The standing backlog:** global visibility, true single-provider-many-folders, safe-upload / content verification, and the audit, storage-usage, isolation-section and upload follow-ups.
+
+---
+
 ## 2026-10-28 — Isolation sections: `nodeId` on the upload event, cross-section `linkDocument` (v1.18.2)
 
 **Verdict:** ✅ Safe to archive **once pushed**. This docs pass and its pointer are the final steps. There is no schema change. veradai is on **1.18.0** and needs `npx document-management update --skip-schema` to pick up 1.18.1 and 1.18.2.

@@ -134,7 +134,7 @@ Every push to `main`, every pull request, a weekly run (Sunday 21:17 UTC — Mon
 
 | Job | What it runs | When |
 |-----|--------------|------|
-| **Module gates** | `npm ci`, then `type-check`, `build`, `check:templates`, `check:template-syntax`, `parity:check`, conformance (through the baseline wrapper below), and a check that `package.json` and `src/module.ts` carry the same version. Once `npm ci` succeeds, every gate runs even when an earlier one failed, so a single run lists every problem. | Every run |
+| **Module gates** | `npm ci`, then `type-check`, `build`, `check:templates`, `check:template-syntax`, `parity:check`, `conformance:check`, the integration tests (`npm test`), and a check that `package.json` and `src/module.ts` carry the same version. Once `npm ci` succeeds, every gate runs even when an earlier one failed, so a single run lists every problem. | Every run |
 | **Dependency audit** | `npm audit --omit=dev --audit-level=moderate` — the runtime dependencies (`commander`, `esbuild`, `postgres`) ship with the CLI onto host machines, so they fail at **moderate** or higher. Then `npm audit --audit-level=high` over the whole tree, build tooling included. | Every run, including the weekly one — advisories arrive without commits |
 | **Host type-check** | Installs this module into a fresh checkout of the starter and runs the host's own type-check and build. See [Enabling the host type-check](#enabling-the-host-type-check). | Opt-in (parked by default) |
 
@@ -143,7 +143,7 @@ The version check exists because hosts detect updates from `module.version` whil
 To run the same gates locally, from the repo root:
 
 ```bash
-npm run type-check && npm run build && npm run check:templates && npm run check:template-syntax && npm run parity:check && node .github/scripts/check-conformance-baseline.cjs
+npm run type-check && npm run build && npm run check:templates && npm run check:template-syntax && npm run parity:check && npm run conformance:check && npm test
 ```
 
 <Aside type="note" title="CI is advisory on a GitHub Free private repository">
@@ -160,20 +160,43 @@ Templates are backtick strings, so `tsc` and `tsup` see the code inside them onl
 
 What it **cannot** catch: type errors, imports that will not resolve in the host (including a missing `.js` extension in a backend import), JSX identifiers that do not exist, or anything about runtime behaviour. Those still need the generated code compiled in a real host — locally, or through the opt-in host type-check job. It also does not replace `check:templates`: an unescaped `${...}` is evaluated when the template module loads, so this gate only ever sees the already-interpolated string (or, when the name is undefined, reports that the module failed to load).
 
-### The conformance baseline
+### Integration tests (`npm test`)
 
-`npm run conformance:check` (the scaffold's `scripts/check-conformance.cjs`) currently reports six **C2** violations — one for each Structure registration (`structure-tabs`, `-widgets`, `-cards`, `-actions`, `-sidebar` and `-fields`). They are by design: their imports in the frontend barrel (`INDEX_TEMPLATE` in `src/templates/frontend/routes.ts`) are commented out on purpose, because a Vite build cannot import a module that may not be installed. The scaffold is meant to accept a commented-out frontend import as a "deferred" marker, but its scan strips comments before it looks, so it never sees the marker inside a template (logged on the [module-starter upstream issues](/module-starter/upstream-issues/) page).
+Since v1.18.3 the repo carries tests for the **generated** backend, built on the scaffold's test harness (scaffold v1.32.0+):
 
-CI therefore runs the real check through `.github/scripts/check-conformance-baseline.cjs` (under `.github/`, because `scripts/` belongs to the scaffold). The wrapper runs the checker unchanged and passes only when:
+- `npm test` renders the backend templates into `tests/.sandbox/`, exactly as `init` would, and runs them against an in-memory Postgres (PGlite) with stand-ins for the host's own files (`tests/harness/host-stubs/`).
+- `tests/harness/` and `vitest.config.ts` belong to the scaffold. Don't edit them; `scaffold:update` overwrites them.
+- `tests/harness.config.ts` is this module's. It renders with every storage engine enabled, so tests can use the Local adapter: real files in a temp folder, no network.
+- Tests live in `tests/*.test.ts`. `tests/upload-contract.test.ts` is the model: it calls the generated service directly, and it mounts the generated controller behind a real `express.json` parser to test the upload route as a host runs it.
 
-- every violation is one of those six named C2 lines (each at most once), **and**
-- each of those registrations still has its commented-out import inside `INDEX_TEMPLATE`.
+```typescript
+import { afterAll, beforeAll, expect, it } from 'vitest';
+import { setupHarness, type Harness } from './harness/index.js';
 
-Anything else fails CI: any other violation, a deleted marker line (that is the real forgotten-registration bug C2 exists to catch), a crashed checker, or checker output the wrapper cannot parse. Fewer baselined hits is fine — for example, one import uncommented.
+let h: Harness;
+let svc: any;
 
-<Aside type="caution" title="Keep the baseline in step with module.ts">
-If you add, remove or rename a Structure registration in `src/module.ts`, update the `DEFERRED` list in `.github/scripts/check-conformance-baseline.cjs` in the **same commit**. Once the scaffold fix arrives through `scaffold:update`, `conformance:check` exits 0 and the wrapper prints that the baseline is no longer needed — then delete the wrapper and call `npm run conformance:check` from `ci.yml` instead.
-</Aside>
+beforeAll(async () => {
+  process.env.DOC_ENCRYPTION_KEY = 'a'.repeat(64); // the generated config reads env at import
+  h = await setupHarness();
+  ({ documentManagementService: svc } = await h.importFeature('document-management.service.ts'));
+});
+afterAll(() => h?.close());
+
+it('reports no storage for a new user', async () => {
+  expect((await svc.getUploadCapability(h.newUserId())).canUpload).toBe(false);
+});
+```
+
+The generated backend imports packages a host installs for it: the AWS SDK, `webdav`, `archiver`, `mime-types` and `express`. They are `devDependencies` here so the tests can load that code. Keep their versions in step with `backend.dependencies` in `src/module.ts`.
+
+A host type-check is still the only check that sees **type** errors inside generated code. The tests run the code; they don't type-check it.
+
+### Conformance and the deferred Structure imports
+
+The six Structure registrations (`structure-tabs`, `-widgets`, `-cards`, `-actions`, `-sidebar` and `-fields`) keep their imports in the frontend barrel (`INDEX_TEMPLATE` in `src/templates/frontend/routes.ts`) commented out on purpose, because a Vite build cannot import a module that may not be installed. Since scaffold v1.31.21, `npm run conformance:check` recognises a commented-out import as a deferred optional registration: it reports them as "C2 deferred" and passes. The CI wrapper that used to tolerate them (`.github/scripts/check-conformance-baseline.cjs`) was retired in v1.18.3.
+
+Deleting one of those commented lines is still an error: it is the forgotten-registration bug C2 exists to catch.
 
 ### Enabling the host type-check
 
@@ -203,7 +226,9 @@ Without the Structure module installed, the six generated `structure-*` registra
 "overrides": { "tsup": { "esbuild": "$esbuild" } }
 ```
 
-`$esbuild` makes `tsup` use the same esbuild as the module's own runtime dependency, so the tree holds a single, patched copy. **Remove the override once a `tsup` release accepts esbuild `^0.28`** (the same problem is logged upstream for the module starter's toolchain).
+`$esbuild` makes `tsup` use the same esbuild as the module's own runtime dependency, so the tree holds a single, patched copy. **Remove the override once a `tsup` release accepts esbuild `^0.28`**. The scaffold ships the same override since v1.31.21.
+
+The whole-tree audit also covers the storage packages the tests install (see [Integration tests](#integration-tests-npm-test)). `archiver` and `webdav` currently pull in a `minimatch` release with a **moderate** advisory, which is below the whole-tree threshold. A host installs the same two packages for this module, so the advisory is tracked on the [roadmap](/document-management/roadmap/#uploads-for-other-modules-follow-ups-v1183).
 
 ---
 
@@ -419,7 +444,7 @@ All adapter SDKs are always installed and all three adapters are always generate
     export { documentManagementRoutes } from './routes.config';
     ```
 
-3. **Structure registrations stay commented out** in the generated barrel by default — the consuming app uncomments them once the Structure module is present. Adding, removing or renaming one means updating `DEFERRED` in the CI [conformance baseline](#the-conformance-baseline) in the same commit, and keeping every static `@/features/structure` import inside those registration files (the opt-in host type-check tolerates that import nowhere else).
+3. **Structure registrations stay commented out** in the generated barrel by default — the consuming app uncomments them once the Structure module is present. Adding one means adding its commented import to the barrel too (see [Conformance and the deferred Structure imports](#conformance-and-the-deferred-structure-imports)), and keeping every static `@/features/structure` import inside those registration files (the opt-in host type-check tolerates that import nowhere else).
 
 </Steps>
 
@@ -668,6 +693,6 @@ If you push the parent repo's submodule-pointer commit before pushing the `docs`
 - [ ] **Code inside templates parses** (`npm run check:template-syntax` passes)
 - [ ] **Registries used** — generated code extends via registries, never edits core starter files
 - [ ] **`npm run build` passes** with no errors
-- [ ] **Conformance baseline in step** — if a Structure registration was added, removed or renamed, `DEFERRED` in `.github/scripts/check-conformance-baseline.cjs` matches
+- [ ] **Conformance and tests pass** — `npm run conformance:check` and `npm test`
 - [ ] **CI green** after the push (it is advisory, so check it — a failure does not block the push)
 - [ ] **Docs submodule pushed** (if `docs/**` changed), then parent pointer committed

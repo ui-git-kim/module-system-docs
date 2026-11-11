@@ -80,12 +80,19 @@ export interface DocumentManagementServiceInterface {
     userId: string,
     fileName: string,
     file: Buffer | Readable,
-    opts?: { folder?: string; mimeType?: string; nodeId?: string }
+    opts?: { folder?: string; mimeType?: string; nodeId?: string; contentLength?: number; reference?: boolean }
     // staged:true when the default is an offline Local Connect folder and the
     // bytes were held on the durable shared default for reconcile on reconnect.
     // documentId: the owned reference created with a shared-default / staged
-    // upload (use it directly); null for an upload to the caller's own provider.
+    // upload (use it directly); null for an upload to the caller's own provider,
+    // unless opts.reference is true (v1.18.3+), which always creates one.
   ): Promise<UploadResult & { providerId: string; documentId: string | null; staged?: boolean }>;
+
+  /**
+   * Whether userId can upload with uploadToDefault right now, where the file
+   * would land, and the upload limits (v1.18.3+). Database only.
+   */
+  getUploadCapability(userId: string): Promise<UploadCapability>;
 
   /**
    * Store a parsed artefact (external-parser output such as Docling JSON /
@@ -234,7 +241,8 @@ export interface ProvenanceResult {
 | `getDownloadStreamByPath(providerId, userId, path)` | `Promise<{ stream: Readable; fileName: string }>` | A `Readable` (plus the derived `fileName`) for a provider path with no `doc_document` reference — how a job-worker consumer pulls the bytes for an uploaded file off the request path. Rejects up front like `getDownloadStream`. |
 | `getFileInfo(documentId, userId)` | `Promise<FileInfo>` | Live metadata (name, size, MIME type, timestamps) fetched from the provider. |
 | `getDocumentCount(nodeId, userId)` | `Promise<number>` | The number of references linked to a node — cheaper than fetching them all. |
-| `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId; documentId; staged? }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cognitive-pipeline routes ingested files into an `Ingested/` folder. |
+| `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId; documentId; staged? }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cognitive-pipeline routes ingested files into an `Ingested/` folder. `opts.reference: true` (v1.18.3+) always returns a `documentId`. |
+| `getUploadCapability(userId)` | `Promise<UploadCapability>` | Read-only (v1.18.3+). Whether the user can upload to the default right now (`canUpload`, with a `reason` and a displayable `message` when not), where the file would land (`own` or `shared`), and the upload limits. Database only. See [Uploading from another module's UI](#uploading-from-another-modules-ui-v1183). |
 | `putParsedArtefact(userId, input)` | `Promise<ParsedArtefact>` | **Store** the output an external parser produced for a source (this module never parses). Bytes default to a derived writable area (`DOC_ARTEFACT_PREFIX`) unless `input.target` overrides; deduped by source `contentHash`. Never written to a read-only or **ephemeral (Local Connect)** provider — derived data is always redirected to a persistent store so it survives the source machine going offline. |
 | `getParsedArtefact(userId, source, opts?)` | `Promise<ParsedArtefact \| null>` | Fetch the latest (or a given `format`/`version`) stored artefact for a source — so a consumer can re-ingest without re-parsing. |
 | `listParsedArtefacts(userId, source)` | `Promise<ParsedArtefact[]>` | Every stored artefact for a source. |
@@ -883,7 +891,16 @@ cognitive-pipeline routes its uploads into a dedicated folder (e.g. `Ingested/`)
 
 **Side effects (both entry points).** A successful write records a `doc_recent_access` `upload` row and emits the awaited async `documents.document.uploaded` event (a storage *reference*, never bytes). `uploadToDefault` on the **shared** default additionally upserts an **owned** `doc_document` reference (idempotent on `(userId, providerId, remotePath)`) so the user can find and download their file — they cannot `createDocument` against a provider they don't own, so trusted server-side writes are the only path to a reference there. The other such write is `requestIngest` (`POST /ingest`), which ensures a reference for a path the caller was already allowed to read.
 
-**The returned `documentId`.** `uploadToDefault` / `uploadGlobal` (and `POST /upload` / `POST /upload-global`) return that server-created reference's id as `documentId` — for a **shared-default**, **global** or **offline-staged** upload. A caller that needs a reference (to link the file to a node, tag it, request ingest) must use it **directly**: calling `createDocument` with the returned `providerId` would `404`, because that provider is the shared/staging store the caller does not own, and `createDocument`'s ownership check is deliberate (`resolveFileProvider`'s owned-reference read carve-out relies on a user never being able to forge a reference to a provider they don't own). `documentId` is `null` only for an upload to the caller's **own** provider, where no reference is created — that is the one case to call `createDocument` yourself:
+**The returned `documentId`.** `uploadToDefault` / `uploadGlobal` (and `POST /upload` / `POST /upload-global`) return that server-created reference's id as `documentId` — for a **shared-default**, **global** or **offline-staged** upload. A caller that needs a reference (to link the file to a node, tag it, request ingest) must use it **directly**: calling `createDocument` with the returned `providerId` would `404`, because that provider is the shared/staging store the caller does not own, and `createDocument`'s ownership check is deliberate (`resolveFileProvider`'s owned-reference read carve-out relies on a user never being able to forge a reference to a provider they don't own). `documentId` is `null` only for an upload to the caller's **own** provider, where no reference is created by default.
+
+Since v1.18.3, pass `reference: true` (or `?reference=true` on `POST /upload`) and the reference is created there too, so `documentId` is **always** set:
+
+```typescript
+const up = await dm.uploadToDefault(userId, fileName, bytes, { nodeId, reference: true });
+const documentId = up.documentId; // never null with reference: true
+```
+
+On an older version, call `createDocument` yourself for the own-provider case:
 
 ```typescript
 const up = await dm.uploadToDefault(userId, fileName, bytes, { nodeId });
@@ -1081,12 +1098,13 @@ function AttachEvidence() {
 }
 ```
 
-It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports the stored file's `{ path, providerId, size, mimeType, documentId, staged }` when the upload completes. **`documentId`** is the reference the server created for a shared-default, offline-staged or global upload — to link or tag the file, use it directly rather than calling `createDocument` (which `404`s on a provider you don't own; see [the upload contract](#the-upload-contract)). It is `null` for an upload to a provider you own, where `createDocument` with `providerId` + `path` is the way to get a reference. A failed upload is shown inline with the server's own reason (for example "File exceeds the maximum upload size"), read through the starter's `getApiErrorMessage` — see [Error handling in the frontend](#error-handling-in-the-frontend).
+It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports the stored file's `{ path, providerId, size, mimeType, documentId, staged }` when the upload completes. **`documentId`** is the reference the server created for a shared-default, offline-staged or global upload — to link or tag the file, use it directly rather than calling `createDocument` (which `404`s on a provider you don't own; see [the upload contract](#the-upload-contract)). It is `null` for an upload to a provider you own, unless you set the `reference` prop (v1.18.3+), which makes it always present. A failed upload is shown inline with the server's own reason (for example "File exceeds the maximum upload size"), read through the starter's `getApiErrorMessage` — see [Error handling in the frontend](#error-handling-in-the-frontend).
 
 | Prop | Type | Description |
 |------|------|-------------|
 | `providerId` | `string?` | Target provider. **Omit** to upload to the user's default provider (via `uploadToDefault`). |
 | `folder` | `string?` | Destination folder within the provider. |
+| `reference` | `boolean?` | v1.18.3+. Always create a document reference, so `onUploaded` gets a `documentId` even when the file went to the user's own provider. Applies to default-provider uploads. |
 | `label` | `string?` | Trigger button label. |
 | `accept` | `string?` | `accept` attribute forwarded to the file input (MIME/extension filter). |
 | `variant` | `string?` | shadcn button variant. |
@@ -1110,6 +1128,168 @@ export const moduleDefinition: ModuleDefinition = {
 };
 ```
 </Aside>
+
+---
+
+## Uploading from another module's UI (v1.18.3+)
+
+The `DocumentUpload` component above is a build-time import, so it only suits a module that requires Document Management. A module that treats Document Management as **optional**, such as an AI chat composer that offers attachments when storage is available, can't import it. That module uses the HTTP contract in this section instead. It needs no import from this module, and it keeps its own upload UI.
+
+The flow is three calls: ask whether the user can upload, upload each file, then keep the returned `documentId`.
+
+### 1. Ask whether the user can upload
+
+`GET /api/v1/document-management/upload/capability` answers for the signed-in user:
+
+```json
+{
+  "canUpload": true,
+  "reason": null,
+  "message": null,
+  "target": "own",
+  "maxUploadSize": 52428800,
+  "maxFileCount": 20,
+  "acceptedMimeTypes": []
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `canUpload` | Whether there is somewhere to upload to right now. |
+| `reason` | `null`, or why not: `no-storage` (no provider of their own and no shared default), `read-only` (their default accepts no writes), `offline` (their default is a Local Connect folder that is offline, and there is no shared default to hold the file). |
+| `message` | A sentence you can show as it is when `canUpload` is `false`. |
+| `target` | Where the file is headed: `own` (the user's own provider) or `shared` (the app's shared default). For an offline Local Connect folder it stays `own`: the file waits on the shared default and moves when the computer reconnects. |
+| `maxUploadSize` | Bytes. The server enforces this. |
+| `maxFileCount` | Files per batch. Your UI applies this; the server sees one file per request. |
+| `acceptedMimeTypes` | The admin's allow-list, empty for all types. Your UI applies this; the server does not check the declared type. |
+
+It reads the database only, so it is cheap to call when a composer mounts. A `404` means Document Management is not installed, so hide the upload control. An upload can still fail after a `canUpload: true`, for example when the storage is down, so handle the upload's own errors too.
+
+On the backend the same answer is `getUploadCapability(userId)` on the service, for a module that wants to fold it into its own config endpoint.
+
+### 2. Upload each file
+
+`POST /api/v1/document-management/upload`, with the file's bytes as the request body:
+
+| Query parameter | Purpose |
+|-----------------|---------|
+| `fileName` | Required. The file's name. |
+| `mimeType` | The file's real type, for example `application/pdf`. Parameters such as `; charset=utf-8` are dropped. |
+| `reference` | `true` to always get a `documentId` back. Pass it. |
+| `folder` | Destination folder. Use a **new folder for every upload**, for example `AI Chat/<random id>` (see the caution below). It follows [the upload contract](#the-upload-contract). |
+| `nodeId` | Optional Structure node the upload belongs to. |
+
+Send the body with `Content-Type: application/octet-stream` and put the real type in `mimeType`.
+
+<Aside type="caution" title="Don't send a file under its own content type">
+The host parses any `application/json` request body before a module's route runs. A `.json` file sent with `Content-Type: application/json` is therefore read by that parser first:
+- a file that isn't strict JSON, such as one with comments or JSON Lines, is refused with a `400`;
+- a file over the host's 10 MB JSON limit is refused with a `413`, whatever the upload limit is.
+
+Since v1.18.3 a valid `.json` file sent that way is still stored correctly. Before v1.18.3 it was stored as an empty file. Sending `application/octet-stream` avoids the parser altogether.
+</Aside>
+
+<Aside type="caution" title="Give every upload its own folder">
+Uploading to a path that already holds a file **replaces** that file, and the upload returns the **same** `documentId`. Two images pasted into a chat are both called `image.png`. Sent to the same folder, the second replaces the first, and the first message now shows the second image.
+
+A consumer that keeps the `documentId` therefore puts each upload in a folder of its own, such as `AI Chat/<random id>`. The file keeps its real name, and every upload gets its own `documentId`.
+</Aside>
+
+The response is `201` with:
+
+```json
+{
+  "path": "AI Chat/3f2b9c1e-6a4d-4c0e-9d57-0b8f6f1c2a11/brief.pdf",
+  "size": 48213,
+  "mimeType": "application/pdf",
+  "providerId": "prov_abc",
+  "documentId": "doc_123",
+  "staged": false
+}
+```
+
+`documentId` is the user's own reference to the stored file. Without `reference=true` it is `null` when the file went to the user's own provider. `staged: true` means the user's default is an offline Local Connect folder: the file is held on the shared default and moves to their computer when it reconnects. The `documentId` stays valid through that move, including when the same file is already in that folder (the moved copy then gets its own name).
+
+A minimal uploader, using the host's `api` client (every host has it, so this is not a Document Management import):
+
+```typescript
+import { api, getApiErrorMessage } from '@/lib/api';
+
+const DM = '/api/v1/document-management';
+
+export interface UploadedAttachment {
+  documentId: string;
+  fileName: string;
+}
+
+export async function uploadAttachment(
+  file: File,
+  opts: { signal?: AbortSignal; onProgress?: (percent: number) => void } = {},
+): Promise<UploadedAttachment> {
+  try {
+    const res = await api.post(`${DM}/upload`, file, {
+      params: {
+        fileName: file.name,
+        mimeType: file.type || undefined,
+        folder: 'AI Chat/' + crypto.randomUUID(), // its own folder: never replaces another upload
+        reference: 'true',
+      },
+      headers: { 'Content-Type': 'application/octet-stream' },
+      signal: opts.signal,
+      onUploadProgress: (e) => {
+        if (opts.onProgress && e.total) opts.onProgress(Math.round((e.loaded / e.total) * 100));
+      },
+    });
+    return { documentId: res.data.documentId, fileName: file.name };
+  } catch (err) {
+    // The server's own reason, e.g. "File exceeds the maximum upload size".
+    throw new Error(getApiErrorMessage(err, 'The upload failed'));
+  }
+}
+```
+
+Upload files one request at a time or a few in parallel. Each is its own request, so one failure doesn't affect the others, and passing an `AbortSignal` cancels a single file. A cancelled upload stores nothing and creates no reference.
+
+| Status | `code` | When |
+|--------|--------|------|
+| `400` | `bad_request` | `fileName` is missing, or the user has no storage to upload to (`No default storage provider is set`). |
+| `403` | `read_only` | The user's default storage is read-only. |
+| `403` | `forbidden` | The `folder` would escape the user's own area on shared storage. |
+| `413` | `too_large` | The file is over `maxUploadSize`. |
+| `503` | `provider_unavailable` | The storage could not be reached. Other storage failures can answer `500`. |
+
+Every error body is `{ error, code }`, and `error` is written to be shown to the user.
+
+### 3. Keep the `documentId`
+
+Store `{ documentId, fileName }` with your own record, for example on a chat message. On the backend, resolve and read it through the service. Both calls are scoped to the owner, so another user's id reads as not found:
+
+```typescript
+const dm = serviceRegistry.getOptional('document-management') as DocumentManagementServiceInterface | undefined;
+if (dm) {
+  const doc = await dm.getDocument(documentId, userId); // null when missing or not this user's
+  if (doc) {
+    // doc: { id, fileName, mimeType, fileSize, providerId, remotePath, status, contentHash, ... }
+    const stream = await dm.getDownloadStream(documentId, userId); // the bytes, on demand
+  }
+}
+```
+
+A backend that already holds the bytes, for example a file that arrived inside its own request, skips the HTTP call and uploads in-process:
+
+```typescript
+const up = await dm.uploadToDefault(userId, fileName, buffer, {
+  folder: 'AI Chat/' + randomUUID(), // from node:crypto
+  mimeType,
+  reference: true, // documentId is always set
+});
+```
+
+**What this contract doesn't do yet:**
+- **Removing an attachment keeps the file.** `DELETE /documents/:id` removes the reference, but the stored file stays until the user's account is erased. See the [roadmap](/document-management/roadmap/#storage-usage-follow-ups-v1181).
+- **No per-consumer limits.** The size limit and the accepted types are app-wide. A consumer that wants its own, such as "images and PDFs only", applies them in its UI.
+- **Uploads pass through the app server.** Files are streamed to storage by the backend, not sent from the browser straight to the bucket.
+- **A cancelled upload is cleaned up fully on Local storage only.** The route stops at once on every storage type. On S3-family storage the request to the bucket is released when the storage endpoint drops the idle connection, and a WebDAV server may keep a partial file.
 
 ---
 
@@ -1270,8 +1450,8 @@ function UploadStatus() {
 - File downloads and the bulk zip use `responseType: 'blob'`, so their error body arrives as a `Blob`. The module's download calls parse a JSON error body back onto the error first, so the helper still shows the server's reason. Those two calls also opt out of the shared API client's 30-second request timeout, because large bodies can take longer.
 - Stable `code` values worth handling: `endpoint_not_allowed` (400), `conflict` (409), `forbidden` (403, including the linked-device refusal on the shared store), `read_only` (403), `not_found` (404), `too_large` (413) and `provider_unavailable` (503).
 
-<Aside type="caution" title="Host requirement — starter v2.13.0 or later">
-The generated frontend imports `getApiErrorMessage` from `@/lib/api`, which the starter exports from v2.13.0. On an older starter, `tsc` or `vite build` fails with "has no exported member getApiErrorMessage". The generated backend routes also import `attachRole` from the starter's auth middleware (`middleware/auth.middleware.js`), which current starters provide.
+<Aside type="caution" title="Host requirement — starter v2.13.1 or later">
+The generated frontend imports `getApiErrorMessage` from `@/lib/api`, which the starter exports from v2.13.0. Since v1.18.3 the admin page registration also passes `preload`, which the starter's admin pages registry accepts from v2.13.1. On an older starter, `tsc` or `vite build` fails with "has no exported member getApiErrorMessage". The generated backend routes also import `attachRole` from the starter's auth middleware (`middleware/auth.middleware.js`), which current starters provide.
 </Aside>
 
 ---
@@ -1611,7 +1791,7 @@ The `doc_recent_access` row is written before the file is opened, so a pull that
 | **Custom adapters.** The adapter `ListOptions` is now just `{ maxItems }` (`limit`, `offset`, `sortBy`, `sortOrder` and `fileTypes` were removed), so an adapter that reads `options.limit` fails type-check. | Return the whole folder up to `maxItems`, with `hasMore: false` and `truncated: true` when capped, and do not sort or page: the service does both. Network adapters must also dial through the endpoint guard (see [Developer Workflow](/document-management/developer-workflow/)). |
 | **`GET /settings` gains `defaultProvider` and `viewerIsAdmin`.** | Optional. See [App Settings and the Default Provider](#app-settings-and-the-default-provider). |
 | **`DocumentLinkDialog` was removed.** It was never exported from the barrel or wired to the node actions. | Nothing, unless you imported the generated file by path. `update` lists the orphaned `components/DocumentLinkDialog.tsx` and offers to remove it (moved to a backup). |
-| **Host floor.** The frontend needs `getApiErrorMessage` from `@/lib/api` (starter v2.13.0 or later) and the backend uses `attachRole` from the starter's auth middleware. | Update the host starter first if it is older. |
+| **Host floor.** The frontend needs `getApiErrorMessage` from `@/lib/api` (starter v2.13.0 or later; v2.13.1 or later since v1.18.3, for the admin page `preload`) and the backend uses `attachRole` from the starter's auth middleware. | Update the host starter first if it is older. |
 
 ---
 
