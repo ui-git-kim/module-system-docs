@@ -920,7 +920,8 @@ Every hook's `Context` below is a **named, exported interface** in Structure's `
 | `structure.node.moved` | `{ userId, node, oldParentId, newParentId, oldRootNodeId, newRootNodeId }` | A node moves parent (or space — compare `oldRootNodeId`/`newRootNodeId`) |
 | `structure.node.archived` | `{ userId, node }` | A node is archived |
 | `structure.node.restored` | `{ userId, node }` | A node is restored from archive or from Deleted |
-| `structure.node.merged` | `{ userId, fromId, intoId, node, reparentedChildren, repointedConnections, droppedConnections }` | A duplicate node is merged into a canonical one (`mergeNode`; `node` is the canonical node) |
+| `structure.node.merged` | `{ userId, fromId, intoId, node, reparentedChildren, repointedConnections, droppedConnections }`, plus `mergeId`, `undoable`, `repointedReferences` and `repointedReferenceIds` (v1.86.0+) | A duplicate node is merged into a canonical one (`mergeNode`; `node` is the canonical node) |
+| `structure.node.unmerged` | `{ userId, mergeId, fromId, intoId }` | A merge was undone (v1.86.0+). Key anything you moved from `fromId` to `intoId` back |
 | `structure.node.purged` | `{ userId, ids, count }` | Deleted entries are permanently removed (`POST /nodes/purge`). `ids` holds at most 500 ids; `count` is the full total |
 | `structure.node.favorited` | `{ userId, node, isFavorite }` | Favourite is toggled |
 | `structure.node.pinned` | `{ userId, node, isPinned }` | Pin is toggled |
@@ -1210,7 +1211,35 @@ The `NodeConnection` wire type now includes `status` and `origin` (legacy rows r
 
 `structureService.getUsage(userId, { nodeId? })` (also `GET /api/v1/structure/usage?nodeId=`) returns a `StructureUsage`: `totals` (`entries`, `connections`, `bytes`), `byType` (count and text bytes per node type), and `items` — one `ModuleUsageItem` (`key`, `label`, `count`, `bytes`) each for entries, deleted entries, connections, text prepared for search, search vectors, text chunks and chunk vectors. `bytes` is the stored text size (UTF-8); vector bytes are estimated as count × dimensions × 4; a figure the install cannot provide (no embeddings) is `null`. It scans the user's rows, so call it for a usage view, not per request. Other modules can return the same `ModuleUsageItem` lines so a host or Cognitive Pipeline can add the figures up.
 
+### Merging Records
+
 **Merge ids (v1.38.1+).** `structure.node.merged` also carries `reparentedChildIds`, `repointedConnectionIds` and `droppedConnectionIds` (each capped at 1,000; `idsTruncated` says when a list was cut), which is enough for an "undo merge": a re-pointed edge's endpoint that is now `intoId` was `fromId` before the merge.
+
+#### Preview, choices and undo (v1.86.0+)
+
+Structure now has its own preview and undo for merges, and can merge shared records and per-section values.
+
+- **`previewMerge(intoId, fromId, userId)`** (`GET /nodes/:id/merge-preview?with=<fromId>`) is read-only. It returns `{ version, into, from, nodeType, fields, section, otherSections, children, connections, references, otherAccounts, link, blockers, undoable, undoReason }`.
+  - Each field gets an outcome: `same`, `fill`, `differs`, `held` or `taken`. Secrets show only as `{ secret: true }`, including inside field-group rows.
+  - The open section is shown in detail. The caller's other sections, and other accounts' use, are counts only, never names or values.
+- **`mergeNode(fromId, intoId, userId, options)`** (`POST /nodes/:id/merge` with `{ from, choices?, sectionChoices?, expect?, link? }`) takes:
+  - `choices`, per field: `'kept'`, `'other'` or `'both'` (lists only).
+  - `sectionChoices`: the same, for the open section only.
+  - `expect`: the preview's `version`. A `409` if either record or its section rows changed since.
+  - `link: 'from'`, to move the other record's user-account link (admin, system, or that account only).
+
+  Choices get the same field locks and checks as an edit.
+- **What a merge does:**
+  - The caller's records that link to the merged-away record are re-pointed to the kept one, refused above 2,000.
+  - In each of the caller's sections, the other record's per-section values move over whole, or fill the kept record's blanks. A clash is set aside in that section (`setAside`, `why: 'merge'`, the 100 newest kept).
+  - The merged-away record is archived with `metadata.mergedInto`.
+  - Shared records can be merged when both are the caller's own and no other account uses either.
+- **`undoMerge(mergeId, userId)`** (`POST /merges/:id/undo`) restores every row the merge touched, from a journal in `structure_merges`:
+  - It works for 30 days, until anything the merge touched changes. It compares a fingerprint of every row (paths, status, data and more) under a row lock, so even a move that doesn't change `updatedAt` refuses it.
+  - Connections the merge removed come back with their ids.
+  - A merge that couldn't be undone exactly says so up front (`undoable: false` with a reason).
+  - Undo fires the connection and node hooks for what it puts back, then `structure.node.unmerged` `{ userId, mergeId, fromId, intoId }`. Modules that re-keyed `fromId` to `intoId` on merge should key it back.
+- **`structure.node.merged`** also carries `mergeId`, `undoable`, `repointedReferences` and `repointedReferenceIds`.
 
 ### Isolation Sections (v1.39.0+)
 
