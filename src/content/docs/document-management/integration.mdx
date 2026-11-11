@@ -85,7 +85,10 @@ export interface DocumentManagementServiceInterface {
     // bytes were held on the durable shared default for reconcile on reconnect.
     // documentId: the owned reference created with a shared-default / staged
     // upload (use it directly); null for an upload to the caller's own provider,
-    // unless opts.reference is true (v1.18.3+), which always creates one.
+    // unless opts.reference is true (v1.18.3+), which always creates one. Since
+    // v1.18.4 that upload is a document of its own: a new documentId every
+    // time, and no file is replaced (a taken name is stored beside the
+    // existing file as "name (ab12cd34).ext").
   ): Promise<UploadResult & { providerId: string; documentId: string | null; staged?: boolean }>;
 
   /**
@@ -241,7 +244,7 @@ export interface ProvenanceResult {
 | `getDownloadStreamByPath(providerId, userId, path)` | `Promise<{ stream: Readable; fileName: string }>` | A `Readable` (plus the derived `fileName`) for a provider path with no `doc_document` reference — how a job-worker consumer pulls the bytes for an uploaded file off the request path. Rejects up front like `getDownloadStream`. |
 | `getFileInfo(documentId, userId)` | `Promise<FileInfo>` | Live metadata (name, size, MIME type, timestamps) fetched from the provider. |
 | `getDocumentCount(nodeId, userId)` | `Promise<number>` | The number of references linked to a node — cheaper than fetching them all. |
-| `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId; documentId; staged? }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cognitive-pipeline routes ingested files into an `Ingested/` folder. `opts.reference: true` (v1.18.3+) always returns a `documentId`. |
+| `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId; documentId; staged? }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cognitive-pipeline routes ingested files into an `Ingested/` folder. `opts.reference: true` (v1.18.3+) always returns a `documentId`; since v1.18.4 it is new for every upload and no file is replaced. |
 | `getUploadCapability(userId)` | `Promise<UploadCapability>` | Read-only (v1.18.3+). Whether the user can upload to the default right now (`canUpload`, with a `reason` and a displayable `message` when not), where the file would land (`own` or `shared`), and the upload limits. Database only. See [Uploading from another module's UI](#uploading-from-another-modules-ui-v1183). |
 | `putParsedArtefact(userId, input)` | `Promise<ParsedArtefact>` | **Store** the output an external parser produced for a source (this module never parses). Bytes default to a derived writable area (`DOC_ARTEFACT_PREFIX`) unless `input.target` overrides; deduped by source `contentHash`. Never written to a read-only or **ephemeral (Local Connect)** provider — derived data is always redirected to a persistent store so it survives the source machine going offline. |
 | `getParsedArtefact(userId, source, opts?)` | `Promise<ParsedArtefact \| null>` | Fetch the latest (or a given `format`/`version`) stored artefact for a source — so a consumer can re-ingest without re-parsing. |
@@ -893,7 +896,7 @@ cognitive-pipeline routes its uploads into a dedicated folder (e.g. `Ingested/`)
 
 **The returned `documentId`.** `uploadToDefault` / `uploadGlobal` (and `POST /upload` / `POST /upload-global`) return that server-created reference's id as `documentId` — for a **shared-default**, **global** or **offline-staged** upload. A caller that needs a reference (to link the file to a node, tag it, request ingest) must use it **directly**: calling `createDocument` with the returned `providerId` would `404`, because that provider is the shared/staging store the caller does not own, and `createDocument`'s ownership check is deliberate (`resolveFileProvider`'s owned-reference read carve-out relies on a user never being able to forge a reference to a provider they don't own). `documentId` is `null` only for an upload to the caller's **own** provider, where no reference is created by default.
 
-Since v1.18.3, pass `reference: true` (or `?reference=true` on `POST /upload`) and the reference is created there too, so `documentId` is **always** set:
+Since v1.18.3, pass `reference: true` (or `?reference=true` on `POST /upload`) and the reference is created there too, so `documentId` is **always** set. Since v1.18.4 that upload is also a document of its own: the id is new every time and no file is replaced (see [Uploading from another module's UI](#uploading-from-another-modules-ui-v1183)):
 
 ```typescript
 const up = await dm.uploadToDefault(userId, fileName, bytes, { nodeId, reference: true });
@@ -1104,7 +1107,7 @@ It wraps the module's own `useUpload` / `useUploadToDefault` hooks and reports t
 |------|------|-------------|
 | `providerId` | `string?` | Target provider. **Omit** to upload to the user's default provider (via `uploadToDefault`). |
 | `folder` | `string?` | Destination folder within the provider. |
-| `reference` | `boolean?` | v1.18.3+. Always create a document reference, so `onUploaded` gets a `documentId` even when the file went to the user's own provider. Applies to default-provider uploads. |
+| `reference` | `boolean?` | v1.18.3+. Make each upload a document of its own: `onUploaded` always gets a `documentId`, new for every upload, and no file is replaced (v1.18.4+). Applies to default-provider uploads. |
 | `label` | `string?` | Trigger button label. |
 | `accept` | `string?` | `accept` attribute forwarded to the file input (MIME/extension filter). |
 | `variant` | `string?` | shadcn button variant. |
@@ -1175,8 +1178,8 @@ On the backend the same answer is `getUploadCapability(userId)` on the service, 
 |-----------------|---------|
 | `fileName` | Required. The file's name. |
 | `mimeType` | The file's real type, for example `application/pdf`. Parameters such as `; charset=utf-8` are dropped. |
-| `reference` | `true` to always get a `documentId` back. Pass it. |
-| `folder` | Destination folder. Use a **new folder for every upload**, for example `AI Chat/<random id>` (see the caution below). It follows [the upload contract](#the-upload-contract). |
+| `reference` | `true` makes the upload a document of its own: it always returns a new `documentId` and never replaces a file. Pass it. |
+| `folder` | Destination folder, for example `AI Chat/<conversation id>`. Many uploads can share one. It follows [the upload contract](#the-upload-contract). |
 | `nodeId` | Optional Structure node the upload belongs to. |
 
 Send the body with `Content-Type: application/octet-stream` and put the real type in `mimeType`.
@@ -1189,17 +1192,25 @@ The host parses any `application/json` request body before a module's route runs
 Since v1.18.3 a valid `.json` file sent that way is still stored correctly. Before v1.18.3 it was stored as an empty file. Sending `application/octet-stream` avoids the parser altogether.
 </Aside>
 
-<Aside type="caution" title="Give every upload its own folder">
-Uploading to a path that already holds a file **replaces** that file, and the upload returns the **same** `documentId`. Two images pasted into a chat are both called `image.png`. Sent to the same folder, the second replaces the first, and the first message now shows the second image.
+<Aside type="note" title="Every upload is its own document (v1.18.4+)">
+With `reference=true`, each upload gets its own `documentId` and its own stored file. Nothing is ever replaced, so a whole conversation can share one folder.
 
-A consumer that keeps the `documentId` therefore puts each upload in a folder of its own, such as `AI Chat/<random id>`. The file keeps its real name, and every upload gets its own `documentId`.
+When a file of that name is already in the folder, the new one is stored beside it with a short tag in its name. Two images pasted into a chat, both called `image.png`, are stored as `image.png` and `image (7f3a9c2b).png`. Each reference keeps the original name, `image.png`, as its `fileName`, and the `documents.document.uploaded` event names the file the same way. This also holds for uploads sent at the same moment.
+
+A reference only becomes a document once its bytes are stored. Until then `getDocument`, the document list, search and usage don't show it, and a failed upload leaves neither a reference nor a file.
+
+Two limits. Both need uploads sent at the same moment; one after the other is always safe:
+- on a **communal** shared default (per-user isolation switched off), two *different* users uploading the same name to the same folder can land on one file;
+- on storage that ignores letter case, `Photo.png` and `photo.PNG` can land on one file.
+
+On v1.18.3, `reference=true` returned the existing `documentId` and replaced the file when the path was taken. Without `reference=true`, an upload to an existing path still replaces the file.
 </Aside>
 
 The response is `201` with:
 
 ```json
 {
-  "path": "AI Chat/3f2b9c1e-6a4d-4c0e-9d57-0b8f6f1c2a11/brief.pdf",
+  "path": "AI Chat/conv_81c2/brief.pdf",
   "size": 48213,
   "mimeType": "application/pdf",
   "providerId": "prov_abc",
@@ -1208,7 +1219,7 @@ The response is `201` with:
 }
 ```
 
-`documentId` is the user's own reference to the stored file. Without `reference=true` it is `null` when the file went to the user's own provider. `staged: true` means the user's default is an offline Local Connect folder: the file is held on the shared default and moves to their computer when it reconnects. The `documentId` stays valid through that move, including when the same file is already in that folder (the moved copy then gets its own name).
+`documentId` is the user's own reference to the stored file, and `path` is where it was actually stored (it carries the tag when the name was taken). Without `reference=true`, `documentId` is `null` when the file went to the user's own provider. `staged: true` means the user's default is an offline Local Connect folder: the file is held on the shared default and moves to their computer when it reconnects. The `documentId` stays valid through that move, including when the same file is already in that folder (the moved copy then gets its own name).
 
 A minimal uploader, using the host's `api` client (every host has it, so this is not a Document Management import):
 
@@ -1224,6 +1235,7 @@ export interface UploadedAttachment {
 
 export async function uploadAttachment(
   file: File,
+  conversationId: string,
   opts: { signal?: AbortSignal; onProgress?: (percent: number) => void } = {},
 ): Promise<UploadedAttachment> {
   try {
@@ -1231,7 +1243,7 @@ export async function uploadAttachment(
       params: {
         fileName: file.name,
         mimeType: file.type || undefined,
-        folder: 'AI Chat/' + crypto.randomUUID(), // its own folder: never replaces another upload
+        folder: 'AI Chat/' + conversationId, // one folder for the whole conversation
         reference: 'true',
       },
       headers: { 'Content-Type': 'application/octet-stream' },
@@ -1279,9 +1291,9 @@ A backend that already holds the bytes, for example a file that arrived inside i
 
 ```typescript
 const up = await dm.uploadToDefault(userId, fileName, buffer, {
-  folder: 'AI Chat/' + randomUUID(), // from node:crypto
+  folder: 'AI Chat/' + conversationId,
   mimeType,
-  reference: true, // documentId is always set
+  reference: true, // its own document: a new documentId, nothing replaced
 });
 ```
 
