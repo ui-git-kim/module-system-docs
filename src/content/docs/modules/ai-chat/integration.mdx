@@ -88,13 +88,15 @@ AI Chat never pushes its conversations into the knowledge graph. Instead it expo
 
 ## Action Hooks
 
-Every successful write fans out through `actionRegistry.doActionAll` (reaching sync and async listeners), fire-and-forget so a failing listener never breaks the write path. **24 hooks:**
+Every successful write fans out through `actionRegistry.doActionAll` (reaching sync and async listeners), fire-and-forget so a failing listener never breaks the write path. **26 hooks:**
 
 | Hook | Fired when | Context shape |
 |------|-----------|---------------|
 | `ai-chat.conversation.created` | A conversation is created — also for the child of a branch (then with `branched: true`) | `{ userId, conversation, branched? }` |
 | `ai-chat.conversation.updated` | A conversation is updated — including a persona switch (`changes: { personaId }`); also by the title job, with `changes: { title }` | `{ userId, conversation, changes }` |
 | `ai-chat.conversation.archived` | A conversation is archived | `{ userId, conversation }` |
+| `ai-chat.conversation.unarchived` | An archived conversation is brought back (since 1.28.0) | `{ userId, conversation }` |
+| `ai-chat.conversation.filed` | A conversation kept under no record is moved under one (since 1.29.0) | `{ userId, conversation, scopeNodeId }` |
 | `ai-chat.conversation.deleted` | A conversation aggregate is deleted | `{ userId, conversationId }` |
 | `ai-chat.message.created` | A message is stored — fires for the user turn and the assistant reply | `{ userId, message, role }` |
 | `ai-chat.persona.created` | A user creates a persona of their own | `{ userId, persona }` |
@@ -120,6 +122,10 @@ Every successful write fans out through `actionRegistry.doActionAll` (reaching s
 
 ---
 
+### The host's audit trail (since 1.29.0)
+
+The host's audit sink records a fixed list of its own hooks, so `audit.registration.ts` subscribes the module's sensitive ones to it: a conversation deleted, archived, brought back or moved under a record; a memory, persona or saved section deleted; a section saved (where it went); data exported or imported; a notice accepted; and `ai-chat.adminconfig.updated`, which now carries `actorId` (the admin who saved, pressed Ensure defaults or imported a settings file). Each row holds ids, counts and setting names only, never anything people wrote. The security manifest's `auditEvents` lists every hook the module fires.
+
 ## Background Jobs
 
 Six handlers register with the host jobs seam at import time (`jobs.registration.ts`): `ai-chat.summarise`, `ai-chat.extract-memories`, `ai-chat.detect-patterns`, `ai-chat.drift-check`, `ai-chat.title` and `ai-chat.mirror-session`. Payloads are Zod-parsed like any untrusted input, every handler re-checks its admin toggle at run time, and all are idempotent — safe for a durable runner to re-deliver. Triggers and behaviour are documented in [Configuration](/modules/ai-chat/configuration/#background-tasks-and-their-triggers).
@@ -132,12 +138,15 @@ The boost modules are never imported and never declared in `depends` — they ar
 
 ### Structure (`ai-chat.cognitive-boost.ts`)
 
-With Structure installed, two things light up:
+With Structure installed, three things light up:
+
+- **Sections (since 1.29.0)** — when Structure [keeps the app in sections](/modules/structure/sections-and-isolation/), conversations follow the one chosen in the top bar (admin switch `integrations.followScope`, on by default). The server asks Structure (`getActiveScope`) which record is chosen; nothing is taken from the browser. A conversation is stamped with it (`ai_chat_conversation.scopeNodeId`), as are its memories and saved sections. Lists show the current record's rows only. A reply reads only its own record's memories, the values locked for that record, and kept records that Structure says are in the same section or shared (`getNodeSection`); it passes the record to AI Core as the run's `spaceId`, and a linked Structure record as `nodeId`. A request for one conversation passes a guard first: one kept under no record can be read, deleted and moved in (`POST /conversations/:id/scope`), and is refused anything else with code `ai-chat-not-in-scope`; one kept under another record is refused with `ai-chat-other-scope`. Background jobs work on a conversation in its own record, wherever the person is now. When the chosen record cannot be read, the person is treated as being in none, so less is shown, never more.
+- **A Conversations tab on Structure record pages (since 1.29.0)** — registered through Structure's `nodeTabRegistry` for every record type. The frontend never imports Structure by name: `hooks/structure-frontend.ts` finds its public index with `import.meta.glob` when the module is installed and finds nothing when it is not.
 
 - **Session mirroring** — when the admin toggle `integrations.structureSessionMirror` is on, every conversation is mirrored to a Structure node (default node type `chat-session`, carrying `{ module: 'ai-chat', kind: 'chat-session-mirror', conversationId }` in its data). The node id persists on `ai_chat_conversation.structureNodeId`; archiving the conversation archives the node; deleting the conversation archives the node before the row disappears. A vanished node is recreated; a missing Structure answers `{ mirrored: false, reason }`.
 - **Saved-section destination** — `sectionsDestination.destination: 'structure'` routes saved sections into a node (the section text in the description so the generic Structure UI renders it; provenance in data) under the admin-chosen parent and node type.
 
-Structure ships no guaranteed node types, so the admin names real ones in config — an unknown type makes the create throw, which degrades to local with the error as the reason.
+Structure ships no guaranteed node types, so the admin names real ones in config — an unknown type makes the create throw, which degrades to local with a plain reason. Since 1.29.0 the record type for saved conversations is a setting (`integrations.recordType`), the Integrations tab says whether Structure has it (`GET /admin/structure-link`), and **Ensure defaults** adds it as an app-wide type when it is missing. A conversation kept under a record is saved inside that record (Structure's system door: a top-level record labelled with the section), and so is a section saved from it.
 
 ### Cognitive Pipeline (`ai-chat.cognitive-boost.ts`)
 
