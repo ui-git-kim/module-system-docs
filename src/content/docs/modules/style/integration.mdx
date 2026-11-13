@@ -27,7 +27,7 @@ Other modules must **not** call `styleRegistry.register()`, edit `components/ui/
 
 Style's install-time module id is `style`, so everything the templates author as `my-feature` lands in the target app as `style`: the feature folder `@/features/style`, the backend mount `/api/v1/style`, the tables `style_theme`, `style_theme_version` and `style_shadcn_config_version`, query keys `['style', ...]`, the window event `style:theme-saved`, the `styleRegistry` ids `style.*`, the action hooks `style.*`, and the service key `STYLE_SERVICE_KEY` (the string `'style'`).
 
-The generated code needs **starter v2.15.5 or later** (the admin page's Data tables tab uses the DataTable features that version added).
+The generated code needs **starter v2.16.1 or later**: the admin page's theme data import and export is the starter's ConfigTransfer (v2.16.0, with its endpoint fix in v2.16.1). Before v1.16.19 the minimum was v2.15.5.
 
 ### What the barrels export
 
@@ -128,20 +128,23 @@ The shared history row is the most recently updated app override named `app-conf
 It writes history only. The admin Theme page saves `AppSettings.appTheme` first, then calls this route (best effort: if it fails, the theme is still saved and the page shows a warning). Calling it on its own records a version without changing the live theme.
 </Aside>
 
-### Data export and import
+### Theme data (ConfigTransfer)
+
+Since v1.16.19 the admin's theme data export and import is the starter's [ConfigTransfer](/starter-template/config-transfer/) (starter v2.16.1 or later), mounted on its own at `/api/v1/style/admin/config`:
 
 | Method | Path | Admin | What it does |
 |--------|------|-------|--------------|
-| `GET` | `/export` | Admin | Return the module's theme data as a versioned JSON envelope |
-| `POST` | `/import` | Admin | Merge an exported envelope back in, in one transaction |
+| `GET` | `/admin/config` | Admin | What the import dialog needs (`moduleId`, `version`, the parts, the ways to apply a file) |
+| `GET` | `/admin/config/export` | Admin | The theme data file |
+| `POST` | `/admin/config/import` | Admin | `{ file, strategy, dryRun, exclude }`: a practice run by default, or the import |
 
-The admin Theme page's **Import and export** tab calls these. The envelope and the import rules are under [Export envelope](#export-envelope).
+The admin Theme page's **Import and export** tab calls these through the starter's `<ConfigTransfer>`. The file and the import rules are under [Theme data file](#theme-data-file). The old `GET /export` and `POST /import` routes are gone.
 
 ### Validation and errors
 
 - **Bad bodies are `400`, not `500`.** Every JSON body is validated with zod, and a bad one is answered with a `400` whose message lists each problem as `path: message` (zod's own message), joined with `; `. A problem with no path is listed by its message alone.
 - A `:version` that isn't a whole number of 1 or more is a `400` (`Invalid version number`).
-- A row that doesn't exist, or that the caller can't see, is a `404`. Deleting a system theme is a `403`; deleting the active app override, and an import that failed and rolled back, are `409`.
+- A row that doesn't exist, or that the caller can't see, is a `404`. Deleting a system theme is a `403`; deleting the active app override is a `409`. The theme data routes answer as the starter's ConfigTransfer does ([API](/starter-template/config-transfer/#api)).
 
 ### Activating a theme on a project
 
@@ -156,37 +159,43 @@ The route accepts the caller's own theme or a system theme; anything else is a `
 - Only the caller's own other active rows for that node are deactivated — never another user's.
 - The response is the row that is now active, so its `id` can differ from `:themeId`. The config is mirrored to `node.data.theme_config`.
 
-### Export envelope
+### Theme data file
 
-`GET /export` answers with this envelope, and `POST /import` takes the same shape:
+`GET /admin/config/export` answers with a ConfigTransfer file, and `POST /admin/config/import` takes one:
 
 ```jsonc
 {
-  "version": 1,            // envelope format; import refuses any other value
-  "moduleId": "style",     // import refuses a file from another module
-  "exportedAt": "2026-10-29T03:12:00.000Z",
-  "counts": { "themes": 2, "systemThemes": 1, "appThemes": 1, "themeVersions": 14, "shadcnConfigVersions": 6 },
-  "data": {
-    "themes": [],          // the exporting admin's own personal themes only
-    "systemThemes": [],    // every system theme
-    "appThemes": []        // every app override, newest first (the shared history row leads)
+  "format": "config-transfer",
+  "formatVersion": 1,
+  "moduleId": "style",       // import refuses a file from another module
+  "version": "2",            // version 1 was the module's own format (below)
+  "exportedAt": "2026-11-13T03:12:00.000Z",
+  "counts": { "sharedThemes": 2, "themeHistory": 14, "presetHistory": 6 },
+  "sections": {
+    "sharedThemes": [
+      { "kind": "app", "name": "app-config", "displayName": "App Theme", "description": null, "config": {} }
+    ],
+    "themeHistory": [
+      { "theme": "app:app-config", "version": 1, "label": "First", "config": {}, "createdAt": "2026-11-01T00:00:00.000Z" }
+    ],
+    "presetHistory": []
   }
 }
 ```
 
-Each theme carries `projectId`, `name`, `displayName`, `description`, `config`, `isGlobal`, `isActive`, `createdAt`, `updatedAt`, and its two histories as `versions` and `shadcnConfigVersions` (each snapshot: `version`, `label`, `config`, `createdAt`). Row ids and owner ids are never exported, and no other user's personal themes are included.
+The parts, in the order an import applies them (`config.transfer.ts` in the backend feature folder):
 
-How import treats a file:
+| Part | Key | What an import does |
+|------|-----|---------------------|
+| `sharedThemes` | `<kind>:<name>` (`system:ocean`, `app:app-config`) | Adds a missing shared theme under the importing admin, never active. Updates display name, description and config. Replace removes one the file leaves out, with its history, but keeps the app theme's history row (`app-config`) and the active app theme |
+| `themeHistory` | `<theme key>#<version>` | Adds a saved version under its own number and date, or updates its label, config and date. Replace keeps the versions of a kept theme |
+| `presetHistory` | `<theme key>#<version>` | The same for the preset (shadcn-config) snapshots |
 
-1. **Checked before any write.** The body must be an object, `moduleId` must be `style` and `version` must be `1`; then the whole shape is validated. Any failure is a `400` with a readable message. Unknown keys, such as a stray `id` or `userId`, are dropped, so a file can't choose row ids or owners.
-2. **Merge only, all or nothing.** Nothing is deleted. Every write runs in one transaction; if one fails, the transaction rolls back and the route answers `409` (`Import failed and was rolled back…`), with the database error in the server log.
-3. **Personal themes land under the importing admin**, matched on project and name. A match has its content updated and keeps its active flag. If the match is one of the admin's shared rows instead, the entry is skipped.
-4. **Shared themes are preserved.** A system theme or app override that already exists is left exactly as it is, history included. A missing one is created under the importing admin, unless that admin already has a theme with the same project and name, in which case it is skipped.
-5. **Activation.** A new personal theme or app override keeps its exported active flag only when nothing in its scope is active yet. A new system theme is never active.
-6. **History.** Snapshots keep their original numbers and dates. A number that already exists is skipped, so importing the same file twice adds nothing new.
-7. **Result:** `{ counts: { themes, systemThemes, appThemes, themeVersions, shadcnConfigVersions, skipped } }` — rows written per table, plus the entries left as they were.
-
-Import does **not** change `AppSettings.appTheme` (the live app theme) and does not re-mirror `node.data.theme_config`. An imported change to a project's active config reaches the builder at that project's next save or activation. Bodies fall under the host's 10 MB limit for signed-in JSON requests, and each list may hold up to 10,000 entries.
+- **Shared themes only.** A shared theme is a system theme or an app theme row with no project. Each person's own themes are personal data and leave through the personal-data export handler (`style.personal-themes`), never through this file. Row ids and owners are never exported.
+- **Not the live app theme.** `AppSettings.appTheme` belongs to the starter, whose App Settings backup carries it. Import doesn't change it, doesn't change which theme is active, and doesn't re-mirror `node.data.theme_config`.
+- **Refusals.** A version whose theme is neither here nor in the file, or a shared theme with the same name as one of the importing admin's own themes, fails the import (`422`, nothing changed) with that reason; the dialog can leave the item out.
+- **Version 1 files** (`{ version: 1, moduleId: 'style', exportedAt, counts, data: { themes, systemThemes, appThemes } }`, exported before v1.16.19) are upgraded on import: `systemThemes` and `appThemes` with their `versions` and `shadcnConfigVersions` become the three parts, and `themes` (the exporting admin's personal themes) is listed as ignored (`personalThemes`).
+- **Size.** Files fall under the host's 10 MB limit for signed-in JSON requests. Each history part may hold up to 10,000 snapshots, the shared themes up to 1,000.
 
 ---
 
@@ -208,10 +217,11 @@ Style contributes to six frontend registries and five backend ones: it registers
 | `filterRegistry` | hook `builder.canvas.globalCss`, id `style`, order 50 | Injects the project's generated CSS into the builder's preview iframe *(full)* |
 | `structureRegistry` *(structure)* | field `theme_config` (moduleId `style`) | The hidden mirror field on the project node type *(full)* |
 | `routeRegistry` | path `/style`, feature `style`, versions `['v1']`, `requiresAuth: true` | Mounts the API under `/api/v1/style` |
+| `routeRegistry` | path `/style/admin/config` | The theme data import and export: the starter's `createConfigTransferRouter`, admin-only inside the router |
 | `serviceRegistry` | `STYLE_SERVICE_KEY` (`'style'`) | Exposes `styleService` with TypeScript augmentation |
 | `securityRegistry` | manifest `style`; deletion and export handlers `style.personal-themes` | The data-category manifest, account erasure and personal-data export |
 | `moduleRegistry` | `style` | Tells the host's modules feature that Style is installed |
-| `actionRegistry` | fires `style.*` hooks | Theme, version, import and export lifecycle events (see [Events](#events)) |
+| `actionRegistry` | fires `style.*` hooks | Theme, version and import lifecycle events (see [Events](#events)) |
 
 <Aside type="note" title="Catalogue ids are toggles, not APIs">
 Admins switch the six opt-in entries on and off on the **Style catalogue** tab of the admin Theme page. The choice is applied through `styleRegistry.setOverride` and stored in the starter's `AppSettings.styleOverrides` with `PUT /api/v1/admin/style-overrides`. `style.table-density` and `style.designer-density` are always on and aren't offered there. Consumer modules never register into these ids — they request a **new** entry instead.
@@ -470,8 +480,7 @@ The service fires these through `actionRegistry.doActionAll`, which runs both th
 | `style.projectTheme.activated` | `PUT /projects/:nodeId/activate/:themeId` | `{ userId, nodeId, themeId, theme }` — `themeId` is the theme the caller chose; `theme` is the row now active (the caller's own copy when a system theme was chosen) |
 | `style.version.labelUpdated` | `PATCH /projects/:nodeId/versions/:version` | `{ userId, themeId, version, themeVersion }` |
 | `style.shadcnVersion.labelUpdated` | `PATCH /projects/:nodeId/shadcn-versions/:version` | `{ userId, themeId, version, shadcnConfigVersion }` |
-| `style.data.exported` | `GET /export` | `{ userId, counts }` |
-| `style.data.imported` | `POST /import` (after a successful commit) | `{ userId, counts }` |
+| `style.data.imported` | A theme data import, after it commits (never a practice run) | `{ actorId, strategy, sections }` — `sections` is ConfigTransfer's per-part counts |
 
 ```ts
 // In another backend module's registration file:
@@ -495,7 +504,7 @@ Timing and scope:
 
 - Hooks fire **after** the write is committed, and the service doesn't await them: the response doesn't wait for async listeners, and the host's dispatcher catches listener errors, so a failing listener can't fail the request.
 - For `style.projectConfig.saved` and `style.projectTheme.activated`, the node mirror is written just after the hook is dispatched. Take the config from the payload's `theme`, not from `node.data.theme_config`.
-- An import fires only `style.data.imported` — not one `created` or `updated` per row.
+- An import fires only `style.data.imported` — not one `created` or `updated` per row. The starter's ConfigTransfer also records the core `config.exported` and `config.imported` hooks (`moduleId: 'style'`) for the audit trail. Before v1.16.19 an export fired `style.data.exported` and the import payload was `{ userId, counts }`.
 
 <Aside type="note" title="Subscribes to nothing">
 Style registers **no** action listeners of its own. Account erasure is handled by the `securityRegistry` deletion handler (`style.personal-themes`), not an action subscription, so there is no `structure.node.deleted`-style cleanup hook to be aware of.
