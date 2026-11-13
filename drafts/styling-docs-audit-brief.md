@@ -11,9 +11,11 @@ Not published (outside `src/content`). Delete it when the work is done.
 
 ## What the starter session should finish
 
-### 1. Decide one rule: who may call `styleRegistry.register()` (owner decision)
+### 1. Apply the decision: only the Style module registers styling
 
-The pages disagree:
+**Decided by the owner on 2026-11-13: "Only Style module".** In the module system, the Style module is the only module that calls `styleRegistry.register()`. Other modules ship looks for their own parts as Style snippets (`snippetsRegistry`), ask the Style module for catalogue entries for shadcn components, and never set the app's tokens (`--primary`, `--radius`, `--background` …). The starter itself still uses `styleRegistry` for its own foundation entries: it is the host pipeline, not a module.
+
+The pages that disagree, and what each needs:
 
 | Page | Says |
 |------|------|
@@ -23,7 +25,16 @@ The pages disagree:
 | `getting-started/llm-rules.mdx` "Style System & styleRegistry" | "Modules contribute styling through the unified `styleRegistry`", example sets `--primary`. |
 | `module-starter/registry-guide.mdx` "Style Registry" and `module-starter/templates.mdx` (the scaffold's `STYLE_REGISTRATION` template) | Same: a module registers `my-feature.theme` with `--primary`. |
 
-Recommendation from the Style session: keep `styleRegistry` documented as the host pipeline (the starter's own foundation entries and the Style module use it), but state on each page that **in the module system the Style module is the only module that registers styling**; other modules ship looks as Style snippets and ask for catalogue entries, and never set the app's tokens. Change the examples so a module never sets `--primary` / `--radius`. If the owner decides the opposite, `modules/style/design.mdx`, `modules/style/integration.mdx` and `module-starter/styling.mdx` change instead.
+What to change:
+
+- Keep `styleRegistry` documented as the host pipeline (the starter's own foundation entries, and the Style module, use it).
+- On each page above that disagrees, state that **in the module system the Style module is the only module that registers styling**, and point module authors at [Styling Modules](/module-starter/styling/).
+- Change every example so no module sets `--primary` / `--radius` or other app tokens. Where an example has to show an entry, show it as the Style module's (or the host's), with `darkTokens` for any palette token and a `radix-*` style.
+- The scaffold's `STYLE_REGISTRATION` template (`module-starter/templates.mdx`, and the template itself in the module-starter repo) teaches every new module to register styling. Retire it, or reduce it to a comment pointing at Style snippets. That is a module-starter change: log it in `module-starter/upstream-issues.mdx` if the starter session can't make it.
+- Rule 7's lane 4 ("`data-slot` + a Style Registry entry") and `typography.mdx` L28 should read "`data-slot` + a Style snippet (or a Style module catalogue entry)" for module code.
+- Already consistent: `modules/style/design.mdx`, `modules/style/integration.mdx`, `module-starter/styling.mdx`, and the "Style snippets" sections in the LLM rules, Building Modules and the Registry Guide.
+
+**One known exception to settle with the owner:** the colour module registers `colour.status-tokens` itself (`--success` / `--warning` in `@layer base`, which any Style theme overrides). The Style module's docs and Styling Modules describe it as the one accepted exception. Under a strict reading of the decision those tokens would move to the Style module (which already defines `--success`, `--warning` and `--info`), and the colour module would stop registering. Ask the owner before changing either.
 
 ### 2. Fix `starter-template/style-system.mdx`
 
