@@ -255,6 +255,10 @@ export default defineConfig({
                   slug: "module-starter/building-modules",
                 },
                 {
+                  label: "Styling Modules",
+                  slug: "module-starter/styling",
+                },
+                {
                   label: "Code Templates",
                   slug: "module-starter/templates",
                 },
