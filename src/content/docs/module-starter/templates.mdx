@@ -45,7 +45,7 @@ import './registrations/settings-page.registration';
 // import './registrations/notification-preferences.registration';
 // import './registrations/language-options.registration';
 // import './header-toolbar.registration';
-import './admin-pages.registration';   // Admin data export/import page (C21–C24)
+import './admin-pages.registration';   // Admin settings + ConfigTransfer backup (C22–C24)
 
 // Pipeline hooks (uncomment to enable):
 // import './filter.registration';
@@ -259,8 +259,8 @@ Settings and admin pages set breadcrumbs automatically from the registry. You on
 
 Every frontend service must use the shared `api` client — never `fetch()` or a custom Axios instance. The `api` client automatically injects auth tokens and points to the correct backend URL.
 
-<Aside type="note" title="Abbreviated — the shipped frontend service + hooks also emit export/import">
-For readability the snippets below show the CRUD surface only. The shipped `SERVICE_TEMPLATE` (`frontend/services.ts`) also emits `exportData` / `importData`, and `QUERY_HOOKS_TEMPLATE` (`frontend/hooks.ts`) also emits `useExportMyFeatureData` / `useImportMyFeatureData` — the surface the module's default **admin export/import page** (Conformance C24) relies on. Keep them when adapting these files.
+<Aside type="note" title="Abbreviated — the shipped frontend service + hooks also emit the admin settings">
+For readability the snippets below show the CRUD surface only. The shipped `SERVICE_TEMPLATE` (`frontend/services.ts`) also emits `getAdminSettings` / `updateAdminSettings`, and `QUERY_HOOKS_TEMPLATE` (`frontend/hooks.ts`) also emits `useMyFeatureAdminSettings` / `useUpdateMyFeatureAdminSettings` and the exported `myFeatureAdminSettingsKey`. The module's default [admin page](#admin-pages) relies on them. Keep them when adapting these files.
 </Aside>
 
 ```typescript
@@ -765,8 +765,8 @@ const MyFeatureAdminPage = lazy(() =>
 
 adminPagesRegistry.register({
   id: 'my-feature',              // URL: /admin/my-feature
-  title: 'My Feature Data',
-  description: 'Export or import your My Feature data',
+  title: 'My Feature',
+  description: 'Settings for everyone, with backup and restore',
   icon: Sparkles,
   component: MyFeatureAdminPage,
   order: 50,
@@ -774,6 +774,19 @@ adminPagesRegistry.register({
 });
 `;
 ```
+
+The default page (`ADMIN_PAGE_COMPONENT_TEMPLATE`, v1.32.6) edits the module's **app-wide admin settings** (one row, `my_feature_admin_settings`) with the shared settings blocks and a Save button. Its header carries the starter's [ConfigTransfer](/starter-template/config-transfer/) buttons, so an admin can back the settings up to a file and restore them in this or another app:
+
+```tsx
+<ConfigTransfer
+  endpoint="/my-feature/admin/config"       // the path route.registration.ts gives the router
+  moduleId="my-feature"
+  title="My Feature settings"
+  invalidate={[myFeatureAdminSettingsKey]}  // refetch the settings after an import
+/>
+```
+
+Never build another file input, paste box or merge dialog for configuration ([C22](/module-starter/conformance-contract/)). Each person's own data isn't here: it leaves through the privacy export handler in `security.registration.ts` ([Security](/module-starter/security/)). A module with no admin settings deletes the page, its registration, the backend `/admin/settings` routes, `config.transfer.ts`, the ConfigTransfer route registration and the `my_feature_admin_settings` model together. The page needs a host on starter **v2.16.1** or newer.
 
 ### Notification Preferences
 
@@ -1019,8 +1032,43 @@ export const myFeatureRoutes = router;
 ```
 
 <Aside type="note">
-The `SERVICE_TEMPLATE` and `ROUTES_TEMPLATE` snippets above are abbreviated for readability. The **shipped** templates also generate the default admin data export/import surface (C21–C24): the service's `exportUserData`/`importUserData` methods and the `requireAdmin`-gated `GET /export` + `POST /import` routes. See the [Conformance Contract](/module-starter/conformance-contract/) for what C21–C24 require.
+The `SERVICE_TEMPLATE` and `ROUTES_TEMPLATE` snippets above are abbreviated for readability. The **shipped** templates also generate:
+
+- **The privacy export.** The service's `exportUserData(userId)` returns one person's whitelisted rows, and the export handler in `security.registration.ts` calls it ([C21](/module-starter/conformance-contract/)).
+- **The admin settings.** `adminSettingsSchema`, `DEFAULT_ADMIN_SETTINGS`, `getAdminSettings` and `saveAdminSettings` take an optional transaction client, and `saveAdminSettings` has no side effects so a ConfigTransfer dry run stays silent. `updateAdminSettings` is the admin page's Save (it logs and fires `my-feature.admin-settings.updated`). The `requireAdmin`-gated `GET` / `PUT /admin/settings` routes serve the page.
+
+There is no hand-built `/export` / `/import` any more: configuration goes through [Config Transfer](#config-transfer) below.
 </Aside>
+
+### Config Transfer
+
+`CONFIG_TRANSFER_TEMPLATE` (`src/templates/backend/config-transfer.ts`, v1.32.6) generates `config.transfer.ts`: the module's **admin configuration** described as starter [ConfigTransfer](/starter-template/config-transfer/) sections. ConfigTransfer supplies the file format, the module and version checks, a practice run that shows what would change, the all-or-nothing write, the report and the audit record.
+
+```typescript
+const settingsSection: ConfigSingleSection<MyFeatureAdminSettings> = {
+  kind: 'single',
+  name: 'settings',               // the section's key in the file — never rename it
+  label: 'Settings',
+  schema: adminSettingsSchema,    // the same rules the admin page's Save uses
+  load: (ctx) => myFeatureService.getAdminSettings(ctx.tx),
+  save: async (item, _existing, ctx) => {
+    await myFeatureService.saveAdminSettings(item, ctx.tx);   // writes ONLY through ctx.tx
+  },
+};
+
+export const myFeatureConfigTransfer: ConfigTransferDefinition = {
+  moduleId: 'my-feature',
+  title: 'My Feature settings',
+  version: '1',
+  strategies: ['merge'],          // one single section: Merge is the only meaningful way
+  sections: [settingsSection],
+  afterImport(_result, ctx) {     // side effects only here — never during a dry run
+    void actionRegistry.doActionAll('my-feature.admin-settings.updated', { imported: true, actorId: ctx.actorId });
+  },
+};
+```
+
+To add configuration lists, declare `ConfigListSection`s, each with a portable `key` (a slug or name, never a database id), before the sections that reference them. The rules are on the starter's [ConfigTransfer page](/starter-template/config-transfer/#rules-for-modules) and in [C22–C24](/module-starter/conformance-contract/).
 
 ### Route Registration
 
@@ -1032,7 +1080,9 @@ export const ROUTE_REGISTRATION = `// ==========================================
 // ========================================================================
 
 import { routeRegistry } from '../../config/route.registry.js';
+import { createConfigTransferRouter } from '../config-transfer/index.js';
 import { myFeatureRoutes } from './my-feature.routes.js';
+import { myFeatureConfigTransfer } from './config.transfer.js';
 
 routeRegistry.register({
   path: '/my-feature',
@@ -1043,6 +1093,16 @@ routeRegistry.register({
   description: 'My Feature management',
   // middleware: [],           // Additional middleware
   // deprecated: false,        // Mark as deprecated
+});
+
+// Admin configuration import/export (ConfigTransfer — starter v2.16.1+):
+// admin-only GET /, GET /export, POST /import; requireAdmin runs inside the router.
+routeRegistry.register({
+  path: '/my-feature/admin/config',
+  router: createConfigTransferRouter(myFeatureConfigTransfer),
+  feature: 'my-feature',
+  requiresAuth: true,
+  description: 'My Feature settings import / export',
 });
 `;
 ```
