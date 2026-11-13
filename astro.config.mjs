@@ -199,6 +199,10 @@ export default defineConfig({
               slug: "starter-template/style-system",
             },
             {
+              label: "Styling Hooks",
+              slug: "starter-template/styling-hooks",
+            },
+            {
               label: "shadcn Component Catalogue",
               slug: "starter-template/shadcn-components",
             },
