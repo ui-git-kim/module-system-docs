@@ -34,7 +34,7 @@ What to change:
 - Rule 7's lane 4 ("`data-slot` + a Style Registry entry") and `typography.mdx` L28 should read "`data-slot` + a Style snippet (or a Style module catalogue entry)" for module code.
 - Already consistent: `modules/style/design.mdx`, `modules/style/integration.mdx`, `module-starter/styling.mdx`, and the "Style snippets" sections in the LLM rules, Building Modules and the Registry Guide.
 
-**One known exception to settle with the owner:** the colour module registers `colour.status-tokens` itself (`--success` / `--warning` in `@layer base`, which any Style theme overrides). The Style module's docs and Styling Modules describe it as the one accepted exception. Under a strict reading of the decision those tokens would move to the Style module (which already defines `--success`, `--warning` and `--info`), and the colour module would stop registering. Ask the owner before changing either.
+**The colour module's status tokens: settled.** The owner chose to move them into Style (2026-11-13, "Move them into Style"). Style v1.16.16 ships them as the always-on `style.status-tokens` entry, and the colour module stops registering `colour.status-tokens` in its own next release. So there are no exceptions to the rule; the docs that described one are updated.
 
 ### 2. Fix `starter-template/style-system.mdx`
 
