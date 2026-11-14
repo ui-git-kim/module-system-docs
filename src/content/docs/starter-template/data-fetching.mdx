@@ -168,6 +168,34 @@ useEffect(() => {
 }, [asleep]);
 ```
 
+### The backend's idle mode
+
+<Badge text="v2.16.10" variant="tip" /> The other half: a backend nobody is using. A dev server left running overnight, or a production app with nobody signed in, still runs work on timers, and each run can wake the database for another few minutes.
+
+`backend/src/lib/backend-idle.ts` tracks the last request the backend served (a middleware mounted early in `app.ts`; health probes don't count, so an uptime monitor can't hold it awake). After **10 minutes** with none, the backend is idle until the next request. While idle:
+
+- the **sign-in key refresh** (Neon Auth's JWKS, every 5 minutes while active) skips its turns. The first request afterwards fetches the keys if the cached ones have expired;
+- the **retention prunes** (devices, audit log; every 6 hours) wait and run once on the next request.
+
+Nothing in the idle check touches the database: it is a local timer.
+
+**Module background work should do the same.** A poller, a scheduled sync or a cleanup on a timer:
+
+```typescript
+import { onBackendIdleChange, whenBackendActive, isBackendIdle } from '../../lib/backend-idle.js';
+
+// Pause and resume a poller.
+onBackendIdleChange((idle) => (idle ? stopPolling() : startPolling()));
+
+// A periodic task: runs now when active; while idle, once on the next request.
+setInterval(() => whenBackendActive('my-module.cleanup', () => void cleanup()), 6 * 60 * 60_000).unref();
+
+// Or just skip a turn.
+if (isBackendIdle()) return;
+```
+
+Work a person is waiting for (a job they started, a delayed email) keeps running: idle mode is for work nobody is waiting for.
+
 <Aside type="tip" title="The other ways a database stays awake">
 Point uptime monitors at `/api/health`, which never touches the database; `/api/health/db` runs a query. The default job runner (`inline`) doesn't poll the database, while `JOBS_RUNNER=pg-boss` does, every few seconds. Every Neon branch (dev, preview) has its own compute, and dev servers left running count too.
 </Aside>
