@@ -1657,6 +1657,77 @@ const { values: members, more } = await structureService.getFieldValues('team', 
 
 **In the browser.** `structureService.getFieldValues(slug, query, { signal })` calls the route (since v1.58.0 `query.store` is passed on, and the answer can carry `label` and `more`). The components are in `components/fields/FieldOptions.tsx`: `SourcedOptionsInput` (the searchable picker, `{ field, value, onChange, disabled?, host }`), `SuggestingTextInput` (a text input with suggestions, same props) and `SelectedOptionsValue` (`{ field, value }`: typed values as badges, links by name through `useNodeNames`, `UNSEEN_ENTRY_TEXT` for one the viewer can't read). `host` is an `OptionSourceHost`: `{ entryId?, parentId?, nodeType?, sectionHostId?, newSection? }`. `NodeFieldRenderer` picks these for a field with sources or suggestions. The editors are in `components/admin/OptionEditors.tsx`: `SelectOptionsEditor` (`{ options, onChange(options, optionSources), optionSources?, sourcesAllowed?, conditionEditor? }`), `SuggestFromEditor` (`{ value, onChange }`) and `optionSourceSaveProblem(fields, self?)`, the admin save's check of the types and fields named. Types: `OptionSource`, `RecordsOptionSource`, `UsedValuesOptionSource` (since v1.58.0 with `store?` and `connect?`), `OptionSourceScope` and `SuggestFromConfig`, and `NodeTypeField.optionSources` and `suggestFrom`.
 
+### Field choices on the server (v1.89.1+)
+
+`structureService.getFieldChoices` answers one question on the server: what would Structure's own create or edit form offer for this field? Use it when your module lets a person pick a value for one of Structure's fields outside Structure's form, for example to show each choice's colour or build a legend. It runs in process only and has no route.
+
+```typescript
+const structureService = serviceRegistry.get('structure');
+
+// Who can be chosen in a new entry's "Who" field, under this parent
+const { choices, more } = await structureService.getFieldChoices('schedule', 'who', userId, { parentId }, { limit: 100 });
+// choices: [{ value: '<id>', label: 'Jane Smith', nodeId: '<id>', color: '#2563eb' }, …]
+
+// A select with option sources, for an entry being edited, filtered by q
+const { choices: courts } = await structureService.getFieldChoices('matter', 'court', userId, { entryId }, { q: 'nor' });
+// [{ value: 'urgent', label: 'Urgent' }, { value: 'node:<id>', label: 'North Court', nodeId: '<id>', color: null }, …]
+```
+
+```typescript
+getFieldChoices(
+  slug: string,
+  fieldId: string,                 // a top-level field, or "group.sub" for a field-group's sub-field
+  userId: string,
+  host?: FieldChoiceHost,          // { parentId?, entryId?, sectionHostId?, newSection? }
+  options?: FieldChoiceOptions,    // { isAdmin?, q?, limit? }
+): Promise<FieldChoices>           // { choices: FieldChoice[]; more: boolean }
+
+interface FieldChoice { value: string; label: string; nodeId?: string; color?: string | null }
+```
+
+**What each field offers:**
+
+- **A link field (`node-reference`):**
+  - the entries of its `allowedTypes` and their subtypes (any type when it names none), less `excludeTypes` and theirs;
+  - inside the host's wall, with `allowGlobalTypes` deciding the shared types;
+  - matching its `filter`.
+  - `value` and `nodeId` are the entry's id; `label` is its name.
+  - Entries are read page by page past what the filter drops, up to 1,000 per call.
+- **A select or multiselect:** its typed options, then each source entry in the admin's order, as the sourced picker lists them.
+  - A "Records of a type" entry gives its records, held to its types, filter and scope. Its scope works as in the form: **In this section** means the host's own section, never a shared type; **Beside this entry** never offers the entry being edited. The label is its template, with the host's section's values. The value is `node:<id>`, or the label with **Store: text**.
+  - A "Values already entered" entry gives values as `getFieldValues` reads them.
+  - Each value appears once; the first one is kept.
+- **A text field with "Suggest values already entered":** those values, each one the field's own format checks accept.
+- **Any other field** (a number, say) has no choices and is a `400`.
+- **A field the user can't write** offers nothing (`{ choices: [], more: false }`), as the form shows it read-only. That is a field whose **Who can edit** shuts the user out (`editableBy`, where `isAdmin` counts), or, on an entry being edited, one that **Can't be changed after creating** (its own setting, or its field group's).
+
+**Each choice that is an entry** carries `nodeId` and `color`. The colour is the one the pages show (`resolveNodeColor`): the entry's own, else its type's colour for a field's value, else its type's colour. It is `null` when the entry shows none. Typed options and text values carry neither.
+
+**The host** is placed as the forms and `createNode` / `updateNode` place the entry:
+
+- `entryId`: the entry being edited, in its own section. Its type may be a subtype of `slug`; another type is a `400`.
+- `parentId`: a new entry under that parent, in the section a create under it gets. The parent must be the user's own, as `createNode` requires; otherwise it's a `404`. Under a shared parent, a new entry goes into `sectionHostId`'s section when its type belongs there.
+- `sectionHostId`: a new top-level entry in that host's section, when its type belongs there (otherwise in none).
+- None of these: a new top-level entry in no section.
+- `newSection` is worked out from the type, as `createNode` works it out. A new top-level record of an isolated type opens a section, so only shared types are offered.
+
+**Every value offered is one the write check accepts** for that host. Each candidate goes through the same rules a create or an update runs:
+
+- the section wall;
+- the link filter and `excludeTypes`;
+- what the option sources can give;
+- the field's format checks.
+
+**Reads and errors:**
+
+- **Read as `userId`, as a non-admin.** Per-type READ permission, the active space and the section wall all apply. `isAdmin` never widens what is read; it only decides whether an admin-only field can be written.
+- **`q`** filters as the picker's search does. Links and records use the list search. Typed options match their label or value. Values already entered match how the value starts. At most 200 characters.
+- **`limit`**: 1 to 200, default 50. **`more`**: there may be more than were returned.
+- **`404`**: a type, field or host the user can't read, or a parent that isn't the user's own.
+- **`400`**: a field with no choices, an `entryId` of another type, or a malformed host.
+
+Types: `FieldChoice`, `FieldChoices`, `FieldChoiceHost` and `FieldChoiceOptions` from `structure.types`.
+
 ### Connections Fields (v1.56.0+)
 
 A field of type `connections` lists an entry's connections of the connection types in its `connectionsConfig`, and adds, edits and removes them where it shows. The rules are on [Field Types](/modules/structure/fields/#connections) and the server's side under [Connections fields](/modules/structure/configuration/#connections-fields-v1560). What a module needs to know:
