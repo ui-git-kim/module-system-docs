@@ -1,11 +1,11 @@
 ---
 title: Record integrity
-description: The shared contract for records modules keep — version history, fingerprints (hash chains), seals, independent timestamps and complete exports — and the starter helpers that implement it
+description: The shared contract for records modules keep — version history, fingerprints (hash chains), seals, independent timestamps, complete exports, the event log and holds — and the starter helpers that implement it
 ---
 
 import { Aside, Badge } from '@astrojs/starlight/components';
 
-<Badge text="Starter v2.17.2" variant="tip" /> Records made in these apps may be relied on later, for example as contemporaneous notes. The bar: records that are **reliable, complete and unaltered**, with a trail of every change; **times nobody can type in**; and **complete, unedited exports**. This page is the one contract every module that keeps records follows (Structure, Document Management, Tasks, and the app's own features), so all records work the same way and one check covers them all. The starter owns it; module docs link here.
+<Badge text="Starter v2.17.4" variant="tip" /> Records made in these apps may be relied on later, for example as contemporaneous notes. The bar: records that are **reliable, complete and unaltered**, with a trail of every change; **times nobody can type in**; and **complete, unedited exports**. This page is the one contract every module that keeps records follows (Structure, Document Management, Tasks, and the app's own features), so all records work the same way and one check covers them all. The starter owns it; module docs link here.
 
 <Aside type="note" title="Background">
 Australian law is technology-neutral. See NSW State Archives, "Legal admissibility of digital records" (Electronic Transactions Act 1999 s10: "reliable, complete and unaltered"; audit trails of changes; security and access controls). RFC 3161 timestamps, SHA-2 hashes and an immutable trail are the accepted practice, and only a hash ever leaves the app, never the content. Names in code stay generic (History, Check integrity, Export): no legal wording in code.
@@ -147,6 +147,53 @@ Questions or changes: raise them before building, so every module stays the same
 
 ---
 
+## 6. The event log and holds
+
+Records show what changed in each record. The **event log** shows what happened around them: who signed in, who confirmed it was them, what was refused, who placed a hold, and whether anyone other than the owner opened their content. The starter keeps it (v2.17.4); modules add their own events through hooks.
+
+### The event log
+
+**What's recorded**, as audit-sink activity (the starter's hooks, plus every admin change it already recorded):
+
+| Event | When | Details kept |
+|---|---|---|
+| `auth.signedIn` / `auth.signedOut` | The app reports it: the first time it sees a session, and just before signing out (sign-in runs on Neon Auth, so the backend never sees it happen) | A hashed session reference, the address and device. Never the session id |
+| `security.stepUpStarted` / `stepUpVerified` / `stepUpFailed` | An emailed code was sent, accepted, or refused | Whether it sent; why it was refused (`wrong-code`, `too-many`, `expired`, `unknown`). Never the code |
+| `access.denied` | A request was refused (401 or 403) | Status, method, path without its query, address, and who asked (when signed in). At most one a minute per address, status and path, and 120 a minute in all |
+| `security.recordHoldPlaced` / `Lifted` | A hold was placed or lifted | Who, and whether a note was given. Never the note |
+| `security.dataAccessed` | Protected content was read through `auditedDecrypt` | The resource, the reason given, and `crossTenant` (the reader isn't the owner) |
+
+**Where it's kept** follows the audit record setting (Admin → Security): in memory (lost on restart), in the database (activity pruned after `SECURITY_AUDIT_RETENTION_DAYS`), or **Permanent**: the compliance table, never pruned, hash-chained, and now **sealed**. Each new row's chain hash is sealed with the record seal key (`sealDigest(hash, { alg: 'sha256' })`, stored in `"seal"` and `"sealKeyId"` columns the starter adds by itself). **Verify integrity** (Admin → Console → History) checks every hash and seal: a row changed outside the app, or stripped of its seal after sealed rows, breaks the chain; rows from before seals, and rows sealed with a key the app no longer has, are counted, not failed.
+
+**Who sees it:** each person sees the entries about them in **Settings → Activity** (`GET /api/v1/user/activity`), worded as plain sentences, with only a short allowlist of details: never another person's email or id, never content. Their own reads of their own content are left out; someone else's read is shown. Admins see the whole log in the System console. See the [Privacy model](/getting-started/privacy-model/).
+
+**Failed sign-ins** happen at Neon Auth and aren't in the log.
+
+### Holds
+
+A person can put a **hold** on their records (Settings → Data & Privacy → Hold my records). While it's on, nothing of theirs may be **permanently** deleted: not by them, not by an admin, and not by a module's automatic clean-up. Editing, archiving and moving to trash still work; restoring from trash still works. The hold lives on the person's `Space` row (`holdSince`, `holdReason`).
+
+- The starter refuses account deletion with **409** `code: 'record_hold'`, both the person's own and an admin's, before anything is marked or erased.
+- Only the person places or lifts it (`PUT /api/v1/user/hold`, web session only). Lifting asks for an emailed code when step-up is on.
+- **Modules must check it** before any permanent deletion of a person's records: emptying trash, a retention clean-up, a "delete forever" action, a purge job.
+
+```typescript
+import { assertNoRecordHold, isUnderRecordHold } from '../security/index.js';
+
+// A person's own action: refuse it (409, with a message they can act on).
+await assertNoRecordHold(tenantId, 'Your records are on hold, so the trash can’t be emptied.');
+
+// A sweep across people: skip anyone on hold, and try again next run.
+for (const tenantId of due) {
+  if (await isUnderRecordHold(tenantId)) continue;
+  await purge(tenantId);
+}
+```
+
+On a starter older than v2.17.4, reach them through the guarded import (`const SECURITY = '../security/index.js'`) and treat a missing function as "no hold". A database without the hold columns reads as "no hold" too. Modules that keep a retention schedule can listen to `security.recordHoldPlaced` / `security.recordHoldLifted` to pause and resume it.
+
+---
+
 ## The starter's helpers
 
 In the security feature (`backend/src/features/security`, exported from its `index.ts`):
@@ -166,6 +213,9 @@ import {
   timestampStores,    // register a module's stamp store
   nudgeTimestamps,    // () => void   after committing pending stamps
   RECORD_HASH_ALG,    // 'sha384'
+  getRecordHold,      // (tenantId) => Promise<{ on, since, reason }>       (v2.17.4)
+  isUnderRecordHold,  // (tenantId) => Promise<boolean>
+  assertNoRecordHold, // (tenantId, message?) => Promise<void>   throws RecordHoldError (409 'record_hold')
 } from '../security/index.js';
 ```
 

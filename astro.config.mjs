@@ -53,6 +53,14 @@ export default defineConfig({
               slug: "getting-started/record-integrity",
             },
             {
+              label: "Privacy model",
+              slug: "getting-started/privacy-model",
+            },
+            {
+              label: "Hosting and operations",
+              slug: "getting-started/hosting-operations",
+            },
+            {
               label: "Backup & Restore",
               slug: "getting-started/backup-restore",
             },
