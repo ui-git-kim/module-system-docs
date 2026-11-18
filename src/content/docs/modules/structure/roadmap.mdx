@@ -1,7 +1,7 @@
 ---
 title: Roadmap
 description: What is outstanding for the Structure module — the ranked Now/Next queue, the Later backlog, the open decisions, and the shipped record.
-lastUpdated: 2026-11-06
+lastUpdated: 2026-11-18
 sidebar:
   order: 11
 ---
@@ -54,6 +54,45 @@ Verified open defects. The **2026-09-30 cleanup & security audit** raised 62 fin
 
 **Pipeline**
 - There is no CI, so the quality gates (build, type-check, `check:templates`, `conformance:check`, `npm audit`) run only when someone remembers to. Not set up yet.
+
+### 2026-11-18 performance audit
+
+A read-only speed audit of the code added since the last one (v1.34.20 to v1.89.47, about 124,000 template lines). Three checkers looked at page rendering, fetching and loading, and the backend. Every 🔴 was re-checked against the code. 🔴 is felt with normal data, 🟡 at scale or on heavier pages, 🟢 is hygiene. Nothing is fixed yet: Kim picks the batches. Lines are template lines at v1.89.47.
+
+**🔴 Felt now**
+- **P1. Typing in a long Numbered or Assembled list lags.** Each keystroke re-renders every row (about 10 buttons each), and every row works out "can indent" by searching the whole list, so the cost grows with the square of the length. Assembled lists also re-read every item's text four times. `frontend/numbered-list.ts:781-840`, `shared/numbered-list.ts:619`. Fix: keep the item's text local while typing, and memo'd rows given their number and indent flag from one pass.
+- **P2. A form with a long field group lags everywhere.** Every row rebuilds its data and handlers on each keystroke in any field, so no cell skips a render, and a formula or computed sub-field stringifies the whole entry once per row (rows²). `frontend/components.ts:6656-6715`, `4687`, `4824`. Fix: a memo'd row with one stable cell setter; give the entry's data only to sub-fields that read it.
+- **P3. Saving a record waits for every record that copies its values.** The save's response waits for `formulaEngine.afterWrite`, which recomputes up to 200 dependents one by one, each in its own history transaction (about 10 round trips each). `backend/index.ts:33150`, `backend/formula-engine.ts:3044-3072`, `2889-2934`. Fix: recompute the record's own values in the request, the dependents after it, in one read and one history transaction per level.
+- **P4. Tables with template or formula columns read every row's linked records on open.** Rows the page doesn't show get a hidden cell too (up to 500), so a 100-row table makes about 100 record reads (and section reads) where 10 would do; each shown cell is also worked out twice. `frontend/components.ts:8181-8189`, `8238-8246`. Fix: mount the hidden cells only once someone sorts by a * column.
+- **P5. Record items in Numbered and Assembled lists load in serial waves of 6.** One full record read per item, and the originals of an Assembled set's copies the same way; Copy and Freeze wait for all of them. `frontend/numbered-list.ts:459-476`, `1341-1350`. Fix: one list read per 100 ids, as link-field lists already do.
+- **P6. "Picked in" badges cost a set of queries per record.** A top-level record's `rootNodeId` is its own id, so each becomes its own group, and each group's counts run one after another. `backend/index.ts:22578-22596`. Fix: group by section (every no-section row in one group, found with one `sectionRootsAmong`), and run the groups in parallel.
+
+**🟡 At scale or on heavier pages**
+- **P7. Typing on a detail page re-renders the whole page.** The draft lives at the page root and the context value changes every keystroke, so the header, tabs, side column, entries lists and entry widgets all re-render; with a side column, two field editors run. `frontend/pages.ts:1902`, `1937-1942`, `2418-2441`, `5539`, `5637`; `frontend/entry-widget.ts:265`, `291`.
+- **P8. Computed, formula and value-rule fields re-check the whole entry on every keystroke** (`JSON.stringify` of all the data, then an async re-resolve). `frontend/components.ts:2022-2064`, `2122`, `2569-2581`, `4687-4860`, `5804`; `frontend/rules.ts:94`; `frontend/pages.ts:3448-3460`. Fix: key on the tokens each one reads.
+- **P9. Entries list rows are new arrays every render,** so the table's memo breaks and on-read formulas re-run. `frontend/entries-list.ts:693-726`, `1446-1453`.
+- **P10. Linked-record reads are not batched.** `{ref->x}` in templates, conditions through a reference, option labels and featured cards make one request per record. `frontend/index.ts:7704-7720`, `4649-4655`, `4631-4638`; `frontend/options.ts:502-519`; `frontend/entries-list.ts:807`. Fix: a batch reader over `listNodes({ ids })`, like `readNodeName`.
+- **P11. "Who uses this record?" reads every record's full text.** `strpos("data"::text, id)` can't use an index. `backend/formula-engine.ts:2602-2616`; also `backend/index.ts:13934`, `24802`, `24845`, `28387`. Fix: a `refIds` text-array column with a GIN index, kept on write (schema change plus a one-off backfill).
+- **P12. `children()` and `scope()` load up to 5,000 full rows, then filter by type,** and on-read ones run once per listed row. `backend/formula-engine.ts:1337-1372`, `3288-3301`. Fix: filter by type in the query; batch a list's reads.
+- **P13. Every save reads all of a record's versions to find the latest** (`DISTINCT ON` has no index shortcut), inside the save's lock. `backend/index.ts:29433`, `30743`. Fix: a `LATERAL … ORDER BY seq DESC LIMIT 1` per id.
+- **P14. Deleting a big folder writes a version for every entry under it in one 30 s transaction;** bulk archive and delete open a history transaction per entry. `backend/index.ts:33262-33280`, `29553-29590`, `36051`, `36078`. Fix: pages of a few hundred.
+- **P15. Record export goes record by record and reads each history twice,** then builds the file synchronously (JSON, a JS CRC-32, `deflateRawSync`) with no byte cap. `backend/index.ts:30829-30852`; `backend/record-export.ts:449-535`. Fix: reuse the integrity read, bounded `Promise.all`, async `zlib`, a byte cap.
+- **P16. Check integrity does all its checking inside a share-locked transaction** (up to 120 s), so saves to that entry wait. `backend/index.ts:38830-38882`. Fix: read in a repeatable-read transaction, check after it commits.
+- **P17. "Values already entered" sorts by `updatedAt`, which has no index.** `backend/index.ts:12141-12143`, `12229-12236`. Fix: `@@index([userId, nodeType, updatedAt])` (schema change).
+- **P18. Serial loops.** Staged connection changes are saved one request at a time (the existing `POST /connections/bulk` is never called); the sidebar refreshes one type at a time after every write; value-rule values and list tokens are worked out one at a time. `frontend/connections.ts:1128-1156`; `frontend/registrations.ts:399-416`; `frontend/rules.ts:158-164`; `frontend/numbered-list.ts:1083`.
+
+**🟢 Hygiene**
+- **P19.** `rendersField` runs about ten times per field per render, and `itemEmpty` reads a registry during render. `frontend/pages.ts:3295`, `5117`.
+- **P20.** The History sheet builds every change line, then shows 8 per version. `frontend/record-history.ts:310`.
+- **P21.** The **Link a user** search sends a request on every keystroke. `frontend/components.ts:7686`, `7717`.
+- **P22.** An entries list from connections loads every connection to show one type. `frontend/entries-list.ts:689`, `719-723`.
+- **P23.** The same section is cached under two keys; several reads use a 30 s staleTime; one key is built by hand. `frontend/options.ts:508-898`; `frontend/entries-list.ts:758-761`.
+- **P24.** The admin page is lazy but passes no `preload`. `frontend/registrations.ts:1140`.
+- **P25.** The History, Export and Merge dialogs are in the detail page's download though they open on a click. `frontend/components.ts:701-705`; `frontend/pages.ts:44`.
+- **P26.** Adding a row on the page (and an entry widget's create) reads the open record twice. `frontend/group-rows.ts:332-333`; `frontend/entry-widget.ts:277`.
+- **P27.** The type's history policy is read again in every history transaction; the field group count loads full `data`. `backend/index.ts:29466-29482`, `31466`.
+
+**Checked and fine:** no polling anywhere; history, export formats, option sources and merge previews load only when opened; the pickers' searches are debounced; RFC 3161 calls never run inside a transaction; reference connections, unique-in-section checks, section values and `getNodeNames` batch; the new tables are indexed. **Worth revisiting:** the five detail tabs were kept eager because the settings page had no Suspense boundary, but the lazy list fields now bring their own (`whenLoaded`), so lazy tabs may be possible.
 
 ---
 
