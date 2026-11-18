@@ -79,9 +79,26 @@ A version's hash can also get a timestamp from an independent Time Stamping Auth
 - **Check integrity** also verifies each token (the imprint equals the hash, the nonce matches, the signature verifies) and shows `tsaAt`; a failure is `reason: "timestamp"`.
 - **Entry time and event time:** the server and TSA times say when a record was **written**; a record's own date field says when the **event** happened. Exports show both.
 
-<Aside type="note" title="Starter support">
-The starter's RFC 3161 client and stamp queue are the next step after v2.17.2. Until then, modules implement 2b to this contract.
-</Aside>
+### The starter's timestamp client and queue (v2.17.3)
+
+- **`requestTimestamp({ hash, alg })`** sends the request to the app's service (`RECORD_TSA_PROVIDER`: `digicert` by default, `globalsign`, `sectigo`, or `custom` with `RECORD_TSA_URL`; Basic auth from `RECORD_TSA_USERNAME` / `RECORD_TSA_PASSWORD` for a paid plan) and resolves only with a token that verified. It returns the contract's stamp: `{ provider, url, requestedAt, tsaAt, serial, token, signer, validation }`, where `validation` holds the OCSP response (or CRL) and any chain certificates the token left out, all base64 DER.
+- **`verifyTimestamp(token, { hash, alg, extraCerts? })`** checks a stored token: the imprint is the version's hash under its algorithm, the signed digest matches, the signature verifies with a certificate marked for timestamping and valid at the stamp's time, and the chain reaches a trusted root. Node's bundled roots cover DigiCert and Sectigo; the starter ships GlobalSign's Timestamping Root R45, which isn't a website root. Pass a stored stamp's `validation.certs` as `extraCerts`. It returns `{ ok, tsaAt, serial, signer }` or `{ ok: false, reason }` (`imprint`, `nonce`, `digest`, `signature`, `certificate`, `untrusted`, `unsupported`, `malformed`).
+- **The queue.** Save the version with `timestamp: { status: 'pending', … }` in your own table, register a **store**, and call `nudgeTimestamps()` after the commit. The starter sweeps every minute while the backend is in use (it pauses with the backend's idle mode), stamps due versions one at a time, and saves each outcome: `done` with the stamp, `pending` with the next try (1 min, 5 min, 15 min, 1 h, 3 h, 6 h, 12 h, 24 h), or `failed` after the last. Your rows are the queue, so nothing is lost on a restart, whichever job runner the app uses.
+
+  ```typescript
+  const SECURITY = '../security/index.js';
+  const { timestampStores, nudgeTimestamps } = await import(SECURITY);
+  timestampStores.register({
+    moduleId: 'structure',
+    label: 'Structure entries',
+    listDue: (limit, now) => /* pending stamps with nextAttemptAt <= now: { id, hash, alg, attempts } */,
+    save: (id, outcome) => /* write outcome.result (done), or attempts / nextAttemptAt / error */,
+    counts: () => /* { pending, failed } */,
+    listFailed: (limit) => /* [{ id, attempts, error }]: never record content */,
+    retryFailed: (ids) => /* failed back to pending; returns how many */,
+  });
+  ```
+- **Admin:** the Security page's **Keys and modules** tab shows the service with a **Test connection** (it stamps a random fingerprint and checks the answer), each module's waiting and failed stamps with **Retry failed**, and the setting on the Settings tab (Records → Timestamp service). The checklist lists **Independent timestamps** under "Worth doing".
 
 ---
 
@@ -144,12 +161,16 @@ import {
   verifySeal,         // ({ hash, seal, sealKeyId, alg?, tenantId? }) => Promise<{ ok } | { ok: false, reason }>
   checkRevisionChain, // (versions, { tenantId?, live? }) => Promise<IntegrityResult>
   getRecordSealStatus,// () => Promise<RecordSealStatus>          for admin screens
+  requestTimestamp,   // ({ hash, alg? }) => Promise<TimestampResult>   (v2.17.3)
+  verifyTimestamp,    // (token, { hash, alg, extraCerts? }) => TimestampVerification
+  timestampStores,    // register a module's stamp store
+  nudgeTimestamps,    // () => void   after committing pending stamps
   RECORD_HASH_ALG,    // 'sha384'
 } from '../security/index.js';
 ```
 
 - `verifySeal` reasons: `unsealed` (no seal), `unknown-key` (none of the app's keys has that id), `mismatch` (the hash or seal was changed outside the app), `bad-alg`.
-- `checkRevisionChain` gives the Check integrity answer above (without `timestamp`, until the starter's timestamp client lands). Pass `live` (the record as stored now) to compare it with the last version.
+- `checkRevisionChain` gives the Check integrity answer above. Pass `live` (the record as stored now) to compare it with the last version. Check each version's token with `verifyTimestamp` and report a failure as `reason: "timestamp"`.
 - The outputs reproduce the agreed vectors exactly: `{ b: 2, a: { d: [1, 'x', null], c: undefined }, e: true }` → `{"a":{"d":[1,"x",null]},"b":2,"e":true}` (SHA-256 `6885d5e6…`), the numbers vector (SHA-256 `581446be…`) and Structure's revision payload (SHA-384 `13142a5e…`). See `record-integrity.test.ts`.
 
 ### Moving a module from `RECORD_SEAL_KEY` to the starter
