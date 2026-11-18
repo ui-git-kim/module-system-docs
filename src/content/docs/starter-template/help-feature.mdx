@@ -1,0 +1,269 @@
+---
+title: Help (support registry)
+description: Help articles modules and the app register, written with merge fields so they read in each app's own words, plus the Help page, HelpLink and the admin's per-app edits
+---
+
+import { Aside, Badge } from '@astrojs/starlight/components';
+
+<Badge text="v2.17.0" variant="tip" /> Modules add features that people need explained in plain words: how their records are kept, what "Check integrity" means, what an export contains. The **support registry** is where modules, and the app itself, register **help articles**. Articles use **merge fields**, so their text matches the app they're installed in: its name, its settings, which features are switched on.
+
+- **Readers** find the articles on the **Help** page (`/support`, linked from every user's sidebar), or open one beside the feature it explains through a **`HelpLink`**.
+- **Admins** can change how any article reads in their app, or hide it, on **Admin → Help**. When a module later updates an article, the admin sees what changed and chooses which text to keep.
+- **Nothing changes** for an app whose modules register no articles: the Help page says help isn't available yet.
+
+The backend is the source of truth: articles, categories and fields register on the server, and fields are resolved there, so a field can read server-only facts (whether an env key is set). The frontend renders what the server sends.
+
+---
+
+## Registering articles
+
+Register from a side-effect `support.registration.ts`, imported from your feature's `index.ts`. A module generated into hosts of any age imports the registry through a guarded dynamic import, so an older starter (before v2.17.0) skips it instead of crashing at boot:
+
+```typescript
+// backend/src/features/structure/support.registration.ts
+const SUPPORT_FEATURE = '../support/index.js';
+try {
+  const { supportRegistry } = await import(SUPPORT_FEATURE);
+
+  supportRegistry.registerCategory({ id: 'records', title: 'Your records', order: 20 });
+
+  supportRegistry.registerFields('structure', {
+    'structure.timestampsOn': {
+      resolve: () => Boolean(process.env.RECORD_TSA_URL),
+      kind: 'condition',
+      description: 'Whether versions are timestamped by an outside service',
+    },
+    'structure.timestampProvider': async () => 'DigiCert',
+  });
+
+  supportRegistry.register({
+    id: 'structure.records-kept',            // '<moduleId>.<slug>', unique
+    moduleId: 'structure',
+    title: 'How {{app.name}} keeps your records',
+    summary: 'Every change is kept, fingerprinted and can be checked.',
+    body: [
+      '{{app.name}} keeps every version of a record. Nothing is overwritten.',
+      '',
+      '{{#if structure.timestampsOn}}Each version is also timestamped by {{structure.timestampProvider}}.{{/if}}',
+    ].join('\n'),
+    category: 'records',
+    audience: 'user',                        // 'user' (default) or 'admin'
+    order: 10,
+    keywords: ['history', 'integrity', 'export'],
+    related: ['structure.check-integrity'],
+    version: 1,                              // bump when you change the text
+  });
+} catch {
+  // Starter predates the support registry; nothing to register.
+}
+```
+
+An app's own feature (moduleId `'app'`) can import it statically: `import { supportRegistry } from '../support/index.js';`.
+
+### Article fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | Yes | `'<moduleId>.<slug>'` in lower case (`structure.records-kept`). Unique; the first registration wins |
+| `moduleId` | Yes | The module that ships it (`'app'` for the app's own). The `id` must start with it |
+| `title` | Yes | Plain text with merge fields (≤ 200 characters) |
+| `summary` | | One or two sentences, plain text with merge fields (≤ 500). Shown in lists and search |
+| `body` | Yes | [Markdown](#the-markdown-subset) with merge fields (≤ 20,000) |
+| `category` | | A registered category id. Unknown or omitted → **General** |
+| `audience` | | `'user'` (the Help page, default) or `'admin'` (admins only, on Admin → Help) |
+| `order` | | Order within its category, lower first (default 50) |
+| `keywords` | | Extra words search should match (≤ 20) |
+| `related` | | Ids of related articles, listed under the article (only those the reader can see) |
+| `show` | | `(ctx) => boolean`: show the article only when a feature is on. A throw or a timeout hides it |
+| `version` | | Bump when you change the text (default 1). See [Versions](#when-a-module-updates-an-article) |
+
+A bad registration (a malformed id, an id that doesn't start with its `moduleId`, a missing title or body, a text that's too long) is logged and skipped. It never throws: help text must not stop an app booting.
+
+### Categories
+
+```typescript
+supportRegistry.registerCategory({ id: 'records', title: 'Your records', description: 'Versions, checks and exports', order: 20 });
+```
+
+Ids are lower case. The first registration of an id wins, so two modules can share a category. **General** (`general`, order 90) always exists. The Help page lists only categories that have articles the reader can see.
+
+---
+
+## Merge fields
+
+The syntax is the same double braces as the auth email templates:
+
+| Write | Shows |
+|-------|-------|
+| `{{app.name}}` | the field's value |
+| `{{#if structure.sealOn}} … {{/if}}` | the words only when the field is true |
+| `{{#if x}} … {{else}} … {{/if}}` | one or the other |
+| `{{#unless x}} … {{/unless}}` | the words only when the field is false (`{{else}}` works here too) |
+
+Blocks nest. For a condition, a field is true when it is `true`, a non-zero number or non-empty text. A value shows as one line of plain text; `true` / `false` show as **Yes** / **No**.
+
+### The starter's fields
+
+| Field | Value |
+|-------|-------|
+| `{{app.name}}` | The app's name, from App Settings |
+| `{{app.url}}` | The app's web address (`FRONTEND_URL`) |
+| `{{app.supportEmail}}` | The support email set on Admin → Help (blank when unset) |
+| `{{date.today}}` | Today's date, in the reader's language and time zone ("18 November 2026") |
+| `{{viewer.firstName}}` | The reader's first name, from **their own** profile |
+| `{{viewer.timeZone}}` | The reader's time zone (`Australia/Sydney`) |
+
+The reader's language and time zone are the ones the rest of the UI uses: the frontend sends them with each request, and they're checked on the server. There is no app-wide time zone setting: each person has their own.
+
+### Module fields
+
+```typescript
+supportRegistry.registerFields('structure', {
+  'structure.timestampProvider': async (ctx) => 'DigiCert',          // text
+  'structure.sealOn': { resolve: () => Boolean(process.env.RECORD_SEAL_KEY), kind: 'condition',
+                        description: 'Whether records are sealed' },   // for {{#if}}
+});
+```
+
+- Each name must start with your `moduleId` and a dot. `app.*`, `date.*` and `viewer.*` belong to the starter (the app itself, `moduleId: 'app'`, may add other `app.*` fields).
+- A provider returns text, a number, or true / false. It may be async. `description` and `kind` show in the admin's field picker.
+- A provider is given `{ audience, isAdmin, signal }`, and **no user id**. A field describes the app or the module; it must never read anyone's records.
+- Fields are resolved per request, and only the ones the articles being shown use. A provider that takes longer than **2 seconds** or throws shows as blank, is flagged on Admin → Help, and never breaks the page.
+
+### Unknown and failing fields
+
+A field the app doesn't know (`{{app.plan}}`, a typo, a module that isn't installed), a failing provider, a stray `{{/if}}` or an unclosed `{{#if}}` all render as nothing for readers. Admin → Help flags them on the article and in the editor's preview.
+
+---
+
+## The markdown subset
+
+| Write | Becomes |
+|-------|---------|
+| `## Heading` (`#` and `##` are level 2, `###` level 3, more `#` level 4) | a heading under the page title |
+| lines with no blank line between them | one paragraph |
+| `- item`, `* item`, `+ item`; `1. item` or `1) item` | a list (one level; an indented line continues an item) |
+| `> note` | a quote |
+| <code>```</code> on its own line, before and after | a code block |
+| `**bold**`, `*italics*` or `_italics_`, `` `code` `` | inline marks (`_` inside a word, as in snake_case, stays literal) |
+| `[words](address)` | a link |
+| `\*` | a literal `*` (any mark) |
+
+There is **no HTML**. The server turns the article into a tree of blocks and the frontend renders it with React elements, so `<b>` in an article is just text, and a field's value can never add markdown (a link, a heading) to an article: conditions are resolved first, then the markdown is parsed, then the values go into the text as plain text.
+
+A link must be `https://…`, `mailto:…` or an app path (`/support/structure.check-integrity`). Anything else (`http://`, `javascript:`, `//host`) keeps its words and loses the link, and is flagged for the admin. Outside links open in a new tab with `noopener`.
+
+---
+
+## HelpLink
+
+Put a `HelpLink` beside a feature that needs explaining:
+
+```tsx
+import { HelpLink } from '@/features/support';
+
+<HelpLink article="structure.check-integrity" />                       // "How this works", opens a sheet
+<HelpLink article="structure.check-integrity">About checks</HelpLink>   // your own words
+<HelpLink article="structure.check-integrity" mode="page" />           // goes to /support/structure.check-integrity
+```
+
+| Prop | Default | Description |
+|------|---------|-------------|
+| `article` | | The article id |
+| `children` | "How this works" | The link's words |
+| `mode` | `'sheet'` | `'sheet'` opens the article beside the page; `'page'` goes to its Help page |
+| `variant` | `'link'` | The Button variant: `'link'`, `'ghost'` or `'outline'` |
+
+The sheet loads on first open, so a `HelpLink` costs almost nothing on a screen. Related articles open in the same sheet, and **Open in Help** goes to the article's page. An article the admin hid, or one that isn't registered, says it isn't available. Admin articles open the same way for admins.
+
+---
+
+## The Help page
+
+`/support` lists the reader's articles by category (in category order, then article order), with a search over titles, summaries and keywords: every word must match, ignoring case and accents. Each article has its own page, `/support/:articleId`, with its related articles. When the admin has set a support email, a **Still need help?** card offers it.
+
+The page is the sidebar's existing **Support** link (`/support`), so no navigation change is needed. To add a header button as well, register one with the [header toolbar registry](/starter-template/header-toolbar/) pointing at `/support`.
+
+---
+
+## Admin → Help
+
+The admin page (Appearance section) has three parts:
+
+- **Support contact**: the email readers can write to (`{{app.supportEmail}}`).
+- **Help for admins**: articles with `audience: 'admin'`, shown only when there are some.
+- **Articles**: every registered article in a data table (search; filters by module, audience and status). The status shows what most needs attention: **Module updated**, **Has problems**, **Hidden**, **Edited** or **Module's text**.
+
+**Edit** opens a sheet with the title, summary and text, **Hide this article in this app**, an **Insert a field** menu (the starter's fields and each module's, with descriptions; a true/false field goes in as an `{{#if}}` block around the selection), and a live preview rendered by the server, with any problems listed. A part left as the module wrote it is saved as "the module's text", so it keeps following the module's updates. **Reset to the module's text** drops the edit (and shows a hidden article again).
+
+### When a module updates an article
+
+A new edit records the article's `version` and the module's text at that moment. When a module ships a new version, the article shows **Module updated**: the editor shows a line-by-line diff of what the module changed, and the admin chooses:
+
+- **Keep my text**: the edit stays, and is recorded against the new version;
+- **Use the new text**: the edit's text goes (the hidden switch stays as it was).
+
+Saving the edit without choosing keeps the notice. An edit is never dropped silently.
+
+### Where edits are kept
+
+In `AppSettings.supportConfig` (one JSON column, kept out of the settings every signed-in user receives). They travel in the app's [configuration export](/starter-template/config-transfer/) (**App configuration**: **Help settings** and **Help article edits**). The export leaves out who made each edit and when; an edit for an article no module in the importing app has is flagged for review and kept, and applies once a module registers that article. Edits for an article whose module is uninstalled are kept too, so reinstalling loses nothing.
+
+Every change fires `support.articleUpdated` (ids and field names, never the text) and `support.settingsUpdated` (whether an email is set, not which), both on the [audit trail](/starter-template/security-feature/).
+
+---
+
+## Privacy
+
+- Articles describe the app. A field provider gets no user id, and the only personal fields are the reader's **own** first name and time zone.
+- Admins never see a user's data through an article: the admin preview renders with the admin's own name.
+- Users never see the issues list.
+
+---
+
+## API
+
+| Route | Who | Description |
+|-------|-----|-------------|
+| `GET /api/v1/support/articles` | signed in | The reader's list, rendered: `{ categories, articles, contact }`. `?audience=admin` for admins' articles (empty for others) |
+| `GET /api/v1/support/articles/:id` | signed in | One article: title, summary, `body` (blocks) and `related`. 404 when hidden, unknown or not for this reader |
+| `GET /api/v1/admin/support` | admin | Every article with the module's text, the edit, status and issues; the field catalogue; the support email |
+| `PUT /api/v1/admin/support/articles/:id/override` | admin | `{ title, summary, body, hidden, rebase? }` (null = the module's text) |
+| `DELETE /api/v1/admin/support/articles/:id/override` | admin | Back to the module's text |
+| `POST /api/v1/admin/support/preview` | admin | Render a draft, with issues; saves nothing |
+| `PUT /api/v1/admin/support/settings` | admin | `{ supportEmail }` |
+
+The reader routes take `?locale=&tz=` (the frontend sends them). A device token reads as a non-admin.
+
+<Aside type="note" title="Frontend-only modules">
+Articles register on the backend only, so merge fields can read server facts and admin edits have one source. A module with no backend of its own adds a small `support.registration.ts` to the backend.
+</Aside>
+
+---
+
+## Files
+
+```
+backend/src/features/support/
+├── index.ts               # Barrel + route registration
+├── support.registry.ts    # supportRegistry: register, registerCategory, registerFields
+├── support.types.ts       # Types, limits, built-in field list, request schemas
+├── support.merge.ts       # {{fields}}, {{#if}} / {{#unless}} / {{else}}
+├── support.markdown.ts    # The markdown subset → block tree
+├── support.render.ts      # Fill fields into the tree, check links
+├── support.fields.ts      # Built-in fields, provider timeouts, show checks
+├── support.service.ts     # Readers' lists and articles; admin edits
+├── support.store.ts       # AppSettings.supportConfig
+├── support.transfer.ts    # Config export/import sections
+├── support.routes.ts      # /support and /admin/support
+└── route.registration.ts
+
+frontend/src/features/support/
+├── index.ts               # supportRoutes, HelpLink, admin page registration
+├── routes.config.tsx      # /support, /support/:articleId
+├── components/            # HelpLink, HelpSheet, SupportBrowser, SupportArticleView, SupportContent, admin/
+├── pages/                 # SupportPage, SupportArticlePage, SupportAdminPage
+├── hooks/                 # useSupport (readers), useSupportAdmin
+├── lib/support-text.ts    # Search, line diff, field insertion
+└── services/support.service.ts
+```

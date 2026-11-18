@@ -152,6 +152,10 @@ export default defineConfig({
                   slug: "starter-template/usage-feature",
                 },
                 {
+                  label: "Help (Support Registry)",
+                  slug: "starter-template/help-feature",
+                },
+                {
                   label: "Modules",
                   slug: "starter-template/modules-feature",
                 },
@@ -261,6 +265,10 @@ export default defineConfig({
                 {
                   label: "Styling Modules",
                   slug: "module-starter/styling",
+                },
+                {
+                  label: "Help Articles",
+                  slug: "module-starter/help-articles",
                 },
                 {
                   label: "Code Templates",
