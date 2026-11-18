@@ -5,7 +5,7 @@ description: The shared contract for records modules keep — version history, f
 
 import { Aside, Badge } from '@astrojs/starlight/components';
 
-<Badge text="Starter v2.17.5" variant="tip" /> Records made in these apps may be relied on later, for example as contemporaneous notes. The bar: records that are **reliable, complete and unaltered**, with a trail of every change; **times nobody can type in**; and **complete, unedited exports**. This page is the one contract every module that keeps records follows (Structure, Document Management, Tasks, and the app's own features), so all records work the same way and one check covers them all. The starter owns it; module docs link here.
+<Badge text="Starter v2.17.6" variant="tip" /> Records made in these apps may be relied on later, for example as contemporaneous notes. The bar: records that are **reliable, complete and unaltered**, with a trail of every change; **times nobody can type in**; and **complete, unedited exports**. This page is the one contract every module that keeps records follows (Structure, Document Management, Tasks, and the app's own features), so all records work the same way and one check covers them all. The starter owns it; module docs link here.
 
 <Aside type="note" title="Background">
 Australian law is technology-neutral. See NSW State Archives, "Legal admissibility of digital records" (Electronic Transactions Act 1999 s10: "reliable, complete and unaltered"; audit trails of changes; security and access controls). RFC 3161 timestamps, SHA-2 hashes and an immutable trail are the accepted practice, and only a hash ever leaves the app, never the content. Names in code stay generic (History, Check integrity, Export): no legal wording in code.
@@ -66,13 +66,15 @@ Every write to a record saves a **version** in the same transaction as the write
   Reasons:
   - `gap`: a missing `seq` (the break names the missing one);
   - `link`: `prevHash` ≠ the previous `hash`;
-  - `hash`: it doesn't recompute over what is stored (the actor exactly as stored), or its `alg` is unknown;
+  - `hash`: it doesn't recompute over what is stored (the actor exactly as stored, with no keys but `id`, `kind` and `module`; the stored hash compared as stored, so one in capitals doesn't match), or its `alg` is unknown;
   - `seal`: with a seal key, a seal that doesn't verify with the key its `sealKeyId` names; an **unsealed version after a sealed one** in the same chain (a stripped seal); an unknown `alg`. Unsealed versions at the start of a chain, from before any key was set, stay merely unsealed;
   - `live`: the record as stored now differs from the last snapshot (compare with encrypted values opened, so re-encryption isn't a break);
-  - `timestamp`: see 2b.
+  - `timestamp`: see 2b. Only stamp entries with a string `provider` and `status` are read (others, `null` among them, are skipped), only status `done` is checked, and an empty kept nonce never matches.
 
   **With no seal key** and some versions sealed, there is no break: every version counts as unsealed, `uncheckedSeals` counts the sealed ones, and the line says the seals can't be checked. `timestamped` counts versions with at least one stamp that verifies, `pendingTimestamps` versions still waiting for one, `failedTimestamps` versions whose every stamp failed (a provider that never answered is not a break).
 - **Locking:** read the versions and the live record in one transaction, under a share lock on the record's row (`SELECT … FOR SHARE`), so a save in flight can't look like a `live` break.
+- **Key-provider outage** (v2.17.6): when the encryption key is set up but the key provider can't give it right now (an AWS KMS outage), `sealDigest` throws `RecordSealUnavailableError` (503, `record_seal_unavailable`, "This change could not be sealed right now. Try again in a moment."): refuse the save rather than store an unsealed version after sealed ones, which would read forever as a stripped seal. `verifySeal` answers `key-unavailable`, and `checkRevisionChain` throws the same error rather than report a break. An app with no key at all still seals nothing and checks nothing.
+- **Seal timing:** the derived seal key is cached per person after its first use. A first seal for someone calls the key provider inside your write transaction; call `warmRecordSeal({ tenantId })` before the transaction to keep that call out of it.
 - **Words in the UI** (`integrityLine` and `timestampIntegrityLine`, the same in every module):
   - "Broken at version 7: it was changed outside the app."
   - "No versions kept yet."
@@ -107,7 +109,7 @@ A version's hash can also get a timestamp from an independent Time Stamping Auth
 - **`verifyTimestamp(token, { hash, alg, nonce?, extraCerts? })`** checks a token: the imprint is the version's hash under its algorithm, the nonce matches (when given), the signed digest matches, the signature verifies with a certificate marked for timestamping and valid at the stamp's time, and the chain reaches a trusted root. Node's bundled roots cover DigiCert, Sectigo and SSL.com; the starter ships GlobalSign's Timestamping Root R45, which isn't a website root. It returns `{ ok, tsaAt, serial, tsaName }` or `{ ok: false, reason }` (`imprint`, `nonce`, `digest`, `signature`, `certificate`, `untrusted`, `unsupported`, `malformed`).
 - **`checkStoredTimestamp(stamp, { hash, alg })`** checks one kept entry: `pending` / `failed` (not a break), `verified` with the token's own values, or `broken` with what the token `says` and the `storedMismatch`. It passes the kept `nonce` and `validation.certs` for you. `timestampTokenValues(token)` reads what a token says without checking it, for display.
 - **The queue.** Save the version with a pending stamp in your own table, register a **store**, and call `nudgeTimestamps()` after the commit. The starter sweeps every minute while the backend is in use (it pauses with the backend's idle mode), stamps due versions one at a time, and saves each outcome: `done` with the stamp, `pending` with the next try (1 min, 5 min, 15 min, 1 h, 3 h, 6 h, 12 h, 24 h), or `failed` after the last. Your rows are the queue, so nothing is lost on a restart, whichever job runner the app uses.
-- **Two instances never ask twice:** `listDue` **claims** what it returns, in one statement (`UPDATE … RETURNING` over `FOR UPDATE SKIP LOCKED`) that pushes each stamp's due time forward by `TIMESTAMP_CLAIM_LEASE_MS` (5 minutes). `retryFailed` changes only failed stamps and keeps a live claim's lease.
+- **Two instances never ask twice:** `listDue` **claims** what it returns, in one statement (`UPDATE … RETURNING` over `FOR UPDATE SKIP LOCKED`) that pushes each stamp's due time forward by `TIMESTAMP_CLAIM_LEASE_MS` (5 minutes). `retryFailed` changes only failed stamps and keeps a live claim's lease. The sweep claims `TIMESTAMP_CLAIM_BATCH` (5) at a time, claims again while more is due (up to 45 seconds a store), and never asks for a stamp whose claim has less than 2 minutes left: that one waits for its lease to run out and a later sweep asks (v2.17.6).
 
   ```typescript
   const SECURITY = '../security/index.js';
@@ -215,7 +217,7 @@ Records show what changed in each record. The **event log** shows what happened 
 
 A person can put a **hold** on their records (Settings → Data & Privacy → Hold my records). While it's on, nothing of theirs may be **permanently** deleted: not by them, not by an admin, and not by a module's automatic clean-up. Editing, archiving and moving to trash still work; restoring from trash still works. The hold lives on the person's `Space` row (`holdSince`, `holdReason`).
 
-- The starter refuses account deletion with **409** `code: 'record_hold'`, both the person's own and an admin's, before anything is marked or erased.
+- The starter refuses account deletion with **409** `code: 'record_hold'`, both the person's own and an admin's, before anything is marked or erased. The deletion cascade itself (`deleteAccount`) also checks once, before any handler runs (v2.17.6), so modules don't check inside their erasure handlers: a refusal mid-cascade would leave a partial erasure.
 - Only the person places or lifts it (`PUT /api/v1/user/hold`, web session only). Lifting asks for an emailed code when step-up is on.
 - **Modules must check it** before any permanent deletion of a person's records: emptying trash, a retention clean-up, a "delete forever" action, a purge job.
 
@@ -253,6 +255,8 @@ import {
   timestampIntegrityLine, // (result) => string                 '' when no version asked for a stamp
   isRevisionActorAsWritten, // (actor) => boolean               the section 1 actor rule
   hasRecordSealKey,   // ({ tenantId? }) => Promise<boolean>     whether seals can be checked
+  warmRecordSeal,     // ({ tenantId? }) => Promise<void>       fetch the seal key before a transaction (v2.17.6)
+  RecordSealUnavailableError, // 503 'record_seal_unavailable'    a key-provider outage (v2.17.6)
   getRecordSealStatus,// () => Promise<RecordSealStatus>          for admin screens
   requestTimestamp,   // ({ hash, alg? }) => Promise<TimestampResult>   (v2.17.3)
   verifyTimestamp,    // (token, { hash, alg, nonce?, extraCerts? }) => TimestampVerification
@@ -263,6 +267,7 @@ import {
   timestampStores,    // register a module's stamp store
   nudgeTimestamps,    // () => void   after committing pending stamps
   TIMESTAMP_CLAIM_LEASE_MS, // 5 minutes: how far listDue pushes a claimed stamp's due time
+  TIMESTAMP_CLAIM_BATCH,    // 5: how many the sweep claims at a time
   RECORD_HASH_ALG,    // 'sha384'
   getRecordHold,      // (tenantId) => Promise<{ on, since, reason }>       (v2.17.4)
   isUnderRecordHold,  // (tenantId) => Promise<boolean>
@@ -270,7 +275,7 @@ import {
 } from '../security/index.js';
 ```
 
-- `verifySeal` reasons: `unsealed` (no seal), `unknown-key` (none of the app's keys has that id), `mismatch` (the hash or seal was changed outside the app), `bad-alg`.
+- `verifySeal` reasons: `unsealed` (no seal), `unknown-key` (none of the app's keys has that id), `mismatch` (the hash or seal was changed outside the app; compared exactly as stored), `bad-alg`, `key-unavailable` (a key-provider outage: not a break).
 - `checkRevisionChain` gives the Check integrity answer above, with every section 2 rule: the actor as stored, seal stripping, no key, unknown alg, and each version's `timestamps` checked entry by entry (`checkStoredTimestamp`). Pass the versions with their `actor`, `alg` and `timestamps` exactly as stored, and `live` (the record as stored now, encrypted values opened on both sides if re-encryption could differ) to compare it with the last version. Take the `FOR SHARE` lock and read inside one transaction yourself: the helper is pure.
 - The outputs reproduce the agreed vectors exactly: `{ b: 2, a: { d: [1, 'x', null], c: undefined }, e: true }` → `{"a":{"d":[1,"x",null]},"b":2,"e":true}` (SHA-256 `6885d5e6…`), the numbers vector (SHA-256 `581446be…`) and Structure's revision payload (SHA-384 `13142a5e…`). See `record-integrity.test.ts`.
 
