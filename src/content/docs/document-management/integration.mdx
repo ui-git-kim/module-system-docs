@@ -110,6 +110,17 @@ export interface DocumentManagementServiceInterface {
   ): Promise<UploadFolderListing>;
 
   /**
+   * Make a Word document from a Structure record: with an admin template
+   * (templateId), or the automatic print-out. Stored as a document of its own
+   * in the record's upload folder and linked to the record. Values are read
+   * as userId through Structure (secret fields read as blank). v1.19.0+.
+   */
+  generateDocument(userId: string, input: GenerateDocumentInput): Promise<GeneratedDocument>;
+
+  /** The enabled document templates a record of this type can use. v1.19.0+. */
+  listGenerationTemplatesFor(nodeType: string): Promise<Array<{ id: string; name: string }>>;
+
+  /**
    * Store a parsed artefact (external-parser output such as Docling JSON /
    * Markdown) for a source file. Versioned + checksummed; identical source
    * bytes (by contentHash) reuse the existing artefact instead of re-storing.
@@ -259,6 +270,8 @@ export interface ProvenanceResult {
 | `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId; documentId; staged? }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cognitive-pipeline routes ingested files into an `Ingested/` folder. `opts.reference: true` (v1.18.3+) always returns a `documentId`; since v1.18.4 it is new for every upload and no file is replaced. |
 | `getUploadCapability(userId)` | `Promise<UploadCapability>` | Read-only (v1.18.3+). Whether the user can upload to the default right now (`canUpload`, with a `reason` and a displayable `message` when not), where the file would land (`own` or `shared`), and the upload limits. Database only. See [Uploading from another module's UI](#uploading-from-another-modules-ui-v1183). |
 | `listUploadFolders(userId, path?, page?)` | `Promise<UploadFolderListing>` | Read-only (v1.18.5+). The folders inside one folder of the place the user's uploads land, for a folder picker. Paths are relative to their upload root, ready to pass as an upload's `folder`. See [Letting the person choose a folder](#letting-the-person-choose-a-folder-v1185). |
+| `generateDocument(userId, input)` | `Promise<GeneratedDocument>` | Writes (v1.19.0+). Makes a Word document from a Structure record, with a template (`templateId`) or the automatic summary, stores it as a new document and links it to the record. See [Making documents from records](#making-documents-from-records-v1190). |
+| `listGenerationTemplatesFor(nodeType)` | `Promise<Array<{ id: string; name: string }>>` | Read-only (v1.19.0+). The enabled templates for that record type, and the any-type ones. |
 | `putParsedArtefact(userId, input)` | `Promise<ParsedArtefact>` | **Store** the output an external parser produced for a source (this module never parses). Bytes default to a derived writable area (`DOC_ARTEFACT_PREFIX`) unless `input.target` overrides; deduped by source `contentHash`. Never written to a read-only or **ephemeral (Local Connect)** provider — derived data is always redirected to a persistent store so it survives the source machine going offline. |
 | `getParsedArtefact(userId, source, opts?)` | `Promise<ParsedArtefact \| null>` | Fetch the latest (or a given `format`/`version`) stored artefact for a source — so a consumer can re-ingest without re-parsing. |
 | `listParsedArtefacts(userId, source)` | `Promise<ParsedArtefact[]>` | Every stored artefact for a source. |
@@ -408,7 +421,7 @@ It reads the module's own records only — no storage provider is contacted — 
 
 ## Reacting to Events (Action Hooks Fired)
 
-Document Management fires eight action hooks from its service as documents and providers change. Any module can subscribe with `actionRegistry.addActionAsync` and react — index a newly uploaded file, clean up derived data when a document is deleted, or refresh a cache when a provider connects.
+Document Management fires twelve action hooks from its service as documents, templates and providers change. Any module can subscribe with `actionRegistry.addActionAsync` and react — index a newly uploaded file, clean up derived data when a document is deleted, or refresh a cache when a provider connects.
 
 The exact event ids and context shapes (from `action.registration.ts` and the service) are:
 
@@ -422,6 +435,10 @@ The exact event ids and context shapes (from `action.registration.ts` and the se
 | `documents.document.updated` | `{ userId, documentId }` | A reference's tags, notes, favourite, or status changes. |
 | `documents.provider.connected` | `{ userId, providerId, providerType }` | A storage provider is created/connected. `providerType` is `s3 \| r2 \| webdav \| local`. |
 | `documents.provider.disconnected` | `{ userId, providerId }` | A storage provider is removed. |
+| `documents.document.generated` | `{ userId, documentId, nodeId, templateId }` | A Word document was made from a record (v1.19.0+). `templateId` is `null` for the automatic summary. The document's own `documents.document.uploaded` and `documents.document.linked` fire first. |
+| `documents.template.created` | `{ userId, templateId }` | An admin added a document template (v1.19.0+). `userId` is the admin. |
+| `documents.template.updated` | `{ userId, templateId }` | An admin changed a template or replaced its file. |
+| `documents.template.deleted` | `{ userId, templateId }` | An admin deleted a template. |
 
 ### Subscribing to a fired hook
 
@@ -703,7 +720,7 @@ nodeCardExtensionRegistry.register({
 
 ### nodeActionRegistry — "Upload File" and "Link Document"
 
-Two header actions. Rather than owning React state, each handler dispatches a window `CustomEvent` that `NodeDocumentsTab` listens for and opens the relevant UI. **Upload File** opens the file picker; the files upload to the user's default provider and are linked to the node, within the admin's **Max files per upload** cap. **Link Document** opens the tab's "Link a document" sheet, a provider picker over a `FileBrowser`, which creates a reference and links it with `linkType: 'attachment'`. Set `'reference'` or `'primary'`, or link notes, through `useLinkDocument()` or the API. The older standalone `DocumentLinkDialog` component was never wired to these actions and was removed in v1.18.0.
+Three header actions; the third, **Create Document** (v1.19.0+), is described after the table. Rather than owning React state, each handler dispatches a window `CustomEvent` that `NodeDocumentsTab` listens for and opens the relevant UI. **Upload File** opens the file picker; the files upload to the user's default provider and are linked to the node, within the admin's **Max files per upload** cap. **Link Document** opens the tab's "Link a document" sheet, a provider picker over a `FileBrowser`, which creates a reference and links it with `linkType: 'attachment'`. Set `'reference'` or `'primary'`, or link notes, through `useLinkDocument()` or the API. The older standalone `DocumentLinkDialog` component was never wired to these actions and was removed in v1.18.0.
 
 | Property | "Upload File" | "Link Document" |
 |----------|---------------|-----------------|
@@ -749,6 +766,8 @@ nodeActionRegistry.register({
   },
 });
 ```
+
+**Create Document** (`create-document`, icon `FilePlus`, order `32`) dispatches `document-management:generate`, which opens the tab's **Create a document** dialog. Like the other two, it works while the record's **Documents** tab is mounted, and the tab has its own **Create document** button. See [Making documents from records](#making-documents-from-records-v1190).
 
 ### nodeSidebarSectionRegistry — "Pinned Documents"
 
@@ -1388,6 +1407,34 @@ On the backend the same list is `listUploadFolders(userId, path?, { offset?, lim
 - **A cancelled upload is cleaned up fully on Local storage only.** The route stops at once on every storage type. On S3-family storage the request to the bucket is released when the storage endpoint drops the idle connection, and a WebDAV server may keep a partial file.
 
 ---
+
+## Making documents from records (v1.19.0+)
+
+Document Management makes Word (.docx) documents from Structure records: from an admin's template, or as an automatic summary. People use it from the record's **Documents** tab (see [Usage](/document-management/usage/#making-word-documents-from-records)); another module can call it too.
+
+```typescript
+const dm = serviceRegistry.getOptional<DocumentManagementServiceInterface>('document-management');
+if (dm?.generateDocument) {
+  const templates = await dm.listGenerationTemplatesFor('matter'); // [] when none
+  const made = await dm.generateDocument(userId, {
+    nodeId,                        // the Structure record
+    templateId: templates[0]?.id,  // omit for the automatic summary
+  });
+  // made.documentId is a new document linked to the record.
+  // made.emptyTokens lists tags that came out blank; made.warnings what could not be read.
+}
+```
+
+From a browser, `POST /api/v1/document-management/generation/documents` with `{ nodeId, templateId? }` does the same as the signed-in user, or use `useGenerateDocument()` from the barrel. `GET /generation/available?nodeType=` (`useGenerationAvailable(nodeType)`) lists what a record of that type can be made into.
+
+How it works:
+
+- **Reads go through Structure, as the person.** Every value comes from Structure's `resolveTemplate(nodeId, template, userId)`, batched under its 2,000-character limit, so Structure's access rules apply and secret fields read as blank. Document Management never uses the record's unsealed data. A tag Structure cannot read comes out blank, with a warning. The children for a loop come from `getNodeChildren`.
+- **It needs Structure's `getNode` and `resolveTemplate`.** Without them the call fails with a `400` that says so. `getMergeFieldSchema` and `listNodeTypes` are used by the automatic summary when present.
+- **The document is stored like a reference upload.** It goes through `uploadToDefault(userId, fileName, bytes, { nodeId, reference: true })`, so it lands in the record's node-type upload folder and gets a new `documentId` every time, then it is linked to the record (`linkType: 'attachment'`). The usual `documents.document.uploaded` (with `documentId` and `nodeId`) and `documents.document.linked` events fire, then `documents.document.generated`.
+- **Limits.** One document lists at most 500 records and makes at most 1,500 `resolveTemplate` calls; past either, the rest is left out or blank, with a warning. A loop lists at most 200 records and loops nest at most 3 deep.
+- **Who may use which template.** Templates are added by admins only. Anyone signed in can use an enabled template for the record's type, or an any-type (`*`) one, on a record they can open. A template for another type is refused with a `400`; a disabled or missing template is a `404`, and so is a record the person cannot open.
+- **File name.** The template's pattern, filled in with the same tags. Without one it is `<record> - <template>.docx`, and the summary is `<record> - Summary.docx`.
 
 ## Browsing Folders
 
