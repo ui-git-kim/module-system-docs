@@ -49,6 +49,10 @@ export default defineConfig({
               slug: "getting-started/neon-setup",
             },
             {
+              label: "Record integrity",
+              slug: "getting-started/record-integrity",
+            },
+            {
               label: "Backup & Restore",
               slug: "getting-started/backup-restore",
             },

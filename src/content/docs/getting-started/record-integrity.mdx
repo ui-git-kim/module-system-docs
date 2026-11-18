@@ -1,0 +1,164 @@
+---
+title: Record integrity
+description: The shared contract for records modules keep — version history, fingerprints (hash chains), seals, independent timestamps and complete exports — and the starter helpers that implement it
+---
+
+import { Aside, Badge } from '@astrojs/starlight/components';
+
+<Badge text="Starter v2.17.2" variant="tip" /> Records made in these apps may be relied on later, for example as contemporaneous notes. The bar: records that are **reliable, complete and unaltered**, with a trail of every change; **times nobody can type in**; and **complete, unedited exports**. This page is the one contract every module that keeps records follows (Structure, Document Management, Tasks, and the app's own features), so all records work the same way and one check covers them all. The starter owns it; module docs link here.
+
+<Aside type="note" title="Background">
+Australian law is technology-neutral. See NSW State Archives, "Legal admissibility of digital records" (Electronic Transactions Act 1999 s10: "reliable, complete and unaltered"; audit trails of changes; security and access controls). RFC 3161 timestamps, SHA-2 hashes and an immutable trail are the accepted practice, and only a hash ever leaves the app, never the content. Names in code stay generic (History, Check integrity, Export): no legal wording in code.
+</Aside>
+
+**Apps are single tenant** (one person is one tenant). **Admins never get a read path to a person's history or exports.** Whoever can read a record can read its history, with the same field rules (secret values never shown).
+
+---
+
+## 1. Version history
+
+Every write to a record saves a **version** in the same transaction as the write: create, update, archive, delete (to trash), restore, move, merge, duplicate, revert, and any module or system write. Versions are never updated or deleted, except when the record itself is permanently deleted (the person's data: the deletion cascade removes them, and the personal-data export includes them).
+
+| Field | Meaning |
+|---|---|
+| `id` | its id |
+| `recordId` | the record's id |
+| `seq` | 1, 2, 3 … per record, no gaps, assigned under a lock on the record |
+| `action` | `baseline`, `create`, `update`, `archive`, `delete`, `restore`, `move`, `merge`, `duplicate`, `revert`; a module may add its own lower-case words (`upload`, `replace-file`) |
+| `at` | the app server's clock at the write, UTC ISO 8601 with milliseconds: `2026-11-18T01:23:45.678Z` |
+| `actor` | `{ id: <user id or null>, kind: 'user' \| 'module' \| 'system', module?: <module id> }` |
+| `snapshot` | the record's full stored state **after** the write, as the module stores it. Encrypted values stay as stored (never decrypted into a version) |
+| `changes` | `[{ path, before, after }]` from the previous snapshot (`name`, `data.mood`, `data.log[3]`). A secret's values are `{ "hidden": true }`. Not part of the hash |
+| `prevHash` | the previous version's `hash`, or `null` for `seq` 1 |
+| `alg` | this version's hash algorithm: `sha384` |
+| `hash` | see 2 |
+| `seal`, `sealKeyId` | see 2 (`null` when the app has no seal key) |
+
+- **Records from before history:** the first write after history arrives saves a `baseline` version of the record as found (`actor.kind: 'system'`), then the write's own version. The History view says "History starts on …".
+- **Revert** ("Restore this version") writes a **new** version (`action: 'revert'`, with `revertedTo: <seq>`). Nothing is rewritten. The module's own locks still apply.
+- **Events:** `<module>.<record>.revisionCreated`, `<module>.<record>.reverted`.
+
+---
+
+## 2. Integrity: hash chain and seal
+
+- **Canonical JSON:** RFC 8785 (JSON Canonicalization Scheme): object keys sorted by UTF-16 code units, no whitespace, strings and numbers as `JSON.stringify` writes them, `undefined` left out of objects (and `null` in arrays). UTF-8 bytes.
+- **Algorithm (agile):** each version records its `alg`. New versions use **`sha384`**; older versions verify with their own `alg` (`sha256` and `sha512` are accepted too), so a later move to another algorithm never breaks a chain. SHA-384 is chosen because, as we understand ASD's guidance in the ISM, SHA-224 and SHA-256 are to be phased out by 2030 while SHA-384 and SHA-512 stay approved. Check the current ISM before relying on this.
+- **hash** = the version's `alg`, lower-case hex, of the canonical JSON of exactly:
+  ```json
+  { "v": 1, "alg": "sha384", "module": "structure", "recordType": "<type>", "recordId": "<id>", "seq": 3, "action": "update",
+    "at": "2026-11-18T01:23:45.678Z", "actor": { "id": "<user id>", "kind": "user" }, "snapshot": { … }, "prevHash": "<hex or null>" }
+  ```
+  (`actor.module` appears only when set.) Anyone can recompute it from an export.
+- **seal** = an HMAC with the version's algorithm (HMAC-SHA-384 for `sha384`) of the `hash` string, lower-case hex, keyed with the app's **record seal key**, which only the server holds. A database edit that also recomputes the hashes is still caught. `sealKeyId` = the first 8 hex characters of SHA-256 of the key's bytes, so keys can change: each version names the key that sealed it.
+- **The record seal key** (starter v2.17.2):
+  1. the app's **encryption key**, when it is set up: an HKDF-SHA256 subkey of it (salt `starter-record-seal/v1`, info `record-seal`), one per person when AWS KMS keeps a key per person (`SECURITY_KMS_PER_TENANT`), else one for the app;
+  2. otherwise **`RECORD_SEAL_KEY`** (at least 32 random bytes, as hex or base64), the env key modules used before the starter had seals;
+  3. otherwise none: versions are saved unsealed, and Check integrity says "Not sealed".
+
+  Checking a seal tries every key the app has (the derived key, `RECORD_SEAL_KEY`, `RECORD_SEAL_KEY_PREVIOUS`) by `sealKeyId`.
+- **Check integrity** walks a record's versions and answers:
+  ```json
+  { "ok": true, "checkedAt": "<ISO>", "versions": 12, "sealed": 12, "unsealed": 0, "liveMatches": true,
+    "breaks": [ { "seq": 7, "reason": "hash" } ] }
+  ```
+  Reasons: `gap` (a missing `seq`), `link` (`prevHash` ≠ the previous `hash`), `hash` (doesn't recompute), `seal` (doesn't verify), `live` (the record as stored now differs from the last snapshot; compare with encrypted values opened, so re-encryption isn't a break), and `timestamp` (see 2b).
+- **Words in the UI:** unbroken, "Unbroken: all 12 versions match their seals."; broken, "Broken at version 7: it was changed outside the app."; unsealed, "Not sealed: the app has no seal key."
+
+---
+
+## 2b. Independent timestamps (RFC 3161)
+
+A version's hash can also get a timestamp from an independent Time Stamping Authority (TSA): proof the record existed in exactly that form at that time, independent of whoever runs the app. **Only the hash (48 bytes for SHA-384) is sent: no content ever leaves the app.**
+
+- **Off by default.** The admin turns it on per record type (and, in Structure, per field group): every version, only when the record is created, or when a row is added.
+- **Providers** (the same list in every module; **DigiCert is the default**): DigiCert `http://timestamp.digicert.com`, GlobalSign `http://timestamp.globalsign.com/tsa/r6advanced1`, Sectigo `http://timestamp.sectigo.com`, or a custom RFC 3161 URL with optional credentials in env (`RECORD_TSA_USERNAME` / `RECORD_TSA_PASSWORD`, never in config). The free endpoints suit modest use; their paid services use the same protocol.
+- **Request:** a `TimeStampReq` whose `messageImprint` is the version's hash bytes under its algorithm, a random `nonce`, and `certReq: true`. Sent **after the write commits** (a save never waits on or fails because of the TSA), retried with back-off, marked failed after a set number of tries.
+- **Stored with the version:** `{ provider, url, status: 'pending' | 'done' | 'failed', requestedAt, tsaAt, serial, token: <base64 DER TimeStampToken>, error }`, the token exactly as received.
+- **Long-term validation (ETSI):** the token keeps the TSA's certificate chain; when the stamp is made, the TSA certificate's revocation data (OCSP or CRL) is kept too, in `validation: { ocsp?, crl? }`, so the stamp can be checked after the certificate expires. Re-timestamping (RFC 4998 / ETSI TS 119 512) comes later. The profile is RFC 3161 as ETSI EN 319 422 profiles it.
+- **Check integrity** also verifies each token (the imprint equals the hash, the nonce matches, the signature verifies) and shows `tsaAt`; a failure is `reason: "timestamp"`.
+- **Entry time and event time:** the server and TSA times say when a record was **written**; a record's own date field says when the **event** happened. Exports show both.
+
+<Aside type="note" title="Starter support">
+The starter's RFC 3161 client and stamp queue are the next step after v2.17.2. Until then, modules implement 2b to this contract.
+</Aside>
+
+---
+
+## 3. Export (complete and unedited)
+
+An export is a **bundle**: one or more records, complete. Every field, with the stored value and the value as shown; each record with its full history and its integrity result. Nothing is filtered within a record, and an export never edits anything.
+
+```json
+{
+  "format": "record-export", "v": 1,
+  "exportedAt": "<ISO UTC>", "exportedBy": { "id": "<user id>", "kind": "user" },
+  "timeZone": "Australia/Sydney",
+  "source": { "module": "structure", "moduleVersion": "1.89.35" },
+  "records": [
+    {
+      "module": "structure", "recordType": "changeover", "recordTypeLabel": "Changeover",
+      "id": "<id>", "title": "<name>", "createdAt": "<ISO>", "updatedAt": "<ISO>",
+      "fields": [ { "id": "notes", "label": "Changeover notes", "type": "field-group", "value": [ … ], "display": [ … ] } ],
+      "history": [ { "seq": 1, "action": "create", "at": "<ISO>", "actor": { … }, "changes": [ … ], "prevHash": null, "hash": "…", "seal": "…", "sealKeyId": "…" } ],
+      "integrity": { "ok": true, "checkedAt": "<ISO>", "versions": 3, "sealed": 3, "unsealed": 0, "liveMatches": true, "breaks": [] }
+    }
+  ],
+  "contentHashAlg": "sha384", "contentHash": "<hash of the canonical JSON of this bundle without contentHash>"
+}
+```
+
+- **Formats:** the bundle (`.json`); a print view of it (every time with its time zone, page numbers, the `contentHash` and export time on every page); Word (`.docx`) through one shared renderer (`renderRecordExportDocx(bundle)` in the service registry, from Document Management).
+- **Export log:** each export is recorded (who, when, which records, `contentHash`, format) and fires `<module>.<record>.exported`. Readable by the same people as the records.
+- **Linked evidence:** a link to another record is exported with that record's id, title and latest `hash` (and, for a Document Management file, the file's `contentHash`).
+- **Certificate of authenticity:** every export opens with a plain-English page explaining how the records were made and kept, and how anyone can check them without the app. It states facts the system can show; it never makes a legal claim.
+
+---
+
+## 4. Verifying an export (for an expert)
+
+For each record: recompute each version's `hash` from the canonical JSON in section 2; check each `prevHash` equals the previous `hash`; check the `seq` values have no gaps. Check each timestamp token against its version's hash with any RFC 3161 tool, for example `openssl ts -verify -data <hash file> -in <file.tsr> -CAfile <TSA chain>`. Then check the bundle's `contentHash`. Seals need the server, through Check integrity.
+
+---
+
+## 5. What each module keeps
+
+- **Structure:** entries (nodes), their fields and field-group rows.
+- **Document Management:** documents and their files. The file's own SHA-256 `contentHash` belongs in the document's snapshot, so the chain covers which file a document held at each version.
+
+Questions or changes: raise them before building, so every module stays the same.
+
+---
+
+## The starter's helpers
+
+In the security feature (`backend/src/features/security`, exported from its `index.ts`):
+
+```typescript
+import {
+  canonicalJson,      // (value) => string                       RFC 8785
+  hashRecord,         // (value, alg = 'sha384') => string        hex
+  hashRevision,       // (fields: RevisionHashFields) => string   the section 2 hash
+  revisionHashInput,  // (fields) => string                       the canonical JSON it hashes
+  sealDigest,         // (hash, { alg?, tenantId? }) => Promise<{ seal, sealKeyId }>  (nulls without a key)
+  verifySeal,         // ({ hash, seal, sealKeyId, alg?, tenantId? }) => Promise<{ ok } | { ok: false, reason }>
+  checkRevisionChain, // (versions, { tenantId?, live? }) => Promise<IntegrityResult>
+  getRecordSealStatus,// () => Promise<RecordSealStatus>          for admin screens
+  RECORD_HASH_ALG,    // 'sha384'
+} from '../security/index.js';
+```
+
+- `verifySeal` reasons: `unsealed` (no seal), `unknown-key` (none of the app's keys has that id), `mismatch` (the hash or seal was changed outside the app), `bad-alg`.
+- `checkRevisionChain` gives the Check integrity answer above (without `timestamp`, until the starter's timestamp client lands). Pass `live` (the record as stored now) to compare it with the last version.
+- The outputs reproduce the agreed vectors exactly: `{ b: 2, a: { d: [1, 'x', null], c: undefined }, e: true }` → `{"a":{"d":[1,"x",null]},"b":2,"e":true}` (SHA-256 `6885d5e6…`), the numbers vector (SHA-256 `581446be…`) and Structure's revision payload (SHA-384 `13142a5e…`). See `record-integrity.test.ts`.
+
+### Moving a module from `RECORD_SEAL_KEY` to the starter
+
+1. **Hash:** call `hashRevision(fields)` (or keep your own: the output is the same).
+2. **Seal:** call `await sealDigest(hash, { alg, tenantId })` and store its `seal` and `sealKeyId` as before.
+3. **Check:** call `checkRevisionChain(versions, { tenantId, live })`, or `verifySeal` per version. Old seals made with `RECORD_SEAL_KEY` keep verifying by their `sealKeyId`, as long as the app keeps `RECORD_SEAL_KEY` (or moves it to `RECORD_SEAL_KEY_PREVIOUS`).
+4. **Older hosts:** reach the helpers through the guarded import (`const SECURITY = '../security/index.js'`), and fall back to your own implementation when `typeof sealDigest !== 'function'` (a starter before v2.17.2).
+
+Once the app's encryption key is set up, new versions are sealed with the derived key. Both modules should switch together, so both seal with the same key.
+
+The admin **Security** page shows what seals records (Keys and modules → Record seal) and lists "Records can be proven unchanged" on its checklist. It never shows anyone's records.
