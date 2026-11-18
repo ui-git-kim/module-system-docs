@@ -5,7 +5,7 @@ description: The shared contract for records modules keep — version history, f
 
 import { Aside, Badge } from '@astrojs/starlight/components';
 
-<Badge text="Starter v2.17.4" variant="tip" /> Records made in these apps may be relied on later, for example as contemporaneous notes. The bar: records that are **reliable, complete and unaltered**, with a trail of every change; **times nobody can type in**; and **complete, unedited exports**. This page is the one contract every module that keeps records follows (Structure, Document Management, Tasks, and the app's own features), so all records work the same way and one check covers them all. The starter owns it; module docs link here.
+<Badge text="Starter v2.17.5" variant="tip" /> Records made in these apps may be relied on later, for example as contemporaneous notes. The bar: records that are **reliable, complete and unaltered**, with a trail of every change; **times nobody can type in**; and **complete, unedited exports**. This page is the one contract every module that keeps records follows (Structure, Document Management, Tasks, and the app's own features), so all records work the same way and one check covers them all. The starter owns it; module docs link here.
 
 <Aside type="note" title="Background">
 Australian law is technology-neutral. See NSW State Archives, "Legal admissibility of digital records" (Electronic Transactions Act 1999 s10: "reliable, complete and unaltered"; audit trails of changes; security and access controls). RFC 3161 timestamps, SHA-2 hashes and an immutable trail are the accepted practice, and only a hash ever leaves the app, never the content. Names in code stay generic (History, Check integrity, Export): no legal wording in code.
@@ -24,9 +24,9 @@ Every write to a record saves a **version** in the same transaction as the write
 | `id` | its id |
 | `recordId` | the record's id |
 | `seq` | 1, 2, 3 … per record, no gaps, assigned under a lock on the record |
-| `action` | `baseline`, `create`, `update`, `archive`, `delete`, `restore`, `move`, `merge`, `duplicate`, `revert`; a module may add its own lower-case words (`upload`, `replace-file`) |
+| `action` | `baseline`, `create`, `update`, `archive`, `delete`, `restore`, `move`, `merge`, `duplicate`, `revert`; a module may add its own lower-case words (Structure: `unmerge`; Document Management: `upload`, `replace-file`, `link`, `unlink`) |
 | `at` | the app server's clock at the write, UTC ISO 8601 with milliseconds: `2026-11-18T01:23:45.678Z` |
-| `actor` | `{ id: <user id or null>, kind: 'user' \| 'module' \| 'system', module?: <module id> }` |
+| `actor` | `{ id: <user id or null>, kind: 'user' \| 'module' \| 'system', module?: <module id> }`. Valid only as a write makes it: a user or module has a non-empty `id`, a module also has its `module` (and only a module has one), the system has an id or `null` |
 | `snapshot` | the record's full stored state **after** the write, as the module stores it. Encrypted values stay as stored (never decrypted into a version) |
 | `changes` | `[{ path, before, after }]` from the previous snapshot (`name`, `data.mood`, `data.log[3]`). A secret's values are `{ "hidden": true }`. Not part of the hash |
 | `prevHash` | the previous version's `hash`, or `null` for `seq` 1 |
@@ -36,6 +36,7 @@ Every write to a record saves a **version** in the same transaction as the write
 
 - **Records from before history:** the first write after history arrives saves a `baseline` version of the record as found (`actor.kind: 'system'`), then the write's own version. The History view says "History starts on …".
 - **Revert** ("Restore this version") writes a **new** version (`action: 'revert'`, with `revertedTo: <seq>`). Nothing is rewritten. The module's own locks still apply.
+- **No-change saves:** a write that leaves the snapshot unchanged saves no version.
 - **Events:** `<module>.<record>.revisionCreated`, `<module>.<record>.reverted`.
 
 ---
@@ -49,21 +50,38 @@ Every write to a record saves a **version** in the same transaction as the write
   { "v": 1, "alg": "sha384", "module": "structure", "recordType": "<type>", "recordId": "<id>", "seq": 3, "action": "update",
     "at": "2026-11-18T01:23:45.678Z", "actor": { "id": "<user id>", "kind": "user" }, "snapshot": { … }, "prevHash": "<hex or null>" }
   ```
-  (`actor.module` appears only when set.) Anyone can recompute it from an export.
+  (`actor.module` appears only when set.) Anyone can recompute it from an export. A check recomputes it over the actor **exactly as stored**: an actor no write makes (see section 1) fails the hash rather than being tidied into a valid one.
 - **seal** = an HMAC with the version's algorithm (HMAC-SHA-384 for `sha384`) of the `hash` string, lower-case hex, keyed with the app's **record seal key**, which only the server holds. A database edit that also recomputes the hashes is still caught. `sealKeyId` = the first 8 hex characters of SHA-256 of the key's bytes, so keys can change: each version names the key that sealed it.
 - **The record seal key** (starter v2.17.2):
   1. the app's **encryption key**, when it is set up: an HKDF-SHA256 subkey of it (salt `starter-record-seal/v1`, info `record-seal`), one per person when AWS KMS keeps a key per person (`SECURITY_KMS_PER_TENANT`), else one for the app;
   2. otherwise **`RECORD_SEAL_KEY`** (at least 32 random bytes, as hex or base64), the env key modules used before the starter had seals;
   3. otherwise none: versions are saved unsealed, and Check integrity says "Not sealed".
 
-  Checking a seal tries every key the app has (the derived key, `RECORD_SEAL_KEY`, `RECORD_SEAL_KEY_PREVIOUS`) by `sealKeyId`.
+  A seal is checked with the key its `sealKeyId` names, among the app's keys (the derived key, `RECORD_SEAL_KEY`, `RECORD_SEAL_KEY_PREVIOUS`). No other key is tried.
 - **Check integrity** walks a record's versions and answers:
   ```json
-  { "ok": true, "checkedAt": "<ISO>", "versions": 12, "sealed": 12, "unsealed": 0, "liveMatches": true,
-    "breaks": [ { "seq": 7, "reason": "hash" } ] }
+  { "ok": true, "checkedAt": "<ISO>", "versions": 12, "sealed": 12, "unsealed": 0, "uncheckedSeals": 0, "liveMatches": true,
+    "breaks": [ { "seq": 7, "reason": "hash" } ], "timestamped": 4, "pendingTimestamps": 1, "failedTimestamps": 0 }
   ```
-  Reasons: `gap` (a missing `seq`), `link` (`prevHash` ≠ the previous `hash`), `hash` (doesn't recompute), `seal` (doesn't verify), `live` (the record as stored now differs from the last snapshot; compare with encrypted values opened, so re-encryption isn't a break), and `timestamp` (see 2b).
-- **Words in the UI:** unbroken, "Unbroken: all 12 versions match their seals."; broken, "Broken at version 7: it was changed outside the app."; unsealed, "Not sealed: the app has no seal key."
+  Reasons:
+  - `gap`: a missing `seq` (the break names the missing one);
+  - `link`: `prevHash` ≠ the previous `hash`;
+  - `hash`: it doesn't recompute over what is stored (the actor exactly as stored), or its `alg` is unknown;
+  - `seal`: with a seal key, a seal that doesn't verify with the key its `sealKeyId` names; an **unsealed version after a sealed one** in the same chain (a stripped seal); an unknown `alg`. Unsealed versions at the start of a chain, from before any key was set, stay merely unsealed;
+  - `live`: the record as stored now differs from the last snapshot (compare with encrypted values opened, so re-encryption isn't a break);
+  - `timestamp`: see 2b.
+
+  **With no seal key** and some versions sealed, there is no break: every version counts as unsealed, `uncheckedSeals` counts the sealed ones, and the line says the seals can't be checked. `timestamped` counts versions with at least one stamp that verifies, `pendingTimestamps` versions still waiting for one, `failedTimestamps` versions whose every stamp failed (a provider that never answered is not a break).
+- **Locking:** read the versions and the live record in one transaction, under a share lock on the record's row (`SELECT … FOR SHARE`), so a save in flight can't look like a `live` break.
+- **Words in the UI** (`integrityLine` and `timestampIntegrityLine`, the same in every module):
+  - "Broken at version 7: it was changed outside the app."
+  - "No versions kept yet."
+  - "Seals can't be checked: the app has no seal key."
+  - "Not sealed: the app has no seal key."
+  - "Unbroken: its 1 version matches its seal." / "Unbroken: all 12 versions match their seals."
+  - "Unbroken: 9 of 12 versions match their seals; 3 are not sealed."
+  - "Independently timestamped: 4 versions; 1 pending; 0 failed." (the pending and failed parts only when not zero)
+- **Known limit:** deleting a whole chain (every version and the record) reads as "No versions kept yet." The app-wide [event log](#the-event-log) anchors it (who deleted what, sealed, under Permanent); a periodic timestamp over every record's latest hash may follow.
 
 ---
 
@@ -72,18 +90,24 @@ Every write to a record saves a **version** in the same transaction as the write
 A version's hash can also get a timestamp from an independent Time Stamping Authority (TSA): proof the record existed in exactly that form at that time, independent of whoever runs the app. **Only the hash (48 bytes for SHA-384) is sent: no content ever leaves the app.**
 
 - **Off by default.** The admin turns it on per record type (and, in Structure, per field group): every version, only when the record is created, or when a row is added.
-- **Providers** (the same list in every module; **DigiCert is the default**): DigiCert `http://timestamp.digicert.com`, GlobalSign `http://timestamp.globalsign.com/tsa/r6advanced1`, Sectigo `http://timestamp.sectigo.com`, or a custom RFC 3161 URL with optional credentials in env (`RECORD_TSA_USERNAME` / `RECORD_TSA_PASSWORD`, never in config). The free endpoints suit modest use; their paid services use the same protocol.
-- **Request:** a `TimeStampReq` whose `messageImprint` is the version's hash bytes under its algorithm, a random `nonce`, and `certReq: true`. Sent **after the write commits** (a save never waits on or fails because of the TSA), retried with back-off, marked failed after a set number of tries.
-- **Stored with the version:** `{ provider, url, status: 'pending' | 'done' | 'failed', requestedAt, tsaAt, serial, token: <base64 DER TimeStampToken>, error }`, the token exactly as received.
+- **One provider for the app, no backup** (decided 2026-11-18): the starter's app-wide setting. Stamps a module already stored as a `timestamps` array with a main and a backup keep verifying: each entry is checked on its own (`checkStoredTimestamp`), and a version counts as timestamped when one verifies.
+- **Providers** (the same list in every module; **DigiCert is the default**): DigiCert `http://timestamp.digicert.com`, GlobalSign `http://timestamp.globalsign.com/tsa/r6advanced1`, Sectigo `http://timestamp.sectigo.com`, SSL.com `http://ts.ssl.com`, or a custom RFC 3161 URL. The free endpoints suit modest use; their paid services use the same protocol.
+- **Credentials** (`RECORD_TSA_USERNAME` / `RECORD_TSA_PASSWORD`, in env, never in config) go **only to the saved custom URL, and only over `https:`**. Test connection on an unsaved URL sends none; a queued stamp whose URL isn't the saved custom URL sends none; a built-in provider gets none.
+- **Addresses:** a custom URL must be `http:` or `https:` with no userinfo. Loopback, private, link-local (cloud metadata among them: `169.254.169.254`, `fd00:ec2::254`), CGNAT, unique-local, multicast, reserved, documentation and unspecified addresses are refused, IPv4 and IPv6, with IPv4-mapped and other embedded forms judged as the IPv4 address. They're refused as IP literals and as resolved addresses, and the connection is pinned to the address that was checked, so DNS rebinding can't swap it. No redirects are followed; replies have a size cap (256 KB for a TSA reply). The same applies to the addresses certificates name (issuers, OCSP, CRL). Errors are generic: "Couldn't get a timestamp from that address." or "That address isn't allowed."
+- **Request:** a `TimeStampReq` whose `messageImprint` is the version's hash bytes under its algorithm (the AlgorithmIdentifier's parameters **absent**, not NULL: RFC 5754; all four free servers accept it), a random `nonce`, and `certReq: true`. Sent **after the write commits** (a save never waits on or fails because of the TSA), retried with back-off, marked failed after a set number of tries. The retry schedule is the queue's (the starter's: 1 min, 5 min, 15 min, 1 h, 3 h, 6 h, 12 h, 24 h); when a version asks for a stamp ("every version", "on create", "when a row is added") stays the module's.
+- **Stored with the version** (`timestamps`, one entry per stamp): `{ provider, role?, url, status: 'pending' | 'done' | 'failed', requestedAt, tsaAt, serial, tsaName, token: <base64 DER TimeStampToken>, validation, nonce, error, attempts, nextAttemptAt }`, the token exactly as received, `nonce` the one sent (hex), `tsaName` the signer certificate's CN (else O). `role` (`main` / `backup`) appears only on stamps stored before the single provider.
+- **Stored values vs the token:** a reader shows a done stamp's `tsaAt`, `serial` and `tsaName` **as its token says them**, never the stored copy. Stored values that don't match what the token verifies to are a `timestamp` break.
 - **Long-term validation (ETSI):** the token keeps the TSA's certificate chain; when the stamp is made, the TSA certificate's revocation data (OCSP or CRL) is kept too, in `validation: { ocsp?, crl? }`, so the stamp can be checked after the certificate expires. Re-timestamping (RFC 4998 / ETSI TS 119 512) comes later. The profile is RFC 3161 as ETSI EN 319 422 profiles it.
-- **Check integrity** also verifies each token (the imprint equals the hash, the nonce matches, the signature verifies) and shows `tsaAt`; a failure is `reason: "timestamp"`.
+- **Check integrity** also verifies each done stamp (the imprint equals the hash under its `alg`, the kept nonce matches, the signature, the signer certificate and its chain verify, and the stored values match the token); a missing, unverifiable or mismatched token is `reason: "timestamp"`. A stamp still pending, or one that never came, is not a break.
 - **Entry time and event time:** the server and TSA times say when a record was **written**; a record's own date field says when the **event** happened. Exports show both.
 
 ### The starter's timestamp client and queue (v2.17.3)
 
-- **`requestTimestamp({ hash, alg })`** sends the request to the app's service (`RECORD_TSA_PROVIDER`: `digicert` by default, `globalsign`, `sectigo`, or `custom` with `RECORD_TSA_URL`; Basic auth from `RECORD_TSA_USERNAME` / `RECORD_TSA_PASSWORD` for a paid plan) and resolves only with a token that verified. It returns the contract's stamp: `{ provider, url, requestedAt, tsaAt, serial, token, signer, validation }`, where `validation` holds the OCSP response (or CRL) and any chain certificates the token left out, all base64 DER.
-- **`verifyTimestamp(token, { hash, alg, extraCerts? })`** checks a stored token: the imprint is the version's hash under its algorithm, the signed digest matches, the signature verifies with a certificate marked for timestamping and valid at the stamp's time, and the chain reaches a trusted root. Node's bundled roots cover DigiCert and Sectigo; the starter ships GlobalSign's Timestamping Root R45, which isn't a website root. Pass a stored stamp's `validation.certs` as `extraCerts`. It returns `{ ok, tsaAt, serial, signer }` or `{ ok: false, reason }` (`imprint`, `nonce`, `digest`, `signature`, `certificate`, `untrusted`, `unsupported`, `malformed`).
-- **The queue.** Save the version with `timestamp: { status: 'pending', … }` in your own table, register a **store**, and call `nudgeTimestamps()` after the commit. The starter sweeps every minute while the backend is in use (it pauses with the backend's idle mode), stamps due versions one at a time, and saves each outcome: `done` with the stamp, `pending` with the next try (1 min, 5 min, 15 min, 1 h, 3 h, 6 h, 12 h, 24 h), or `failed` after the last. Your rows are the queue, so nothing is lost on a restart, whichever job runner the app uses.
+- **`requestTimestamp({ hash, alg })`** sends the request to the app's service (`RECORD_TSA_PROVIDER`: `digicert` by default, `globalsign`, `sectigo`, `sslcom`, or `custom` with `RECORD_TSA_URL`) under the address and credential rules above, and resolves only with a token that verified. It returns the contract's stamp: `{ provider, url, requestedAt, tsaAt, serial, tsaName, nonce, token, validation }`, where `validation` holds the OCSP response (or CRL) and any chain certificates the token left out, all base64 DER. A failure throws a `TimestampError` whose message is the generic words (store and show that) and whose `detail` is for the server log only.
+- **`verifyTimestamp(token, { hash, alg, nonce?, extraCerts? })`** checks a token: the imprint is the version's hash under its algorithm, the nonce matches (when given), the signed digest matches, the signature verifies with a certificate marked for timestamping and valid at the stamp's time, and the chain reaches a trusted root. Node's bundled roots cover DigiCert, Sectigo and SSL.com; the starter ships GlobalSign's Timestamping Root R45, which isn't a website root. It returns `{ ok, tsaAt, serial, tsaName }` or `{ ok: false, reason }` (`imprint`, `nonce`, `digest`, `signature`, `certificate`, `untrusted`, `unsupported`, `malformed`).
+- **`checkStoredTimestamp(stamp, { hash, alg })`** checks one kept entry: `pending` / `failed` (not a break), `verified` with the token's own values, or `broken` with what the token `says` and the `storedMismatch`. It passes the kept `nonce` and `validation.certs` for you. `timestampTokenValues(token)` reads what a token says without checking it, for display.
+- **The queue.** Save the version with a pending stamp in your own table, register a **store**, and call `nudgeTimestamps()` after the commit. The starter sweeps every minute while the backend is in use (it pauses with the backend's idle mode), stamps due versions one at a time, and saves each outcome: `done` with the stamp, `pending` with the next try (1 min, 5 min, 15 min, 1 h, 3 h, 6 h, 12 h, 24 h), or `failed` after the last. Your rows are the queue, so nothing is lost on a restart, whichever job runner the app uses.
+- **Two instances never ask twice:** `listDue` **claims** what it returns, in one statement (`UPDATE … RETURNING` over `FOR UPDATE SKIP LOCKED`) that pushes each stamp's due time forward by `TIMESTAMP_CLAIM_LEASE_MS` (5 minutes). `retryFailed` changes only failed stamps and keeps a live claim's lease.
 
   ```typescript
   const SECURITY = '../security/index.js';
@@ -91,11 +115,11 @@ A version's hash can also get a timestamp from an independent Time Stamping Auth
   timestampStores.register({
     moduleId: 'structure',
     label: 'Structure entries',
-    listDue: (limit, now) => /* pending stamps with nextAttemptAt <= now: { id, hash, alg, attempts } */,
+    listDue: (limit, now) => /* CLAIM pending stamps due at now (lease TIMESTAMP_CLAIM_LEASE_MS): { id, hash, alg, attempts } */,
     save: (id, outcome) => /* write outcome.result (done), or attempts / nextAttemptAt / error */,
     counts: () => /* { pending, failed } */,
     listFailed: (limit) => /* [{ id, attempts, error }]: never record content */,
-    retryFailed: (ids) => /* failed back to pending; returns how many */,
+    retryFailed: (ids) => /* failed back to pending, keeping a live claim's lease; returns how many */,
   });
   ```
 - **Admin:** the Security page's **Keys and modules** tab shows the service with a **Test connection** (it stamps a random fingerprint and checks the answer), each module's waiting and failed stamps with **Retry failed**, and the setting on the Settings tab (Records → Timestamp service). The checklist lists **Independent timestamps** under "Worth doing".
@@ -117,24 +141,37 @@ An export is a **bundle**: one or more records, complete. Every field, with the 
       "module": "structure", "recordType": "changeover", "recordTypeLabel": "Changeover",
       "id": "<id>", "title": "<name>", "createdAt": "<ISO>", "updatedAt": "<ISO>",
       "fields": [ { "id": "notes", "label": "Changeover notes", "type": "field-group", "value": [ … ], "display": [ … ] } ],
-      "history": [ { "seq": 1, "action": "create", "at": "<ISO>", "actor": { … }, "changes": [ … ], "prevHash": null, "hash": "…", "seal": "…", "sealKeyId": "…" } ],
-      "integrity": { "ok": true, "checkedAt": "<ISO>", "versions": 3, "sealed": 3, "unsealed": 0, "liveMatches": true, "breaks": [] }
+      "history": [ { "seq": 1, "action": "create", "at": "<ISO>", "actor": { … }, "changes": [ … ], "snapshot": { … },
+                     "prevHash": null, "alg": "sha384", "hash": "…", "seal": "…", "sealKeyId": "…", "timestamps": [ … ] } ],
+      "integrity": { "ok": true, "checkedAt": "<ISO>", "versions": 3, "sealed": 3, "unsealed": 0, "uncheckedSeals": 0, "liveMatches": true, "breaks": [],
+                     "timestamped": 3, "pendingTimestamps": 0, "failedTimestamps": 0 },
+      "linkedEvidence": [ … ]
     }
   ],
   "contentHashAlg": "sha384", "contentHash": "<hash of the canonical JSON of this bundle without contentHash>"
 }
 ```
 
-- **Formats:** the bundle (`.json`); a print view of it (every time with its time zone, page numbers, the `contentHash` and export time on every page); Word (`.docx`) through one shared renderer (`renderRecordExportDocx(bundle)` in the service registry, from Document Management).
+- **History entries** carry `alg`, `snapshot` (exactly as hashed, encrypted values as stored: without it an expert can't recompute the hashes section 4 asks for), `timestamps` (each with its token as received), and `revertedTo` on a revert.
+- **Display values** (`display`): a string, or `null` when blank; `{ "hidden": true }` for a secret, whose `value` is hidden too; a field group as rows `[{ "fields": [{ "id", "label", "type", "display" }], "$stamp"? }]`.
+- **Built-ins in `fields`:** `$description`, `$reference`, `$stage`, `$status`, `$classification`, `$observedAt` and `$parentId`, with type `built-in`. A stored key the record type no longer names has type `unknown` (it is still exported).
+- **Formats:** the bundle (`.json`); a print view of it (every time with its time zone, page numbers, the `contentHash` and export time on every page); Word (`.docx`) through one shared renderer (`renderRecordExportDocx(bundle)` in the service registry, from Document Management, which also offers `documentsForRecords(nodeIds, userId)`). If either service is offered but fails, the export is refused (503) rather than made incomplete.
+- **ZIP:** `bundle.json`, `tsr/<recordId>-v<seq>-<provider>.tsr` (each TimeStampToken as received), `README.txt` and `verify.mjs` (recomputes every hash and the `contentHash` offline). Each file is served with an `X-Content-Hash` header.
 - **Export log:** each export is recorded (who, when, which records, `contentHash`, format) and fires `<module>.<record>.exported`. Readable by the same people as the records.
-- **Linked evidence:** a link to another record is exported with that record's id, title and latest `hash` (and, for a Document Management file, the file's `contentHash`).
+- **Linked evidence:** `record.linkedEvidence: [{ fieldId, fieldLabel, module, recordType, id, title, latestSeq, latestAlg, latestHash, fileName?, contentHashAlg?, contentHash? }]`: each record a field links to, under the same reading rules, with its latest version's hash (and, for a Document Management file, its name and the file's `contentHash`).
 - **Certificate of authenticity:** every export opens with a plain-English page explaining how the records were made and kept, and how anyone can check them without the app. It states facts the system can show; it never makes a legal claim.
 
 ---
 
 ## 4. Verifying an export (for an expert)
 
-For each record: recompute each version's `hash` from the canonical JSON in section 2; check each `prevHash` equals the previous `hash`; check the `seq` values have no gaps. Check each timestamp token against its version's hash with any RFC 3161 tool, for example `openssl ts -verify -data <hash file> -in <file.tsr> -CAfile <TSA chain>`. Then check the bundle's `contentHash`. Seals need the server, through Check integrity.
+For each record: recompute each version's `hash` from its `snapshot` and the canonical JSON in section 2; check each `prevHash` equals the previous `hash`; check the `seq` values have no gaps. Check each timestamp token against its version's hash with any RFC 3161 tool. The `.tsr` files hold the TimeStampToken as received (not a full response), so:
+
+```bash
+openssl ts -verify -token_in -in <recordId>-v<seq>-<provider>.tsr -digest <hash> -sha384 -CAfile <the authority's root>
+```
+
+Then check the bundle's `contentHash`. `verify.mjs` in the ZIP does the hashes and the `contentHash` for you. Seals need the server, through Check integrity.
 
 ---
 
@@ -142,6 +179,11 @@ For each record: recompute each version's `hash` from the canonical JSON in sect
 
 - **Structure:** entries (nodes), their fields and field-group rows.
 - **Document Management:** documents and their files. The file's own SHA-256 `contentHash` belongs in the document's snapshot, so the chain covers which file a document held at each version.
+
+**Document Management's extensions** (optional for other modules):
+
+- **File check:** break reason `file` when the stored file no longer matches its `contentHash`, plus `file: { checked, matches, reason? }` in the result (`reason`: `offline`, `missing` or `no-fingerprint`). Not being able to check is not a break.
+- **Action words:** `upload`, `replace-file`, `link`, `unlink`.
 
 Questions or changes: raise them before building, so every module stays the same.
 
@@ -206,12 +248,21 @@ import {
   revisionHashInput,  // (fields) => string                       the canonical JSON it hashes
   sealDigest,         // (hash, { alg?, tenantId? }) => Promise<{ seal, sealKeyId }>  (nulls without a key)
   verifySeal,         // ({ hash, seal, sealKeyId, alg?, tenantId? }) => Promise<{ ok } | { ok: false, reason }>
-  checkRevisionChain, // (versions, { tenantId?, live? }) => Promise<IntegrityResult>
+  checkRevisionChain, // (versions, { tenantId?, live? }) => Promise<IntegrityResult>   the section 2 rules (v2.17.5)
+  integrityLine,      // (result) => string                     the words in section 2
+  timestampIntegrityLine, // (result) => string                 '' when no version asked for a stamp
+  isRevisionActorAsWritten, // (actor) => boolean               the section 1 actor rule
+  hasRecordSealKey,   // ({ tenantId? }) => Promise<boolean>     whether seals can be checked
   getRecordSealStatus,// () => Promise<RecordSealStatus>          for admin screens
   requestTimestamp,   // ({ hash, alg? }) => Promise<TimestampResult>   (v2.17.3)
-  verifyTimestamp,    // (token, { hash, alg, extraCerts? }) => TimestampVerification
+  verifyTimestamp,    // (token, { hash, alg, nonce?, extraCerts? }) => TimestampVerification
+  checkStoredTimestamp, // (stamp, { hash, alg }) => StoredTimestampCheck   (v2.17.5)
+  timestampTokenValues, // (token) => { tsaAt, serial, tsaName } | null     for display
+  timestampUrlProblem,  // (url) => string | null                 a custom URL's address check
+  TIMESTAMP_ERRORS,   // the generic error words
   timestampStores,    // register a module's stamp store
   nudgeTimestamps,    // () => void   after committing pending stamps
+  TIMESTAMP_CLAIM_LEASE_MS, // 5 minutes: how far listDue pushes a claimed stamp's due time
   RECORD_HASH_ALG,    // 'sha384'
   getRecordHold,      // (tenantId) => Promise<{ on, since, reason }>       (v2.17.4)
   isUnderRecordHold,  // (tenantId) => Promise<boolean>
@@ -220,15 +271,16 @@ import {
 ```
 
 - `verifySeal` reasons: `unsealed` (no seal), `unknown-key` (none of the app's keys has that id), `mismatch` (the hash or seal was changed outside the app), `bad-alg`.
-- `checkRevisionChain` gives the Check integrity answer above. Pass `live` (the record as stored now) to compare it with the last version. Check each version's token with `verifyTimestamp` and report a failure as `reason: "timestamp"`.
+- `checkRevisionChain` gives the Check integrity answer above, with every section 2 rule: the actor as stored, seal stripping, no key, unknown alg, and each version's `timestamps` checked entry by entry (`checkStoredTimestamp`). Pass the versions with their `actor`, `alg` and `timestamps` exactly as stored, and `live` (the record as stored now, encrypted values opened on both sides if re-encryption could differ) to compare it with the last version. Take the `FOR SHARE` lock and read inside one transaction yourself: the helper is pure.
 - The outputs reproduce the agreed vectors exactly: `{ b: 2, a: { d: [1, 'x', null], c: undefined }, e: true }` → `{"a":{"d":[1,"x",null]},"b":2,"e":true}` (SHA-256 `6885d5e6…`), the numbers vector (SHA-256 `581446be…`) and Structure's revision payload (SHA-384 `13142a5e…`). See `record-integrity.test.ts`.
 
 ### Moving a module from `RECORD_SEAL_KEY` to the starter
 
 1. **Hash:** call `hashRevision(fields)` (or keep your own: the output is the same).
 2. **Seal:** call `await sealDigest(hash, { alg, tenantId })` and store its `seal` and `sealKeyId` as before.
-3. **Check:** call `checkRevisionChain(versions, { tenantId, live })`, or `verifySeal` per version. Old seals made with `RECORD_SEAL_KEY` keep verifying by their `sealKeyId`, as long as the app keeps `RECORD_SEAL_KEY` (or moves it to `RECORD_SEAL_KEY_PREVIOUS`).
-4. **Older hosts:** reach the helpers through the guarded import (`const SECURITY = '../security/index.js'`), and fall back to your own implementation when `typeof sealDigest !== 'function'` (a starter before v2.17.2).
+3. **Check:** call `checkRevisionChain(versions, { tenantId, live })` and show `integrityLine(result)` and `timestampIntegrityLine(result)`. Its rules match Structure v1.89.36 and Document Management v1.20.x, so switching changes no behaviour. Old seals made with `RECORD_SEAL_KEY` keep verifying by their `sealKeyId`, as long as the app keeps `RECORD_SEAL_KEY` (or moves it to `RECORD_SEAL_KEY_PREVIOUS`).
+4. **Timestamps:** register your store with `timestampStores` (its `listDue` claims with the lease) and drop your own provider settings: the app has one provider. Keep your "when" setting.
+5. **Older hosts:** reach the helpers through the guarded import (`const SECURITY = '../security/index.js'`), and fall back to your own implementation when `typeof sealDigest !== 'function'` (a starter before v2.17.2).
 
 Once the app's encryption key is set up, new versions are sealed with the derived key. Both modules should switch together, so both seal with the same key.
 
