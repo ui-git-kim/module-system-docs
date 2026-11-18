@@ -93,9 +93,21 @@ export interface DocumentManagementServiceInterface {
 
   /**
    * Whether userId can upload with uploadToDefault right now, where the file
-   * would land, and the upload limits (v1.18.3+). Database only.
+   * would land, and the upload limits (v1.18.3+). Database only. Since
+   * v1.18.5 it also says whether a folder can be chosen (folderChoice).
    */
   getUploadCapability(userId: string): Promise<UploadCapability>;
+
+  /**
+   * The folders inside one folder of the place userId's uploads land, paths
+   * relative to their upload root (v1.18.5+). See "Letting the person choose
+   * a folder".
+   */
+  listUploadFolders(
+    userId: string,
+    path?: string,
+    page?: { offset?: number; limit?: number }
+  ): Promise<UploadFolderListing>;
 
   /**
    * Store a parsed artefact (external-parser output such as Docling JSON /
@@ -246,6 +258,7 @@ export interface ProvenanceResult {
 | `getDocumentCount(nodeId, userId)` | `Promise<number>` | The number of references linked to a node — cheaper than fetching them all. |
 | `uploadToDefault(userId, fileName, file, opts?)` | `Promise<UploadResult & { providerId; documentId; staged? }>` | Upload a file to the user's default provider (own `isDefault`, else the admin-set shared default). `opts.folder` is honoured on **every** target — relative to the caller's effective root, nested under `u/<userId>/` on an isolated shared default (guarded against escape) — else the provider's `uploadPath`, else its root. Parent folders are created as needed. See [The upload contract](#the-upload-contract) — e.g. cognitive-pipeline routes ingested files into an `Ingested/` folder. `opts.reference: true` (v1.18.3+) always returns a `documentId`; since v1.18.4 it is new for every upload and no file is replaced. |
 | `getUploadCapability(userId)` | `Promise<UploadCapability>` | Read-only (v1.18.3+). Whether the user can upload to the default right now (`canUpload`, with a `reason` and a displayable `message` when not), where the file would land (`own` or `shared`), and the upload limits. Database only. See [Uploading from another module's UI](#uploading-from-another-modules-ui-v1183). |
+| `listUploadFolders(userId, path?, page?)` | `Promise<UploadFolderListing>` | Read-only (v1.18.5+). The folders inside one folder of the place the user's uploads land, for a folder picker. Paths are relative to their upload root, ready to pass as an upload's `folder`. See [Letting the person choose a folder](#letting-the-person-choose-a-folder-v1185). |
 | `putParsedArtefact(userId, input)` | `Promise<ParsedArtefact>` | **Store** the output an external parser produced for a source (this module never parses). Bytes default to a derived writable area (`DOC_ARTEFACT_PREFIX`) unless `input.target` overrides; deduped by source `contentHash`. Never written to a read-only or **ephemeral (Local Connect)** provider — derived data is always redirected to a persistent store so it survives the source machine going offline. |
 | `getParsedArtefact(userId, source, opts?)` | `Promise<ParsedArtefact \| null>` | Fetch the latest (or a given `format`/`version`) stored artefact for a source — so a consumer can re-ingest without re-parsing. |
 | `listParsedArtefacts(userId, source)` | `Promise<ParsedArtefact[]>` | Every stored artefact for a source. |
@@ -1152,7 +1165,8 @@ The flow is three calls: ask whether the user can upload, upload each file, then
   "target": "own",
   "maxUploadSize": 52428800,
   "maxFileCount": 20,
-  "acceptedMimeTypes": []
+  "acceptedMimeTypes": [],
+  "folderChoice": true
 }
 ```
 
@@ -1165,6 +1179,7 @@ The flow is three calls: ask whether the user can upload, upload each file, then
 | `maxUploadSize` | Bytes. The server enforces this. |
 | `maxFileCount` | Files per batch. Your UI applies this; the server sees one file per request. |
 | `acceptedMimeTypes` | The admin's allow-list, empty for all types. Your UI applies this; the server does not check the declared type. |
+| `folderChoice` | v1.18.5+. Whether you can let the person choose the folder (see [Letting the person choose a folder](#letting-the-person-choose-a-folder-v1185)). It is `false` when `canUpload` is, and for a Local Connect folder that is offline. It is absent on older versions, so treat a missing value as `false`. |
 
 It reads the database only, so it is cheap to call when a composer mounts. A `404` means Document Management is not installed, so hide the upload control. An upload can still fail after a `canUpload: true`, for example when the storage is down, so handle the upload's own errors too.
 
@@ -1296,6 +1311,75 @@ const up = await dm.uploadToDefault(userId, fileName, buffer, {
   reference: true, // its own document: a new documentId, nothing replaced
 });
 ```
+
+### Letting the person choose a folder (v1.18.5+)
+
+By default you choose the folder, for example `AI Chat/<conversation id>`. You can also let the person choose. Show the choice only when the capability answer has `folderChoice: true`.
+
+**The ready-made picker.** Document Management fills the slot `document-management.folder-picker` in the starter's [component registry](/starter-template/registries/#component-registry). Render it with `<EmbeddedSlot>`. Nothing is imported from Document Management, and the fallback shows when it isn't installed:
+
+```tsx
+import { EmbeddedSlot } from '@/components/EmbeddedSlot';
+
+// Your own copy of the props: they are not checked across the slot.
+interface UploadFolderPickerProps {
+  value: string | null; // the chosen folder; null = your default
+  onChange: (folder: string | null) => void;
+  defaultLabel?: string; // what your default is called; omit to offer none
+  allowCreate?: boolean; // let the person name a new folder (default true)
+  disabled?: boolean;
+}
+
+const [folder, setFolder] = useState<string | null>(null);
+
+{capability?.folderChoice ? (
+  <EmbeddedSlot
+    id="document-management.folder-picker"
+    props={{ value: folder, onChange: setFolder, defaultLabel: "This chat's folder" } satisfies UploadFolderPickerProps}
+    fallback={null}
+  />
+) : null}
+
+// When sending: the person's choice, else your own default.
+const target = folder ?? 'AI Chat/' + conversationId;
+```
+
+The picker shows the chosen folder and a **Change** button. Change opens a panel in place, with no overlay, so it works inside your own dialog. While `disabled` is true, every control in it is switched off. The panel has:
+- breadcrumbs, and the folders of the current folder;
+- a **New folder** box (unless `allowCreate` is `false`);
+- **Use this folder**, **Use default** (when you give `defaultLabel`) and **Cancel**.
+
+A new folder is only a name until the first upload into it creates it, so nothing is left behind when the person changes their mind. `value` is a path relative to the person's upload root (`''` is the root itself), which is exactly what `POST /upload` takes as `folder`.
+
+**The folder list, for a picker of your own.** `GET /api/v1/document-management/upload/folders?path=&offset=&limit=` lists the folders inside one folder of the place the person's uploads land:
+
+```json
+{
+  "path": "AI Chat",
+  "folders": [{ "name": "conv_81c2", "path": "AI Chat/conv_81c2" }],
+  "totalCount": 1,
+  "hasMore": false,
+  "truncated": false,
+  "target": "own"
+}
+```
+
+- `path` is relative to the person's upload root, and every listed `path` can be sent straight back as an upload's `folder`.
+- It lists folders only, sorted by name. `limit` is at most 500.
+- Hidden folders, whose names start with a dot, are left out, and so are the folders Document Management keeps for itself, whatever they are called. So is a folder whose name holds a `\`, which can't be sent back as a path.
+- `truncated: true` means the folder holds more than 5,000 entries and not all of its folders are listed. The picker says so.
+- A folder that doesn't exist yet lists as empty.
+- A Local Connect folder that is offline answers `503`. No storage at all answers `400`, with the same reason the capability gives.
+
+Where the list comes from depends on where the person's uploads land:
+
+| Uploads land in | The list shows |
+|-----------------|----------------|
+| Their own default storage | The folders of that storage, from its root. |
+| The shared default, isolation on | The folders of their own area (`u/<userId>/`), from its root. A path can never leave that area. |
+| The shared default, isolation off | Only folders that hold their own files. The shared storage itself is never listed, because that would show other people's folder names. The list is worked out from their first 5,000 files under that folder, so a folder whose files all come later is missed. |
+
+On the backend the same list is `listUploadFolders(userId, path?, { offset?, limit? })` on the service.
 
 **What this contract doesn't do yet:**
 - **Removing an attachment keeps the file.** `DELETE /documents/:id` removes the reference, but the stored file stays until the user's account is erased. See the [roadmap](/document-management/roadmap/#storage-usage-follow-ups-v1181).
