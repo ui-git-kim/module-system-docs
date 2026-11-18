@@ -419,6 +419,7 @@ export default defineConfig({
                 { label: "Integration", slug: "document-management/integration" },
                 { label: "Developer Workflow", slug: "document-management/developer-workflow" },
                 { label: "Security", slug: "document-management/security" },
+                { label: "Record History & Integrity", slug: "document-management/history" },
                 { label: "Changelog", slug: "document-management/changelog" },
                 { label: "Roadmap", slug: "document-management/roadmap" },
                 {

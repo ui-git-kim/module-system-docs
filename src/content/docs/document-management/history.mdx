@@ -1,0 +1,255 @@
+---
+title: Record History & Integrity
+description: Every change to a document kept as a version, a fingerprint chain and seal anyone can check, Check integrity, the trash, and how an expert verifies versions without the app
+sidebar:
+  order: 7
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Since **v1.20.0**, Document Management keeps every change to a document as a **version**. Each version records:
+
+- the server's time;
+- who made the change;
+- exactly what the document looked like afterwards.
+
+Every version has a fingerprint that links it to the one before. When the app has a seal key, each version also gets a seal that only the server can make. **Check integrity** tells you whether anything was changed outside the app. A deleted document goes to the **trash** with its history kept, until someone deletes it permanently.
+
+The goal is records that are reliable, complete and unaltered, as the *Electronic Transactions Act* asks of electronic records. Every change leaves a trail, the times can't be typed in, and the checks can be run by someone who doesn't trust the app. Structure keeps its records the same way: both modules follow one shared set of rules, so a document and a Structure record are checked alike.
+
+<Aside type="note" title="Who can see a document's history">
+Only the person who owns the document, like the document itself. An admin has **no** way to read another person's history or check their documents.
+</Aside>
+
+---
+
+## What a version holds
+
+Every write to a document saves a version **in the same database transaction as the write**. If the change is saved, so is its version; if the change fails, neither is saved. Version numbers run 1, 2, 3 … per document, with no gaps. They are assigned while the document's row is locked, so two changes arriving together still get consecutive numbers.
+
+| Field | What it is |
+|-------|------------|
+| `seq` | The version number |
+| `action` | What happened (see below) |
+| `at` | The server's clock at the write, in UTC with milliseconds: `2026-11-18T01:23:45.678Z` |
+| `actor` | Who made it: `{ id, kind }`. `kind` is `user` (a person, through the app), `module` (another module; `module` names it when known) or `system` (the app itself, for example moving an offline upload into place) |
+| `snapshot` | The document's full state **after** the change (below) |
+| `changes` | What changed since the previous version, as `{ path, before, after }` |
+| `prevHash` | The previous version's fingerprint (`null` for version 1) |
+| `hash` | This version's fingerprint |
+| `alg` | The fingerprint algorithm: `sha384` for new versions |
+| `seal`, `sealKeyId` | The seal and which key made it (`null` when the app has no seal key) |
+| `revertedTo` | For a restored version: the version it went back to |
+| `timestamps` | Independent timestamps, once that feature arrives (see [what's next](#whats-next)) |
+
+### The actions
+
+| Action | When |
+|--------|------|
+| `upload` | A file is uploaded and becomes a document |
+| `create` | A document is made for a file already in storage |
+| `replace-file` | A new upload replaces the file a document holds (its fingerprint changes) |
+| `update` | Its name, tags, notes, favourite or status change |
+| `archive` | It is archived, by you or because the Structure record it is attached to was archived |
+| `link` / `unlink` | It is attached to or detached from a record |
+| `move` | The app moves its file, for example an offline upload moved onto your computer when it reconnects |
+| `delete` / `restore` | It goes to the trash, or comes back |
+| `revert` | **Restore this version** |
+| `baseline` | A document from before v1.20.0, saved as it was found just before its first change |
+
+### The snapshot
+
+A version keeps the document's own state:
+
+- its id, owner, storage and location;
+- its name, type and size;
+- **the file's fingerprint** (`contentHash`, the SHA-256 of the file's bytes, with `contentHashAlg: "sha256"`);
+- its favourite flag, status, tags and notes;
+- when it was created, and when it went to the trash;
+- **the records it is attached to**.
+
+So the chain shows which file a document held, and where it was filed, at every version.
+
+Some values are only caches: when it was last opened, a cached thumbnail, cached details from the storage provider, and the last-updated time. They are not part of the snapshot. A change that touches only those saves no version. A change that alters nothing in the snapshot saves no version either.
+
+---
+
+## Fingerprints and seals
+
+A version's **fingerprint** (`hash`) is SHA-384, in lower-case hex, of exactly this, written as canonical JSON:
+
+```json
+{ "v": 1, "alg": "sha384", "module": "document-management", "recordType": "document",
+  "recordId": "<document id>", "seq": 3, "action": "update", "at": "2026-11-18T01:23:45.678Z",
+  "actor": { "id": "<user id>", "kind": "user" }, "snapshot": { … }, "prevHash": "<hex or null>" }
+```
+
+- **Canonical JSON** is [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785): object keys sorted, no spaces, strings and numbers written exactly as JavaScript's `JSON.stringify` writes them, encoded as UTF-8.
+- `actor.module` appears only when it is set.
+- Each version includes the previous version's fingerprint, so changing any version breaks every one after it.
+- **SHA-384** is used because, as we understand the Australian Signals Directorate's ISM cryptography guidance, SHA-224 and SHA-256 are to be phased out by 2030 while SHA-384 and SHA-512 remain approved. Check the current ISM before relying on this. Each version records its own `alg`, so a later move to another algorithm never breaks an existing chain. Versions made with `sha256`, `sha384` or `sha512` all verify.
+
+A **seal** is an HMAC of the fingerprint, using the same algorithm, made with the app's **record seal key**. Anyone can recompute a fingerprint, so someone who edits the database could recompute those too. They can't make the seal without the key, which is never stored in the database. That is how an edit that also recomputes the fingerprints is still caught.
+
+### The record seal key
+
+The seal key is the `RECORD_SEAL_KEY` setting in the backend's `.env`. It is shared by every module that keeps record history, so one key covers Structure's records and your documents.
+
+```bash
+openssl rand -hex 32
+```
+
+- At least 32 random bytes, written as hex or base64. A shorter key is ignored and logged as an error.
+- Without a key, versions are still kept and fingerprinted, but not sealed. Check integrity then says *Not sealed: the app has no seal key.*
+- **Keep the key secret and backed up.** Anyone with it can make valid seals; without it, existing seals can no longer be checked.
+- **Rotating:** put the new key in `RECORD_SEAL_KEY` and the old one in `RECORD_SEAL_KEY_PREVIOUS`. New versions are sealed with the new key, and versions sealed with the old key still verify. Each version records which key sealed it (`sealKeyId`, the first 8 hex characters of the SHA-256 of the key's bytes).
+- **After a rotation, keep the old key** in `RECORD_SEAL_KEY_PREVIOUS`. If a version's key is no longer configured, Check integrity reports that version as broken.
+- **Don't switch sealing off and on.** A version saved without a seal after an earlier sealed one is reported as broken, because stripping seals is exactly what an edit would do. With no key set at all, seals can't be checked, and Check integrity says so instead of reporting breaks.
+
+---
+
+## Check integrity
+
+**Check integrity** is on the document's page. It works through the document's versions and reports:
+
+| Break | Meaning |
+|-------|---------|
+| `gap` | A version number is missing |
+| `link` | A version's `prevHash` is not the previous version's fingerprint |
+| `hash` | A fingerprint doesn't recompute from its version (or its algorithm is unknown) |
+| `seal` | A seal doesn't verify, its key isn't configured, its algorithm is unknown, or a version has **no** seal although an earlier version of the same document has one (seals stripped after an edit). Only checked when the app has a seal key. Versions at the start of a document's history, saved before any key was set, count as *not sealed*, not broken |
+| `live` | The document as stored now differs from its last version: it was changed outside the app |
+| `file` | The stored file no longer matches the fingerprint taken when it was added, or it is no longer in storage |
+
+The check reads the versions and the document together, so a change saved at that moment can't look like an edit outside the app. The fingerprint covers each version's `actor` exactly as stored, so changing who a version says made it breaks its hash.
+
+The **file check** reads the whole file again and compares its SHA-256 with the document's `contentHash`. That takes longer for large files. On S3, R2, MinIO and Wasabi, a missing object counts as *no longer in storage*, as on the other storage types.
+
+- If the storage, or the computer behind a Local Connect folder, can't be reached, the result is *The file couldn't be checked*, not a break.
+- A document with no fingerprint (one added by reference without hashing) says so instead.
+- Each file check is recorded in the document's access history as `verify`.
+
+What the result says:
+
+- *Unbroken: all 12 versions match their seals.*
+- *Unbroken: its 1 version matches its seal.*
+- *Unbroken: 10 of 12 versions match their seals; 2 are not sealed.* (versions saved before a seal key was set)
+- *Broken at version 7: it was changed outside the app.*
+- *Not sealed: the app has no seal key.*
+- *Seals can't be checked: the app has no seal key.* (versions carry seals, but the key is not set now; not a break)
+- *No versions kept yet.*
+- For the file: *The file matches its fingerprint.*, *The file has changed since it was added.*, *The file is no longer in storage.*, or *The file couldn't be checked: …*
+
+The answer the API gives (`GET /documents/:id/integrity`):
+
+```json
+{ "ok": true, "checkedAt": "2026-11-18T02:00:00.000Z", "versions": 12, "sealed": 12, "unsealed": 0,
+  "liveMatches": true, "breaks": [], "sealing": true,
+  "file": { "checked": true, "matches": true } }
+```
+
+---
+
+## Restore this version
+
+Every version except the latest has **Restore** in the History panel. Restoring writes a **new** version (`action: "revert"`, `revertedTo: <seq>`); nothing is rewritten. It puts back the document's own fields as they were: name, tags, notes, favourite, and active or archived.
+
+The file it holds, where the file is kept, and the records it is attached to are facts of your storage and of Structure, so restoring a version doesn't change them. The answer lists what stayed as it is (`unchanged`: `file`, `attachments`, `trash`), and the panel says so.
+
+---
+
+## The trash
+
+Deleting a document moves it to the **trash** (`/documents/trash`, also linked from the Documents page). It keeps its file, its attachments and its whole history. A document in the trash:
+
+- leaves the document lists, search and the records it is attached to;
+- can still be opened, checked and restored;
+- can't be edited, attached or restored to a version.
+
+**Restore** brings it back with the status it had (active or archived), and its attachments show again.
+
+**Delete permanently** (one document, several, or **Empty the trash**) removes the document, its attachments and its history for good. The file in your storage stays, as it always has: a document points at a file, it doesn't own it. A document whose offline upload hasn't reached its computer yet is **kept**, because that waiting copy is the only copy of the file; delete it once the computer is back online. If the computer was removed, the document can go, and the waiting copy stays until account erasure reclaims it. Because this can't be undone, the server asks for a sign-in on the web (never a linked computer's token) and a recent sign-in check, as Structure's purge does.
+
+Uploading the same file again, or referencing it again yourself, brings its document back from the trash, with a `restore` version. Another module referencing it in the background (a re-ingest, for example) leaves it in the trash.
+
+**A fingerprint is never replaced by referencing a file again.** If the file changed in storage outside the app, the document keeps the fingerprint it was given, so Check integrity still reports the change. A new upload is what records a new file (`replace-file`).
+
+**Structure records.** When a Structure record goes to Structure's trash, its documents stay attached, so restoring the record brings them back. When it is deleted permanently, each document records an `unlink` version made by Structure. If Structure's notice misses some records, a sweep asks Structure which records still exist (Structure v1.89.35 or later) before detaching anything.
+
+---
+
+## Verifying versions without the app
+
+Someone who doesn't trust the app, such as an expert witness, can check the fingerprint chain from the versions alone. Today they get them from `GET /documents/:id/history`; the export coming next bundles them with a certificate.
+
+<Steps>
+
+1. **Recompute each fingerprint.** For each version, build the object shown in [Fingerprints and seals](#fingerprints-and-seals) from its fields. Use `at` exactly as given, `actor` without `module` when it is absent, and the `snapshot` exactly as given. Write it as RFC 8785 canonical JSON and hash it with the version's `alg`. The result must equal `hash`.
+
+2. **Check the links.** Each version's `prevHash` must equal the previous version's `hash`, and version 1's must be `null`.
+
+3. **Check the numbering.** `seq` must run 1, 2, 3 … with no gaps.
+
+4. **Compare the file.** The SHA-256 of the file must equal the last version's `snapshot.contentHash`.
+
+</Steps>
+
+Seals need the key, so only the server can check them, through Check integrity.
+
+A short Node.js check of one version:
+
+```js
+import { createHash } from 'node:crypto';
+
+// RFC 8785 for the values a version holds (no undefined, no non-finite numbers).
+function canonical(v) {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+  return '{' + Object.keys(v).sort().map((k) => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+}
+
+function fingerprint(documentId, version) {
+  const { id, kind, module } = version.actor;
+  return createHash(version.alg)
+    .update(canonical({
+      v: 1, alg: version.alg, module: 'document-management', recordType: 'document',
+      recordId: documentId, seq: version.seq, action: version.action, at: version.at,
+      actor: module ? { id, kind, module } : { id, kind },
+      snapshot: version.snapshot, prevHash: version.prevHash,
+    }), 'utf8')
+    .digest('hex');
+}
+```
+
+<Aside type="tip" title="Shared test values">
+Structure and Document Management check their canonical JSON against both of RFC 8785's own examples and a set of shared test values, so they produce identical fingerprints. The values are in the module's tests (`tests/document-history.test.ts`).
+</Aside>
+
+---
+
+## For developers
+
+- **Service:**
+  - `getDocumentHistory(documentId, userId)` returns the versions, oldest first;
+  - `checkDocumentIntegrity(documentId, userId, { file? })`;
+  - `revertDocument`, `restoreDocument` and `purgeDocuments`.
+
+  See [Integration](/document-management/integration/#record-history-and-the-trash-v1200).
+- **Routes:** `GET /documents/:id/history`, `GET /documents/:id/integrity?file=false`, `POST /documents/:id/revert`, `POST /documents/:id/restore` and `POST /documents/purge`. `DELETE /documents/:id` now moves a document to the trash. See [Usage](/document-management/usage/#history-integrity-and-the-trash).
+- **Events:**
+  - `documents.document.revisionCreated` and `documents.document.reverted`;
+  - `documents.document.restored` and `documents.document.purged`;
+  - `documents.document.deleted`, which now means *moved to the trash*.
+- **Table:** [`doc_document_revision`](/document-management/database/#doc_document_revision). Account erasure removes it with the person's documents (data category `document_history`).
+- **Code:** `document-management.history.ts` has the canonical JSON, fingerprints, seals, snapshots and the chain check. A write calls `documentHistory(tx).begin(id)` before changing a document, which locks the row and saves a baseline if needed, then `record(...)` after. Another module should never write `doc_document` directly.
+
+---
+
+## What's next
+
+These come next, in the same order as Structure, and use the same shared rules:
+
+- **Independent timestamps (RFC 3161).** An admin can choose to have a version's fingerprint stamped by public timestamp authorities: DigiCert by default, with an optional backup such as Sectigo. Only the fingerprint is sent, never the document. A stamp proves the version existed at that time, independent of whoever runs the app. Each stamp is kept with the authority's certificate and revocation data, so it can still be checked after the certificate expires.
+- **Export.** A complete, unedited bundle of documents with their history and integrity results, as a data file, a print/PDF view and Word. It opens with a certificate page that explains in plain English how to check the bundle without the app. Document Management will also turn any module's export bundle into Word, so Structure's records and your documents export the same way.
+
+See the [roadmap](/document-management/roadmap/#record-history-follow-ups-v1200).

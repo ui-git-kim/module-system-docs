@@ -46,6 +46,12 @@ export interface DocumentManagementServiceInterface {
   /** Get a single document reference (ownership-checked). */
   getDocument(documentId: string, userId: string): Promise<DocumentReference | null>;
 
+  /** A document's version history, oldest first (owner only). v1.20.0+. */
+  getDocumentHistory(documentId: string, userId: string): Promise<DocumentHistory>;
+
+  /** Check a document's integrity: chain, live state and (unless file is false) its file. v1.20.0+. */
+  checkDocumentIntegrity(documentId: string, userId: string, opts?: { file?: boolean }): Promise<IntegrityResult>;
+
   /** Get a readable download stream for a document's underlying file. */
   getDownloadStream(documentId: string, userId: string): Promise<Readable>;
 
@@ -262,7 +268,9 @@ export interface ProvenanceResult {
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `getDocumentsForNode(nodeId, userId)` | `Promise<DocumentReference[]>` | All document references linked to a Structure node, ownership-checked against `userId`. |
-| `getDocument(documentId, userId)` | `Promise<DocumentReference \| null>` | A single reference, or `null` if it does not exist or is not owned by `userId`. |
+| `getDocument(documentId, userId)` | `Promise<DocumentReference \| null>` | A single reference, or `null` if it does not exist or is not owned by `userId`. A document in the trash is returned, with `status: 'deleted'` (v1.20.0+). |
+| `getDocumentHistory(documentId, userId)` | `Promise<DocumentHistory>` | Read-only (v1.20.0+). The document's versions, oldest first, each with its snapshot, changes, fingerprint and seal. See [Record history and the trash](#record-history-and-the-trash-v1200). |
+| `checkDocumentIntegrity(documentId, userId, opts?)` | `Promise<IntegrityResult>` | Read-only (v1.20.0+). Check integrity: the chain, the document now against its last version, and (unless `file: false`) the stored file against its fingerprint. |
 | `getDownloadStream(documentId, userId)` | `Promise<Readable>` | A Node `Readable` of the underlying file, streamed live from the provider. The promise **rejects** when the file cannot be opened (see [Download errors](#download-errors-reject-up-front)). |
 | `getDownloadStreamByPath(providerId, userId, path)` | `Promise<{ stream: Readable; fileName: string }>` | A `Readable` (plus the derived `fileName`) for a provider path with no `doc_document` reference — how a job-worker consumer pulls the bytes for an uploaded file off the request path. Rejects up front like `getDownloadStream`. |
 | `getFileInfo(documentId, userId)` | `Promise<FileInfo>` | Live metadata (name, size, MIME type, timestamps) fetched from the provider. |
@@ -421,7 +429,7 @@ It reads the module's own records only — no storage provider is contacted — 
 
 ## Reacting to Events (Action Hooks Fired)
 
-Document Management fires twelve action hooks from its service as documents, templates and providers change. Any module can subscribe with `actionRegistry.addActionAsync` and react — index a newly uploaded file, clean up derived data when a document is deleted, or refresh a cache when a provider connects.
+Document Management fires sixteen action hooks from its service as documents, templates and providers change. Any module can subscribe with `actionRegistry.addActionAsync` and react — index a newly uploaded file, clean up derived data when a document is deleted, or refresh a cache when a provider connects.
 
 The exact event ids and context shapes (from `action.registration.ts` and the service) are:
 
@@ -430,7 +438,11 @@ The exact event ids and context shapes (from `action.registration.ts` and the se
 | `documents.document.linked` | `{ userId, documentId, nodeId, linkType }` | A document reference is linked to a Structure node. `linkType` is `'attachment' \| 'reference' \| 'primary'`. |
 | `documents.document.unlinked` | `{ userId, documentId, nodeId }` | A document reference is unlinked from a node. |
 | `documents.document.uploaded` | `{ userId, providerId, remotePath, fileName, mimeType, size, contentHash, documentId, nodeId }` | A file is uploaded through the module, or manually re-emitted via `requestIngest`. Emitted as an **awaited async fan-out** (`doActionParallel`), so job-worker consumers receive it. `contentHash` is populated for streamed HTTP uploads (`null` for included-folder **Sync now**, which reads no bytes). **`documentId` carries the durable `doc_document` id whenever the upload creates a reference** — the user's default when it is the shared app default, an offline-staged Local Connect upload, a global upload, and the manual-ingest path — so an event-driven (auto-ingest) consumer can pull by reference and the handle survives an offline reconcile re-point. It is `null` only for a bare upload to a user's own provider (no reference is created). **`nodeId`** (v1.18.2+) is the Structure node the uploader asked to file the upload under — `opts.nodeId` on `uploadToDefault` / `uploadGlobal`, or `?nodeId=` on `POST /upload` / `POST /upload-global` — so a consumer can file what it derives into that node's isolation section. It is `null` when no node was given, and always `null` for **Sync now** and manual ingest. See [`nodeId` is the uploader's claim](#nodeid-is-the-uploaders-claim). |
-| `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` | A document reference (and optionally its underlying file) is deleted. |
+| `documents.document.deleted` | `{ userId, documentId, providerId, remotePath }` | A document is moved to the trash (v1.20.0+; before, it was deleted outright). It is no longer listed; it can still be restored. |
+| `documents.document.restored` | `{ userId, documentId }` | A document comes back from the trash (v1.20.0+). |
+| `documents.document.purged` | `{ userId, ids, count }` | Documents are deleted permanently from the trash, with their history (v1.20.0+). |
+| `documents.document.revisionCreated` | `{ userId, documentId, seq, action }` | A version of a document was saved (v1.20.0+). Fires after the change commits. |
+| `documents.document.reverted` | `{ userId, documentId, seq, revertedTo }` | **Restore this version** saved version `seq` with version `revertedTo`'s fields (v1.20.0+). |
 | `documents.document.created` | `{ userId, documentId, providerId, remotePath }` | A `doc_document` reference is created (favourite/link/tag/notes, or a cross-module `createDocument`). |
 | `documents.document.updated` | `{ userId, documentId }` | A reference's tags, notes, favourite, or status changes. |
 | `documents.provider.connected` | `{ userId, providerId, providerType }` | A storage provider is created/connected. `providerType` is `s3 \| r2 \| webdav \| local`. |
@@ -479,12 +491,12 @@ These hooks are emitted by the Document Management service itself, so they alway
 
 ## Structure Hook Subscriptions
 
-Document Management is a **standalone** module — Structure is optional and detected at runtime. When Structure *is* installed, the module keeps its document links and references in sync with node lifecycle events by subscribing to three Structure action hooks. All three are registered at priority `20` and are completely inert when Structure is absent (nothing emits the hooks).
+Document Management is a **standalone** module — Structure is optional and detected at runtime. When Structure *is* installed, the module keeps its document links and references in sync with node lifecycle events by subscribing to three Structure action hooks (since v1.20.0: `structure.node.purged`, `archived` and `moved`). All three are registered at priority `20` and are completely inert when Structure is absent (nothing emits the hooks).
 
 | Subscribed hook | Context | What Document Management does |
 |-----------------|---------|-------------------------------|
-| `structure.node.deleted` | `{ userId, nodeId, nodeType }` | Calls `handleNodeDeleted(nodeId, userId)` — removes the `doc_node_link` rows for that node so links don't dangle. The document references themselves survive. |
-| `structure.node.archived` | `{ userId, node }` | Calls `handleNodeArchived(node.id, userId)` — sets `status = 'archived'` on `doc_document` references linked to the node. |
+| `structure.node.purged` | `{ userId, ids, count }` | Since v1.20.0. Calls `handleNodesPurged(userId, ids, count)`: each listed entry's links are removed, each in an `unlink` version of the document by `{ kind: 'module', module: 'structure' }`. When `count` is more than `ids` lists (Structure caps it at 500), `sweepPurgedNodeLinks` asks Structure's `existingNodeIds` (v1.89.35+) which linked entries still exist and detaches the rest. Without that method it detaches nothing. Until v1.19.x this was done on `structure.node.deleted`, which now means an entry went to Structure's trash: its links stay so a restore brings them back. |
+| `structure.node.archived` | `{ userId, node }` | Calls `handleNodeArchived(node.id, userId)` — archives the node's **active** documents, each in an `archive` version by Structure (a document in the trash stays there). |
 | `structure.node.moved` | `{ userId, node, oldParentId, newParentId }` | Calls `handleNodeMoved(node.id, userId)` — nulls `lastSyncedAt` on the linked documents so cached context is refreshed on next access. |
 
 This is the relevant slice of `action.registration.ts`:
@@ -493,13 +505,14 @@ This is the relevant slice of `action.registration.ts`:
 import { actionRegistry } from '../../config/action.registry.js';
 import { documentManagementService } from './document-management.service.js';
 
-// Clean up document links when a node is deleted.  Context: { userId, nodeId, nodeType }
+// Remove document links when entries are deleted PERMANENTLY. Context: { userId, ids, count }
+// (structure.node.deleted means Structure's trash: links stay, so a restore keeps them.)
 actionRegistry.addActionAsync(
-  'structure.node.deleted',
-  'document-management-node-deleted',
+  'structure.node.purged',
+  'document-management-nodes-purged',
   async (context) => {
-    const { userId, nodeId } = context as { userId: string; nodeId: string };
-    await documentManagementService.handleNodeDeleted(nodeId, userId);
+    const { userId, ids, count } = context as { userId: string; ids?: string[]; count?: number };
+    await documentManagementService.handleNodesPurged(userId, Array.isArray(ids) ? ids : [], count);
   },
   20
 );
@@ -1435,6 +1448,26 @@ How it works:
 - **Limits.** One document lists at most 500 records and makes at most 1,500 `resolveTemplate` calls; past either, the rest is left out or blank, with a warning. A loop lists at most 200 records and loops nest at most 3 deep.
 - **Who may use which template.** Templates are added by admins only. Anyone signed in can use an enabled template for the record's type, or an any-type (`*`) one, on a record they can open. A template for another type is refused with a `400`; a disabled or missing template is a `404`, and so is a record the person cannot open.
 - **File name.** The template's pattern, filled in with the same tags. Without one it is `<record> - <template>.docx`, and the summary is `<record> - Summary.docx`.
+
+## Record history and the trash (v1.20.0+)
+
+Every write to a document saves a version in the same transaction, following the record history conventions Structure and Document Management share. The user-facing side, the fingerprint and seal formats, and how an expert verifies versions without the app are on [Record History & Integrity](/document-management/history/).
+
+For another module:
+
+- **Read a document's history and check it** (for example a Tasks chronology that shows the same written times and integrity status):
+
+  ```typescript
+  const dm = serviceRegistry.getOptional<DocumentManagementServiceInterface>('document-management');
+  const history = await dm?.getDocumentHistory?.(documentId, userId); // versions, oldest first
+  const check = await dm?.checkDocumentIntegrity?.(documentId, userId, { file: false });
+  // check.ok, check.breaks: [{ seq, reason: 'gap' | 'link' | 'hash' | 'seal' | 'live' | 'file' }]
+  ```
+
+- **Write through the service, never `doc_document` directly.** Only the service records versions; a direct write shows as a `live` break.
+- **Who a version says made it.** An HTTP request is the person (`kind: 'user'`). An in-process call from another module, with no request principal, is `kind: 'module'`. Document Management reacting to Structure's events is `{ kind: 'module', module: 'structure' }`. The app's own moves (Local Connect reconcile) are `kind: 'system'`.
+- **Structure's trash.** On `structure.node.deleted` (an entry moved to Structure's trash) Document Management does nothing, so a restored entry keeps its documents. On `structure.node.purged { userId, ids, count }` it detaches each listed entry's documents (an `unlink` version by `{ kind: 'module', module: 'structure' }`). When `count` is more than `ids` lists, it sweeps the rest with Structure's `existingNodeIds` (v1.89.35+); without that method it detaches nothing it can't confirm.
+- **The trash.** `deleteDocument` moves a document to the trash, and `documents.document.deleted` fires. A consumer that drops what it derived from a document on `deleted` should treat `documents.document.restored` as the document coming back, and `documents.document.purged` as final. `getDocumentsForNode`, the node count, lists and search leave documents in the trash out; `linkDocument` refuses one.
 
 ## Browsing Folders
 
