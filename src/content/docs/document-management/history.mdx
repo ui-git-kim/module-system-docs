@@ -40,7 +40,7 @@ Every write to a document saves a version **in the same database transaction as 
 | `alg` | The fingerprint algorithm: `sha384` for new versions |
 | `seal`, `sealKeyId` | The seal and which key made it (`null` when the app has no seal key) |
 | `revertedTo` | For a restored version: the version it went back to |
-| `timestamps` | Its [independent timestamps](#independent-timestamps-v1201), main first, then the backup (empty when none was asked for). They are not part of the fingerprint: they are the only part of a version written after it is saved |
+| `timestamps` | Its [independent timestamp](#independent-timestamps-v1201) (empty when none was asked for). A version stamped before v1.22.0 may also carry a backup, after the main one. Stamps are not part of the fingerprint: they are the only part of a version written after it is saved |
 
 ### The actions
 
@@ -106,24 +106,46 @@ openssl rand -hex 32
 - **After a rotation, keep the old key** in `RECORD_SEAL_KEY_PREVIOUS`. If a version's key is no longer configured, Check integrity reports that version as broken.
 - **Don't switch sealing off and on.** A version saved without a seal after an earlier sealed one is reported as broken, because stripping seals is exactly what an edit would do. With no key set at all, seals can't be checked, and Check integrity says so instead of reporting breaks.
 
+### On the starter's helpers (v1.22.0)
+
+The starter now owns the shared record history rules ([Record integrity](/getting-started/record-integrity/)) and carries helpers for them. Since v1.22.0, Document Management uses them when the app's starter has them, and its own code otherwise, as Structure does (v1.89.39). The answers are the same either way.
+
+- **Fingerprints** go through the starter's `hashRevision` (v2.17.2), but only after it has reproduced this module's own fingerprint on a sample. If it ever doesn't, this module keeps its own and logs an error.
+- **Seals** come from the starter's `sealDigest` (v2.17.2). Its key is derived from the app's encryption key, one per person where the starter keeps keys per person (here, the document's owner), else it is `RECORD_SEAL_KEY`.
+  - Versions sealed with `RECORD_SEAL_KEY` keep verifying by their `sealKeyId`. The starter's check tries its own keys; a key it doesn't hold falls back to `RECORD_SEAL_KEY` and `RECORD_SEAL_KEY_PREVIOUS`.
+  - If the starter can't make a seal, `RECORD_SEAL_KEY` seals the version. With neither, the change is refused rather than saved unsealed, because an unsealed version after sealed ones would read as a stripped seal. The same goes when the starter's key provider can't give a key for a moment (a key-management outage, say): a change to a document whose last version is sealed is refused (`503`, *This change could not be sealed right now*) and can be made again once the key is back.
+  - *The app has a seal key* means `RECORD_SEAL_KEY` (or the previous one), or a key the starter has for the document's owner.
+- **Check integrity** stays this module's own walk with every rule above. Only the per-version checks (fingerprint, seal, timestamp token) go through the starter.
+- On an older starter (veradai runs 2.16.12), nothing changes: everything is this module's own, as before.
+
 ---
 
 ## Independent timestamps (v1.20.1)
 
-A version can also be timestamped by an outside Time Stamping Authority (RFC 3161). That proves the document existed in exactly that form at that time, independent of whoever runs the app: the authority signs the version's fingerprint together with its own clock. **Only the fingerprint (48 bytes for SHA-384) is sent, never the document or its name.** It works the same way as [Structure's](/modules/structure/usage/#independent-timestamps-v18936), with the same providers and the same checks.
+A version can also be timestamped by an outside Time Stamping Authority (RFC 3161). That proves the document existed in exactly that form at that time, independent of whoever runs the app: the authority signs the version's fingerprint together with its own clock. **Only the fingerprint (48 bytes for SHA-384) is sent, never the document or its name.** It works the same way as [Structure's](/modules/structure/usage/#independent-timestamps-v18936), through the same timestamp service and with the same checks.
 
-It is **off by default**. An admin turns it on under **Admin → Document Storage → Record history**:
+It is **off by default**. An admin turns it on under **Admin → Document Storage → Record history**, under **Timestamp**: off, **Every version** (baselines included), or **When a document is added** (the `upload` or `create` version that made it). It is saved as soon as it's chosen.
 
-- **Timestamp**: off, **Every version** (baselines included), or **When a document is added** (the `upload` or `create` version that made it).
-- **Main provider**: DigiCert by default. The built-in providers are the free public servers of DigiCert, Sectigo, GlobalSign and SSL.com: no account, no cost. Check each provider's usage terms before relying on one long term.
-- **Backup provider** (optional): a different authority, Sectigo suggested. A stamped version is sent to both, independently, so one provider being down never leaves it unstamped.
-- **Custom provider URL**: your own authority's address (`http://` or `https://`). If it needs a login, put it in `RECORD_TSA_USERNAME` and `RECORD_TSA_PASSWORD` in the backend's `.env` (shared with Structure), never in the URL. The login is sent only over `https://`, and only to the custom URL as saved: not to an address typed for **Test connection** before saving, and not to an old address a waiting stamp still carries.
-- **Test connection** stamps a random value with each provider and checks the answer. It tests what is on screen, saved or not. Nothing is kept.
-- **Stamp queue**: how many stamps are pending and how many failed across the app, with **Retry failed**. Counts only: an admin never sees a document or a version here.
+### Which authority stamps (v1.22.0)
 
-Structure has its own timestamp settings for its records (App Structure → Settings); the providers and their rules are the same.
+The app has **one timestamp service**, shared by every module that keeps record history. There is no backup provider.
 
-**When it happens.** Right after the save commits. A save never waits for a stamp, and never fails because of one. A worker on the server (every minute, while the backend is in use) asks for whatever is due. A failed request is retried after 1 minute, 5 minutes, 30 minutes, 2 hours and 12 hours, then the stamp is marked failed. Requests time out after 10 seconds. With several backend instances, each stamp is still asked for only once at a time.
+- **On a starter with its own timestamp service** (v2.17.3 or later), the provider is set on the app's **Security** page. That page also shows the queue across modules, **Retry failed** and **Test connection**. Document Management registers its stamps with the starter's queue (as *Documents*) and nudges it after each save. The starter asks the authority and checks the answer, and Document Management keeps the outcome on the version. The Record history tab says *The timestamp service is set on the app's Security page.*
+- **On an older starter**, Document Management asks the authority itself, at the provider the backend's `.env` names (shared with Structure):
+  - `RECORD_TSA_PROVIDER`: `digicert` (the default), `globalsign`, `sectigo`, `sslcom`, or `custom` with `RECORD_TSA_URL`. The built-in providers are free public servers: no account, no cost. Check each provider's usage terms before relying on one long term. A name it doesn't know means DigiCert, and the problem is logged once.
+  - A custom provider's login goes in `RECORD_TSA_USERNAME` and `RECORD_TSA_PASSWORD`, never in the URL. It is sent only over `https://` and only to `RECORD_TSA_URL`, not to an old address a waiting stamp still carries.
+  - A custom address on a private network, or one with a login in it, is refused. With `custom` and no usable `RECORD_TSA_URL`, nothing is stamped.
+  - The Record history tab shows *Timestamp service: DigiCert (RECORD_TSA_PROVIDER).* (or *No timestamp service: set RECORD_TSA_PROVIDER.*), how many stamps are pending and how many failed across the app, and **Retry failed**. Counts only: an admin never sees a document or a version here.
+
+Until v1.22.0 an admin chose a main and a backup provider on this tab, with **Test connection**. Those settings are gone (only *when* is read from what was saved). Stamps already kept, backups included, keep verifying and showing.
+
+Structure keeps its own setting for when its records are stamped (in each type's editor), through the same service.
+
+**When it happens.** Right after the save commits. A save never waits for a stamp, and never fails because of one.
+
+- With the starter's service, its queue asks and retries.
+- On an older starter, a worker on the server (every minute, while the backend is in use) asks for whatever is due. A failed request is retried after 1 minute, 5 minutes, 30 minutes, 2 hours and 12 hours, then the stamp is marked failed. Requests time out after 10 seconds. A stamp queued for the starter's service (a starter since rolled back) is asked at the `.env` provider.
+- With several backend instances, each stamp is still asked for only once at a time: a version is claimed for 5 minutes, and **Retry failed** leaves a claimed version's claim alone.
 
 **What is checked before a stamp is kept:**
 
@@ -132,11 +154,13 @@ Structure has its own timestamp settings for its records (App Structure → Sett
 - its signature verifies;
 - the signer is a timestamping certificate that chains to a trusted root (the system's roots; GlobalSign's timestamping-only root is pinned by its fingerprint).
 
-The stamp is kept with the signer certificate's revocation data (OCSP, else CRL) where it could be fetched, so it can still be checked years later.
+The stamp is kept with the signer certificate's revocation data (OCSP, else CRL) where it could be fetched, so it can still be checked years later. Its time, serial number and authority are stored as its token says them.
 
-**On the History panel**, under each version: *Timestamped by DigiCert · 18 Nov 2026, 12:23:46 pm AEDT (UTC+11:00)* (the authority's own time, in your time zone), *Timestamp pending*, *Timestamp failed: will retry* or *Timestamp failed*.
+**What Check integrity checks.** Each kept stamp's token must verify against the version's fingerprint: through the starter's `verifyTimestamp` when it has one (with the chain certificates kept beside the token), and this module's own check as a second opinion, so a stamp that verified before keeps verifying. A nonce stored with it must be the token's. Its stored time, serial number and authority must be what the token says. A kept stamp whose token is missing is a break.
 
-**Limits.** Stamps are not part of a version's fingerprint. Batching (one stamp over many versions) and re-timestamping are not built. Revocation data covers the signer certificate only. Turning timestamps on doesn't stamp versions saved before. Which provider a stamp names (shown as *Timestamped by …*) is stored beside the token, not inside it; the authority's own name (`tsaName`) comes from the token and is checked.
+**On the History panel**, under each version: *Timestamped by DigiCert SHA384 RSA4096 Timestamp Responder 2025 1 · 18 Nov 2026, 12:23:46 pm AEDT (UTC+11:00)*: the authority as its token names it, and the token's own time, in your time zone. If the copy stored beside the token differs, the line ends *· stored details differ*. Otherwise: *Timestamp pending*, *Timestamp failed: will retry* or *Timestamp failed*.
+
+**Limits.** Stamps are not part of a version's fingerprint. Batching (one stamp over many versions) and re-timestamping are not built. Revocation data covers the signer certificate only. Turning timestamps on doesn't stamp versions saved before.
 
 ---
 
@@ -146,15 +170,17 @@ The stamp is kept with the signer certificate's revocation data (OCSP, else CRL)
 
 | Break | Meaning |
 |-------|---------|
-| `gap` | A version number is missing |
-| `link` | A version's `prevHash` is not the previous version's fingerprint |
-| `hash` | A fingerprint doesn't recompute from its version (or its algorithm is unknown) |
-| `seal` | A seal doesn't verify, its key isn't configured, its algorithm is unknown, or a version has **no** seal although an earlier version of the same document has one (seals stripped after an edit). Only checked when the app has a seal key. Versions at the start of a document's history, saved before any key was set, count as *not sealed*, not broken |
+| `gap` | A version number is missing. The break names the **missing** number (the first, when several are missing) |
+| `link` | A version's `prevHash` is not the fingerprint of the version before it in the list, across a gap too |
+| `hash` | A fingerprint doesn't recompute from its version, its algorithm is unknown, or its `actor` is not one a write makes (a key other than `id`, `kind` and `module` included) |
+| `seal` | A seal doesn't verify, its key isn't configured, it names no key (`sealKeyId` empty), its algorithm is unknown, or a version has **no** seal although an earlier version of the same document has one (seals stripped after an edit). Only checked when the app has a seal key. Versions at the start of a document's history, saved before any key was set, count as *not sealed*, not broken |
 | `live` | The document as stored now differs from its last version: it was changed outside the app |
-| `timestamp` | A version's kept [independent timestamp](#independent-timestamps-v1201) no longer verifies against its fingerprint, or the time, serial number or authority stored beside it is not what its token says. A provider that never answered is not a break |
+| `timestamp` | A version's kept [independent timestamp](#independent-timestamps-v1201) no longer verifies against its fingerprint, its token is missing, or the time, serial number, authority or nonce stored beside it is not what its token says. A provider that never answered is not a break |
 | `file` | The stored file no longer matches the fingerprint taken when it was added, or it is no longer in storage |
 
 The check reads the versions and the document together, so a change saved at that moment can't look like an edit outside the app. The fingerprint covers each version's `actor` exactly as stored, so changing who a version says made it breaks its hash.
+
+Since v1.22.0 the rules, and the answer, are exactly the shared ones: the starter's `checkRevisionChain` and Structure's Check integrity give the same breaks for the same versions. Breaks are listed lowest version first. Within a version they come in this order: `gap`, `hash`, `link`, `seal`, `timestamp`; then `live`, then `file`. Removing version 2 of 4, for example, gives a `gap` at 2 and a `link` at 3. Before v1.22.0 this module reported that as a `gap` at 3 alone.
 
 The **file check** reads the whole file again and compares its SHA-256 with the document's `contentHash`. That takes longer for large files. On S3, R2, MinIO and Wasabi, a missing object counts as *no longer in storage*, as on the other storage types.
 
@@ -184,7 +210,8 @@ The answer the API gives (`GET /documents/:id/integrity`):
 ```
 
 - `uncheckedSeals`: versions that carry a seal the app can't check, because no seal key is set now (not a break).
-- `timestamped`: versions with at least one stamp that verifies. `pendingTimestamps`: versions still waiting for one. `failedTimestamps`: versions whose every stamp failed.
+- `timestamped`: versions with at least one stamp that verifies. `pendingTimestamps`: versions still waiting for one. `failedTimestamps`: versions whose stamps all failed (none verifies, none waiting, none broken).
+- `liveMatches`: whether the document as stored now matches its last version (`true` when it has none yet; before v1.22.0 that was `null`).
 
 ---
 
@@ -208,6 +235,8 @@ Deleting a document moves it to the **trash** (`/documents/trash`, also linked f
 
 **Delete permanently** (one document, several, or **Empty the trash**) removes the document, its attachments and its history for good. The file in your storage stays, as it always has: a document points at a file, it doesn't own it. A document whose offline upload hasn't reached its computer yet is **kept**, because that waiting copy is the only copy of the file; delete it once the computer is back online. If the computer was removed, the document can go, and the waiting copy stays until account erasure reclaims it. Because this can't be undone, the server asks for a sign-in on the web (never a linked computer's token) and a recent sign-in check, as Structure's purge does.
 
+**Record holds (v1.22.0).** When the starter has record holds (v2.17.4 or later) and the person's records are on hold (a legal hold, say), **Delete permanently** and **Empty the trash** are refused with the starter's own answer (`409`, `record_hold`) until the hold is lifted. Nothing is deleted. Moving a document to the trash still works. Account erasure isn't checked here: the starter checks the hold before an erasure starts, so a hold never leaves an erasure half done.
+
 Uploading the same file again, or referencing it again yourself, brings its document back from the trash, with a `restore` version. Another module referencing it in the background (a re-ingest, for example) leaves it in the trash.
 
 **A fingerprint is never replaced by referencing a file again.** If the file changed in storage outside the app, the document keeps the fingerprint it was given, so Check integrity still reports the change. A new upload is what records a new file (`replace-file`).
@@ -223,10 +252,9 @@ Uploading the same file again, or referencing it again yourself, brings its docu
 The export holds, for each document:
 
 - **every field**, as stored and as shown: its name, type, size, the file's fingerprint, its storage and location, tags, notes, favourite, status, and when it went to the trash;
-- **the file check at export**: whether the file was read again and matched its fingerprint, had changed, or couldn't be read (storage offline, say). It is a field, so every format shows it;
-- **every version**, with its snapshot exactly as it was fingerprinted, its seal, and every independent timestamp **with its token**;
-- **the integrity check**, made at the moment of export, with the file read again;
-- **the Structure records it is attached to**, each with the fingerprint of the record's latest version (a record you can't open keeps only its id).
+- **every version**, with its snapshot exactly as it was fingerprinted, its seal, and every independent timestamp **with its token**, its time, serial number and authority as the token says them (since v1.22.0, with `storedMismatch` when the copy stored beside it differs);
+- **the integrity check**, made at the moment of export, with the file read again. **The file check** is part of it, in the shape the shared rules give it: `{ "checked": true, "matches": true }`, or `{ "checked": false, "matches": false, "reason": "its storage could not be reached" }`. A file no longer in storage reads *the file is no longer in storage* and is still a `file` break. Every format shows it under Integrity (until v1.22.0 it was a field, *File check at export*);
+- **the Structure records it is attached to**, each with the fingerprint of the record's latest version (a record you can't open keeps only its id). Since v1.22.0 they are read in one call (Structure's `latestVersions`, v1.89.39 or later); a record with no versions yet keeps its name.
 
 Choose one of four formats:
 
@@ -253,11 +281,11 @@ Document Management also makes the **Word (.docx)** version of Structure's recor
 
 - its fingerprint (`contentHash`) is worked out again;
 - every version's fingerprint, its link to the version before and its numbering are checked, as `verify.mjs` does;
-- each seal is checked when the app holds the key that made it.
+- each seal is checked when the app holds the key that made it: `RECORD_SEAL_KEY`, or since v1.22.0 the starter's key for the record's owner (the `userId` in its snapshot).
 
-A version that fails any of these must be reported by the record's integrity result. If it isn't, the export is refused, so a Word file never names a fingerprint its content doesn't have, and never prints "Unbroken" over versions that don't chain.
+A version that fails any of these must be reported by the record's integrity result. If it isn't, the export is refused, so a Word file never names a fingerprint its content doesn't have, and never prints "Unbroken" over versions that don't chain. A missing version must be reported as a `gap` at the missing number, with a `link` break on the version after it (the shared rule). An export this module made before v1.22.0 reported a `gap` at the version after it instead, and is still accepted.
 
-Timestamps in a Word file show the time and serial number read from the **token itself**, never the copy stored beside it. A token that isn't for its version says so.
+Timestamps in a Word file show the authority, time and serial number read from the **token itself**, never the copy stored beside it, and end *· stored details differ* when that copy doesn't match. A token that isn't for its version says so. A record's file check has its own line under Integrity.
 
 When Structure exports records, it asks Document Management for the documents attached to them (`documentsForRecords`), each with its file's fingerprint and the fingerprint of its latest version. The same rules apply as for a record's Documents tab: your own links to your own documents, nothing in the trash.
 
@@ -325,7 +353,7 @@ Structure and Document Management check their canonical JSON against both of RFC
   - since v1.21.0: `documentsForRecords(nodeIds, userId)` and `renderRecordExportDocx(bundle)` (for Structure's exports), and `exportDocuments` and `listDocumentExports`.
 
   See [Integration](/document-management/integration/#record-history-and-the-trash-v1200).
-- **Routes:** `GET /documents/:id/history`, `GET /documents/:id/integrity?file=false`, `POST /documents/:id/revert`, `POST /documents/:id/restore`, `POST /documents/purge`, `POST /documents/export` and `GET /documents/exports`. `DELETE /documents/:id` now moves a document to the trash. Admin only: `GET`/`PUT /admin/timestamps`, `GET /admin/timestamps/queue`, `POST /admin/timestamps/retry-failed` and `POST /admin/timestamps/test`. See [Usage](/document-management/usage/#history-integrity-and-the-trash).
+- **Routes:** `GET /documents/:id/history`, `GET /documents/:id/integrity?file=false`, `POST /documents/:id/revert`, `POST /documents/:id/restore`, `POST /documents/purge`, `POST /documents/export` and `GET /documents/exports`. `DELETE /documents/:id` now moves a document to the trash. Admin only: `GET`/`PUT /admin/timestamps` (`{ when }`), `GET /admin/timestamps/queue` and `POST /admin/timestamps/retry-failed` (`POST /admin/timestamps/test` was removed in v1.22.0: Test connection is on the starter's Security page). See [Usage](/document-management/usage/#history-integrity-and-the-trash).
 - **Events:**
   - `documents.document.revisionCreated` and `documents.document.reverted`;
   - `documents.document.revisionTimestamped` (a stamp done, or failed after the last try: `{ userId, documentId, seq, provider, role, status, tsaAt, attempts, error }`) and `documents.timestampSettings.updated`;
@@ -333,16 +361,15 @@ Structure and Document Management check their canonical JSON against both of RFC
   - `documents.document.deleted`, which now means *moved to the trash*;
   - `documents.document.exported` `{ userId, documentIds, count, format, contentHash, exportId }` (v1.21.0).
 - **Table:** [`doc_document_revision`](/document-management/database/#doc_document_revision) (since v1.20.1 with `timestampStatus` and `timestampDueAt`, the stamp queue). Account erasure removes it with the person's documents (data category `document_history`). The export log is [`doc_record_export`](/document-management/database/#doc_record_export) (data category `document_exports`).
-- **Code:** `document-management.history.ts` has the canonical JSON, fingerprints, seals, snapshots and the chain check. `document-management.timestamps.ts` has the timestamp settings, the queue and its worker. `document-management.record-timestamps.ts` (the RFC 3161 request, parsing and checking) is identical to Structure's. `document-management.record-export.ts` has the Word renderer and a document as an exported record; its bundle shapes, certificate words and files are Structure's, copied unchanged (kept in the module's `src/templates/record-export-core.ts`). A write calls `documentHistory(tx).begin(id)` before changing a document, which locks the row and saves a baseline if needed, then `record(...)` after. Another module should never write `doc_document` directly.
+- **Code:** `document-management.history.ts` has the canonical JSON, fingerprints, seals, snapshots and the chain check. `document-management.timestamps.ts` has the timestamp setting, the store the starter's queue drives, this module's own queue and worker for an older starter, and the stamp checks. `document-management.starter-integrity.ts` (v1.22.0) reaches the starter's helpers through a guarded import, so an older starter loads it all the same. `document-management.record-timestamps.ts` (the RFC 3161 request, parsing and checking) is identical to Structure's. `document-management.record-export.ts` has the Word renderer and a document as an exported record; its bundle shapes, certificate words and files are Structure's, copied unchanged (kept in the module's `src/templates/record-export-core.ts`). A write calls `documentHistory(tx).begin(id)` before changing a document, which locks the row and saves a baseline if needed, then `record(...)` after. Another module should never write `doc_document` directly.
 
 ---
 
 ## What's next
 
-The shared rules now belong to the starter ([Record integrity](/getting-started/record-integrity/)). Next, in step with Structure:
+The shared rules now belong to the starter ([Record integrity](/getting-started/record-integrity/)), and since v1.22.0 this module uses its helpers for fingerprints, seals, timestamps and holds. Next, in step with Structure:
 
-- **Using the starter's helpers** for fingerprints and seals (the seal key then comes from the app's encryption key), keeping this module's stricter Check integrity until the starter's has every agreed rule.
-- **Timestamps:** whether both modules move to the starter's timestamp service and its one app-wide setting is your decision, so it's on hold until then.
-- **Holds:** a permanent delete will check the starter's record hold once it ships.
+- **The starter's chain check:** use its `checkRevisionChain` once it is shown to give this module's answers, with its `hasRecordSealKey`, and keep the authority's name and the nonce its `requestTimestamp` now returns.
+- **Holds in automatic clean-up:** skip a held person's records in any automatic permanent clean-up (the starter's `isUnderRecordHold`).
 
 See the [roadmap](/document-management/roadmap/#record-history-follow-ups-v1200-v1201-v1210).
