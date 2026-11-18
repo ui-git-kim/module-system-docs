@@ -1,6 +1,6 @@
 ---
 title: Record History & Integrity
-description: Every change to a document kept as a version, a fingerprint chain and seal anyone can check, Check integrity, the trash, and how an expert verifies versions without the app
+description: Every change to a document kept as a version, a fingerprint chain and seal anyone can check, independent timestamps, Check integrity, the trash, and how an expert verifies versions without the app
 sidebar:
   order: 7
 ---
@@ -13,7 +13,7 @@ Since **v1.20.0**, Document Management keeps every change to a document as a **v
 - who made the change;
 - exactly what the document looked like afterwards.
 
-Every version has a fingerprint that links it to the one before. When the app has a seal key, each version also gets a seal that only the server can make. **Check integrity** tells you whether anything was changed outside the app. A deleted document goes to the **trash** with its history kept, until someone deletes it permanently.
+Every version has a fingerprint that links it to the one before. When the app has a seal key, each version also gets a seal that only the server can make. Since **v1.20.1**, an admin can also have versions [timestamped by an independent authority](#independent-timestamps-v1201). **Check integrity** tells you whether anything was changed outside the app. A deleted document goes to the **trash** with its history kept, until someone deletes it permanently.
 
 The goal is records that are reliable, complete and unaltered, as the *Electronic Transactions Act* asks of electronic records. Every change leaves a trail, the times can't be typed in, and the checks can be run by someone who doesn't trust the app. Structure keeps its records the same way: both modules follow one shared set of rules, so a document and a Structure record are checked alike.
 
@@ -40,7 +40,7 @@ Every write to a document saves a version **in the same database transaction as 
 | `alg` | The fingerprint algorithm: `sha384` for new versions |
 | `seal`, `sealKeyId` | The seal and which key made it (`null` when the app has no seal key) |
 | `revertedTo` | For a restored version: the version it went back to |
-| `timestamps` | Independent timestamps, once that feature arrives (see [what's next](#whats-next)) |
+| `timestamps` | Its [independent timestamps](#independent-timestamps-v1201), main first, then the backup (empty when none was asked for). They are not part of the fingerprint: they are the only part of a version written after it is saved |
 
 ### The actions
 
@@ -108,6 +108,38 @@ openssl rand -hex 32
 
 ---
 
+## Independent timestamps (v1.20.1)
+
+A version can also be timestamped by an outside Time Stamping Authority (RFC 3161). That proves the document existed in exactly that form at that time, independent of whoever runs the app: the authority signs the version's fingerprint together with its own clock. **Only the fingerprint (48 bytes for SHA-384) is sent, never the document or its name.** It works the same way as [Structure's](/modules/structure/usage/#independent-timestamps-v18936), with the same providers and the same checks.
+
+It is **off by default**. An admin turns it on under **Admin → Document Storage → Record history**:
+
+- **Timestamp**: off, **Every version** (baselines included), or **When a document is added** (the `upload` or `create` version that made it).
+- **Main provider**: DigiCert by default. The built-in providers are the free public servers of DigiCert, Sectigo, GlobalSign and SSL.com: no account, no cost. Check each provider's usage terms before relying on one long term.
+- **Backup provider** (optional): a different authority, Sectigo suggested. A stamped version is sent to both, independently, so one provider being down never leaves it unstamped.
+- **Custom provider URL**: your own authority's address (`http://` or `https://`). If it needs a login, put it in `RECORD_TSA_USERNAME` and `RECORD_TSA_PASSWORD` in the backend's `.env` (shared with Structure), never in the URL. The login is sent only over `https://`, and only to the custom URL as saved: not to an address typed for **Test connection** before saving, and not to an old address a waiting stamp still carries.
+- **Test connection** stamps a random value with each provider and checks the answer. It tests what is on screen, saved or not. Nothing is kept.
+- **Stamp queue**: how many stamps are pending and how many failed across the app, with **Retry failed**. Counts only: an admin never sees a document or a version here.
+
+Structure has its own timestamp settings for its records (App Structure → Settings); the providers and their rules are the same.
+
+**When it happens.** Right after the save commits. A save never waits for a stamp, and never fails because of one. A worker on the server (every minute, while the backend is in use) asks for whatever is due. A failed request is retried after 1 minute, 5 minutes, 30 minutes, 2 hours and 12 hours, then the stamp is marked failed. Requests time out after 10 seconds. With several backend instances, each stamp is still asked for only once at a time.
+
+**What is checked before a stamp is kept:**
+
+- it is for exactly this version's fingerprint and algorithm;
+- its nonce matches the one sent;
+- its signature verifies;
+- the signer is a timestamping certificate that chains to a trusted root (the system's roots; GlobalSign's timestamping-only root is pinned by its fingerprint).
+
+The stamp is kept with the signer certificate's revocation data (OCSP, else CRL) where it could be fetched, so it can still be checked years later.
+
+**On the History panel**, under each version: *Timestamped by DigiCert · 18 Nov 2026, 12:23:46 pm AEDT (UTC+11:00)* (the authority's own time, in your time zone), *Timestamp pending*, *Timestamp failed: will retry* or *Timestamp failed*.
+
+**Limits.** Stamps are not part of a version's fingerprint. Batching (one stamp over many versions) and re-timestamping are not built. Revocation data covers the signer certificate only. Turning timestamps on doesn't stamp versions saved before. Which provider a stamp names (shown as *Timestamped by …*) is stored beside the token, not inside it; the authority's own name (`tsaName`) comes from the token and is checked.
+
+---
+
 ## Check integrity
 
 **Check integrity** is on the document's page. It works through the document's versions and reports:
@@ -119,6 +151,7 @@ openssl rand -hex 32
 | `hash` | A fingerprint doesn't recompute from its version (or its algorithm is unknown) |
 | `seal` | A seal doesn't verify, its key isn't configured, its algorithm is unknown, or a version has **no** seal although an earlier version of the same document has one (seals stripped after an edit). Only checked when the app has a seal key. Versions at the start of a document's history, saved before any key was set, count as *not sealed*, not broken |
 | `live` | The document as stored now differs from its last version: it was changed outside the app |
+| `timestamp` | A version's kept [independent timestamp](#independent-timestamps-v1201) no longer verifies against its fingerprint, or the time, serial number or authority stored beside it is not what its token says. A provider that never answered is not a break |
 | `file` | The stored file no longer matches the fingerprint taken when it was added, or it is no longer in storage |
 
 The check reads the versions and the document together, so a change saved at that moment can't look like an edit outside the app. The fingerprint covers each version's `actor` exactly as stored, so changing who a version says made it breaks its hash.
@@ -138,15 +171,20 @@ What the result says:
 - *Not sealed: the app has no seal key.*
 - *Seals can't be checked: the app has no seal key.* (versions carry seals, but the key is not set now; not a break)
 - *No versions kept yet.*
+- When versions were timestamped, a second line: *Independently timestamped: 12 versions; 1 pending; 1 failed.* (pending and failed only when there are some)
 - For the file: *The file matches its fingerprint.*, *The file has changed since it was added.*, *The file is no longer in storage.*, or *The file couldn't be checked: …*
 
 The answer the API gives (`GET /documents/:id/integrity`):
 
 ```json
 { "ok": true, "checkedAt": "2026-11-18T02:00:00.000Z", "versions": 12, "sealed": 12, "unsealed": 0,
-  "liveMatches": true, "breaks": [], "sealing": true,
+  "uncheckedSeals": 0, "liveMatches": true, "breaks": [], "sealing": true,
+  "timestamped": 11, "pendingTimestamps": 1, "failedTimestamps": 0,
   "file": { "checked": true, "matches": true } }
 ```
+
+- `uncheckedSeals`: versions that carry a seal the app can't check, because no seal key is set now (not a break).
+- `timestamped`: versions with at least one stamp that verifies. `pendingTimestamps`: versions still waiting for one. `failedTimestamps`: versions whose every stamp failed.
 
 ---
 
@@ -194,7 +232,7 @@ Someone who doesn't trust the app, such as an expert witness, can check the fing
 
 </Steps>
 
-Seals need the key, so only the server can check them, through Check integrity.
+Seals need the key, so only the server can check them, through Check integrity. The history list leaves out each stamp's token; the export coming next includes them, so the stamps can be checked with standard RFC 3161 tools.
 
 A short Node.js check of one version:
 
@@ -235,21 +273,21 @@ Structure and Document Management check their canonical JSON against both of RFC
   - `revertDocument`, `restoreDocument` and `purgeDocuments`.
 
   See [Integration](/document-management/integration/#record-history-and-the-trash-v1200).
-- **Routes:** `GET /documents/:id/history`, `GET /documents/:id/integrity?file=false`, `POST /documents/:id/revert`, `POST /documents/:id/restore` and `POST /documents/purge`. `DELETE /documents/:id` now moves a document to the trash. See [Usage](/document-management/usage/#history-integrity-and-the-trash).
+- **Routes:** `GET /documents/:id/history`, `GET /documents/:id/integrity?file=false`, `POST /documents/:id/revert`, `POST /documents/:id/restore` and `POST /documents/purge`. `DELETE /documents/:id` now moves a document to the trash. Admin only: `GET`/`PUT /admin/timestamps`, `GET /admin/timestamps/queue`, `POST /admin/timestamps/retry-failed` and `POST /admin/timestamps/test`. See [Usage](/document-management/usage/#history-integrity-and-the-trash).
 - **Events:**
   - `documents.document.revisionCreated` and `documents.document.reverted`;
+  - `documents.document.revisionTimestamped` (a stamp done, or failed after the last try: `{ userId, documentId, seq, provider, role, status, tsaAt, attempts, error }`) and `documents.timestampSettings.updated`;
   - `documents.document.restored` and `documents.document.purged`;
   - `documents.document.deleted`, which now means *moved to the trash*.
-- **Table:** [`doc_document_revision`](/document-management/database/#doc_document_revision). Account erasure removes it with the person's documents (data category `document_history`).
-- **Code:** `document-management.history.ts` has the canonical JSON, fingerprints, seals, snapshots and the chain check. A write calls `documentHistory(tx).begin(id)` before changing a document, which locks the row and saves a baseline if needed, then `record(...)` after. Another module should never write `doc_document` directly.
+- **Table:** [`doc_document_revision`](/document-management/database/#doc_document_revision) (since v1.20.1 with `timestampStatus` and `timestampDueAt`, the stamp queue). Account erasure removes it with the person's documents (data category `document_history`).
+- **Code:** `document-management.history.ts` has the canonical JSON, fingerprints, seals, snapshots and the chain check. `document-management.timestamps.ts` has the timestamp settings, the queue and its worker. `document-management.record-timestamps.ts` (the RFC 3161 request, parsing and checking) is identical to Structure's. A write calls `documentHistory(tx).begin(id)` before changing a document, which locks the row and saves a baseline if needed, then `record(...)` after. Another module should never write `doc_document` directly.
 
 ---
 
 ## What's next
 
-These come next, in the same order as Structure, and use the same shared rules:
+This comes next, in step with Structure, and uses the same shared rules:
 
-- **Independent timestamps (RFC 3161).** An admin can choose to have a version's fingerprint stamped by public timestamp authorities: DigiCert by default, with an optional backup such as Sectigo. Only the fingerprint is sent, never the document. A stamp proves the version existed at that time, independent of whoever runs the app. Each stamp is kept with the authority's certificate and revocation data, so it can still be checked after the certificate expires.
 - **Export.** A complete, unedited bundle of documents with their history and integrity results, as a data file, a print/PDF view and Word. It opens with a certificate page that explains in plain English how to check the bundle without the app. Document Management will also turn any module's export bundle into Word, so Structure's records and your documents export the same way.
 
 See the [roadmap](/document-management/roadmap/#record-history-follow-ups-v1200).
