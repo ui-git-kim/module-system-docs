@@ -27,6 +27,35 @@ V1 has shipped at release version `1.7.0`. The items below were surfaced while d
 - **`uploadToDefault` ignored `opts.folder` on the shared default — resolved (v1.5.4).** The requested folder was applied only on a user's *own* default provider; on the admin-set app-wide shared default it was silently dropped, so a consumer (cognitive-pipeline) could not reliably place uploads under an `Ingested/` marker folder for a user who had no provider of their own — leaving a double-ingest edge open when that user also had a catch-all auto-ingest source. `opts.folder` is now honoured on the shared default too (nested under `u/<userId>/` when isolated, guarded against escape; relative to the provider root when communal). The full behaviour is now stated as [The upload contract](/document-management/integration/#the-upload-contract). Severity: Medium.
 - **`DOC_ENCRYPTION_KEY` must be generated and kept stable by hand — no install lifecycle hook automates it — open.** The module declares `DOC_ENCRYPTION_KEY` as a **required secret** env var (it seals storage credentials with AES-256-GCM), but the bundled scaffold cannot generate secrets and the module currently defines **no lifecycle hooks** (`onInstall` / `onPrepareDatabase` / `onUpdate` / `onActivate` / `onUninstall`). So `init` — and every `update` — surfaces *"Required env variable DOC_ENCRYPTION_KEY was not provided"* until an operator sets it manually (`openssl rand -hex 32`). The key must stay **identical for the life of the install**: rotating or losing it makes every previously stored credential undecryptable, so on `update` the existing value in the backend `.env` must be preserved and never re-generated (if a scaffold update ever blanks it, that is an upstream scaffold concern). **Planned fix:** add an `onInstall` (or `onPrepareDatabase`) lifecycle hook that generates the key **once, only when it is absent on a first install** — never on update — and writes it to the backend `.env`, pending confirmation that the scaffold's lifecycle context can persist a generated secret. The same hook is the natural place for any future first-run setup. Severity: Low (operability only — no data is at risk as long as the key is set once and left unchanged).
 
+### Cleanup & security audit (18 Nov 2026) — open
+
+A second cleanup and security audit (v1.21.0): automated scans, three independent read-only reviews of the code the templates generate, and spot checks. Runtime dependencies and the pattern scans were clean. The Critical and Moderate findings are below, highest first. The Minor ones are under [Audit follow-ups (18 Nov 2026)](#audit-follow-ups-18-nov-2026).
+
+- **A former shared default can be deleted with everyone's documents on it** (Critical). `deleteProvider` refuses only the *current* app default and a store holding offline uploads. It doesn't check other users' documents, artefacts or reconciled rows, so deleting a former default loses the only copy of its credentials. Every reference on it then fails to download, verify or export, and erasure can't reach its `u/<id>/` bytes. A device token keeps full owner rights on a former default (browse, zip, overwrite, re-point). **Fix:** refuse while other users' rows remain, and treat a device principal as a non-owner on any provider holding other users' rows.
+- **Communal mode (isolation off) lets any user write anywhere on the shared store** (Moderate). A folder is only normalised, so a user can upload into the admin-only global prefix or another user's `u/<id>/`, and an upload without `reference` replaces whatever is at that path. An included folder at the store's root emits every user's files into the caller's ingest. **Fix:** refuse the global and `u/` prefixes on communal uploads, never replace another user's referenced file, and limit included folders on a non-owned store to the caller's own references.
+- **A previewed file can run script in the app's origin** (Moderate). The preview builds a blob URL with no type, and `/download` sends neither a `Content-Type` nor `nosniff`. A crafted SVG or HTML file on shared storage, opened from the preview in a new tab, runs as the viewer. **Fix:** give the blob an allow-listed type (never inline SVG), and send the stored type and `X-Content-Type-Options: nosniff` on downloads.
+- **Chunked uploads to S3 are held in memory** (Moderate). A request without `Content-Length` is buffered whole, up to the upload limit, so concurrent or large ones can exhaust the server's memory. **Fix:** a multipart upload for streams of unknown length, or a `411`.
+- **Expensive operations have no rate or concurrency limit** (Moderate):
+  - Check integrity re-reads the whole file on every call;
+  - ingest re-hashes before checking for a hash;
+  - generation (up to 1,500 Structure calls);
+  - a 200-file bulk zip at the highest compression;
+  - bucket discovery fans out over every name a hostile server returns;
+  - WebDAV and S3 listing responses are parsed unbounded.
+
+  **Fix:** per-person in-flight guards (as exports have), skip a re-hash that isn't needed, and cap counts and response sizes.
+- **Reads aren't audited** (Moderate). Downloads, previews, zips and file checks are only recorded in the Recent table, capped at 100 rows a person, so a user's own later activity pushes a download out. There is no `audit: true` line or event for reads, template create, update and delete aren't audited, and several events (`documents.template.*`, `documents.document.generated`, `.created`, `.updated`) aren't declared in `auditEvents`. **Fix:** an audited `documents.document.accessed` event; the capped table only for the Recent view.
+- **Storage connections aren't closed after use** (Moderate). About a dozen paths (preview, file info, uploads, reconcile, erasure clean-up, search, ingest, artefacts) load an adapter and never `disconnect()`, leaving an S3 client and its sockets behind each time. Teardown is also written three ways. **Fix:** one `withAdapter(row, fn)` helper that always disconnects.
+- **Saving a document reference with its history is written four times** (Moderate): `createDocument`, `ensureReference`, the shared upload path and offline staging. They already disagree about the trash (an upload brings a trashed document back for any caller; the others don't for a module's call; staging ignores the trash). **Fix:** one helper, with the rules as explicit options.
+- **The live provider search does nothing** (Moderate). No adapter implements `search`, yet every search loads an adapter per provider and never closes it. **Fix:** remove the loop and the optional `search` member.
+- **Many failed actions are silent in the UI** (Moderate). Storage settings, the admin page, the document page, the browser, included folders, a record's Documents tab and the file preview all have failures that show nothing. The admin page and the document page wait forever on a failed load. **Fix:** `getApiErrorMessage` into `ErrorAlert` for each, and an error branch before each loading guard.
+- **Copies that have drifted in the frontend** (Moderate). The History panel re-implements the record-export helpers (`formatRecordTime`, the timestamp words) that `utils/record-export.ts` now provides. The upload flow is written three times: the browser page and a record's Documents tab skip the shared `DocumentUpload`'s size pre-check and its offline note.
+- **The admin "Node-type upload folders" list isn't a `DataTable`** (Moderate), and its delete has no confirmation.
+- **The `defaultRegion` install prompt has no effect** (Moderate). `DOC_S3_DEFAULT_REGION` always has a value and overrides it, so installers answer a question that changes nothing.
+- **The public service interface isn't checked against the service** (Moderate). There's no `satisfies`; `linkDocument` (whose system tier exists only for in-process callers) is missing; and the docs' interface block lacks `uploadGlobal`, `documentsForRecords` and `renderRecordExportDocx`.
+- **The hashing tee is written twice** (Moderate). The upload and artefact paths each tee through SHA-256, and only one refuses an already-destroyed stream, which otherwise hangs.
+- **The host type-check job in CI never runs** (Moderate). It needs the `STARTER_REPO_TOKEN` secret and the `HOST_TYPECHECK` variable, and neither is set. A type error in the generated code is only caught by a manual check (one was caught that way in v1.21.0).
+
 <Aside type="tip" title="Where to look first when something breaks">
 Most field issues fall into one of three buckets: a provider is unreachable (check `status` and `statusMessage` on `doc_storage_provider`, then re-run `POST /providers/:id/test`), a credential failed to decrypt (`DOC_ENCRYPTION_KEY` changed or is missing), or a preview type isn't supported inline in V1 (office, archives — these intentionally show a download prompt). None of these are bugs; they are documented behaviour.
 </Aside>
@@ -223,6 +252,71 @@ The 2026-09-30 cleanup and security audit is [resolved in v1.18.0](#cleanup--sec
   - a "held until your computer reconnects" note for offline-staged uploads from the Documents page Upload button, as `DocumentUpload` already shows.
 
 Accepted as-is for now: the erasure sweep runs synchronously inside the `DELETE` request, the shared-infrastructure check scans unindexed `providerId` columns, and any admin can rename a default that another admin created.
+
+### Audit follow-ups (18 Nov 2026)
+
+The Minor findings of the [18 Nov 2026 audit](#cleanup--security-audit-18-nov-2026--open), by area.
+
+- **Backend hardening:**
+  - any provider can be made the app default, including a regular user's own (require an admin- or organisation-owned provider);
+  - file paths leak in the local adapter's test message, and erasure logs keep WebDAV URLs (log the error class only);
+  - several inputs have no length bounds: tags, notes, paths, bookmark fields, provider config strings, accepted types, and the ingest `hint` record;
+  - no step-up on `PUT /settings` (turning isolation off) or on artefact prune;
+  - credential encryption (known design): pin the GCM tag length, bind the row with AAD, derive the key with a KDF.
+- **Frontend safety:**
+  - ids from the URL go into API paths without `encodeURIComponent`;
+  - the secret fields in Add provider have no `autoComplete`.
+- **Frontend data fetching:**
+  - FilePreview fetches in `useEffect`;
+  - several components call the service directly;
+  - the download-and-save helper is written three times;
+  - delete and reconcile provider, and delete and restore document, don't invalidate every cache they change.
+- **Frontend copies and dead code:**
+  - the folder breadcrumb is written twice, the provider status maps three times, `acceptFilter` three times;
+  - unused hooks and service methods (artefact retention and prune, `useFileInfo`, `useDocumentArtefacts`, `useDocumentExports`);
+  - `FormState.token`;
+  - `shadcnComponents` entries nothing imports (`dropdown-menu`, `context-menu`, `progress`, `command`).
+- **Frontend markup (rule 8):**
+  - raw `<button>`s;
+  - `<details>` instead of `Collapsible`;
+  - a bare `<h1>` and about 70 `<p className>` instead of `Heading` and `Text`;
+  - custom empty states instead of `Empty`;
+  - status dots as spans;
+  - a `Card` used as a button;
+  - "Loading…" text instead of `Skeleton` or `Spinner`;
+  - icon-only buttons without `aria-label`;
+  - labels not tied to their inputs.
+- **Frontend styling (rule 7):** geometry and surface classes on shadcn primitives (`Card`, `CardContent`, `CardHeader`, `CardTitle`, `TableCell`, `Badge`, `Button`) in components.ts, pages.ts, structure.ts and widgets.ts.
+- **Backend dead code:**
+  - `listLocalConnectTunnels`;
+  - `initDocumentManagementModule`;
+  - `CursorListResult` and `BulkDownloadInput`;
+  - the `DocumentManagementService` and `CloudflareTunnelService` type exports;
+  - the backend's `SUGGESTED_TIMESTAMP_BACKUP`;
+  - the adapters' `move`, `copy` and `createFolder`;
+  - `artefactQuerySchema.format` and `.version`;
+  - `AccessAction 'unlink'`;
+  - `lastSyncedAt` and `doc_document.metadata`, which nothing reads or writes;
+  - unused `principal` parameters;
+  - an unreachable tunnel message.
+- **Backend duplication and inconsistency:**
+  - the record module and type constants are duplicated;
+  - the timestamp provider lists and types are duplicated (the planned move to the starter's helpers removes these);
+  - the tunnel rollback;
+  - the "no storage" message differs between the capability check and uploads;
+  - policy refusals are written twice;
+  - the app settings row is read five times per `GET /settings`;
+  - the bucket discovery code is written twice;
+  - the optional Structure service is cast inline seven times;
+  - four handlers pass the raw body to the service (it validates);
+  - inline `404`s and `413`s.
+- **Comments:**
+  - stacked and detached doc comments;
+  - repeated sentences;
+  - stale comments (search, the event-payload list, template variables);
+  - a mis-indented block in `createDocument`.
+- **CLAUDE.md** still says the backend reacts to `structure.node.deleted` (now `structure.node.purged`).
+- **Dependencies (no change):** build and test tooling carries a `picomatch` advisory (allow-listed in CI, no fixed release yet), and `archiver` / `webdav` carry the known `minimatch` advisory. Runtime dependencies are clean.
 
 ### Storage usage follow-ups (v1.18.1)
 
