@@ -21,6 +21,7 @@ The starter template includes shell scripts for creating new apps and keeping th
 | `npm run components:sync` / `components:sync:dry` | Merge module `styleRegistry` contributions into `components.json` and reinstall shadcn components | [Sync shadcn components](#sync-shadcn-components) |
 | `npm run deps:check` / `deps:update` / `deps:update:latest` / `deps:lockfile` | Check or apply dependency updates across root/frontend/backend (cross-platform; preserves `npm link`s) | [Dependency Updates](#dependency-updates) |
 | `npm run release:{patch,minor,major}` | Bump the **app's** version (not the template's) in apps cloned from this starter | [Version Tracking](#app-version) |
+| `npm run security:check` / `security:fix` | Report, or apply, npm's non-breaking security fixes for the app's installed packages (v2.18.2). `template:update` runs the fix itself | [Security fixes for installed packages](#security-fixes-for-installed-packages) |
 | `npm run security:setup-kms` | Interactive AWS KMS field-encryption setup (prompts for KMS/IAM values, generates the wrapped data key, writes to `backend/.env`) | [Field encryption with AWS KMS](/getting-started/aws-kms-setup/) |
 | `npm run ensure-pgvector` | Declare pgvector in the Prisma generator/datasource — non-interactive, idempotent, **declaration only** | [Ensure pgvector](#ensure-pgvector) |
 | `npm run install:all` | Install the foundation packages in root, frontend and backend, then `prisma generate` (runs the template-owned `scripts/install-all.mjs`) | [Foundation install list](#foundation-install-list) |
@@ -760,8 +761,59 @@ node scripts/audit-gate.mjs --enforce       # fail on a NEW advisory (see below)
 - **Runs in CI** as the `audit` job in `.github/workflows/ci.yml` — see [Testing & CI](/starter-template/testing/#the-dependency-audit-gate). There is no `npm run` alias; invoke it via `node` directly.
 
 <Aside type="note" title="The gate is a mirror, not a fix">
-On first run it reports every high/critical advisory the committed lockfiles carry, including stale-lockfile pins that already have patched versions in range. Refresh with `npm run deps:lockfile`, then allowlist (or fix) whatever genuinely remains before enforcing.
+On first run it reports every high/critical advisory the committed lockfiles carry, including stale-lockfile pins that already have patched versions in range. Refresh with `npm run deps:lockfile`, then allowlist (or fix) whatever genuinely remains before enforcing. In an app, `npm run security:fix` applies the in-range fixes (see [the next section](#security-fixes-for-installed-packages)).
 </Aside>
+
+---
+
+## Security fixes for installed packages
+
+<Badge text="v2.18.2" variant="tip" /> `scripts/security-fix.mjs` applies npm's non-breaking security fixes to an app's installed packages. `template:update` runs it after the install, `npm run security:fix` runs it at any other time, and `npm run security:check` only reports.
+
+**Why it exists.** An app's lockfiles are its own: a template update never replaces them, and `npm install` keeps a version that is already locked. So a package the template refreshed months ago can sit at an old, vulnerable version in an app indefinitely. When this was built, the template's lockfiles carried no new high or critical advisories, while an app a few weeks behind carried 17, all but one of them fixable inside the version ranges it already allowed.
+
+```bash
+npm run security:check                            # report only: what npm can fix, and what would stay open
+npm run security:fix                              # check, fix, verify, commit
+node scripts/security-fix.mjs --no-commit         # leave the lockfile change for you to commit
+node scripts/security-fix.mjs --no-verify         # skip the compile check
+node scripts/security-fix.mjs --min-age-days=7    # a longer cool-down (0 switches it off)
+```
+
+For `backend/` and `frontend/` it:
+
+1. **Asks npm what is known to be vulnerable** (`npm audit`). An audit that could not run (offline, no lockfile) is reported as unknown, never as clean.
+2. **Applies the fixes that stay inside the versions your `package.json` already allows** (`npm audit fix`, never `--force`). It runs when npm can clear something at moderate level or above. A fix that needs a bigger upgrade is reported and left to you.
+3. **Checks the app still compiles** (`npm run type-check` in that directory, after `prisma generate` in the backend). If it no longer does, the previous packages go back and the check runs again. If that passes, the fix was the cause and stays out. If it fails too, the app was already broken, so the fix goes back in and the report says it could not be confirmed.
+4. **Commits the lockfile change by itself** (`chore: security fixes for installed packages (npm audit fix)`), so one `git revert`, followed by `npm run install:all`, takes it back out. Package files with uncommitted edits of your own are fixed but never committed for you.
+5. **Says what happened in plain words**: what was fixed, what needs a bigger upgrade, what has no fix yet, and what is on the accepted list (`.audit-allowlist.json`, shared with the [audit gate](#audit-gate)).
+
+- **Cool-down.** A fix only takes package versions published more than **3 days** ago (npm's `min-release-age`). A hijacked release shows up among the newest versions and is usually pulled within days. A fix newer than that waits for the next run.
+- **Linked modules survive.** `npm audit fix` prunes `npm link`-ed modules like any install, so they are saved first and restored afterwards (see [npm-link preservation](#npm-link-preservation)).
+- **It never fails a template update.** Whatever happens, the update carries on and the summary says what to do.
+- **Git stays clean.** When nothing was fixed, or a fix was undone, the lockfile is left byte-for-byte as it was. On Windows npm rewrites it with different line endings, which git would otherwise list as modified and the next update would refuse to start over.
+
+The settings live in the root `package.json`, or in the environment, which wins:
+
+```json
+{
+  "config": {
+    "securityFix": "off",
+    "securityFixMinAgeDays": 7
+  }
+}
+```
+
+| Setting | Environment variable | Effect |
+|---|---|---|
+| `securityFix: "off"` | `SECURITY_FIX=off` | `template:update` skips the step. Running `npm run security:fix` yourself still works. |
+| `securityFixMinAgeDays` | `SECURITY_FIX_MIN_AGE_DAYS` | The cool-down in days (default 3, `0` for none). |
+
+<Aside type="note" title="A compile check is not a test run">
+The check catches a fix that changes a type the app relies on. It cannot tell you that a package now behaves differently. After an update that applied fixes, use the app as you would after any update. If something is off, `git revert` the security-fix commit first to see whether it was the cause.
+</Aside>
+
+In the template repo itself there is nothing installed to fix. Refresh its lockfiles with `npm run deps:lockfile`.
 
 ---
 
@@ -988,6 +1040,7 @@ Both scripts follow the same structure and can be customized.
   - enable-vectors.ps1 (pgvector declaration + demo Embedding model + migrate — wraps ensure-pgvector.mjs)
   - prisma-migrate-safe.mjs (Drift-safe Prisma migrate primitive — wired by backend db:migrate)
   - lib/
+    - npm-audit.mjs (Runs `npm audit` and reads its report and the accepted list; shared by audit-gate and security-fix; v2.18.2)
     - migrate-text.mjs (prisma-migrate-safe's pure text helpers: error summary, retry check, CREATE EXTENSION order; v2.14.2)
     - shadcn-foundation.mjs (The shadcn CSS foundation contract: the doctor's checker, the Typeset import wiring, keep-local snapshot/restore; v2.16.2)
     - shadcn-foundation.test.mjs (Offline self-check: `node --test`)
@@ -1017,6 +1070,8 @@ Both scripts follow the same structure and can be customized.
   - saved-theme-style.mjs (Reads the shadcn style an admin saved in the app theme, from `GET /api/v1/theme`, for components:sync; v2.16.5)
   - saved-theme-style.test.mjs (Offline self-check: `node --test`)
   - audit-gate.mjs (CI dependency-audit gate — allowlist-aware npm audit)
+  - security-fix.mjs (Applies npm's non-breaking security fixes in an app: check, fix, verify, commit; run by template:update; v2.18.2)
+  - security-fix.test.mjs (Offline self-check: `node --test`)
 </FileTree>
 
 ### Customizing Scripts
