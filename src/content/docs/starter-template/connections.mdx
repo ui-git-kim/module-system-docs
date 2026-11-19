@@ -13,7 +13,9 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 
 **Shipped in v2.18.3:** the first half of phase A4: [Microsoft 365](#microsoft-365-what-shipped) as the second service, [a switch per feature for each connected account](#a-switch-per-feature-for-each-account), the Integrations page as a grid of cards with a detail panel, and a way for an admin to prove a permission (calendar access, say) on their own account before any module asks for it.
 
-**Everything else on this page is the agreed design and is not built yet:** API-key services, the `ConnectionPicker`, the reconnect prompt, an activity log per connection, access keys, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
+**Shipped in v2.18.4:** the [activity log](#the-activity-log): what has happened to a person's connected accounts, and when, at the foot of each service's detail panel.
+
+**Everything else on this page is the agreed design and is not built yet:** API-key services, the `ConnectionPicker`, the reconnect prompt, access keys, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
 </Aside>
 
 ## The decision this page designs to
@@ -265,7 +267,7 @@ Still to come (phase A4): applying an API key for key-based services, and addres
 
 #### The data model
 
-Two tables in the starter's schema (plus `ServiceConnectionConfig` for each service's app-wide set-up, see [A5](#a5-app-owner-setup)). Both follow the isolation convention: `tenantId` is the isolation key, `userId` the actor, no foreign key to `User` (so the tables add cleanly on `template:update`). The names carry a `Service` prefix so they cannot clash with an app's or a module's own `Connection` model.
+Two tables in the starter's schema (plus `ServiceConnectionConfig` for each service's app-wide set-up, see [A5](#a5-app-owner-setup)). Both follow the isolation convention: `tenantId` is the isolation key, `userId` the actor, no foreign key to `User` (so the tables add cleanly on `template:update`). The names carry a `Service` prefix so they cannot clash with an app's or a module's own `Connection` model. A third per-account table, `ServiceConnectionEvent`, holds the [activity log](#the-activity-log) (v2.18.4).
 
 ```prisma
 // One user's authorised link to one account at a service.
@@ -393,6 +395,29 @@ How it is kept:
 - The `connection.useChanged` action fires with the module id and `enabled`, so a module can stop or resume its own background work for that account.
 - `requireService` takes an optional `title`: what the feature is called beside its switch. Without one, the module's id is tidied up ("ai-chat" becomes "Ai chat").
 
+#### The activity log
+
+**Shipped in v2.18.4.** A person can see what has happened to their accounts at each service: the **Activity** section at the foot of the service's detail panel, newest first, each entry with when it happened (and with the account, once there is more than one to tell apart).
+
+| Entry | When it is written |
+|---|---|
+| Connected | An account was connected for the first time. |
+| Signed in again: access renewed or added | The person went back through the service's screen for an account that was already connected (Reconnect, Add access, or switching on a feature that needed more access). |
+| Switched on for … / Switched off for … | A feature's switch was changed for the account. Connecting also notes each feature it switched on. |
+| Used by … | A feature made a call with the account. **Noted once a day** for each account and feature, however many calls it makes. |
+| Needs reconnecting | The service stopped accepting the app's access, or the access ran out and could not be renewed. |
+| Renewing the access failed for now | A renewal failed for a passing reason. Written once per run of failures, like the `connection.refreshFailed` hook. |
+| Disconnected | With whether the service confirmed it cancelled the access. **The log outlives the connection**, so this can be its last line. |
+
+How it is kept:
+
+- One table, `ServiceConnectionEvent`: the tenant and user, the connection's id (not a foreign key, so the log survives a disconnect), the service, the account's label as it was at the time, the kind of event, the feature's module id where there is one, and one short code (how the revoke went, or why it needs reconnecting). **Never a token, a scope list or a service's own error text.**
+- It is per-account data on the isolation convention, behind the same row-level-security policy as the connection tables, and every query runs inside `withTenantContext`.
+- **Writing an entry can never fail the work it describes.** If the log cannot be written, connecting, renewing and disconnecting carry on; an app whose database has not been updated yet simply has no log.
+- Entries are kept for a year. A person's old entries are removed as they write new ones (at most once a day).
+- `GET /api/v1/connections/activity?serviceId=…` returns the newest 30 (up to 100 with `limit`), with the words already written by the backend.
+- Account deletion removes the log with the connections (the `connections.account` handler). The personal-data export includes it (the `connections.activity` handler).
+
 ### The handshake
 
 The backend is authenticated by a bearer token, so a redirect arriving at the backend carries no login. The design does not pretend otherwise: **the service sends the person back to the app's own page, and the signed-in page hands the one-time code to the backend.**
@@ -437,7 +462,7 @@ If the person's sign-in expired while they were on the service's screen, the pag
 
 - The page asks `GET /api/v1/connections/catalog`, which returns the services this user should see (configured **and** required by an installed, enabled module), each with its permissions, which modules need them and why, and the user's connections with live status.
 - **A grid of cards** (v2.18.3), one generic card per service under its category, each category with a count. A card shows the service's mark, name and description, who is connected (or what it is used for), one main action (**Connect**, or **Manage** once connected) and a small menu. An account the service has cut off, or a switched-on feature that lacks access, shows **Needs attention**.
-- **A detail panel per service** (v2.18.3), opened from its card: each connected account with Reconnect and Disconnect, and [a switch per feature](#a-switch-per-feature-for-each-account); the features to choose before connecting; and "Connect another account". A small form for API-key services is still to come.
+- **A detail panel per service** (v2.18.3), opened from its card: each connected account with Reconnect and Disconnect, and [a switch per feature](#a-switch-per-feature-for-each-account); the features to choose before connecting; and "Connect another account". A small form for API-key services is still to come. Since v2.18.4 the panel ends with the service's [activity log](#the-activity-log).
 - **No provider logos are shipped** (they are the providers' trademarks). The mark is the service's initial in a shadcn `Avatar`, with `data-part="service-icon"` and `data-service="<id>"` for a style module to put a logo in its place. The card and the panel are canonical shadcn compositions (`Card`, `Sheet`, `Item`, `Switch`): they keep the primitives' own `data-slot` hooks and add `data-part` hooks beside them (`service-connection-card`, `service-connection-sheet`, `service-connection`, `service-connection-use`).
 - One notice at the top of the page shows the latest event only (`ConnectionNotice`, v2.18.1): the account just connected, a return that failed, or the account just disconnected, with whether the service confirmed it cancelled the access.
 - Keys for outside tools are not on this page. They sit with linked devices on one **Devices and keys** page (see [B1](#b1-access-keys)), and this page links there.
@@ -1018,7 +1043,8 @@ Part A first, then Part B. Each phase ends with something to see or test, then o
 | **A2. Connect and disconnect** (shipped, v2.18.0) | The handshake; encrypted storage; the catalogue; the generic card; extensible categories; disconnect with revoke; the deletion and export handlers. | **Connect a real Google account in a test app**, see "Connected as …", connect a second account, disconnect, delete the test account and confirm the rows are gone. |
 | **A3. Using a connection** (shipped, v2.18.1) | The row-level-security switch for the new tables; `connections.use()` and `fetch()`; refresh with one in flight; typed errors; "needs reconnecting", the notification and the audit events; an admin "test call" button. | Press "test call" before and after the token expires; revoke access at Google and watch the card change and the notification arrive. |
 | **A4, first half** (shipped, v2.18.3) | Microsoft 365; a switch per feature for each account, with the service asked only for what the switched-on features need; adding access to a connected account; the Integrations page as a grid of cards with a detail panel; ticking permissions to try on the admin's own test account, proved by the test call. | Connect a Microsoft account; tick calendar access in the guide and run the test call; switch a feature off and on. |
-| **A4, second half** | API-key services; the `ConnectionPicker`; the prompt that offers Reconnect when a call answers `connection_needs_reconnect`; an activity log per connection. | Paste a key for a key-based service; see what a connection has been used for. |
+| **A4, the activity log** (shipped, v2.18.4) | A log of what happened to each connected account (connected, switched, used, cut off, disconnected), kept for a year and shown in the service's detail panel; its table, with the update scripts' auto-add; deletion and export. | Open a service's panel and read its Activity after connecting, switching a feature and disconnecting. |
+| **A4, second half** | API-key services; the `ConnectionPicker`; the prompt that offers Reconnect when a call answers `connection_needs_reconnect`. | Paste a key for a key-based service. |
 | **A5. Recurring work** | `registerSweep`; the keep-alive refresh. | Leave a test connection unused and watch the sweep refresh it. |
 | **B1. Devices and keys** | The key table; create / list / revoke; `requireAccessKey`; the Linked devices page becomes Devices and keys. | Create a key, call `/automation/me` with it, revoke it, call again and get refused. |
 | **B2. Actions and the catalogue** | `registerAction`, the action route, idempotency, the catalogue. | Call a sample action with a key from a command line. |
@@ -1040,6 +1066,7 @@ Part A first, then Part B. Each phase ends with something to see or test, then o
 3. To switch a service on, the owner registers an app with that provider and follows its guide on the admin Connections page (or sets its two env values and restarts). The page says what is still missing.
 4. **v2.18.1 needs no migration.** The update adds a commented `SECURITY_RLS` line to `backend/.env`, and on its next start the backend applies the row-level-security policy to the two connection tables (see [what shipped](#row-level-security-what-shipped)).
 5. **v2.18.3 needs no migration either.** The update adds commented Microsoft lines to `backend/.env`. Accounts connected before it stay open to every feature until the person switches one off.
+6. **v2.18.4 adds one table** (`ServiceConnectionEvent`, the activity log). The update adds it to the schema and applies its migration, the same drift-immune way as the first three. Until that has run, everything works and there is simply no log.
 
 ---
 
@@ -1130,7 +1157,7 @@ So: for the new tables, where all access goes through one file the starter owns,
 
 ### Row-level security: what shipped
 
-Shipped in v2.18.1 for the two connection tables (`ServiceConnection` and `ServiceConnectionState`).
+Shipped in v2.18.1 for the two connection tables (`ServiceConnection` and `ServiceConnectionState`). The activity log's table, `ServiceConnectionEvent`, joined them in v2.18.4.
 
 - **How a table asks for it.** `rowSecurity: true` on its `ownedModels` entry in the feature's security manifest. Nothing else in the starter asks for it today.
 - **What the backend does.** At startup, and again before the first connection is started, it switches row-level security on for each such table (`ENABLE` and `FORCE`) and creates two policies. `starter_tenant_isolation` makes a row visible and writable only when its `tenantId` equals the `app.tenant_id` setting that `withTenantContext` publishes. `starter_system_read` gives read-only access to work with no signed-in person. The work runs under a transaction-scoped advisory lock, so several instances starting together do not collide, and it never stops the app from starting.
