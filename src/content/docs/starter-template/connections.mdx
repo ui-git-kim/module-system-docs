@@ -9,7 +9,9 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 <Aside type="caution" title="In progress: part of this is built">
 **Shipped in v2.18.0:** the groundwork and connecting an account (phases A1 and A2 of the [build plan](#build-plan)): the admin Connections page with its setup guides, Google as the first service, and the Integrations page cards.
 
-**Everything else on this page is the agreed design and is not built yet:** using a connection from a module, Microsoft 365, access keys, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
+**Shipped in v2.18.1:** using a connection (phase A3): `connections.use()` and its `fetch()`, renewal with one in flight, the typed errors, "Needs reconnecting" with its notification, the admin test call, and the [row-level-security switch](#row-level-security-what-shipped) for the connection tables.
+
+**Everything else on this page is the agreed design and is not built yet:** Microsoft 365, API-key services, the reconnect prompt, access keys, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
 </Aside>
 
 ## The decision this page designs to
@@ -241,13 +243,18 @@ const response = await google.fetch(
 );
 ```
 
-`fetch()` is the standard `fetch` signature. Underneath it:
+`use()` returns a handle with `id`, `serviceId`, `accountLabel` and `fetch`. `fetch()` is the standard `fetch` signature. Underneath it:
 
-- attaches the access token (or applies the API key), and addresses a `resource` when one is given (`google.fetch(url, { resource: organisationId })`);
-- refreshes first when the token is about to expire, with only one refresh in flight per connection (see [Refreshing](#refreshing));
-- retries once after a forced refresh when the service answers 401;
-- refuses any host outside the definition's `allowedHosts`, and does not follow a redirect to one;
+- attaches the access token, and nothing the caller passes can replace that header;
+- refreshes first when the token is within a minute of expiring, with only one refresh in flight per connection (see [Refreshing](#refreshing));
+- retries once after a forced refresh when the service answers 401 (when the request body can be sent again);
+- sends the token only to `https` addresses on the definition's `allowedHosts`, and refuses a call to anywhere else. A redirect is followed only for a read (`GET` or `HEAD`) and only to an allowed host; otherwise the redirect response is handed back to the caller;
+- gives a call with no time limit of its own 30 seconds;
 - throws a typed error instead of failing quietly (see [A6](#a6-when-things-go-wrong)).
+
+**A module can only use what it declared.** `use()` checks that `moduleId` declared this service, and each permission asked for, with `requireService`. Asking for anything else is a coding mistake and throws a plain error, not one of the typed ones.
+
+Still to come (phase A4): applying an API key for key-based services, and addressing a `resource` (`google.fetch(url, { resource: organisationId })`).
 
 **Modules never see a refresh token, and in this design not an access token either.** A module that wants to remember which connection to use stores the `connectionId` (an id, not a secret) in its own settings.
 
@@ -387,10 +394,11 @@ If the person's sign-in expired while they were on the service's screen, the pag
 
 ### Refreshing
 
-- **On demand.** `fetch()` refreshes when the access token is within a minute of expiring. No background job is needed for a connection that is in use, so nothing is lost when the server restarts on the default runner.
-- **One refresh in flight per connection.** Within a process, callers share one promise per connection. Across server instances, the refresher first takes a short lease on the row (`refreshLeaseUntil`, one conditional `UPDATE`); the others wait and then read the new token from the row. The new access token **and the new refresh token** are written in the same statement that releases the lease. This is what keeps services that issue a new refresh token each time (and cancel the old one) from breaking.
-- **Keep-alive for unused connections.** A refresh token that is never used eventually dies. A sweep (see [Recurring work](#recurring-work)) refreshes connections whose refresh token is within a third of its lifetime of expiring. It pauses while the backend is idle and catches up on the next request.
-- **A refresh the service refuses** (the person revoked access, or the token expired) moves the connection to "needs reconnecting". A refresh that fails for a passing reason (the service is down) does not: the call fails with a temporary error and the next call tries again.
+- **On demand.** `fetch()` refreshes when the access token is within a minute of expiring, or when the service has just refused it (a 401). No background job is needed for a connection that is in use, so nothing is lost when the server restarts on the default runner.
+- **One refresh in flight per connection.** Within a process, callers share one promise per connection. Across server instances, the refresher first takes a short lease on the row (`refreshLeaseUntil`, one conditional `UPDATE`, 30 seconds); the others wait and then read the new token from the row. The new access token **and the new refresh token** are written in the same statement that releases the lease. This is what keeps services that issue a new refresh token each time (and cancel the old one) from breaking.
+- **Keep-alive for unused connections** (phase A5, not built). A refresh token that is never used eventually dies. A sweep (see [Recurring work](#recurring-work)) refreshes connections whose refresh token is within a third of its lifetime of expiring. It pauses while the backend is idle and catches up on the next request.
+- **A refresh the service refuses** moves the connection to "needs reconnecting". Only the service's own "this grant is no longer valid" answer (`invalid_grant`) counts as a refusal: the person revoked access, or the refresh token ran out.
+- **Any other failure is passing** (the service is down, a timeout, the new tokens could not be saved). The connection's state does not change, the call fails with `ConnectionUnavailableError`, and that connection waits 30 seconds before trying again. `connection.refreshFailed` fires once per run of failures, not once per attempt.
 
 ### Disconnect and deletion
 
@@ -404,6 +412,7 @@ If the person's sign-in expired while they were on the service's screen, the pag
 
 - The page asks `GET /api/v1/connections/catalog`, which returns the services this user should see (configured **and** required by an installed, enabled module), each with its permissions, which modules need them and why, and the user's connections with live status.
 - One generic card per service, built from the shared blocks: the service name and icon; a row per connected account ("Connected as …", status badge, Disconnect); Connect, or "Connect another account"; "Needs reconnecting" with a Reconnect button; "Tasks needs extra access" with Add access; and, for API-key services, a small form.
+- One notice at the top of the page shows the latest event only (`ConnectionNotice`, v2.18.1): the account just connected, a return that failed, or the account just disconnected, with whether the service confirmed it cancelled the access.
 - Keys for outside tools are not on this page. They sit with linked devices on one **Devices and keys** page (see [B1](#b1-access-keys)), and this page links there.
 
 What changes in the existing public pieces:
@@ -422,7 +431,7 @@ New frontend pieces, in `frontend/src/features/connections/`:
 
 - `useConnections(serviceId?)` and `useServiceAvailability(serviceId)`: TanStack Query hooks, keys namespaced `['connections', …]`.
 - `ConnectionPicker`: choose which connection (and which resource) a module should use.
-- A standard prompt when a call fails with "needs reconnecting": the API client recognises the error code, as it does for step-up, and offers Reconnect.
+- A standard prompt when a call fails with "needs reconnecting" (phase A4): the API client recognises the error code, as it does for step-up, and offers Reconnect.
 
 ### A5. App-owner setup
 
@@ -458,7 +467,11 @@ An admin page, **Connections** (registered with `adminPagesRegistry`, a `DataTab
 | What it needs | The env var names (never their values), the exact return address to register at the provider, the webhook address where one applies, and a link to the provider's console. |
 | Connections | How many users have connected, and how many need reconnecting. |
 
-Above the table: whether the encryption key is ready (connecting is refused without it) and which job runner is active. Each service has a help article (the `supportRegistry`) with the provider's own steps, including the review a provider demands before strangers can connect.
+Above the table: whether the encryption key is ready (connecting is refused without it) and which job runner is active. Below it (v2.18.1): whether row-level security is really enforced for the connection tables (see [what shipped](#row-level-security-what-shipped)).
+
+**The test call (v2.18.1).** Once the owner has connected an account of their own, the guide's last step offers **Run a test call** (`POST /api/v1/admin/connections/services/:serviceId/test`, admin and web session only). It makes a harmless read with each of the admin's own connections to that service (up to five), forces a renewal, reads again, and reports each step in plain words. It never touches another person's connection.
+
+Each service has a help article (the `supportRegistry`) with the provider's own steps, including the review a provider demands before strangers can connect.
 
 <Aside type="note" title="What every app owner takes on, whatever the mechanism">
 Registering an app with a provider is the owner's job and cannot be done once for everybody. Some providers also review an app before the public may connect to it. Those costs come from the provider, not from this design; the per-service help articles spell them out.
@@ -478,9 +491,9 @@ Registering an app with a provider is the owner's job and cannot be done once fo
 | `ConnectionNeedsReconnectError` | Revoked, expired, or a permission is missing (`reason`, `missingPermissions`). | Pause; the user has been told. |
 | `ConnectionUnavailableError` | A passing failure (the service is down). | Retry later. |
 
-A route that lets one of these escape answers `409` with a stable `code` (`connection_required`, `connection_needs_reconnect`, …) and the `serviceId`, which is what the frontend prompt reads.
+A route that lets one of these escape answers `409` (`503` for `ConnectionUnavailableError`, which is safe to retry) with a stable `code` (`service_not_configured`, `connection_required`, `connection_choice_required`, `connection_needs_reconnect`, `connection_unavailable`) and a `details` object carrying the `serviceId`. A reconnect error adds `reason` (`revoked`, `expired` or `permissions`), `missingPermissions` and `connectionId`. This is what the frontend prompt (phase A4) reads. `AppError` gained the optional `details` field for this in v2.18.1.
 
-**For the audit trail.** Action hooks, added to the `CoreHooks` catalogue, ids only and never token material: `connection.connected`, `connection.reconnected`, `connection.disconnected`, `connection.refreshFailed`, `connection.needsReconnect`. Modules subscribe to the last two to pause and resume their own work.
+**For the audit trail.** Action hooks, added to the `CoreHooks` catalogue, ids only and never token material: `connection.connected` (with `reconnected: true` when the person renewed an account that was already connected; there is no separate reconnected hook), `connection.disconnected`, `connection.refreshFailed` (with the service's error `code` and whether it is `temporary`) and `connection.needsReconnect` (with the `reason`). A module subscribes to `connection.needsReconnect` to pause its own work and to `connection.connected` to resume it.
 
 Tokens and client secrets are never logged and never placed in an error message: the logger's redaction list gains the token field names, and errors from a service are reduced to its error code.
 
@@ -956,8 +969,8 @@ Part A first, then Part B. Each phase ends with something to see or test, then o
 |---|---|---|
 | **A1. Groundwork** (shipped, v2.18.0) | The two tables and their auto-add blocks; the engine folder and its boundary test; the service and requirement registries; the Google definition; the shared setup-guide component; the admin Connections page with Google's guide; the key-readiness guard and the `standard`-tier key backfill; the corrected Security wording. | Walk through Google's guide on the admin page until it shows "Ready". The Integrations page is unchanged for users. |
 | **A2. Connect and disconnect** (shipped, v2.18.0) | The handshake; encrypted storage; the catalogue; the generic card; extensible categories; disconnect with revoke; the deletion and export handlers. | **Connect a real Google account in a test app**, see "Connected as …", connect a second account, disconnect, delete the test account and confirm the rows are gone. |
-| **A3. Using a connection** | The row-level-security switch for the new tables; `connections.use()` and `fetch()`; refresh with one in flight; typed errors; "needs reconnecting", the notification and the audit events; an admin "test call" button. | Press "test call" before and after the token expires; revoke access at Google and watch the card change and the notification arrive. |
-| **A4. Microsoft 365 and more** | Microsoft 365; API-key services; adding permissions later; the `ConnectionPicker`. | Connect a Microsoft account; add a permission to an existing Google connection. |
+| **A3. Using a connection** (shipped, v2.18.1) | The row-level-security switch for the new tables; `connections.use()` and `fetch()`; refresh with one in flight; typed errors; "needs reconnecting", the notification and the audit events; an admin "test call" button. | Press "test call" before and after the token expires; revoke access at Google and watch the card change and the notification arrive. |
+| **A4. Microsoft 365 and more** | Microsoft 365; API-key services; adding permissions later; the `ConnectionPicker`; the prompt that offers Reconnect when a call answers `connection_needs_reconnect`. | Connect a Microsoft account; add a permission to an existing Google connection. |
 | **A5. Recurring work** | `registerSweep`; the keep-alive refresh. | Leave a test connection unused and watch the sweep refresh it. |
 | **B1. Devices and keys** | The key table; create / list / revoke; `requireAccessKey`; the Linked devices page becomes Devices and keys. | Create a key, call `/automation/me` with it, revoke it, call again and get refused. |
 | **B2. Actions and the catalogue** | `registerAction`, the action route, idempotency, the catalogue. | Call a sample action with a key from a command line. |
@@ -968,7 +981,7 @@ Part A first, then Part B. Each phase ends with something to see or test, then o
 | **Later, when wanted** | Xero (organisations and events); renewable calendar watches (with Tasks); Facebook (with Reviews). | |
 | **Finish** | Version bump (minor: a new subsystem and a new registry), the docs, the roadmap entries, the propagation notes. | The published pages. |
 
-**Proof.** The starter cannot run by itself, so each phase is proved the way the project always proves template changes: in a scratch test app created from the working tree, never in one of the owner's apps. Phase A2 needs a real Google registration; the exact steps to set up and click are written out when that phase is built.
+**Proof.** The starter cannot run by itself, so each phase is proved the way the project always proves template changes: in a scratch test app created from the working tree, never in one of the owner's apps. Phase A2 needs a real Google registration; the exact steps to set up and click are written out when that phase is built. (As it happened, the owner ran phase A2's real Google connection in an app of their own, at their request, once v2.18.0 was released. It passed.)
 
 ---
 
@@ -976,7 +989,8 @@ Part A first, then Part B. Each phase ends with something to see or test, then o
 
 1. **Nothing, to stay as they are.** With no credentials set, no service is shown and nothing changes for users.
 2. The update adds the new tables and applies their migration (the drift-immune path), adds the commented env block to `backend/.env`, installs the one new backend package, and gives a `standard`-tier app without an encryption key a key.
-3. To switch a service on, the owner registers an app with that provider, sets its two env values, and restarts. The admin Connections page says what is still missing.
+3. To switch a service on, the owner registers an app with that provider and follows its guide on the admin Connections page (or sets its two env values and restarts). The page says what is still missing.
+4. **v2.18.1 needs no migration.** The update adds a commented `SECURITY_RLS` line to `backend/.env`, and on its next start the backend applies the row-level-security policy to the two connection tables (see [what shipped](#row-level-security-what-shipped)).
 
 ---
 
@@ -1042,7 +1056,7 @@ All settled on 19 November 2026: the owner reviewed the design, changed its scop
 | 3 | **Services in the first release** | **Settled** | Google and Microsoft 365, plus Zapier support. Xero is out of the first release; a Zap bridges it until it is built. Google's caps are acceptable. Facebook arrives with Reviews. |
 | 4 | **More than one account per service** | **Settled** | Supported from the start. A picker component and a little more logic, against a real limit for anyone with two Google accounts. |
 | 5 | **The encryption key at the `standard` tier** | **Settled** | The update gives a `standard` app a key if it has none; connecting is refused without one. |
-| 6 | **Row-level security** | **Settled** | It stays each app's choice. For the new tables, the code is written to work with it, and it is on unless the app switches it off (`SECURITY_RLS=off`). It is **not** made the default for every table: see [the downside](#the-downside-of-row-level-security-on-by-default). |
+| 6 | **Row-level security** | **Settled** | It stays each app's choice. For the new tables, the code is written to work with it, and it is on unless the app switches it off (`SECURITY_RLS=off`). It is **not** made the default for every table: see [the downside](#the-downside-of-row-level-security-on-by-default). **Shipped in v2.18.1, with a caveat on Neon:** see [what shipped](#row-level-security-what-shipped). |
 | 7 | **Timed work when nobody is using the app** | **Settled** | The starter's own sweeps pause while the app is idle. An app that needs exact timing switches on the durable job runner, which a paid database can afford (the database then stays awake). |
 | 8 | **What a module gets** | **Settled** | An authorised `fetch()` only, never a token. A module that wants a provider's own SDK cannot hand it a token; an escape hatch can be added when a real case appears. |
 | 9 | **Part B's home, and the reach of a key** | **Settled** | In the starter, replacing the planned webhooks module. A key works only on routes that ask for it by scope. |
@@ -1061,6 +1075,24 @@ Row-level security (the database itself refusing to return another account's row
 - **Forgetting returns nothing, silently.** Background jobs, admin screens, reports and incoming webhooks have no signed-in person, so each needs a deliberate way through. One that is missed looks like data that vanished, not like an error.
 - **Every module would have to be written for it.** Most modules key their tables on the user and are not. A blanket default would break them.
 - **It guards against our own coding mistakes, not against a stolen database password.** The app connects as the owner of the tables, and that role may claim to be any account.
-- **The policy is not part of the Prisma schema**, so the starter has to carry and apply that SQL itself, which it has never done.
+- **The policy is not part of the Prisma schema**, so the starter has to carry and apply that SQL itself (it does since v2.18.1, for the connection tables only).
 
 So: for the new tables, where all access goes through one file the starter owns, the cost is small and "on unless switched off" is reasonable. For everything else it stays what it is today, a choice each app and each module makes.
+
+### Row-level security: what shipped
+
+Shipped in v2.18.1 for the two connection tables (`ServiceConnection` and `ServiceConnectionState`).
+
+- **How a table asks for it.** `rowSecurity: true` on its `ownedModels` entry in the feature's security manifest. Nothing else in the starter asks for it today.
+- **What the backend does.** At startup, and again before the first connection is started, it switches row-level security on for each such table (`ENABLE` and `FORCE`) and creates two policies. `starter_tenant_isolation` makes a row visible and writable only when its `tenantId` equals the `app.tenant_id` setting that `withTenantContext` publishes. `starter_system_read` gives read-only access to work with no signed-in person. The work runs under a transaction-scoped advisory lock, so several instances starting together do not collide, and it never stops the app from starting.
+- **The switch.** `SECURITY_RLS` in `backend/.env`: `on` unless set to `off`. `off` removes the starter's two policies, and switches row-level security off for the table only when no other policy remains on it.
+- **The way through for system work.** `withSystemReadContext(fn)` (from `features/security`) lets code with no signed-in person **read** across accounts. The admin page's connection counts use it. It cannot write.
+- **Honest status.** The backend asks the database whether the policy applies to the connection it is really using (`row_security_active`), not merely whether a policy exists. The admin Connections page shows the answer: enforced, switched on but not enforced, switched off, or not applied (with the reason).
+
+<Aside type="caution" title="On Neon, the policy is in place but not enforced by default">
+Neon's default database role (`neondb_owner`, on projects created since August 2023) has the `BYPASSRLS` privilege. A role with it skips **every** row-level-security policy, including on a table marked `FORCE`. An app that connects with that role, which is how every app connects today, has the policies in place and is not held to them. The Connections page says so in plain words.
+
+What still protects the data: every query goes through `owned()` and `withTenantContext`, which scope it to the caller's account in the application code. What is missing is the second wall behind that.
+
+To have the database enforce the policies, the app must connect with a role that does not have `BYPASSRLS`. Neon's guidance is to create that role with SQL. Such a role cannot create or alter tables, and the starter creates a few of its own at runtime, so this needs a guided setup of its own. It is planned as a separate piece of work and is **not built**. The same caveat applies to any policy an app adds by hand from the [database page](/starter-template/database/#user-data-isolation-neon-rls).
+</Aside>
