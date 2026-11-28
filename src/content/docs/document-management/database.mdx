@@ -10,7 +10,7 @@ import { Aside } from '@astrojs/starlight/components';
 Document Management ships a **self-contained** Prisma schema: eight tables, all prefixed with `doc_` — `doc_storage_provider`, `doc_document`, `doc_node_link`, `doc_folder_bookmark`, `doc_recent_access`, `doc_app_settings`, `doc_included_folder`, and `doc_parsed_artefact`. The schema adds **no `@relation` directives** and never modifies the `User` model or the Structure module's tables. Foreign keys to other modules (the user a row belongs to, a Structure node) are stored as plain `String` fields with `@@index` for fast lookups.
 
 <Aside type="note" title="Connector, not storage">
-These tables hold **references, metadata, and your organisation** of files (favourites, tags, node links, audit trail). They never store your files — the bytes stay in the external storage provider. The one exception is `doc_generation_template` (v1.19.0+), which holds the small Word templates an admin adds for making documents. `doc_document` is a pointer to a file that lives in S3, WebDAV, or a local folder.
+These tables hold **references, metadata, and your organisation** of files (favourites, keywords, node links, audit trail). They never store your files — the bytes stay in the external storage provider. The one exception is `doc_generation_template` (v1.19.0+), which holds the small Word templates an admin adds for making documents. `doc_document` is a pointer to a file that lives in S3, WebDAV, or a local folder.
 </Aside>
 
 The scaffold appends these models to your app's Prisma schema at `init` and **applies the schema migrate for you** — no manual migrate step is needed. As of module-starter scaffold **v1.31.9** it does this the drift-immune way (an offline `prisma migrate diff` → a real migration file → `prisma migrate deploy`, so a shared DB with runtime-created objects is never reset); older scaffolds ran `prisma migrate dev` at `init`. Avoid running `prisma migrate dev` by hand on an app that carries runtime-created DB objects — use `prisma migrate deploy` if you ever need to apply migrations manually.
@@ -19,7 +19,7 @@ The scaffold appends these models to your app's Prisma schema at `init` and **ap
 
 ## `doc_storage_provider`
 
-A configured connection to an external storage service. The `config` column holds **AES-256-GCM encrypted JSON** (credentials) — never plaintext. See [Security](/document-management/security/) for the encryption model.
+A configured storage connection to an external storage service. The `config` column holds **AES-256-GCM encrypted JSON** (credentials) — never plaintext. See [Security](/document-management/security/) for the encryption model.
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -27,7 +27,7 @@ A configured connection to an external storage service. The `config` column hold
 | `userId` | `String` | The user it belongs to |
 | `name` | `String` | e.g. `"My NAS"`, `"Company R2 Bucket"` |
 | `providerType` | `String` | `s3` \| `r2` \| `webdav` \| `local` |
-| `config` | `String` `@db.Text` | Encrypted JSON connection details |
+| `config` | `String` `@db.Text` | Encrypted JSON storage connection details |
 | `isDefault` | `Boolean` | `@default(false)` |
 | `isReadOnly` | `Boolean` | `@default(false)` — blocks upload/modify/delete via the module |
 | `isEphemeral` | `Boolean` | `@default(false)` — Local Connect: raw reachable only while the user's machine is connected. Derived artefacts are never stored here; raw bytes are never persisted server-side |
@@ -35,7 +35,7 @@ A configured connection to an external storage service. The `config` column hold
 | `deviceLabel` | `String?` | Local Connect: optional human-readable device name (the group heading). Display-only |
 | `status` | `String` | `@default("pending")` — `connected` \| `error` \| `pending` \| `unavailable` |
 | `statusMessage` | `String?` | Human-readable status detail |
-| `lastCheckedAt` | `DateTime?` | Last connection test |
+| `lastCheckedAt` | `DateTime?` | When the storage connection was last tested |
 | `basePath` | `String?` | Optional root path within the provider |
 | `uploadPath` | `String?` | Default folder for app uploads (relative to the provider) |
 | `metadata` | `Json?` | Provider settings/capabilities cache |
@@ -72,7 +72,7 @@ model doc_storage_provider {
 
 ## `doc_document`
 
-A lightweight reference to a file in connected storage. A row is created when you interact meaningfully with a file (favourite, tag, note, link to a node) **or** when another module requests a stable reference via the service registry (for example cognitive-pipeline needing a durable `documentId` to cite). Not every browsed file gets a row.
+A lightweight reference to a file in connected storage. A row is created when you interact meaningfully with a file (favourite, keyword, note, link to a node) **or** when another module requests a stable reference via the service registry (for example cognitive-pipeline needing a durable `documentId` to cite). Not every browsed file gets a row.
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -86,7 +86,7 @@ A lightweight reference to a file in connected storage. A row is created when yo
 | `contentHash` | `String?` | SHA-256 of the file at reference time (integrity) |
 | `isFavourite` | `Boolean` | `@default(false)` |
 | `status` | `String` | `@default("active")` — `active` \| `archived` \| `deleted` (in the trash, v1.20.0+). Since v1.18.4 a row can briefly be `uploading`: a reference reserved for an upload that is still being written. The service never returns such a row, and one left by a server that stopped mid-upload is removed at that user's next reference upload, once it is an hour old. |
-| `tags` | `String[]` | `@default([])` |
+| `tags` | `String[]` | `@default([])` — the document's keywords |
 | `notes` | `String?` `@db.Text` | User notes |
 | `thumbnailPath` | `String?` | Cached thumbnail path/URL |
 | `metadata` | `Json?` | Provider metadata cache |
@@ -291,14 +291,14 @@ model doc_recent_access {
 
 ## `doc_app_settings`
 
-An app-wide **singleton** (always `id = "app"`) holding the admin policy: which adapter engines users may configure on their Document Storage settings page, the shared default, user self-service, upload limits, artefact retention and independent timestamps. It is **not** user-scoped. An empty `allowedAdapters` means "all installed engines are allowed".
+An app-wide **singleton** (always `id = "app"`) holding the admin policy: which adapter engines users may configure on their Document Storage settings page, the app storage, user self-service, upload limits, artefact retention and independent timestamps. It is **not** user-scoped. An empty `allowedAdapters` means "all installed engines are allowed".
 
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | `String` | `@id @default("app")` — single row |
 | `allowedAdapters` | `String[]` | Allowed engine ids (`s3` \| `webdav` \| `local`); empty = all installed |
-| `defaultProviderId` | `String?` | App-wide shared default provider for users with no default of their own; `null` if unset |
-| `defaultIsolateUsers` | `Boolean` | `@default(true)` — namespace each user's uploads under `u/<userId>/` on the shared default and confine access |
+| `defaultProviderId` | `String?` | The app storage: the provider users with no default of their own upload to; `null` if unset |
+| `defaultIsolateUsers` | `Boolean` | `@default(true)`. Since v1.25.0 it is always written `true` and nothing reads it: each user's files on the app storage are always in their own folder, `u/<userId>/`, which no other user can reach. A row saved earlier may still say `false` |
 | `userProviderPolicy` | `String` | `@default("unlimited")` — `disabled` | `limited` | `unlimited`: whether a non-admin may connect their own storage |
 | `userProviderLimit` | `Int?` | The cap when the policy is `limited` (`null` = 1) |
 | `maxUploadSize` | `Int?` | Upload size limit in bytes, enforced on the server; `null` = `DOC_MAX_UPLOAD_SIZE` |
@@ -331,7 +331,7 @@ model doc_app_settings {
 
 The engine policy is read via `GET /settings` (any authenticated user) and written via `PUT /settings` (admin-only). It can only narrow the engines installed at init, never widen them. See [Configuration](/document-management/configuration/) for the user-settings vs admin-policy split.
 
-`artefactKeepVersions` and `artefactMaxAgeDays` hold the admin **parsed-artefact retention** policy — both `null` by default, so **every artefact version is kept forever** (the knowledge base has no automatic decay; cleanup is an explicit admin choice). `keepVersions` is enforced on each `putParsedArtefact` write; `maxAgeDays` (and `keepVersions`) are applied when an admin runs `POST /artefacts/prune`. Both are set through the same admin-only `PUT /settings` and surfaced on the **Parsed-artefact retention** card at `/admin/documents`.
+`artefactKeepVersions` and `artefactMaxAgeDays` hold the admin **parsed-artefact retention** policy — both `null` by default, so **every artefact version is kept forever** (the knowledge base has no automatic decay; cleanup is an explicit admin choice). `keepVersions` is enforced on each `putParsedArtefact` write; `maxAgeDays` (and `keepVersions`) are applied when an admin runs `POST /artefacts/prune`. Both are set through the same admin-only `PUT /settings`; the admin page has had no retention card since v1.15.2 (Document Management makes no artefacts itself), so they are set over the API by the module that produces artefacts.
 
 ---
 
@@ -372,7 +372,7 @@ The `@@unique([userId, providerId, folderPath])` constraint means marking the sa
 
 Stores the **output an external parser produced** for a source file — for example the JSON the cognitive-pipeline Docling sidecar extracts. This module **never parses content itself**; it only persists the byproduct so re-ingest, re-extraction, and re-chunking never re-parse. A row points at both the original **source** (`sourceProviderId` + `sourceRemotePath`, optionally a `doc_document.id`) and the stored **artefact** (`artefactProviderId` + `artefactPath`).
 
-Artefacts default to a **derived writable area** (`DOC_ARTEFACT_PREFIX`, default `.derived-artefacts`) rather than beside the original — the original may sit on a read-only/evidence provider that rejects writes — and an explicit `target` can override that. Versioning keeps a monotonic `version` ordinal, but the **content hash is the dedup key**: identical source bytes reuse the existing artefact. On the shared app-default provider, artefact bytes are namespaced under the user's `u/<userId>/` prefix.
+Artefacts default to a **derived writable area** (`DOC_ARTEFACT_PREFIX`, default `.derived-artefacts`) rather than beside the original — the original may sit on a read-only/evidence provider that rejects writes — and an explicit `target` can override that. Versioning keeps a monotonic `version` ordinal, but the **content hash is the dedup key**: identical source bytes reuse the existing artefact. On the app storage, artefact bytes are namespaced under the user's `u/<userId>/` prefix.
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -462,7 +462,7 @@ at Cloudflare before these rows are deleted.
 
 ## `doc_pending_reconcile`
 
-Records a file uploaded to a **Local Connect (ephemeral) default while the machine was offline**. The bytes are staged on the durable shared default; the `doc_document` reference points at the staged location so the file is immediately usable, and this row records the intent to organise the bytes **into the local folder** — and re-point the reference route — once the machine reconnects. No document is ever duplicated; only the route changes. Rows are cleared on account erasure (along with the staged bytes).
+Records a file uploaded to a **Local Connect (ephemeral) default while the machine was offline**. The bytes are staged on the app storage; the `doc_document` reference points at the staged location so the file is immediately usable, and this row records the intent to organise the bytes **into the local folder** — and re-point the reference route — once the machine reconnects. No document is ever duplicated; only the route changes. Rows are cleared on account erasure (along with the staged bytes).
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -584,7 +584,7 @@ Since v1.19.0. The Word (.docx) templates an admin adds for making documents fro
 | `sizeBytes` | `Int` | |
 | `outputName` | `String?` | File name pattern, such as `{name} - Letter`; `null` for the default |
 | `enabled` | `Boolean` | `@default(true)`; a switched-off template is not offered |
-| `tags` | `String[]` | The tags the template uses, for the admin list (`#children:task` for a loop) |
+| `tags` | `String[]` | The merge tokens the template uses, for the admin list (`#children:task` for a loop) |
 | `createdById` | `String?` | The admin who added it; cleared when that account is erased |
 | `createdAt` | `DateTime` | `@default(now())` |
 | `updatedAt` | `DateTime` | `@updatedAt` |
