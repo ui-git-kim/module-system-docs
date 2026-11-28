@@ -211,7 +211,7 @@ How the built model works:
 - The companion mints a random **256-bit bearer token** and stores it in every provider row's `config.token` (rotating it on demand, on unlink and on re-registration); the module encrypts it at rest with AES-256-GCM (above) and never returns it. The adapter sends it on every request; the companion checks it with a timing-safe comparison **before** reading a body or touching the disk, and refuses with `401` otherwise.
 - **Cloudflare Tunnel** carries traffic encrypted from the edge to the user's machine, outbound-only, with no port forwarding and no inbound firewall holes. The WebDAV server binds loopback only; the tunnel is the sole way in.
 - **Read-only** is enforced twice — by the adapter's `assertWritable()` (below) and by the companion for every writing verb, including `MOVE` and `COPY`, which the module never issues itself.
-- **Path confinement** for a Local Connect folder is the companion's responsibility: the module does not sanitise paths for providers a user owns, so the companion mirrors `safeResolve` (below) and adds the checks a public origin needs, before any filesystem call.
+- **Path confinement** for a Local Connect folder is the companion's responsibility: the module does not sanitise paths for a user's own storage providers, so the companion mirrors `safeResolve` (below) and adds the checks a public origin needs, before any filesystem call.
 - Each shared folder is its own provider row at `https://<hostname>/s/<share-id>/`, so the module's folder routing (`?folder=`, node-type templates, `uploadPath`) always lands inside that folder.
 
 What the origin-auth model gives up relative to Access — per-request audit logging at the edge, MFA and device-posture policies, and blocking before the request reaches the machine — and the two ways to get it back (an Access policy that accepts the same bearer, or a header-injecting proxy on the app's side) are recorded on the companion's [security](/document-management/local-connect/security/) and [roadmap](/document-management/local-connect/roadmap/#cloudflare-access-options) pages. Zero Trust Access remains the right control in front of the **web app's own** origins (see [Cloudflare Edge](/getting-started/cloudflare-edge/)); it is only the machine-to-machine WebDAV path that authenticates at the origin.
@@ -223,7 +223,7 @@ The companion registers the provider through the API itself — you do not add i
 https://kim-laptop.example.com/s/3f9a1c2b7d4e/
 ```
 
-The tunnel hostname is also why Local Connect passes the [Storage Endpoint Guard](#storage-endpoint-guard-ssrf): it resolves to Cloudflare's public edge, not to the user's machine. A provider pointed straight at the companion's loopback port, with no tunnel, is a private-network endpoint. Only an admin can save one, or every user can once the operator sets `DOC_ALLOW_PRIVATE_ENDPOINTS=true`, which is meant for development only.
+The tunnel hostname is also why Local Connect passes the [Storage Endpoint Guard](#storage-endpoint-guard-ssrf): it resolves to Cloudflare's public edge, not to the user's machine. A provider pointed straight at the companion's loopback port, with no tunnel, is a private-network endpoint. Only an admin can save one, or every user can once the app owner sets `DOC_ALLOW_PRIVATE_ENDPOINTS=true`, which is meant for development only.
 
 ---
 
@@ -258,9 +258,9 @@ When an admin, signed in to the web app, saves a provider whose endpoint resolve
 
 The flag is server-owned. The validation schema strips any client-supplied value, the service discards it as a backstop, and it is recomputed on every config write. "Admin" comes from the session's role (see [Caller Trust Model](#caller-trust-model)); a linked device's token is never treated as admin, even when it belongs to an admin.
 
-### The operator opt-in
+### The app owner's opt-in
 
-`DOC_ALLOW_PRIVATE_ENDPOINTS=true` lets **every** provider, whoever saved it, reach loopback and private-network addresses. It suits a single-team or development deployment whose storage lives on a private network. It defaults to `false`, is read when the backend starts (restart after changing it), and never unlocks the always-refused tier. See [Configuration](/document-management/configuration/#private-network-storage-endpoints).
+`DOC_ALLOW_PRIVATE_ENDPOINTS=true` lets **every** provider, whoever saved it, reach loopback and private-network addresses. It suits a development deployment, or an app whose storage all lives on a private network the app owner runs. It defaults to `false`, is read when the backend starts (restart after changing it), and never unlocks the always-refused tier. See [Configuration](/document-management/configuration/#private-network-storage-endpoints).
 
 ### Client-safe connection errors
 
@@ -276,7 +276,7 @@ This applies to the connection test and the stored `statusMessage`, bucket disco
 Providers saved before v1.18.0 carry no approval flag. After the update (no schema change: `npx document-management update --skip-schema`), any existing provider whose endpoint is a loopback or private-network address, such as a Docker-network MinIO or a LAN NAS, is **refused at connect time**. If that provider is the app-wide default, every user's uploads to it and downloads from it fail until it is restored. To restore it, either:
 
 - set `DOC_ALLOW_PRIVATE_ENDPOINTS=true` and restart the backend, or
-- have an admin, signed in to the web app, re-add the provider, or re-save its full connection settings. An admin can only re-save a provider they own, so a user's own private-network provider, or an organisation-owned one, needs the environment variable.
+- have an admin, signed in to the web app, re-add the provider, or re-save its full connection settings. An admin can only re-save a provider that belongs to them, so a user's own private-network provider, or one that belongs to the organisation, needs the environment variable.
 
 Providers on cloud-metadata or link-local addresses stay refused either way.
 </Aside>
@@ -304,21 +304,21 @@ Before v1.18.0 these routes never populated the role, so the admin bypass silent
 
 ### Linked devices and the shared store
 
-The app-wide shared default is an ordinary provider row owned by the admin who provisioned it, so owner rights over it span every user's `u/<userId>/` namespace and the global prefix. A device token never gets those owner rights, even when it belongs to that admin. Since v1.21.1 the same holds for any **shared store**: the current default, or a provider that holds other users' documents, staged uploads or artefacts (a former default, say):
+The app-wide shared default is an ordinary provider row that belongs to the admin who provisioned it, so the admin's rights over it span every user's `u/<userId>/` namespace and the global prefix. A device token never gets those rights, even when it belongs to that admin. Since v1.21.1 the same holds for any **shared store**: the current default, or a provider that holds other users' documents, staged uploads or artefacts (a former default, say):
 
 | Operation on a shared store, with a device token | Result |
 |------------------------------------------------------------------|--------|
 | Browse, file info, upload to a named path, bulk download, manual references (`POST /documents`), update (`PUT /providers/:id`) and test | `403`: "The app-wide shared storage can only be browsed or managed from a web session, not from a linked device." |
 | Live search | That provider is skipped; only database-reference results are returned |
-| Download, preview, ingest, include a folder | Resolved as for any other user: confined to the device owner's own `u/<userId>/` namespace, plus references they hold that isolation honours |
-| `POST /upload` (upload to default) | Treated as a shared upload: namespaced under `u/<userId>/` when isolation is on, the file name reduced to a basename, and the owned reference returned as `documentId` |
+| Download, preview, ingest, include a folder | Resolved as for any other user: confined to the `u/<userId>/` namespace of the user the device belongs to, plus references they hold that isolation honours |
+| `POST /upload` (upload to default) | Treated as a shared upload: namespaced under `u/<userId>/` when isolation is on, the file name reduced to a basename, and the user's own reference returned as `documentId` |
 
 The admin's web session is unchanged. On a former default, an upload to default from a device is always namespaced under `u/<userId>/` (no isolation setting applies to it).
 
 ### Shared stores can't be deleted, and the default must be the organisation's
 
 - **A provider holding other users' documents, staged uploads or artefacts can't be deleted** (v1.21.1), whoever asks. Its encrypted config is the only copy of the credentials and their rows are pinned to its id, so deleting it would cut them off from their files for good. The current app-wide default, and a store holding unreconciled offline uploads, were already refused.
-- **Only the admin's own provider, an organisation-owned one, or the one already chosen can become the app-wide default** (v1.21.1). Never another user's own provider: its owner, or that user's linked device, would gain owner rights over every user's area.
+- **Only the admin's own provider, one that belongs to the organisation, or the one already chosen can become the app-wide default** (v1.21.1). Never another user's own provider: that user, or their linked device, would gain rights over every user's area.
 
 ### Communal mode guards
 
@@ -720,8 +720,8 @@ The strongest form of data sovereignty is a source whose raw files **never leave
 The raw original stays on the user's machine; only the **derived** knowledge base (extracted text + embeddings) lives in the app. That is a deliberate choice — the searchable index leaves the machine, the evidence does not — and it is what lets a legal source be both *ingestible* and *never uploaded*.
 </Aside>
 
-<Aside type="caution" title="Owned references, isolation, and revocation">
-`resolveFileProvider` honours a reference the caller owns by the provider it names, whichever provider is the *current* app-wide default. That keeps offline-staged bytes readable after an admin repoints the default, and lets an admin read back their global uploads. A reference to a store the caller does not own is only ever a server write: `uploadToDefault`, `uploadGlobal` and offline staging create one for the caller's own content, and `ensureReference` (behind `POST /ingest`) creates one for a path the resolver already let the caller reach.
+<Aside type="caution" title="A user's own references, isolation, and revocation">
+`resolveFileProvider` honours a reference that belongs to the caller by the provider it names, whichever provider is the *current* app-wide default. That keeps offline-staged bytes readable after an admin repoints the default, and lets an admin read back their global uploads. A reference to a store that does not belong to the caller is only ever a server write: `uploadToDefault`, `uploadGlobal` and offline staging create one for the caller's own content, and `ensureReference` (behind `POST /ingest`) creates one for a path the resolver already let the caller reach.
 
 **Isolation on (the default).** Since v1.18.0 such a reference is honoured only inside the caller's own `u/<userId>/` namespace or the global prefix. That includes references created while isolation was off, so switching isolation on revokes a user's communal-era references outside their namespace. The bytes stay on the store, and an admin can move them from a web session.
 
@@ -744,11 +744,11 @@ Since v1.20.0, every write to a document saves a version in the same transaction
 
 The controls:
 
-- **Only the owner reads a document's history**, like the document. There is no admin read path.
+- **Only the user the document belongs to reads its history**, like the document. There is no admin read path.
 - **Deleting is recoverable.** A delete moves the document to the trash with its history. Deleting permanently needs a web session (never a linked computer's token) and a recent sign-in.
 - **The seal key is shared with Structure** and rotatable (`RECORD_SEAL_KEY_PREVIOUS`). Without it, versions are kept but unsealed, and Check integrity says so.
 - **File checks are audited** (`verify` in the access history).
-- **Independent timestamps send only the fingerprint** (v1.20.1+). When an admin turns them on, the version's SHA-384 fingerprint goes to the app's timestamp authority, never the document, its name or its owner. Since v1.22.0 that is the app's one timestamp service: the starter's (its Security page) or, on an older starter, the provider `.env` names (`RECORD_TSA_PROVIDER`, `RECORD_TSA_URL`). Each answer is checked before it is kept: the fingerprint, the nonce, the signature and a timestamping certificate that chains to a trusted root. A custom provider's login lives only in env (`RECORD_TSA_USERNAME` / `RECORD_TSA_PASSWORD`), and a URL with credentials in it, or on a private network, is refused. The login is sent only over https and only to `RECORD_TSA_URL`. Check integrity also compares each stamp's stored time, serial, authority and nonce with its token. The admin screen and its routes (`requireAdmin`) show the setting and queue counts only.
+- **Independent timestamps send only the fingerprint** (v1.20.1+). When an admin turns them on, the version's SHA-384 fingerprint goes to the app's timestamp authority, never the document, its name or its user. Since v1.22.0 that is the app's one timestamp service: the starter's (its Security page) or, on an older starter, the provider `.env` names (`RECORD_TSA_PROVIDER`, `RECORD_TSA_URL`). Each answer is checked before it is kept: the fingerprint, the nonce, the signature and a timestamping certificate that chains to a trusted root. A custom provider's login lives only in env (`RECORD_TSA_USERNAME` / `RECORD_TSA_PASSWORD`), and a URL with credentials in it, or on a private network, is refused. The login is sent only over https and only to `RECORD_TSA_URL`. Check integrity also compares each stamp's stored time, serial, authority and nonce with its token. The admin screen and its routes (`requireAdmin`) show the setting and queue counts only.
 - **The starter's helpers are used only when they agree** (v1.22.0+). Its `hashRevision` is used only after it reproduces this module's fingerprint on a sample. A seal it can't make falls back to `RECORD_SEAL_KEY`; with no key at all the change is refused, never saved unsealed. Its seal check's *mismatch* is final; a key it doesn't hold falls back to this module's keys. Check integrity stays this module's own walk.
 - **Record holds block permanent deletion** (v1.22.0+). With the starter's holds (v2.17.4+), Delete permanently and Empty the trash are refused (`409`, `record_hold`) while the person's records are on hold.
 - **A save never depends on a timestamp authority.** Stamps are asked for after the commit; an authority that is down or slow can't block or fail a change.
@@ -768,62 +768,62 @@ The formats and how an expert verifies versions without the app: [Record History
 
 ## Exports
 
-Since v1.21.0 a document can be exported complete (fields, every version as fingerprinted, timestamps with their tokens, the integrity check, attached records). The controls:
+Since v1.21.0 a document can be exported complete (fields, every version as fingerprinted, timestamps with their tokens, the integrity check, linked nodes). The controls:
 
-- **Owner only**, like a document's history; an admin has no export path to anyone's documents.
+- **Only the user the documents belong to**, like a document's history; an admin has no export path to anyone's documents.
 - **A web sign-in** is needed (`requireWebSession`), never a linked computer's token.
 - **Every export is logged** (`doc_record_exports`: who, when, which documents, format, fingerprint; never content) and fires `documents.document.exported`, which is in the security manifest's audit events.
 - **Exports never change a document.** The integrity check runs at export time, and the export carries exactly the versions it checked, read under one lock with the document. Only the export log is written: the file checks aren't added to the access history, so an export can't push older entries out of it.
 - **Exports are bounded:** 200 documents, 10,000 versions, 2 GB of files to read again, a 200 MB export, one at a time per person.
-- **Attached records fail closed:** if Structure can't be read (other than "you can't open this record"), nothing is exported.
+- **Linked nodes fail closed:** if Structure can't be read (other than "you can't open this node"), nothing is exported.
 - **The Word renderer refuses a changed or inconsistent bundle.** Before rendering any module's export, `renderRecordExportDocx` checks it:
   - it works out the bundle's `contentHash` again;
   - it works out each version's fingerprint and link again;
   - it checks each seal against the app's keys.
 
   Any failure the bundle's own integrity result doesn't report means refusal. Someone who rewrites a bundle and works its fingerprints out again is still caught by the seals, wherever the app holds the key. Timestamps in the Word file are read from their tokens.
-- **Attached records** are read through Structure under its own rules (names, types and latest version only, never a record's data); a record the person can't read keeps only its id.
+- **Linked nodes** are read through Structure under its own rules (names, types and latest version only, never a node's data); a node the person can't read keeps only its id.
 
-## Making Documents from Records
+## Making Documents from Nodes
 
-Since v1.19.0 the module makes Word documents from Structure records ([Usage](/document-management/usage/#making-word-documents-from-records)). The controls:
+Since v1.19.0 the module makes Word documents from Structure nodes ([Usage](/document-management/usage/#making-word-documents-from-nodes)). The controls:
 
-- **Values come only from Structure, as the person.** Every tag is read through Structure's `resolveTemplate` with the requesting user's id, so Structure's access rules apply and **secret fields always read as blank**. Structure's `getNode` returns the owner's unsealed data; generation uses only the record's id, type and name from it.
-- **Templates are admin-only.** Adding, changing, downloading and deleting templates need `requireAdmin`. Any signed-in user can make a document, but only from a record they can open and only with an enabled template for that record's type (or an any-type one).
-- **Templates are checked as they are added.** The file must be a Word document of at most 5 MB that unpacks to at most 50 MB, and its tags must parse. The zip-bomb guard inflates each part with a hard cap and refuses a part whose real size differs from the size the file declares, because those sizes are the uploader's word. Raw-XML tags (`{@...}`), which would put a record's text into the document as XML, are refused.
-- **Bounded work.** Loops multiply, so the limits apply to the whole document: at most 500 records and 1,500 reads from Structure, with values read in batches under its 2,000-character limit and each record's children read once. A loop lists at most 200 records and loops nest at most 3 deep. At most 50 warnings are returned.
-- **No values in the logs.** docxtemplater's own error printing, which includes the record's values, is turned off; the module reports errors itself.
-- **The document is stored like any upload.** It goes to the person's default storage through the normal upload path, with the same isolation and size rules, and is linked to the record.
+- **Values come only from Structure, as the person.** Every tag is read through Structure's `resolveTemplate` with the requesting user's id, so Structure's access rules apply and **secret fields always read as blank**. Structure's `getNode` returns the unsealed data of the user the node belongs to; generation uses only the node's id, type and name from it.
+- **Templates are admin-only.** Adding, changing, downloading and deleting templates need `requireAdmin`. Any signed-in user can make a document, but only from a node they can open and only with an enabled template for that node's type (or an any-type one).
+- **Templates are checked as they are added.** The file must be a Word document of at most 5 MB that unpacks to at most 50 MB, and its tags must parse. The zip-bomb guard inflates each part with a hard cap and refuses a part whose real size differs from the size the file declares, because those sizes are the uploader's word. Raw-XML tags (`{@...}`), which would put a node's text into the document as XML, are refused.
+- **Bounded work.** Loops multiply, so the limits apply to the whole document: at most 500 nodes and 1,500 reads from Structure, with values read in batches under its 2,000-character limit and each node's children read once. A loop lists at most 200 nodes and loops nest at most 3 deep. At most 50 warnings are returned.
+- **No values in the logs.** docxtemplater's own error printing, which includes the node's values, is turned off; the module reports errors itself.
+- **The document is stored like any upload.** It goes to the person's default storage through the normal upload path, with the same isolation and size rules, and is linked to the node.
 
 ## Account Erasure and Data Categories
 
-The module declares a **security manifest** (`security.registration.ts`) so the host can erase a user's data when their account is deleted. Since v1.18.0 the deletion handler tells the user's **personal data** apart from **shared infrastructure** they happened to create, and it reaches the user's files on operator-controlled storage, not only their database rows.
+The module declares a **security manifest** (`security.registration.ts`) so the host can erase a user's data when their account is deleted. Since v1.18.0 the deletion handler tells the user's **personal data** apart from **shared infrastructure** they happened to create, and it reaches the user's files on storage the app provides, not only their database rows.
 
 <Steps>
 
-1. **Classify the user's providers.** A provider the user owns is **shared infrastructure** when it is the app-wide default, or when any other user's reference, offline-staged upload (any status) or parsed artefact points at it. A database failure here fails the handler before anything is erased, so the account-deletion cascade retries it.
+1. **Classify the user's providers.** A provider that belongs to the user is **shared infrastructure** when it is the app-wide default, or when any other user's reference, offline-staged upload (any status) or parsed artefact points at it. A database failure here fails the handler before anything is erased, so the account-deletion cascade retries it.
 
 2. **Purge the bytes the user's rows point at:** parsed artefacts (`purgeUserArtefactBlobs`) and offline-staged uploads (`purgeUserStagedBytes`), by exact path, best effort.
 
-3. **Sweep the user's namespace on operator storage.** Everything under `u/<userId>/` is deleted, recursively, on every shared store the user has bytes on: the current app-wide default, former defaults and staging stores (found from the user's own rows), and the user's own providers classified as shared infrastructure. The prefix is reserved for that user whatever the current isolation setting. Local Connect (ephemeral) stores are never swept, because they are a user's own machine.
+3. **Sweep the user's namespace on the app's storage.** Everything under `u/<userId>/` is deleted, recursively, on every shared store the user has bytes on: the current app-wide default, former defaults and staging stores (found from the user's own rows), and the user's own providers classified as shared infrastructure. The prefix is reserved for that user whatever the current isolation setting. Local Connect (ephemeral) stores are never swept, because they are a user's own machine.
 
-4. **Purge the server-local folder** `DOC_LOCAL_BASE_PATH/u/<userId>`, where a user's Local provider keeps its files, and which is left behind even after the provider is removed. The purge is skipped when that folder is part of a shared store: the user's Local provider is shared infrastructure, or a Local provider someone else owns (typically the organisation) is based on, above or inside it. If an overlap cannot be ruled out, the folder is kept and reported.
+4. **Purge the server-local folder** `DOC_LOCAL_BASE_PATH/u/<userId>`, where a user's Local provider keeps its files, and which is left behind even after the provider is removed. The purge is skipped when that folder is part of a shared store: the user's Local provider is shared infrastructure, or a Local provider that belongs to someone else (typically the organisation) is based on, above or inside it. If an overlap cannot be ruled out, the folder is kept and reported.
 
 5. **Tear down Local Connect managed tunnels** at Cloudflare.
 
-6. **One transaction for the rows.** The per-user rows are deleted, and shared-infrastructure providers are **kept and re-owned** to the organisation (`org:document-management`), with the user's default flag and the Local Connect device fields cleared. The user's other providers are deleted. The current app-wide default is re-read just before the transaction, so `defaultProviderId` never points at a deleted row.
+6. **One transaction for the rows.** The per-user rows are deleted, and shared-infrastructure providers are **kept and passed to** the organisation (`org:document-management`), with the user's default flag and the Local Connect device fields cleared. The user's other providers are deleted. The current app-wide default is re-read just before the transaction, so `defaultProviderId` never points at a deleted row.
 
 </Steps>
 
-Re-owning instead of deleting matters because every other user's references, staged uploads and artefacts are pinned to the provider's id, and the row holds the only copy of the operator's encrypted credentials. Deleting it would cut those users off for good; a re-added bucket gets a new id that none of their rows point at. The config is operator credentials, not the erased person's data. No signed-in principal ever has the organisation's owner id, so nobody gets owner access to an organisation-owned store: every file operation on it goes through the namespace-guarded paths. An admin sees an organisation-owned default on `/admin/documents`, labelled "(organisation)", and can rename it there. Its connection settings cannot be edited, tested or removed yet; organisation-owned provider management is on the [roadmap](/document-management/roadmap/).
+Passing a provider to the organisation instead of deleting it matters because every other user's references, staged uploads and artefacts are pinned to the provider's id, and the row holds the only copy of the app owner's encrypted credentials. Deleting it would cut those users off for good; a re-added bucket gets a new id that none of their rows point at. The config holds the app owner's credentials, not the erased person's data. No signed-in principal ever has the organisation's id, so nobody has a store that belongs to the organisation as their own: every file operation on it goes through the namespace-guarded paths. An admin sees a default that belongs to the organisation on `/admin/documents`, labelled "(organisation)", and can rename it there. Its connection settings cannot be edited, tested or removed yet; managing providers that belong to the organisation is on the [roadmap](/document-management/roadmap/).
 
 **Kept by design:**
 
-- **The user's own storage**, such as their bucket, NAS or Local Connect machine. It is their storage, not the operator's, so the module never deletes from it.
-- **Files outside `u/<userId>/` on shared stores**: communal-mode uploads (isolation off), global uploads under `DOC_GLOBAL_PREFIX`, and files the user added as the owner of a store that is now organisation infrastructure. These are shared or organisation content. They are **counted, never listed**, in the cascade report and the audit line.
+- **The user's own storage**, such as their bucket, NAS or Local Connect machine. It is their storage, not the app's, so the module never deletes from it.
+- **Files outside `u/<userId>/` on shared stores**: communal-mode uploads (isolation off), global uploads under `DOC_GLOBAL_PREFIX`, and files the user added to a store of their own that is now organisation infrastructure. These are shared or organisation content. They are **counted, never listed**, in the cascade report and the audit line.
 - **Anything on a read-only store.** Read-only providers are never written to, so their namespace is not swept. Each one shows up as a failed store in the report.
 
-The handler's `detail` in the cascade report summarises what was kept or could not be reached, in counts only: shared providers re-owned to the organisation, stores where the namespace purge failed, a failed server-local purge, and files retained outside the namespace. A `DOC_GLOBAL_PREFIX` configured to overlap `u/` makes the namespace sweep refuse to run (it is logged), rather than guess which files are whose.
+The handler's `detail` in the cascade report summarises what was kept or could not be reached, in counts only: shared providers passed to the organisation, stores where the namespace purge failed, a failed server-local purge, and files retained outside the namespace. A `DOC_GLOBAL_PREFIX` configured to overlap `u/` makes the namespace sweep refuse to run (it is logged), rather than guess which files are whose.
 
 <Aside type="tip" title="Keep isolation on when per-user erasure matters">
 With isolation **on**, everything a user uploads to the shared default lands under their own `u/<userId>/` and is erased with their account. In communal mode (isolation **off**) their shared-default uploads sit outside that namespace, so erasure deletes the user's references to them but keeps the files.
@@ -833,7 +833,7 @@ The category names below are exactly those declared in the manifest's `dataCateg
 
 | Data category | Classification | What is erased |
 |---------------|----------------|----------------|
-| `storage_providers` | `owned` | `doc_storage_provider` rows (including encrypted `config`). Shared infrastructure is re-owned to the organisation instead of deleted |
+| `storage_providers` | `owned` | `doc_storage_provider` rows (including encrypted `config`). Shared infrastructure is passed to the organisation instead of deleted |
 | `document_references` | `owned` | `doc_document` references |
 | `node_links` | `owned` | `doc_node_link` rows |
 | `folder_bookmarks` | `owned` | `doc_folder_bookmark` rows |
@@ -848,7 +848,7 @@ The category names below are exactly those declared in the manifest's `dataCateg
 On top of the categories, the handler deletes the user's files under `u/<userId>/` on shared storage and their server-local folder (steps 3 and 4), and their Local Connect tunnel rows.
 
 <Aside type="note" title="Best-effort byte purge, guaranteed row deletion">
-Deleting bytes is best effort per store: an unreachable or read-only store is logged (ids, counts and the error class, never file paths), reported, and skipped, and the row erasure still runs. Reading the rows that **locate** those bytes is not best effort. If they cannot be read, the handler fails and the cascade retries before any row is deleted, rather than reporting success and orphaning the files for good. The byte passes are idempotent, so a retried erasure is safe, including for the creator of an organisation-owned Local default. Every delete is confined to the erased user's namespace, their server-local folder, or the exact files their own rows point at.
+Deleting bytes is best effort per store: an unreachable or read-only store is logged (ids, counts and the error class, never file paths), reported, and skipped, and the row erasure still runs. Reading the rows that **locate** those bytes is not best effort. If they cannot be read, the handler fails and the cascade retries before any row is deleted, rather than reporting success and orphaning the files for good. The byte passes are idempotent, so a retried erasure is safe, including for the creator of a Local default that belongs to the organisation. Every delete is confined to the erased user's namespace, their server-local folder, or the exact files their own rows point at.
 </Aside>
 
 ---
@@ -869,8 +869,8 @@ A consolidated lookup of every control described on this page.
 | Outbound endpoint guard (SSRF) | Address classifier + guarded HTTP/HTTPS agents (every connection, redirect and DNS answer) + save-time `400 endpoint_not_allowed`; private networks only for admin-saved providers or `DOC_ALLOW_PRIVATE_ENDPOINTS` | `adapters/endpoint-guard.ts` |
 | Client-safe connection errors | Fixed refusal text; network failures collapsed to one sentence; provider answers capped | `safeConnectionMessage()` in `adapters/endpoint-guard.ts` |
 | Caller principal | `device` / `admin` derived from the session only (`attachRole` / `requireAdmin`), never the body | `principalOf()` in the controller |
-| Device tokens on the shared store | No owner rights over the current app-wide default; namespace-confined like any other user | `findOwnedProviderRow`, `getProviderRow` |
-| Owned-reference isolation | With isolation on, owned references honoured only inside `u/<userId>/` or the global prefix | `resolveFileProvider` |
+| Device tokens on the shared store | Never given the rights of the user the current app-wide default belongs to; namespace-confined like any other user | `findOwnedProviderRow`, `getProviderRow` |
+| Isolation of a user's own references | With isolation on, a user's own references honoured only inside `u/<userId>/` or the global prefix | `resolveFileProvider` |
 | File proxying | Backend streams bytes; frontend never holds long-lived credentials | `download` / `preview` controller |
 | Download stream hygiene | Open failures reject up front; mid-body failure cuts the response; client abort releases the storage connection | `sendStream` (controller), adapters' `download()` |
 | Short-lived presigned URLs | Preview-only, provider-issued (S3/R2) | `preview` endpoint (`{ kind: 'url' }`) |
@@ -883,7 +883,7 @@ A consolidated lookup of every control described on this page.
 | Path-traversal prevention | `safeResolve()` → `PathTraversalError` (403) | `LocalAdapter` |
 | Upload size enforcement | Counting transform aborts at the effective cap (admin override, else `DOC_MAX_UPLOAD_SIZE`) | `runSizeLimitedUpload`, `createSizeLimiter` |
 | Parsed-artefact integrity | SHA-256 `artefactHash` per stored artefact + `sourceContentHash` link | `doc_parsed_artefact` |
-| Account erasure | Per-user rows deleted in one transaction; shared-infrastructure providers re-owned to the organisation; `u/<userId>/` swept on every shared store and the server-local folder purged; the user's own storage untouched; communal and global files retained and counted | `security.registration.ts`, `purgeUserNamespaceBytes` |
+| Account erasure | Per-user rows deleted in one transaction; shared-infrastructure providers passed to the organisation; `u/<userId>/` swept on every shared store and the server-local folder purged; the user's own storage untouched; communal and global files retained and counted | `security.registration.ts`, `purgeUserNamespaceBytes` |
 
 ### Security-relevant environment variables
 
