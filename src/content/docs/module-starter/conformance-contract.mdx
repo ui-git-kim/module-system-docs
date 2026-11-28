@@ -39,10 +39,10 @@ If a barrel genuinely can't be resolved, C2 stands down for that side with a sin
 
 The module declares its data surface to the [security registry](/module-starter/security/) and provides a deletion handler so an account erasure removes its rows. Getting this wrong leaks personal data past account deletion.
 
-- **C6** — MUST emit `security.registration.ts` calling `securityRegistry.register({ moduleId, ownedModels, dataCategories, [encryptedFields], [hashedSecrets], [auditEvents], [minimumTier] })`. `dataCategories` MUST list **every** owned table with a `classification`, and `moduleId` MUST equal the module id.
-- **C7** — `ownedModels` MUST default to `[]` (userId-keyed). RLS / `tenantId` isolation is an explicit opt-in — only list a model here once it carries a `tenantId` column.
-- **C8** <Badge text="linter-checked v1.31.16" variant="success" /> — The deletion cascade MUST be a **separate** `securityRegistry.registerDeletionHandler({...})` call and MUST erase **every** owned per-user table. *(Linter asserts the handler erases via `deleteMany`; the multi-table single-`$transaction` SHOULD stays review-only.)* For a multi-table module the handler SHOULD wrap all `deleteMany` calls in a single `prisma.$transaction([...])` so erasure is atomic (all-or-nothing) — chosen over per-store handlers because account erasure across N tables should not partially succeed. Any table deliberately **not** erased (e.g. a global singleton) MUST be documented in a comment.
-- **C9** <Badge text="linter-checked v1.31.16" variant="success" /> — The handler body MUST resolve `const userId = ctx.subject.userId ?? ctx.subject.tenantId`, **refuse if it's absent: `throw`, or `return { action: 'failed', error }`** (the host's `DeletionHandler` contract allows both, and `runDeletion` treats them the same; accepted by the linter since v1.32.5). Either way it must happen before any `deleteMany`, because Prisma treats an undefined `where` value as *match every row*, use idempotent `deleteMany`, audit-log `{ audit: true, userId, ... }`, and `return { action, recordsAffected }`.
+- **C6** — MUST emit `security.registration.ts` calling `securityRegistry.register({ moduleId, ownedModels, dataCategories, [encryptedFields], [hashedSecrets], [auditEvents], [minimumTier] })`. `dataCategories` MUST list **every** per-user table with a `classification`, and `moduleId` MUST equal the module id.
+- **C7** <Badge text="redesigned v1.32.8" variant="caution" /> — One user is one tenant. Every per-user table MUST carry `tenantId` (whose space the row is in, always the user's id) and `userId` (who made it), and MUST be listed in `ownedModels` as `{ model, ownerColumn: 'tenantId' }`. Every query on it MUST run inside `withTenantContext(tenantId, …)` and filter with `owned(tenantId, …)`; while that holds, the entry SHOULD set `rowSecurity: true` so the starter applies a database row-security policy. `ownedModels: []` only for a module that keeps no per-user data. *(Review-only. Until v1.32.8 this item asked for `ownedModels: []` and `userId` keying, which the starter's [Product model](/getting-started/product-model/) has since ruled out.)*
+- **C8** <Badge text="linter-checked v1.31.16" variant="success" /> — The deletion cascade MUST be a **separate** `securityRegistry.registerDeletionHandler({...})` call and MUST erase **every** per-user table. *(Linter asserts the handler erases via `deleteMany`; the multi-table single-`$transaction` SHOULD stays review-only.)* For a multi-table module the handler SHOULD run all its `deleteMany` calls in one transaction (`withTenantContext` is one) so erasure is atomic (all-or-nothing) — chosen over per-store handlers because account erasure across N tables should not partially succeed. Any table deliberately **not** erased (e.g. a global singleton) MUST be documented in a comment.
+- **C9** <Badge text="linter-checked v1.31.16" variant="success" /> — The handler body MUST resolve the subject's space, `const tenantId = ctx.subject.tenantId ?? ctx.subject.userId` (the same value: one user is one tenant), **refuse if it's absent: `throw`, or `return { action: 'failed', error }`** (the host's `DeletionHandler` contract allows both, and `runDeletion` treats them the same; accepted by the linter since v1.32.5). Either way it must happen before any `deleteMany`, because Prisma treats an undefined `where` value as *match every row*, use idempotent `deleteMany`, audit-log `{ audit: true, tenantId, ... }`, and `return { action, recordsAffected }`.
 
 <Aside type="tip">Reference: Builder's single atomic `$transaction` (C8) combined with Structure's per-handler `throw` guard (C9). Since **v1.24.2** the scaffold emits both — the earlier template deleted only the primary table and omitted the guard.</Aside>
 
@@ -85,7 +85,7 @@ After a write, the service fires an action so other modules can react. The dispa
 
 Two different things leave a module, by two different routes. **Each person's own data** is personal data: it leaves through the privacy "download my data" export. **The module's app-wide configuration** (what an admin sets for everyone) is backed up and restored through the starter's [ConfigTransfer](/starter-template/config-transfer/) (starter v2.16.1+). Until v1.32.5 the template hand-built one admin `/export` + `/import` pair for a user's own rows; that surface is retired.
 
-- **C21** <Badge text="linter advisory v1.32.6" variant="caution" /> — A module that owns per-user data (it has a deletion handler, C6) MUST register a **personal-data export handler** (`securityRegistry.registerExportHandler`) next to it, covering the same tables. The handler MUST resolve `ctx.subject.userId ?? ctx.subject.tenantId` and **refuse to run without one** (throw), and MUST return whitelisted fields only: no ownership columns, secrets, token hashes or ciphertext.
+- **C21** <Badge text="linter advisory v1.32.6" variant="caution" /> — A module that keeps per-user data (it has a deletion handler, C6) MUST register a **personal-data export handler** (`securityRegistry.registerExportHandler`) next to it, covering the same tables. The handler MUST resolve `ctx.subject.tenantId ?? ctx.subject.userId` and **refuse to run without one** (throw), and MUST return whitelisted fields only: no ownership columns, secrets, token hashes or ciphertext.
 - **C22** <Badge text="linter advisory v1.32.6" variant="caution" /> — Admin **configuration** import/export MUST use ConfigTransfer: `createConfigTransferRouter(definition)` mounted on an admin path, and `<ConfigTransfer>` on the admin page. A module MUST NOT hand-build its own `/export` + `/import` routes, file input, paste box or merge/replace dialog for it. Each person's own data never goes through ConfigTransfer (that is C21).
 - **C23** <Badge text="linter-checked v1.32.6" variant="success" /> — A `ConfigTransferDefinition` MUST carry `moduleId` (the module's id), `version` and `sections`. Every section MUST declare a `schema`, the same one the admin screens validate with. A list section MUST declare a portable `key` (a slug or name, never a database id). `load` MUST return exactly the schema's shape. Writes MUST go only through `ctx.tx`, and side effects (events, cache clears) MUST go in `afterImport`, never in a section, because a dry run rolls the transaction back.
 - **C24** <Badge text="review only" variant="note" /> — The admin page MUST render `<ConfigTransfer>` with `endpoint` equal to the router's registered path and `invalidate` listing the module's namespaced query keys, so the page shows the imported settings. `strategies` MUST be narrowed to what the sections support (`['merge']` for single sections only).
@@ -98,11 +98,12 @@ A freshly generated module ships both routes. **Personal data:** `security.regis
 `npm run conformance:check` prints C21 and C22 findings as **ADVISORY** lines without failing, because modules built before v1.32.6 still carry the old hand-built surface and move when they choose ([changelog](/module-starter/changelog/)). C23 only applies where ConfigTransfer is already used, so it fails. Moving a module: describe its configuration as sections and mount the router, put `<ConfigTransfer>` on its admin page, register an export handler for each person's own rows, then delete the old `/export` / `/import` routes, the envelope code and the hand-built page. The starter's [Moving an existing import/export](/starter-template/config-transfer/#moving-an-existing-importexport) table maps the old pieces to sections.
 </Aside>
 
-## D8 — Styling: one stylist <Badge text="v1.32.4" variant="success" />
+## D8 — Styling: the Style module controls the look <Badge text="v1.32.8" variant="success" />
 
-In the module system the Style module is the only module that registers styling ([Styling Modules](/module-starter/styling/)).
+In the module system the Style module is the only module that registers styling, and it controls the look of the whole app ([Styling Modules](/module-starter/styling/)).
 
 - **C30** <Badge text="linter-checked v1.32.4" variant="success" /> — A module other than Style MUST NOT call `styleRegistry.register()` or `styleRegistry.update()` in emitted code. A look for a part only the module draws ships as a Style snippet (`snippetsRegistry`), and the module MUST NOT set the app's tokens (`--primary`, `--radius` …). The linter reads the module id from `src/module.ts`; the Style module (`id: 'style'`) is exempt, and if the id can't be read the check stands down.
+- **C31** <Badge text="linter advisory v1.32.8" variant="caution" /> — Standalone text MUST use the starter's typography pieces from `@/components/typography`, never a hand-styled element: a caption, hint or subtitle is `<Text variant="caption">`, dimmed running text is `<Text muted>`, and a heading is `<Heading level={n}>` (a bare `<h1>` is reset to body text). Text inside a shadcn primitive uses the primitive (`CardDescription`, `DialogDescription`, `Label`). The linter flags a text element made grey by hand (`<p className="… text-muted-foreground …">`, and the same on `span`, `div`, `small`, `li`, `label`) and a bare `<h1>`–`<h6>`, one advisory line per file; an icon coloured with `text-muted-foreground` is fine. It is an advisory while existing modules move.
 
 ## META — cross-cutting conventions
 
@@ -116,18 +117,18 @@ In the module system the Style module is the only module that registers styling 
 
 ## Scaffold conformance status
 
-Where a freshly-generated module stands against the contract, as of scaffold **v1.32.4**:
+Where a freshly-generated module stands against the contract, as of scaffold **v1.32.8**:
 
 | Dimension | Items | Scaffold status |
 |-----------|-------|-----------------|
 | D1 Registrations | C1–C5 | ✅ Conforms |
-| D2 Security & deletion | C6–C9 | ✅ Conforms (C8/C9 since v1.24.2; C8/C9 **linter-checked** since v1.31.16) |
+| D2 Security & deletion | C6–C9 | ✅ Conforms (C8/C9 since v1.24.2; C8/C9 **linter-checked** since v1.31.16; C7 redesigned v1.32.8: tables keyed on `tenantId`, every query through `withTenantContext` + `owned()`, row security on) |
 | D3 Service key & types | C10, C11, C12 | ✅ Conforms (C10 since v1.24.2, C12 since v1.29.0) |
 | D4 Query-key namespacing | C13, C14 | ✅ Conforms |
 | D5 Structured logging | C15–C17 | ✅ Conforms |
 | D6 Action hooks | C18–C20 | ✅ Conforms (since v1.24.2) |
 | D7 Personal data export & admin config transfer | C21–C24 | ✅ Conforms (redesigned v1.32.6: C23 **linter-checked**, C21–C22 linter advisories, C24 review-only) |
-| D8 Styling: one stylist | C30 | ✅ Conforms (**linter-checked** since v1.32.4) |
+| D8 Styling | C30, C31 | ✅ Conforms (C30 **linter-checked** since v1.32.4; C31 linter advisory since v1.32.8) |
 | META | C25–C29 | ✅ Conforms |
 
 <Aside type="note" title="Applying the contract to an existing module">

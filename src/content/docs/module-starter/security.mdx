@@ -1,11 +1,11 @@
 ---
 title: Security
-description: How a module integrates with the starter's security feature — the security manifest, field encryption, hashed secrets, deletion handlers, RLS, and minimum tier
+description: How a module integrates with the starter's security feature — each user's data keyed on tenantId with row security, the security manifest, field encryption, hashed secrets, deletion and export handlers, holds, and the minimum security level
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-The starter template ships a foundation **security feature** — a `securityRegistry`, app-layer field encryption, a deletion cascade, and tier-based posture. A module doesn't build any of that; it **declares** what it needs and the foundation enforces it.
+The starter template ships a foundation **security feature** — a `securityRegistry`, app-layer field encryption, a deletion cascade, row security, and security levels (standard, hardened, strict). A module doesn't build any of that; it **declares** what it needs and the foundation enforces it.
 
 Every generated **backend** module includes a **`security.registration.ts`** (a side-effect import from `index.ts`, alongside the route and service registrations) that declares the module's security surface and registers an account-deletion handler and (since v1.32.6) a personal-data export handler.
 
@@ -20,14 +20,18 @@ The generated file declares a manifest, a deletion handler and an export handler
 ```typescript
 // backend/src/features/my-feature/security.registration.ts
 import { securityRegistry } from '../security/index.js';
-import { prisma } from '../../lib/prisma.js';
+import { owned, withTenantContext } from '../../lib/owned.js';
 import { createModuleLogger } from '../../lib/logger.js';
 
 const log = createModuleLogger('my-feature:security');
 
 securityRegistry.register({
   moduleId: 'my-feature',
-  ownedModels: [],                                           // RLS — opt-in (see below)
+  // Each user's tables, keyed on tenantId, with database row security (v1.32.8)
+  ownedModels: [
+    { model: 'my_feature_item', ownerColumn: 'tenantId', rowSecurity: true },
+    { model: 'my_feature_settings', ownerColumn: 'tenantId', rowSecurity: true },
+  ],
   dataCategories: [
     { name: 'my_feature_item', classification: 'owned' },
     { name: 'my_feature_settings', classification: 'owned' },
@@ -41,19 +45,19 @@ securityRegistry.registerDeletionHandler({
   classification: 'owned',
   description: "Hard-delete the subject's my-feature items and settings",
   async run(ctx) {
-    const userId = ctx.subject.userId ?? ctx.subject.tenantId;
+    const tenantId = ctx.subject.tenantId ?? ctx.subject.userId;
     // Refuse to run unscoped — an undefined where-value would match every row.
-    if (!userId) {
-      throw new Error('my-feature deletion handler: subject has no userId/tenantId — refusing unscoped deleteMany');
+    if (!tenantId) {
+      throw new Error('my-feature deletion handler: subject has no tenantId/userId — refusing unscoped deleteMany');
     }
-    // Erase every owned per-user table atomically (all-or-nothing). deleteMany is
-    // idempotent, so a retried cascade succeeds on an already-cleared account.
-    const [items, settings] = await prisma.$transaction([
-      prisma.my_feature_item.deleteMany({ where: { userId } }),
-      prisma.my_feature_settings.deleteMany({ where: { userId } }),
-    ]);
-    const recordsAffected = items.count + settings.count;
-    log.info({ audit: true, userId, recordsAffected }, 'my-feature user data deleted (account erasure)');
+    // Erase every per-user table in one transaction (all-or-nothing). deleteMany
+    // is idempotent, so a retried cascade succeeds on an already-cleared account.
+    const recordsAffected = await withTenantContext(tenantId, async (tx) => {
+      const items = await tx.my_feature_item.deleteMany({ where: owned(tenantId) });
+      const settings = await tx.my_feature_settings.deleteMany({ where: owned(tenantId) });
+      return items.count + settings.count;
+    });
+    log.info({ audit: true, tenantId, recordsAffected }, 'my-feature user data deleted (account erasure)');
     return { action: 'hard-delete', recordsAffected };
   },
 });
@@ -69,11 +73,11 @@ securityRegistry.registerExportHandler({
   moduleId: 'my-feature',
   description: "The subject's my-feature items and settings",
   async run(ctx) {
-    const userId = ctx.subject.userId ?? ctx.subject.tenantId;
-    if (!userId) {
-      throw new Error('my-feature export handler: subject has no userId/tenantId — refusing unscoped export');
+    const tenantId = ctx.subject.tenantId ?? ctx.subject.userId;
+    if (!tenantId) {
+      throw new Error('my-feature export handler: subject has no tenantId/userId — refusing unscoped export');
     }
-    return myFeatureService.exportUserData(userId);   // a field whitelist: no userId, no secrets, no ciphertext
+    return myFeatureService.exportUserData(tenantId);   // a field whitelist: no ids, no secrets, no ciphertext
   },
 });
 ```
@@ -95,13 +99,13 @@ External and desktop apps (e.g. the Local Connect companion) can authenticate to
 | Field | Required | Purpose |
 |-------|:--:|---------|
 | `moduleId` | ✅ | Your module id (kebab-case). |
-| `ownedModels` | ✅ (may be `[]`) | Models put behind **Neon RLS**, keyed on `tenantId`. |
+| `ownedModels` | ✅ | Each user's tables, keyed on `tenantId` (`ownerColumn` is the starter's name for that key). `rowSecurity: true` asks the starter to apply a database row-security policy. The default lists both per-user tables, with row security on. `[]` only for a module that keeps no per-user data. |
 | `dataCategories` | ✅ | Drive the deletion cascade + compliance bundle. |
-| `encryptedFields` | — | Columns encrypted at rest (hardened+). |
+| `encryptedFields` | — | Columns encrypted at rest (hardened and strict security levels). |
 | `hashedSecrets` | — | Columns stored as a SHA-256 hash, never plaintext. |
 | `auditEvents` | — | Event names this module emits. |
 | `credentialTypes` | — | Third-party secret types this module stores. |
-| `minimumTier` | — | Refuse to run below `standard`/`hardened`/`strict`. |
+| `minimumTier` | — | The lowest security level the module runs at: `standard`, `hardened` or `strict` (the starter's field name keeps the old word). |
 
 ## Field encryption
 
@@ -112,20 +116,24 @@ For sensitive columns (API responses, tax ids, tokens), encrypt at rest. The col
    ```typescript
    encryptedFields: [{ model: 'my_feature_item', field: 'secretValue' }],
    ```
-2. **Encrypt on write / decrypt on read** in your service:
+2. **Encrypt on write, read through `auditedDecrypt`** in your service:
    ```typescript
-   import { encryptField, decryptField } from '../security/index.js';
+   import { encryptField, auditedDecrypt } from '../security/index.js';
 
-   // create
-   const sealed = await encryptField(input.secretValue, { tenantId: userId });
-   await prisma.my_feature_item.create({ data: { ...input, secretValue: sealed, userId } });
+   // create (inside withTenantContext, like every query on the table)
+   const sealed = await encryptField(input.secretValue, { tenantId: actor.tenantId });
+   await tx.my_feature_item.create({
+     data: { ...input, secretValue: sealed, tenantId: actor.tenantId, userId: actor.userId },
+   });
 
-   // read
-   item.secretValue = await decryptField(item.secretValue, { tenantId: userId });
+   // read: a read by anyone but the user is recorded and shown to them
+   item.secretValue = await auditedDecrypt(item.secretValue, {
+     actorId: actor.userId, tenantId: actor.tenantId, resource: `my-feature:item:${item.id}`,
+   });
    ```
 </Steps>
 
-Field encryption is on at `hardened`+ tiers. `decryptField` throws if the envelope is tampered with or the key is wrong. Since starter **v1.64.0** the `{ tenantId }` option is live, not just forward-compatible: passing it encrypts under a key **distinct to that tenant** (envelope `v2:`; decrypt requires the same `tenantId`). Always pass the owning `tenantId` for tenant-owned content — it's what makes per-tenant separation and per-tenant crypto-shred work. For content that must be *provably* access-controlled, prefer `auditedDecrypt(envelope, { actorId, tenantId, resource })` — every read (success or failure) fires the `security.dataAccessed` audit hook, recorded by the audit sink with a `crossTenant` flag.
+Field encryption is on at the hardened and strict security levels. `decryptField` throws if the envelope is tampered with or the key is wrong. Since starter **v1.64.0** the `{ tenantId }` option is live, not just forward-compatible: passing it encrypts under a key **distinct to that tenant** (envelope `v2:`; decrypt requires the same `tenantId`). Always pass the space's `tenantId` for a user's content — it's what makes per-user keys and per-user crypto-shred work. Read a user's protected content through `auditedDecrypt(envelope, { actorId, tenantId, resource })` (the [Privacy model](/getting-started/privacy-model/#what-modules-must-do), rule 2): every read fires the `security.dataAccessed` hook, and a read by anyone other than the user is flagged `crossTenant` and shown in their Activity.
 
 ## Hashed secrets
 
@@ -155,7 +163,7 @@ No provider erases data across **all** your stores, so each module registers a h
 The cascade may retry. Use `deleteMany` (not `delete`) so a re-run finds 0 rows and succeeds. A handler must **throw** (or return `{ action: 'failed' }`) if it did not complete — the orchestrator treats any non-failed return as success and removes the auth identity last.
 </Aside>
 
-Scope the handler to the subject. The scaffold schema keys on `userId` (the actor), so it resolves `ctx.subject.userId ?? ctx.subject.tenantId` (a tenant-offboard may set only `tenantId`) and deletes `where: { userId }`. If you adopt `tenantId` isolation (below), switch to `owned(ctx.subject.tenantId)`.
+Scope the handler to the subject: it resolves `ctx.subject.tenantId ?? ctx.subject.userId` (the same value — one user is one tenant), refuses to run without one, and deletes with `owned(tenantId)` inside `withTenantContext`, which is one transaction.
 
 ## Holds: check before deleting for good (starter v2.17.4)
 
@@ -168,37 +176,35 @@ await assertNoRecordHold(tenantId);                 // a person's action: 409 'r
 if (await isUnderRecordHold(tenantId)) continue;    // a sweep: skip them this run
 ```
 
-Moving to trash, archiving, editing and restoring are not permanent, so they don't check. On a starter before v2.17.4, use the guarded import and treat a missing function as "no hold".
+The generated service's `delete` does this (v1.32.8). Moving to trash, archiving, editing and restoring are not permanent, so they don't check. On a starter before v2.17.4, use the guarded import and treat a missing function as "no hold".
 
-## RLS & ownership (`tenantId`)
+## Each user's data: `tenantId`, `owned()` and row security
 
-`ownedModels` puts a model behind **Neon Row-Level Security**, keyed on the isolation column **`tenantId`** (which equals `userId` in solo mode). The scaffold's default schema is `userId`-keyed, so RLS is an **explicit upgrade**:
+One user is one tenant, always ([Product model](/getting-started/product-model/)). Since **v1.32.8** the default template follows the starter's rule for a user's data, the same way the starter's own service connections do:
 
-<Steps>
-1. Add the isolation column to your model in `schema.prisma`:
-   ```prisma
-   model my_feature_item {
-     // ...
-     tenantId String
-     @@index([tenantId])
-   }
-   ```
-2. Populate it on write (`tenantId: userId` in solo) and scope queries with `owned()`:
-   ```typescript
-   import { owned } from '../../lib/owned.js';
-   await prisma.my_feature_item.findMany({ where: owned(tenantId) });
-   ```
-3. Declare the model:
-   ```typescript
-   ownedModels: [{ model: 'my_feature_item', ownerColumn: 'tenantId' }],
-   ```
-</Steps>
+1. **Every per-user table carries `tenantId`** (whose space the row is in, always the user's id) **and `userId`** (who made it), with an index that starts with `tenantId`.
+2. **Every query on those tables runs inside `withTenantContext(tenantId, (tx) => …)` and filters with `owned(tenantId, …)`.** `withTenantContext` tells the database whose space it is, so its row security can hold. `owned()` puts the same scope in the query itself, so a forgotten filter can't leak another user's rows. Both refuse to run without a tenant, so a missing id fails closed.
+3. **The tables are declared in `ownedModels` with `rowSecurity: true`**, so the starter applies a database row-level-security policy to them (unless the app sets `SECURITY_RLS=off`).
 
-The foundation pairs this with the `FORCE ROW LEVEL SECURITY` + `current_setting('app.tenant_id')` policy template — see the starter's [Database & Prisma](/starter-template/database/) guide.
+```typescript
+import { owned, withTenantContext } from '../../lib/owned.js';
 
-## Minimum tier
+const rows = await withTenantContext(actor.tenantId, (tx) =>
+  tx.my_feature_item.findMany({ where: owned(actor.tenantId), orderBy: { createdAt: 'desc' } }),
+);
+```
 
-A security-sensitive module can refuse to run below a tier. At bootstrap the startup posture guardrail halts (at `strict` in production) if the active tier is lower:
+The routes build the actor, `{ tenantId, userId }`, from `req.user` (`actorOf` in the generated routes) and refuse a request with no tenant. The admin settings table is app-wide, so it has no `tenantId` and isn't declared.
+
+<Aside type="caution" title="rowSecurity: true is a promise">
+It says every query on that table runs inside `withTenantContext`. A query that skips it finds nothing once the policy is on. If a table has to be read another way, take `rowSecurity` off for that table and keep `owned()`. A deliberate read across every user (rare, and never for an admin screen: [Privacy model](/getting-started/privacy-model/#what-modules-must-do), rule 1) goes through the starter's `withSystemReadContext`.
+</Aside>
+
+**A module made before v1.32.8** keys its tables on `userId` and declares `ownedModels: []`. Its code templates are its own, so `scaffold:update` doesn't change them. To move it: add `tenantId String` to each per-user table and index it; fill it with a [module migration](/module-starter/migrations/) (`UPDATE "my_feature_item" SET "tenantId" = "userId"`); write `tenantId` on create; run every query through `withTenantContext` + `owned()`; then declare the tables with `rowSecurity: true`. The generated service and `security.registration.ts` of a new module show the finished shape.
+
+## Minimum security level
+
+A security-sensitive module can refuse to run below a security level. At startup the posture check halts (at `strict` in production) if the app's level is lower. The starter's field name is still `minimumTier`:
 
 ```typescript
 minimumTier: 'strict',   // requires field encryption + compliance audit
@@ -213,25 +219,25 @@ import {
   hashSecret, verifySecret,
   assertNoRecordHold, isUnderRecordHold,   // v2.17.4: check before any permanent deletion
 } from '../security/index.js';
-import { owned } from '../../lib/owned.js';   // RLS scoping helper (see the RLS section above)
+import { owned, withTenantContext } from '../../lib/owned.js';   // scope every query on a per-user table
 import { prisma } from '../../lib/prisma.js';
 import { createModuleLogger } from '../../lib/logger.js';
 ```
 
 <Aside type="note">
-The shipped templates demonstrate `owned()` for row scoping. The starter template's `lib/owned` also exports `withTenantContext()` (to set the RLS session variable around a query) — reach for it only if you've enabled Neon row-level security; see the [Starter Template Database](/starter-template/database/) guide.
+The shipped templates run every query on a per-user table through `withTenantContext` + `owned()` — see [Each user's data](#each-users-data-tenantid-owned-and-row-security) above and the starter's [Database](/starter-template/database/) guide.
 </Aside>
 
 ## Checklist
 
 - [ ] Keep `security.registration.ts` if your module stores per-user data (delete it if not).
 - [ ] List each data store in `dataCategories` with the right `classification`.
-- [ ] Register a **single deletion handler** that erases every owned table atomically (one `prisma.$transaction`, idempotent `deleteMany`, subject-scoped).
+- [ ] Key every per-user table on `tenantId` (plus `userId`), run every query on it inside `withTenantContext` with `owned()`, and declare it in `ownedModels` with `rowSecurity: true`.
+- [ ] Register a **single deletion handler** that erases every per-user table in one transaction (`withTenantContext`, idempotent `deleteMany`, scoped to the subject).
 - [ ] Register an **export handler** covering the same tables, subject-scoped, refusing to run without a subject, returning whitelisted fields only (no secrets or ciphertext).
-- [ ] Declare `encryptedFields` and call `encryptField`/`decryptField` for sensitive columns.
+- [ ] Declare `encryptedFields`, call `encryptField`, and read back through `auditedDecrypt`.
 - [ ] Declare `hashedSecrets` for tokens; never store them plaintext.
-- [ ] Adopt `tenantId` + `ownedModels` if you want Neon RLS.
-- [ ] Set `minimumTier` if the module needs encryption / compliance audit.
+- [ ] Set `minimumTier` (the lowest security level) if the module needs encryption / compliance audit.
 - [ ] Check `assertNoRecordHold` / `isUnderRecordHold` before any permanent deletion your module does by itself (trash, retention, purge jobs).
 - [ ] Read another person's protected content only through `auditedDecrypt`, and give admins no read path to people's records ([Privacy model](/getting-started/privacy-model/)).
 

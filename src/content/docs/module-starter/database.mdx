@@ -44,17 +44,18 @@ Use plain foreign key fields with compound `@@index` that cover the columns you 
 // ✅ CORRECT - Self-contained, no @relation, compound index
 model my_feature_item {
   id          String   @id @default(cuid())
-  userId      String                          // Plain FK, NOT a @relation
+  tenantId    String                          // whose space (the user's id), NOT a @relation
+  userId      String                          // who made it, a plain id, NOT a @relation
   name        String
   description String?
   status      String   @default("active")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  // Compound index covers WHERE userId AND ORDER BY createdAt — the
+  // Compound index covers WHERE tenantId AND ORDER BY createdAt — the
   // default list query pattern. Without the createdAt column in the
   // index, Postgres would sort in memory on every list fetch.
-  @@index([userId, createdAt])
+  @@index([tenantId, createdAt])
 }
 ```
 
@@ -62,8 +63,8 @@ model my_feature_item {
 
 | Allowed | Not Allowed |
 |---------|-------------|
-| `userId String` (plain FK to User) | `user User @relation(...)` |
-| `@@index([userId])` | Cross-module `@relation` |
+| `tenantId String` / `userId String` (plain ids, no relation) | `user User @relation(...)` |
+| `@@index([tenantId, createdAt])` | Cross-module `@relation` |
 | Separate settings tables | Adding fields to User model |
 | Runtime service calls between modules | Database FKs to other module tables |
 | `Json` fields for flexible data | Assuming other module schemas exist |
@@ -160,50 +161,44 @@ import type { TransactionClient } from '../../lib/prisma.js';
 ```
 
 <Aside type="note">
-The **shipped** backend service (`src/templates/backend/services.ts`) imports only `prisma` and runs its atomic ownership-checked update with `prisma.$transaction(async (tx) => …)` directly. `withTransaction`, `batchTransaction`, and `TransactionClient` are **optional** starter-provided helpers — reach for them when the ergonomics help, but the default template does not use them.
+Each user's tables are queried through `withTenantContext` + `owned()` from `../../lib/owned.js`, not straight through `prisma` (v1.32.8): one user is one tenant, every per-user row carries `tenantId`, and the tables have database row security on. See [Security → Each user's data](/module-starter/security/#each-users-data-tenantid-owned-and-row-security). `withTenantContext` is itself a transaction, so several writes inside it are all-or-nothing. `prisma`, `withTransaction` and `batchTransaction` remain for app-wide tables such as the admin settings.
 </Aside>
 
 ### Simple Queries
 
 ```typescript
-// Standard Prisma queries
-const items = await prisma.my_feature_item.findMany({
-  where: { userId },
-  orderBy: { createdAt: 'desc' },
-});
+import { owned, withTenantContext } from '../../lib/owned.js';
 
-const item = await prisma.my_feature_item.findUnique({
-  where: { id: itemId },
-});
+// The user's items, newest first
+const items = await withTenantContext(actor.tenantId, (tx) =>
+  tx.my_feature_item.findMany({ where: owned(actor.tenantId), orderBy: { createdAt: 'desc' } }),
+);
+
+// One of the user's items (another user's reads as not found)
+const item = await withTenantContext(actor.tenantId, (tx) =>
+  tx.my_feature_item.findFirst({ where: owned(actor.tenantId, { id: itemId }) }),
+);
 ```
 
 ### Transactions
 
-Use `withTransaction` for atomic operations across multiple tables:
+`withTenantContext` runs its callback in one transaction, so writes to several per-user tables inside it are all-or-nothing:
 
 ```typescript
-const result = await withTransaction(async (tx: TransactionClient) => {
+const result = await withTenantContext(actor.tenantId, async (tx) => {
   const item = await tx.my_feature_item.create({
-    data: { userId, name: 'New Item' },
+    data: { tenantId: actor.tenantId, userId: actor.userId, name: 'New Item' },
   });
   const settings = await tx.my_feature_settings.upsert({
-    where: { userId },
+    where: { tenantId: actor.tenantId },
     update: { enabled: true },
-    create: { userId, enabled: true },
+    create: { tenantId: actor.tenantId, userId: actor.userId, enabled: true },
   });
   return { item, settings };
 });
 ```
 
-Use `batchTransaction` when operations are independent but must all succeed:
-
-```typescript
-// Both use my_feature_item — the only item model the default schema defines.
-const [first, second] = await batchTransaction([
-  prisma.my_feature_item.create({ data: { userId, name: 'First item' } }),
-  prisma.my_feature_item.create({ data: { userId, name: 'Second item' } }),
-]);
-```
+For an app-wide table (no `tenantId`, such as the admin settings), use `prisma` or the starter's `withTransaction` / `batchTransaction` as usual.
 
 <Aside type="tip">
 For more details on the Prisma client setup, connection architecture, and migration commands, see [Database & Prisma](/starter-template/database/).
@@ -220,12 +215,15 @@ export const SCHEMA = `
 // ========================================================================
 // My Feature Models
 // ========================================================================
-// Self-contained — NO @relation to the User model (avoids requiring changes
-// to User). Use plain foreign keys + indexes. To add referential integrity,
-// add the relation fields to your own User model.
+// Self-contained: no relations to the starter's models (and never edit the
+// User model). Rows point at the user by id, with an index.
+//
+// EACH USER'S ROWS: one user is one tenant. A per-user table carries tenantId
+// (whose space the row is in, always the user's id) and userId (who made it).
 
 model my_feature_item {
   id          String   @id @default(cuid())
+  tenantId    String
   userId      String
   name        String
   description String?
@@ -233,23 +231,27 @@ model my_feature_item {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  // Supports "items per user, newest first" without an in-memory sort.
-  @@index([userId, createdAt])
-
-  // Security integration (see security.registration.ts):
-  // - Field encryption: keep a sensitive column as String and store the
-  //   encryptField() envelope in it; declare it in encryptedFields.
-  // - Neon RLS: add tenantId String (+ @@index([tenantId])) and list it in
-  //   the manifest's ownedModels. tenantId == userId in solo mode.
+  // Supports "the user's items, newest first" without an in-memory sort.
+  @@index([tenantId, createdAt])
 }
 
 model my_feature_settings {
   id        String   @id @default(cuid())
-  userId    String   @unique          // @unique already creates the index
+  tenantId  String   @unique          // @unique already creates the index
+  userId    String
   enabled   Boolean  @default(true)
   config    Json     @default("{}")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// App-wide (one row): backed up through ConfigTransfer, no tenantId.
+model my_feature_admin_settings {
+  id              String   @id @default("default")
+  enabled         Boolean  @default(true)
+  maxItemsPerUser Int      @default(500)
+  notice          String?
+  updatedAt       DateTime @updatedAt
 }
 `;
 ```
@@ -259,7 +261,7 @@ Remember to list all model names in `module.ts`:
 ```typescript
 schema: {
   content: SCHEMA,
-  modelNames: ['my_feature_item', 'my_feature_settings'],
+  modelNames: ['my_feature_item', 'my_feature_settings', 'my_feature_admin_settings'],
 },
 ```
 
@@ -279,20 +281,22 @@ If a migration's objects already exist without history (a drifted dev DB), the s
 
 ### Paginated List Query
 
-The compound `[userId, createdAt]` index pairs with cursor-based pagination in the generated backend service. The service's `getAll()` method (see `src/templates/backend/services.ts`) uses:
+The compound `[tenantId, createdAt]` index pairs with cursor-based pagination in the generated backend service. The service's `getAll()` method (see `src/templates/backend/services.ts`) uses:
 
 ```typescript
 // limit is clamped to [1, MAX_PAGE_SIZE] before use (MAX_PAGE_SIZE = 200,
 // DEFAULT_PAGE_SIZE = 50), so a caller can't request an unbounded page.
 const take = Math.min(Math.max(1, limit), MAX_PAGE_SIZE);
 
-await prisma.my_feature_item.findMany({
-  where: { userId },
-  orderBy: { createdAt: 'desc' },
-  take: take + 1,                          // Fetch one extra to detect next page
-  ...(cursor && { cursor: { id: cursor }, skip: 1 }),
-  select: LIST_SELECT,                      // shared { id, name, status, createdAt, updatedAt }
-});
+await withTenantContext(actor.tenantId, (tx) =>
+  tx.my_feature_item.findMany({
+    where: owned(actor.tenantId),
+    orderBy: { createdAt: 'desc' },
+    take: take + 1,                        // Fetch one extra to detect next page
+    ...(cursor && { cursor: { id: cursor }, skip: 1 }),
+    select: LIST_SELECT,                    // shared { id, name, status, createdAt, updatedAt }
+  }),
+);
 ```
 
 The `limit` is clamped to `[1, MAX_PAGE_SIZE]` (`MAX_PAGE_SIZE = 200`, default `50`) before `take + 1`, and the columns come from a shared `LIST_SELECT` constant. That `select` keeps list payloads small — full objects (including `description` and any `Json` columns) only come back from `getById()`. See the Frontend Service template for the matching client-side pagination signature.
@@ -305,8 +309,8 @@ The `limit` is clamped to `[1, MAX_PAGE_SIZE]` (`MAX_PAGE_SIZE = 200`, default `
 |------------|---------|---------|
 | Prefix tables with module ID | `billing_subscription` | Avoids name collisions between modules |
 | Use `snake_case` for table names | `my_feature_item` | PostgreSQL convention |
-| Use `camelCase` for field names | `userId`, `createdAt` | Prisma convention |
-| Use **compound** indexes for list queries | `@@index([userId, createdAt])` | Covers filter AND sort — avoids in-memory sort |
+| Use `camelCase` for field names | `tenantId`, `createdAt` | Prisma convention |
+| Use **compound** indexes for list queries | `@@index([tenantId, createdAt])` | Covers filter AND sort — avoids in-memory sort |
 | Always include timestamps | `createdAt`, `updatedAt` | Audit trail |
 
 ---
