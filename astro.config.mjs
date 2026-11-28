@@ -470,6 +470,7 @@ export default defineConfig({
           label: "Reference",
           collapsed: true,
           items: [
+            { label: "Glossary", slug: "reference/glossary" },
             { label: "CLI Commands", slug: "reference/cli-commands" },
             { label: "Types", slug: "reference/types" },
             { label: "Registries API", slug: "reference/registries-api" },

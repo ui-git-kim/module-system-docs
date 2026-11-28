@@ -132,6 +132,7 @@ src/content/docs/
 │   ├── changelog.mdx
 │   └── roadmap.mdx
 └── reference/                   # API reference (collapsed)
+    ├── glossary.mdx             # The one list of words every module uses
     ├── cli-commands.mdx
     ├── types.mdx
     ├── registries-api.mdx
