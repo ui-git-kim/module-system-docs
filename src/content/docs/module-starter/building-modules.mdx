@@ -191,6 +191,7 @@ Group prompts with `{ section: 'Heading' }` markers (cosmetic headers that carry
 | `envVariables` | No | Split into `{ frontend: [], backend: [] }` — see [Environment Variables](#environment-variables) |
 | `depends` | No | Module id → semver range map (e.g. `{ 'ai-core': '^1.2.0' }`) — see [Module Dependencies](#module-dependencies). Ranges **hard-fail at install** (CLI, scaffold v1.27.0 — bypass with `--skip-dep-check`) and are **enforced at boot** (host, starter v2.0.0 / contract v1.3.0) per `MODULES_DEPENDENCY_POLICY` |
 | `requiredModules` | No | **Deprecated** — use `depends`. Still honoured everywhere `depends` is checked |
+| `requires` | No | The host app the module needs: `{ starter: '>=2.16.11' }`, a semver range checked against the app's `VERSION` file. `init`, `update` and `reconfigure` refuse an older app before writing anything (scaffold v1.32.7; bypass with `--skip-dep-check`). The default template declares `>=2.16.1` — see [The starter release a module needs](#the-starter-release-a-module-needs) |
 | `lifecycle` | No | Hooks for install, update, activate, deactivate, uninstall — see [Lifecycle Hooks](/module-starter/lifecycle-hooks/) |
 
 Fields marked **Yes*** are required only when their parent block is present.
@@ -512,6 +513,24 @@ export const GOOD = `const msg = \`Hello \${name}\`;`;
 
 **How to catch it:** run **`npm run check:templates`** — it scans `src/templates/**` for any unescaped `${` and reports the file and line.
 
+**Backslash escapes are decoded twice too** (checked since scaffold v1.32.7). Inside a template, a single-backslash escape is turned into its character when the *module* builds, so the generated file gets the character, not the escape. Two kinds silently change the generated code:
+
+```typescript
+// WRONG — the generated file holds a real NUL, 0x1F and DEL. The regex still
+// works, but git treats the file as binary in every app, so its changes can't be read.
+export const BAD = `const CTRL = /[\u0000-\u001f\u007f]/;`;
+
+// WRONG — \d and \s are not escapes in a template string: the backslash is
+// dropped, so the generated code reads /d+s*/
+export const BAD = `const n = /\d+\s*/;`;
+
+// CORRECT — double the backslash and the generated code keeps the escape
+export const GOOD = `const CTRL = /[\\u0000-\\u001f\\u007f]/;`;
+export const GOOD = `const n = /\\d+\\s*/;`;
+```
+
+`check:templates` flags an escape that becomes a control or text-direction character (`\u0000`–`\u001f`, `\u007f`, `\x00`, `\0`, `\b`, `\f`, `\v`, the bidi controls), a regex escape that loses its backslash (`\d`, `\w`, `\s`, `\B`, `\p{…}` and their capitals), and the same control characters typed straight into a template file. An escape for a visible character, such as an em dash or a pound sign, comes out correctly and is not flagged, nor are harmless invisible ones such as a zero-width space. Tagged templates (`String.raw`) keep their backslashes and are skipped.
+
 <Aside type="caution" title="A clean build is NOT enough">
 A clean `npm run build` does **not** prove your escaping is correct:
 
@@ -607,6 +626,26 @@ The older `requiredModules: string[]` is **deprecated but still honoured** — e
 import { billingService } from '@/features/billing';
 const subscription = await billingService.getSubscription(userId);
 ```
+
+### The starter release a module needs
+
+A module that uses something the starter added in a given release — a shared component, a registry, a helper — breaks in an older app: the install goes ahead and the app then fails its build or type-check with errors that don't say why. Since scaffold **v1.32.7**, a module says which starter releases it works in with `requires`:
+
+```typescript
+export const moduleDefinition: ModuleDefinition = {
+  id: 'tasks',
+  requires: { starter: '>=2.16.11' },  // the app palette in QuickColourPicker
+  // ...
+};
+```
+
+- `init`, `update` and `reconfigure` read the app's root **`VERSION`** file (the starter release it is on, kept current by `template:update`) and, when the app is older than the range, **stop before writing anything** with a plain message: the module needs starter `>=2.16.11`, the app is on `2.16.3`, update the app first (`npm run template:update`). The command exits with a failure code, so CI notices.
+- `--skip-dep-check` goes ahead anyway with a warning (expect build or type errors). `--dry-run` only warns.
+- An app with no readable `VERSION` file gets a warning, not a refusal.
+- `npx <module> info` shows the requirement.
+- The range syntax is the same as `depends` (`>=2.16.11`, `^2.16.0`, `>=2.16.1 <3`). The **default template declares `>=2.16.1`** — the release that fixed the [ConfigTransfer](/starter-template/config-transfer/) endpoint its admin page uses. Raise it whenever your templates start using something newer.
+
+This is an install-time check. Checking the same range when the app starts is the starter's side and is logged on its [upstream issues](/starter-template/upstream-issues/).
 
 ---
 
@@ -1132,6 +1171,17 @@ npm test        # vitest run — renders templates, boots PGlite, runs tests/*.t
 - **The scaffold owns** `tests/harness/**`, `vitest.config.ts`, `tests/tsconfig.json` and `tests/.gitignore` — updated via `scaffold:update`, so don't edit them.
 - **Your backend's own packages are installed for the tests too.** The sandbox lives inside your module repo, so the packages your generated code imports (`backend.dependencies` in `module.ts`, which an app installs at `init`) must also be in the module's `node_modules`. Since v1.32.5, `scaffold:update` adds them as `devDependencies` (your own pins win); then run `npm install`. If npm reports install scripts "not covered by allowScripts" for one of them (for example `sharp`), approve it with `npm install-scripts approve <name>`. When a package is still missing, `npm test` prints a warning naming it and the install command.
 - A test file calls `setupHarness()` once and imports your generated code with `importFeature('my-feature.service.ts')`; `h.db.pg` gives raw SQL for assertions. See the harness's `tests/harness/index.ts` header for the pattern, or the structure module's `tests/` for a worked example.
+- **Guarded imports are tested too.** Generated code that looks for an optional part of the app with a variable import (`const X = '../modules/index.js'; await import(X)`) gets the real answer. Before v1.32.7 the harness loaded files by `file://` URL, and on Windows that import always failed, so the "not there" branch ran and tests passed without testing the real path. If you worked around it by importing a file by plain path in your own test, you can go back to `importFeature`.
+- **The stand-in security feature matches the starter where tests depend on it** (v1.32.7). `computeHmac(payload, secret, algorithm = 'sha256', encoding = 'hex')` honours the algorithm, so a test of an HMAC-SHA-384 record seal proves the algorithm. The record-hold functions are there (`getRecordHold`, `setRecordHold`, `isUnderRecordHold`, `assertNoRecordHold`, `RecordHoldError`), with holds kept in memory. Put someone on hold with the real call and check your permanent delete refuses:
+
+  ```typescript
+  const security = await h.importHost('features/security/index.ts');
+  await security.setRecordHold(userId, { on: true }, userId);
+  await expect(myFeatureService.emptyTrash(userId)).rejects.toThrow(security.RecordHoldError);
+  ```
+
+  Lift it with `{ on: false }`, or call `clearRecordHolds()` from `features/security/record-hold.ts` (test-only) in a `beforeEach`. A module-owned replacement of the security stand-in for either of these (through `extraHostStubs`) can be deleted.
+- **GitHub CI is off by default in a module** (v1.32.7). `.github/workflows/scaffold-ci.yml` runs the template, conformance and parity checks and `npm test` on GitHub, which uses Actions minutes — limited on a private repo. It runs automatically only in the module starter itself. In a module, run it when you want it (Actions → Scaffold CI → Run workflow, or `gh workflow run scaffold-ci.yml`), or switch it on for every push with its own repository variable: `gh variable set SCAFFOLD_CI_AUTO_RUN --body true`. It no longer follows `CI_AUTO_RUN`, the switch a module's own `ci.yml` uses, so turning on your own CI doesn't turn this one on too. When it runs, it is one job on Node 24 (add Node 22 with the "all Node versions" option on a manual run), and a newer push cancels an older run of the same branch.
 - Frontend-only module? The harness renders nothing, the scaffold gives you no `test` script or harness devDependencies, and CI treats the missing script as a pass. The harness files are inert — but if you want them gone entirely, delete them and put the line `tests/harness` (plus `vitest.config.ts`, `tests/tsconfig.json`, `tests/.gitignore`) in `.scaffoldignore` so the backfill doesn't restore them.
 
 ### Installing into a real app
@@ -1220,11 +1270,12 @@ Before publishing your module, verify:
 - [ ] Updated `package.json` (name, description, bin command)
 - [ ] Updated `module.ts` (id, name, description, version)
 - [ ] Set `depends` (id → semver range) if depending on other modules
+- [ ] Set `requires.starter` to the oldest starter release your templates work in (the default is `>=2.16.1`)
 - [ ] Wrote Prisma schema (if needed) — self-contained, no `@relation`, no cross-module FKs
 - [ ] Wrote frontend templates
 - [ ] Wrote backend templates (if needed) — `.js` extensions on all relative imports
 - [ ] **Updated `shadcnComponents` with every shadcn import from templates**
-- [ ] **Ran `npm run check:templates`** — no unescaped `` ` `` / `${}` in any template (the build misses the silent `${}` case)
+- [ ] **Ran `npm run check:templates`** — no unescaped `` ` `` / `${}` and no single-backslash `\u0000` / `\d` escapes in any template (the build misses both)
 - [ ] Added registry registrations (navigation, dashboard, preferences, etc.)
 - [ ] Updated `index.ts` barrel files to import registrations as side effects
 - [ ] Tested with `npm run build && npm link`
