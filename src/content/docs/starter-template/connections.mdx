@@ -21,6 +21,8 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 
 **Shipped in v2.18.10:** the second half of phase A4: [key-based services](#key-based-services) (a user pastes a key where a sign-in service sends them to its own page), [the account picker](#the-account-picker) modules share, and [the Reconnect prompt](#the-reconnect-prompt) every module gets when a call finds a connected account cut off.
 
+**Shipped in v2.18.11:** phase A5, [recurring work](#recurring-work): `registerSweep` in the jobs feature, and the [keep-alive](#refreshing) that renews unused service connections before a service lets them lapse, with an admin setting to switch it off.
+
 **Everything else on this page is the agreed design and is not built yet:** resources inside a service connection, access keys, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
 </Aside>
 
@@ -470,7 +472,7 @@ If the person's sign-in expired while they were on the service's screen, the pag
 
 - **On demand.** `fetch()` refreshes when the access token is within a minute of expiring, or when the service has just refused it (a 401). No background job is needed for a service connection that is in use, so nothing is lost when the server restarts on the default runner.
 - **One refresh in flight per service connection.** Within a process, callers share one promise per service connection. Across server instances, the refresher first takes a short lease on the row (`refreshLeaseUntil`, one conditional `UPDATE`, 30 seconds); the others wait and then read the new token from the row. The new access token **and the new refresh token** are written in the same statement that releases the lease. This is what keeps services that issue a new refresh token each time (and cancel the old one) from breaking.
-- **Keep-alive for unused service connections** (phase A5, not built). A refresh token that is never used eventually dies. A sweep (see [Recurring work](#recurring-work)) refreshes service connections whose refresh token is within a third of its lifetime of expiring. It pauses while the backend is idle and catches up on the next request.
+- **Keep-alive for unused service connections** (phase A5, shipped in v2.18.11). A refresh token that is never used eventually dies (Microsoft: 90 days; Google: six months unused). A sweep (see [Recurring work](#recurring-work)), every six hours while the backend is in use, renews the active service connections whose refresh token is within a third of its lifetime of running out, through the same path a call uses (one renewal at a time, the lease, a rotated token stored in the same write). A renewal is noted in the person's activity list ("Access renewed while unused"). A service that refuses moves the account to "Needs reconnecting" and the person is told once: better now than when a module next needs it. A passing failure waits for the next sweep. It only acts for a service the app owner has set up whose definition says how long its refresh token lasts (`auth.refreshTokenLifetimeDays`). It pauses while the backend is idle and catches up on the next request. [The admin's setting](#the-admins-settings) "Keep unused service connections from running out" (on to begin with) switches it off.
 - **A refresh the service refuses** moves the service connection to "needs reconnecting". Only the service's own "this grant is no longer valid" answer (`invalid_grant`) counts as a refusal: the person revoked access, or the refresh token ran out.
 - **Any other failure is passing** (the service is down, a timeout, the new tokens could not be saved). The service connection's state does not change, the call fails with `ConnectionUnavailableError`, and that service connection waits 30 seconds before trying again. `connection.refreshFailed` fires once per run of failures, not once per attempt.
 
@@ -603,6 +605,7 @@ Registering an app with a provider is the app owner's job and cannot be done onc
 | Email users when a service connection needs reconnecting | On | On: the email is sent unless the user turns it off. Off: it is sent only to users who turn it on. The notice inside the app is always shown. |
 | Keep activity for | 1 year | How long each event of a service's activity list is kept (30 days to 10 years). |
 | Show in the activity list | 30 | How many of the latest events a service's detail panel shows (5 to 100). |
+| Keep unused service connections from running out (v2.18.11) | On | On: an account nobody has used lately has its access renewed before the service lets it lapse (the [keep-alive](#refreshing)). Off: it lapses, and the user reconnects it when a module next needs it. |
 
 What is **not** a setting: anything that keeps a service connection safe. The sign-in handshake's checks, encryption, the renewal rules and the time limits on calls stay in code.
 
@@ -711,7 +714,7 @@ Events from connected services (above) are receivers with one extra step: findin
 
 ### Recurring work
 
-The jobs seam can run something once, later. It cannot run something **every hour**, and the default runner forgets delayed work on restart. Three parts of this foundation need recurring work (the keep-alive refresh, the incoming-event sweeper, the outgoing-delivery sweeper), and the consumers need more (polling for reviews, renewing calendar watches, scheduled document pulls).
+**Shipped in v2.18.11** (see [Jobs](/starter-template/jobs-feature/#recurring-work-sweeps)). Before it, the jobs seam could run something once, later, but not **every hour**, and the default runner forgets delayed work on restart. Three parts of this foundation need recurring work (the keep-alive refresh, the incoming-event sweeper, the outgoing-delivery sweeper), and the consumers need more (polling for reviews, renewing calendar watches, scheduled document pulls).
 
 The design adds one small helper to the jobs feature, generalising what the timestamp queue already does:
 
@@ -725,6 +728,8 @@ registerSweep({
 
 - A sweep is a timer in the process, not a queue: **the work it claims lives in database rows**, with a lease so two server instances never take the same row.
 - It **pauses while the backend is idle** and runs once on the next request, so it never keeps the Neon compute awake.
+- One run at a time per sweep; the first run comes shortly after start, so a backend that restarts often still runs it; a run that throws is logged and the next tries again; at shutdown its `signal` is aborted and the drain waits for it.
+- The keep-alive (`connections.keep-alive`, every six hours) is the first sweep. The incoming-event and outgoing-delivery sweepers come with their phases.
 
 <Aside type="caution" title="The honest limit: timed work waits for the app to be awake">
 With nobody using the app and no incoming event, a sweep does not run. For most of this foundation that is harmless (a token is refreshed on the next call). It matters for a module that must act at a set time with nobody around, such as a follow-up email three days after a job. That module needs the durable runner (`JOBS_RUNNER=pg-boss`, paid compute) or an outside timer that calls the app. See [Decision 7](#decisions).
@@ -1130,7 +1135,7 @@ Part A first, then Part B. Each phase ends with something to see or test, then o
 | **A4, first half** (shipped, v2.18.3) | Microsoft 365; a switch per use for each account, with the service asked only for what the switched-on uses need; adding access to a connected account; the Integrations page as a grid of cards with a detail panel; ticking permissions to try on the admin's own test account, proved by the test call. | Connect a Microsoft account; tick calendar access in the guide and run the test call; switch a use off and on. |
 | **A4, the activity log** (shipped, v2.18.4) | A log of what happened to each connected account (connected, switched, used, cut off, disconnected), kept for a year and shown in the service's detail panel; its table, with the update scripts' auto-add; deletion and export. | Open a service's panel and read its Activity after connecting, switching a use and disconnecting. |
 | **A4, second half** (shipped, v2.18.10) | Key-based services; the account picker; the prompt that offers Reconnect when a call answers `connection_needs_reconnect`. | Paste a key for a key-based service (once a module registers one: none ships with the starter). Open the picker with two accounts connected. Make a call on an account the service has cut off. |
-| **A5. Recurring work** | `registerSweep`; the keep-alive refresh. | Leave a test service connection unused and watch the sweep refresh it. |
+| **A5. Recurring work** (shipped, v2.18.11) | `registerSweep`; the keep-alive refresh, with its admin setting. | Leave a test service connection unused and watch the sweep refresh it (its activity list notes "Access renewed while unused"). Microsoft's window opens 60 days after the last renewal, so a quick test needs a test account whose `refreshTokenExpiresAt` is moved closer. |
 | **B1. Devices and keys** | The key table; create / list / revoke; `requireAccessKey`; the Linked devices page becomes Devices and keys. | Create a key, call `/automation/me` with it, revoke it, call again and get refused. |
 | **B2. Actions and the catalogue** | `registerAction`, the action route, idempotency, the catalogue. | Call a sample action with a key from a command line. |
 | **B3. Triggers** | `registerTrigger`, `emitTrigger`, subscriptions, signed deliveries with retries, the private-address check, the delivery log. | Subscribe a test address, fire a sample trigger, see it arrive signed and appear in the log; point it at a private address and see it refused. |

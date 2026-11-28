@@ -103,9 +103,44 @@ Since v2.13.0 the user feature registers **`user.deletionRetry`** (`features/use
 
 See [When a deletion doesn't finish](/starter-template/security-feature/#when-a-deletion-doesnt-finish) for the whole flow.
 
+## Recurring work (sweeps)
+
+**Since v2.18.11.** A job runs once, later. A **sweep** runs every so often, while the backend is in use: renewing service connections nobody has used, polling a service for new items, tidying up. Register one at import time, in a `*.registration.ts`:
+
+```typescript
+import { registerSweep } from '../jobs/index.js';
+
+registerSweep({
+  name: 'reviews.poll',            // dotted, by owner
+  everyMs: 60 * 60_000,           // at least a minute
+  firstRunAfterMs: 5 * 60_000,    // optional; default a minute after start
+  run: async ({ signal }) => {
+    // Find due rows (claim them with a lease), work them, stop when `signal` is aborted.
+    return { polled: 3 }; // optional: logged with the run when it isn't empty
+  },
+});
+```
+
+What a sweep is, and isn't:
+
+- **A timer in the process, not a queue.** The work it finds lives in database rows, which it claims with a lease, so two server instances never take the same row and a restart loses nothing.
+- **One run at a time** per sweep. A tick while one runs is skipped; `runSweepNow(name)` while one runs joins it.
+- **It pauses while the backend is idle** ([idle mode](/starter-template/data-fetching/#the-backends-idle-mode)): a tick then runs once on the next request, however many were missed, so a sweep never keeps the database compute awake.
+- **The first run comes shortly after start**, so a backend that restarts often still runs its sweeps.
+- **A run that throws is logged** and the next tick tries again. `getSweepStatus()` gives each sweep's last run and outcome.
+- **At shutdown** the timers stop, a running sweep's `signal` is aborted, and the jobs drain waits for it (within the shutdown timeout).
+
+Sweeps start with `startJobRunner()` (whatever the runner does, so a broken durable adapter doesn't stop them) and stop with the jobs drain on `app.shutdown`. Timers are unref'd.
+
+<Aside type="caution" title="With nobody using the app, a sweep doesn't run">
+That is the point of idle mode, and harmless for upkeep. Work that must happen at a set time with nobody around (a reminder email three days after something) needs the durable runner (`JOBS_RUNNER=pg-boss`, which keeps the compute awake) or an outside timer that calls the app.
+</Aside>
+
+The first sweep is the service connections keep-alive (`connections.keep-alive`, every six hours). See [Service connections](/starter-template/connections/#refreshing).
+
 ## What the foundation deliberately does not do
 
-- **Cron / recurring schedules** — use the runner's native scheduling through the adapter escape hatch (pg-boss has `schedule()`), or an interval that calls `enqueueJob`. A first-class scheduling seam is future roadmap territory.
+- **Cron-style schedules at a set time of day** — a sweep runs every so often, not at 9am. For exact timing use the runner's native scheduling through the adapter escape hatch (pg-boss has `schedule()`).
 - **Retries on the inline runner** — retry semantics belong to a durable queue; faking them in-process would hide the durability gap.
 - **Concurrency caps / backpressure on the inline runner** — every enqueue starts immediately. If an HTTP-reachable path can enqueue at attacker-controlled rates, rate-limit that route (the global limiter already applies) or use the durable runner, whose worker pool bounds concurrency.
 - **A jobs dashboard** — pg-boss's tables are queryable; admin surfacing can come later.
