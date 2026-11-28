@@ -19,7 +19,9 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 
 **Added in v2.18.7:** [the admin's settings](#the-admins-settings). Six judgement calls about service connections are settings on the admin Integrations page instead of values fixed in code.
 
-**Everything else on this page is the agreed design and is not built yet:** API-key services, the `ConnectionPicker`, the reconnect prompt, access keys, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
+**Shipped in v2.18.10:** the second half of phase A4: [key-based services](#key-based-services) (a user pastes a key where a sign-in service sends them to its own page), [the account picker](#the-account-picker) modules share, and [the Reconnect prompt](#the-reconnect-prompt) every module gets when a call finds a connected account cut off.
+
+**Everything else on this page is the agreed design and is not built yet:** resources inside a service connection, access keys, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
 </Aside>
 
 ## The decision this page designs to
@@ -188,7 +190,7 @@ What a definition can contain:
 |---|---|
 | `id`, `name`, `description`, `category` | Identity and where its card sits. `category` is a string checked against the category registry (extensible). |
 | `auth` | **How to sign in.** `type: 'oauth2'` (addresses, PKCE, client authentication, base scopes, extra parameters) or `type: 'apiKey'` (the fields to ask for and how the key rides on a request). |
-| `auth.identify` | Works out which account was connected (a stable id and a label). For API-key services it doubles as "test this key". |
+| `auth.identify` | Works out which account was connected (a stable id and a label). For key-based services it doubles as "test this key". |
 | `auth.refresh` | **How to refresh:** `'refresh_token'` (the standard exchange), `'none'`, or a function for services that do it their own way. |
 | `auth.revoke` | **How to revoke.** Defaults to the standard revocation call at `revokeUrl`; a function for services with their own call; absent when the service has none. |
 | `auth.refreshTokenLifetimeDays` | Lets the keep-alive sweep refresh a service connection before an unused refresh token dies (Xero's lasts 60 days). |
@@ -200,7 +202,7 @@ What a definition can contain:
 | `webhooks` (optional) | Incoming events: how to verify a delivery against the raw body, how to answer the service's own handshake, how to turn a delivery into events. See [A7](#a7-events-coming-in-from-connected-services). |
 | `setup` | Env var names, the provider console address and a help article, for the admin page. |
 
-An API-key service (an SMS provider, say) is the same definition with a different `auth`:
+A key-based service (an SMS provider, say) is the same definition with a different `auth`:
 
 ```typescript
 auth: {
@@ -209,8 +211,8 @@ auth: {
     { key: 'accountId', label: 'Account ID', secret: false },
     { key: 'apiKey', label: 'API key', secret: true },
   ],
-  apply: (request, credentials) => {
-    request.headers.set('Authorization', `Bearer ${credentials.apiKey}`);
+  apply: (headers, credentials) => {
+    headers.set('Authorization', `Bearer ${credentials.apiKey}`);
   },
   identify: async (ctx) => {
     const account = await ctx.fetchJson('https://api.example-sms.com/v1/account');
@@ -219,7 +221,23 @@ auth: {
 },
 ```
 
-The key is typed into a form on the card, sent once over HTTPS, encrypted, and never sent back to the browser.
+The key is typed into a form in the service's detail panel, sent once over HTTPS, encrypted, and never sent back to the browser.
+
+#### Key-based services
+
+**Shipped in v2.18.10.** A **sign-in service** sends the user to its own sign-in page. A **key-based service** hands the user a key, which they paste into this app. Everything after connecting is the same for both: uses and their switches, the activity log, the typed errors, the notice when it stops working, disconnecting, and account deletion.
+
+- **The definition.** `fields` names what to ask for, each with a `label`, whether it is `secret`, and an optional `help` line (where to find it). `apply(headers, credentials)` puts the key on a request however the service wants it (an `Authorization` header, an `X-API-Key` header). `identify` says whose key it is, which doubles as testing the key.
+- **What the registry refuses.** A key-based service with no field, a field without a key or a label, two fields with the same key, or a permission that lists scopes. A key grants what it grants: there is nothing to ask the service for, so its permissions are labels only (`scopes: []`).
+- **Nothing for the app owner to set up.** So a key-based service is on offer once an installed module uses it, and not before. The admin Integrations page lists it as "No set-up needed".
+- **Connecting.** `POST /api/v1/connections/key` with `{ serviceId, fields, uses?, connectionId? }` (a web session only, like the other routes that change something). The fields are checked against the definition (exactly its fields, each non-empty, trimmed), then the key is tested with the service through `identify`. A key the service refuses answers `400` with the code `connection_key_rejected` and stores nothing. A service that can't be reached answers `502`. Error messages never quote what was typed.
+- **Stored the same way.** One encrypted envelope in `credentialsCiphertext`, the tenant's key, bound to the row's id. The key is never logged, never placed in an error and never sent back: the catalogue carries the fields' labels only (`keyFields`).
+- **Replacing a key.** The same route with `connectionId`. A new key for the **same** account renews that service connection in place (and brings it back from "Needs reconnecting"); the uses the person had switched off stay off. A key for a **different** account becomes a service connection of its own and the first is left untouched, exactly as when a person picks another account on a sign-in service's screen.
+- **Using it.** `connections.use()` and `fetch()` work unchanged. The key rides on each call the way `apply` says, set last so a module can't replace it, and only to the service's `allowedHosts`.
+- **When the service refuses the key.** There is nothing to renew. After a `401` the key is tested once with `identify`. If the service refuses it there too, the service connection moves to "Needs reconnecting", the person is told once, and the call throws `ConnectionNeedsReconnectError`. If the test passes, the call is repeated once (the first refusal was about that call, not the key). A test that can't be made is a passing failure and changes nothing.
+- **Disconnecting** deletes the stored key. A key can't be cancelled from here, so the notice says the key still works at the service until it is removed there.
+
+No key-based service ships with the starter: a module registers the one it needs.
 
 #### How a module declares what it needs
 
@@ -267,7 +285,7 @@ const response = await google.fetch(
 
 **A module can only use what it declared.** `use()` checks that `moduleId` declared this service, and each permission asked for, with `requireService`. Asking for anything else is a coding mistake and throws a plain error, not one of the typed ones.
 
-Still to come (phase A4): applying an API key for key-based services, and addressing a `resource` (`google.fetch(url, { resource: organisationId })`).
+For a [key-based service](#key-based-services) (v2.18.10) the same `fetch()` puts the key on the call the way the definition says. Still to come: addressing a `resource` (`google.fetch(url, { resource: organisationId })`).
 
 **Modules never see a refresh token, and in this design not an access token either.** A module that wants to remember which service connection to use stores the `connectionId` (an id, not a secret) in its own settings.
 
@@ -369,7 +387,7 @@ securityRegistry.register({
 **Supported from day one.** Two Google accounts, or a second Xero login, are two `ServiceConnection` rows. The unique key stops the same account being connected twice (connecting it again updates the existing row).
 
 - A module that finds exactly one service connection for its service uses it without asking.
-- With more than one switched on for the module (see [a switch per use](#a-switch-per-use-for-each-account)), `connections.use()` without a `connectionId` throws `ConnectionChoiceRequiredError`. A shared `ConnectionPicker`, so every module asks the same way, is still to come.
+- With more than one switched on for the module (see [a switch per use](#a-switch-per-use-for-each-account)), `connections.use()` without a `connectionId` throws `ConnectionChoiceRequiredError`. Every module asks the same way, with [the account picker](#the-account-picker) (v2.18.10).
 - **Several Xero organisations under one Xero login are resources of one service connection**, not several service connections. The picker shows them under the service connection.
 
 Ruling it out would have been cheaper by one picker component and a little query logic, and would have been wrong for the first real consumer (a business owner with a personal and a work Google account is the normal case).
@@ -468,8 +486,8 @@ If the person's sign-in expired while they were on the service's screen, the pag
 
 - The page asks `GET /api/v1/connections/catalog`, which returns the services this user should see (every sign-in service the app owner has configured, every key-based service a module requires, and any the person already holds a service connection to), each with its permissions, which modules need them and why, and the user's service connections with live status.
 - **A grid of cards** (v2.18.3), one generic card per service under its category, each category with a count. A card shows the service's mark, name and description, who is connected (or what it is used for), one main action (**Connect**, or **Manage** once connected) and a small menu. An account the service has cut off, or a switched-on use that lacks access, shows **Needs attention**.
-- **A detail panel per service** (v2.18.3), opened from its card: each connected account with Reconnect and Disconnect, and [a switch per use](#a-switch-per-use-for-each-account); the uses to choose before connecting; and "Connect another account". A small form for API-key services is still to come. Since v2.18.4 the panel ends with the service's [activity log](#the-activity-log).
-- **No provider logos are shipped** (they are the providers' trademarks). The mark is the service's initial in a shadcn `Avatar`, with `data-part="service-icon"` and `data-service="<id>"` for a style module to put a logo in its place. The card and the panel are canonical shadcn compositions (`Card`, `Sheet`, `Item`, `Switch`): they keep the primitives' own `data-slot` hooks and add `data-part` hooks beside them (`service-connection-card`, `service-connection-sheet`, `service-connection`, `service-connection-use`).
+- **A detail panel per service** (v2.18.3), opened from its card: each connected account with Reconnect and Disconnect, and [a switch per use](#a-switch-per-use-for-each-account); the uses to choose before connecting; and "Connect another account". A [key-based service](#key-based-services) is connected from the same panel with a small form (v2.18.10): its card's Connect always opens the panel, each account offers **Replace key**, and a key is never shown once saved. Since v2.18.4 the panel ends with the service's [activity log](#the-activity-log).
+- **No provider logos are shipped** (they are the providers' trademarks). The mark is the service's initial in a shadcn `Avatar`, with `data-part="service-icon"` and `data-service="<id>"` for a style module to put a logo in its place. The card and the panel are canonical shadcn compositions (`Card`, `Sheet`, `Item`, `Switch`): they keep the primitives' own `data-slot` hooks and add `data-part` hooks beside them (`service-connection-card`, `service-connection-sheet`, `service-connection`, `service-connection-use`, and since v2.18.10 `service-key-form`, `connection-picker` with `data-state`, and `reconnect-prompt` with `data-reason` and `data-service`).
 - One notice at the top of the page shows the latest event only (`ConnectionNotice`, v2.18.1): the account just connected, a return that failed, or the account just disconnected, with whether the service confirmed it cancelled the access.
 - Keys for outside tools are not on this page. They sit with linked devices on one **Devices and keys** page (see [B1](#b1-access-keys)), and this page links there.
 
@@ -487,9 +505,47 @@ What changes in the existing public pieces:
 
 New frontend pieces, in `frontend/src/features/connections/`:
 
-- `useConnections(serviceId?)` and `useServiceAvailability(serviceId)`: TanStack Query hooks, keys namespaced `['connections', …]`.
-- `ConnectionPicker`: choose which service connection (and which resource) a module should use.
-- A standard prompt when a call fails with "needs reconnecting" (phase A4): the API client recognises the error code, as it does for step-up, and offers Reconnect.
+- `useConnections(serviceId?, moduleId?)` and `useServiceAvailability(serviceId)` (v2.18.10): TanStack Query hooks that read the same catalogue the Integrations page does, so they cost no request of their own. With a `moduleId`, `useConnections` gives only the accounts that module's use is switched on for. A module uses `useServiceAvailability` to hide what needs a service the app owner has not set up. Import them from `@/features/connections/hooks/useConnections`.
+- [The account picker](#the-account-picker) (v2.18.10).
+- [The Reconnect prompt](#the-reconnect-prompt) (v2.18.10).
+
+#### The account picker
+
+**Shipped in v2.18.10.** A person may connect more than one account at a service. A module that needs one shows the picker, so every module asks the same way. A module renders it through the [component registry](/starter-template/registries/), without importing it and without it joining the first load:
+
+```tsx
+import { EmbeddedSlot } from '@/components/EmbeddedSlot';
+import type { ConnectionPickerProps } from '@/features/connections';
+
+<EmbeddedSlot<ConnectionPickerProps>
+  id="connections.picker"
+  props={{ serviceId: 'google', moduleId: 'tasks', value: connectionId, onChange: setConnectionId }}
+/>
+```
+
+It offers only the accounts the module's use is switched on for, which are the ones `connections.use()` would find. What it shows:
+
+| The person has | The picker shows |
+|---|---|
+| No account switched on for this module | That none is connected, with a link to the Integrations page |
+| Exactly one | Its name. It is used without asking, so there is nothing to choose |
+| Several | A dropdown. An account that needs reconnecting, or lacks access the module needs, says so in its label |
+| A choice that has since gone | That the account chosen before is no longer connected, and the dropdown again |
+| The service is not on offer | That it isn't available (a module usually hides its part instead) |
+
+The module stores the chosen `connectionId` (an id, not a secret) in its own settings and passes it to `connections.use()`. Choosing a **resource** inside a service connection (a Xero organisation) comes with resources, which are not built yet.
+
+#### The Reconnect prompt
+
+**Shipped in v2.18.10.** When a module's route lets `ConnectionNeedsReconnectError` escape, the backend answers `409` with the code `connection_needs_reconnect` (see [A6](#a6-when-things-go-wrong)). The API client recognises that answer, as it does step-up's, and the app shell opens one standard dialog. No module builds its own.
+
+- **What it says.** Which account at which service, and why: the access was cancelled, it ran out, or it lacks something the call needed (named in plain words).
+- **What it offers.** For a sign-in service, **Reconnect** (or **Add access**) goes straight to the service's own sign-in page for that account and comes back to the Integrations page. For a key-based service there is no sign-in to repeat, so it opens the service's panel on the Integrations page (`/settings/integrations?service=<id>`), where the key is replaced.
+- **It doesn't nag.** One prompt at a time, and once per account per visit: a page that makes five calls on a cut-off account asks once, and "Not now" is respected until the page is reloaded. The card on the Integrations page keeps saying "Needs attention".
+- **Nothing is retried.** Unlike step-up, reconnecting usually means leaving the page. The failed call still reaches its caller as it is, so a module can show its own message too.
+- **Opting out.** A call whose own screen explains the failure passes `withoutReconnectPrompt()` from `@/lib/connection-prompt` as its request options. The admin's test call does.
+
+How it is wired: `lib/connection-prompt.ts` is the bridge (no React, no feature imports), `lib/api.ts` calls it from its response interceptor, and the connections feature mounts `ReconnectPromptHost` through `shellInitRegistry`. The dialog itself loads on demand.
 
 ### A5. App-owner setup
 
@@ -572,7 +628,7 @@ How it is kept:
 | `ConnectionNeedsReconnectError` | Revoked, expired, or a permission is missing (`reason`, `missingPermissions`). | Pause; the user has been told. |
 | `ConnectionUnavailableError` | A passing failure (the service is down). | Retry later. |
 
-A route that lets one of these escape answers `409` (`503` for `ConnectionUnavailableError`, which is safe to retry) with a stable `code` (`service_not_configured`, `connection_required`, `connection_choice_required`, `connection_needs_reconnect`, `connection_unavailable`) and a `details` object carrying the `serviceId`. A reconnect error adds `reason` (`revoked`, `expired` or `permissions`), `missingPermissions` and `connectionId`. This is what the frontend prompt (phase A4) reads. `AppError` gained the optional `details` field for this in v2.18.1.
+A route that lets one of these escape answers `409` (`503` for `ConnectionUnavailableError`, which is safe to retry) with a stable `code` (`service_not_configured`, `connection_required`, `connection_choice_required`, `connection_needs_reconnect`, `connection_unavailable`) and a `details` object carrying the `serviceId`. A reconnect error adds `reason` (`revoked`, `expired` or `permissions`), `missingPermissions` and `connectionId`. This is what [the Reconnect prompt](#the-reconnect-prompt) reads (v2.18.10). `AppError` gained the optional `details` field for this in v2.18.1.
 
 **For the audit trail.** Action hooks, added to the `CoreHooks` catalogue, ids only and never token material: `connection.connected` (with `reconnected: true` when the person renewed an account that was already connected; there is no separate reconnected hook), `connection.disconnected`, `connection.refreshFailed` (with the service's error `code` and whether it is `temporary`) and `connection.needsReconnect` (with the `reason`). A module subscribes to `connection.needsReconnect` to pause its own work and to `connection.connected` to resume it. `connection.useChanged` (v2.18.3) fires when a person switches one use on or off for one account, with the module id and `enabled`.
 
@@ -970,7 +1026,7 @@ Added on review. Sending a text message becomes a foundation service with the sa
 - **One call for modules:** `sendSms({ to, body, tenantId, category })`. It answers with what happened (sent, skipped, failed), never a faked success.
 - **A provider behind an adapter.** Twilio first, called over HTTPS, so there is no SDK to install. The adapter interface leaves room for another provider.
 - **Set up by the admin through a setup guide:** choose the provider, enter its credentials (stored encrypted, or from env), choose the sender, then send a test message to the admin's own phone and type the code back. That last step is the same proof the email setup uses.
-- **App-wide to begin with.** One provider account, the app owner's, sends every message, as with email, and the app owner pays per message. Because of that, the admin sets a daily cap per account. A user bringing their own SMS account (an API-key service connection from Part A) is the alternative: see [Decision 12](#decisions).
+- **App-wide to begin with.** One provider account, the app owner's, sends every message, as with email, and the app owner pays per message. Because of that, the admin sets a daily cap per account. A user bringing their own SMS account (a key-based service connection from Part A) is the alternative: see [Decision 12](#decisions).
 - **Delivery reports and replies** come back through an [incoming-webhook receiver](#incoming-webhooks-for-the-apps-own-providers). A reply of STOP puts the number on a do-not-text list that `sendSms` honours.
 - **Audit:** `sms.sent` and `sms.failed` action hooks, with the number masked and never the message.
 
@@ -1073,7 +1129,7 @@ Part A first, then Part B. Each phase ends with something to see or test, then o
 | **A3. Using a service connection** (shipped, v2.18.1) | The row-level-security switch for the new tables; `connections.use()` and `fetch()`; refresh with one in flight; typed errors; "needs reconnecting", the notification and the audit events; an admin "test call" button. | Press "test call" before and after the token expires; revoke access at Google and watch the card change and the notification arrive. |
 | **A4, first half** (shipped, v2.18.3) | Microsoft 365; a switch per use for each account, with the service asked only for what the switched-on uses need; adding access to a connected account; the Integrations page as a grid of cards with a detail panel; ticking permissions to try on the admin's own test account, proved by the test call. | Connect a Microsoft account; tick calendar access in the guide and run the test call; switch a use off and on. |
 | **A4, the activity log** (shipped, v2.18.4) | A log of what happened to each connected account (connected, switched, used, cut off, disconnected), kept for a year and shown in the service's detail panel; its table, with the update scripts' auto-add; deletion and export. | Open a service's panel and read its Activity after connecting, switching a use and disconnecting. |
-| **A4, second half** | API-key services; the `ConnectionPicker`; the prompt that offers Reconnect when a call answers `connection_needs_reconnect`. | Paste a key for a key-based service. |
+| **A4, second half** (shipped, v2.18.10) | Key-based services; the account picker; the prompt that offers Reconnect when a call answers `connection_needs_reconnect`. | Paste a key for a key-based service (once a module registers one: none ships with the starter). Open the picker with two accounts connected. Make a call on an account the service has cut off. |
 | **A5. Recurring work** | `registerSweep`; the keep-alive refresh. | Leave a test service connection unused and watch the sweep refresh it. |
 | **B1. Devices and keys** | The key table; create / list / revoke; `requireAccessKey`; the Linked devices page becomes Devices and keys. | Create a key, call `/automation/me` with it, revoke it, call again and get refused. |
 | **B2. Actions and the catalogue** | `registerAction`, the action route, idempotency, the catalogue. | Call a sample action with a key from a command line. |
