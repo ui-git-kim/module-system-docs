@@ -81,6 +81,16 @@ export interface DocumentManagementServiceInterface {
   linkDocument(nodeId: string, userId: string, input: LinkDocumentInput): Promise<NodeLink>;
 
   /**
+   * Split one of the person's PDFs into parts by page, each a document of its
+   * own mapped to the original (never changed). Same file and sizes: the same
+   * parts. v1.24.0+; see "Splitting a PDF into parts".
+   */
+  splitDocument(documentId: string, userId: string, options?: SplitDocumentOptions & { source?: string }): Promise<DocumentParts>;
+
+  /** A document's parts: an original's newest complete split, or the split a part belongs to (null: none). v1.24.0+. */
+  getDocumentParts(documentId: string, userId: string): Promise<DocumentParts | null>;
+
+  /**
    * Upload a file to the user's default provider (the user's own isDefault
    * provider, else the admin-set app-wide shared default). opts.folder is
    * honoured on EVERY target, resolved relative to the caller's effective
@@ -459,6 +469,7 @@ The exact event ids and context shapes (from `action.registration.ts` and the se
 | `documents.document.updated` | `{ userId, documentId }` | A reference's tags, notes, favourite, or status changes. |
 | `documents.provider.connected` | `{ userId, providerId, providerType }` | A storage provider is created/connected. `providerType` is `s3 \| r2 \| webdav \| local`. |
 | `documents.provider.disconnected` | `{ userId, providerId }` | A storage provider is removed. |
+| `documents.document.split` | `{ userId, documentId, parts: [{ documentId, part, of, fromPage, toPage }] }` | A PDF was split into parts (v1.24.0+). `documentId` is the original. A part fires no `documents.document.uploaded`, so an upload consumer doesn't take its pages in again. |
 | `documents.document.generated` | `{ userId, documentId, nodeId, templateId }` | A Word document was made from a record (v1.19.0+). `templateId` is `null` for the automatic summary. The document's own `documents.document.uploaded` and `documents.document.linked` fire first. |
 | `documents.template.created` | `{ userId, templateId }` | An admin added a document template (v1.19.0+). `userId` is the admin. |
 | `documents.template.updated` | `{ userId, templateId }` | An admin changed a template or replaced its file. |
@@ -1460,6 +1471,48 @@ How it works:
 - **Limits.** One document lists at most 500 records and makes at most 1,500 `resolveTemplate` calls; past either, the rest is left out or blank, with a warning. A loop lists at most 200 records and loops nest at most 3 deep.
 - **Who may use which template.** Templates are added by admins only. Anyone signed in can use an enabled template for the record's type, or an any-type (`*`) one, on a record they can open. A template for another type is refused with a `400`; a disabled or missing template is a `404`, and so is a record the person cannot open.
 - **File name.** The template's pattern, filled in with the same tags. Without one it is `<record> - <template>.docx`, and the summary is `<record> - Summary.docx`.
+
+## Splitting a PDF into parts (v1.24.0+)
+
+A long PDF is more than an AI call should take whole. Another module can ask for it in parts by page, find out once what each part covers, and from then on send only the part a question needs. Document Management does the splitting and keeps the map between the original and its parts; working out what each part covers is the consumer's.
+
+```typescript
+const dm = serviceRegistry.getOptional<DocumentManagementServiceInterface>('document-management');
+if (typeof dm?.splitDocument === 'function') {
+  const split = await dm.splitDocument(documentId, userId, {
+    maxPages: 40,           // what one call can carry
+    maxBytes: 8 * 1024 * 1024,
+    source: 'ai-chat',      // the actor of the parts' first versions
+  });
+  // split.parts: [{ documentId, part, of, fromPage, toPage, fileName, fileSize, contentHash }]
+  // Read a part as any file: dm.getDocument(part.documentId, userId), dm.getDownloadStream(...)
+}
+// Later, from the original or from any part:
+const map = await dm.getDocumentParts(documentId, userId); // null: never split
+```
+
+What comes back (`DocumentParts`):
+
+| Field | Meaning |
+|-------|---------|
+| `original` | `{ documentId, fileName, pageCount }` |
+| `split` | `false` when the PDF already fits the sizes: nothing was copied, and its one part is the original itself |
+| `stale` | The original's file has changed since it was split. Split again for parts of the file as it is now |
+| `complete` | Every part is still there; `false` when one has gone to the trash (only from a part: from the original you get its newest complete split, or `null`) |
+| `maxPages`, `maxBytes` | The sizes the parts were made to |
+| `createdAt` | When the parts were made; `null` when nothing was copied |
+| `parts` | In page order: `{ documentId, part, of, fromPage, toPage, fileName, fileSize, contentHash }`. Pages are 1-based and inclusive |
+
+How it works:
+
+- **Pages are copied as they are.** No text is read or changed; each part is a PDF of consecutive pages. The original is never touched and stays the record. A part records which original it came from and the original file's SHA-256 when it was split, in `doc_document_parts`.
+- **Each part is a document of its own**, stored through `uploadToDefault(..., { reference: true })` on the person's default storage, in *Document parts/<original name>/*, named like *Affidavit - part 3 of 5 (pages 87-128).pdf*. It has its own `documentId`, first version (`upload`, by `source` when given) and fingerprint, and it can be attached, linked or read like any document.
+- **Sizes.** `maxPages` 1 to 1,000 (default 50) and `maxBytes` 256 KB to 100 MB (default 10 MB); anything else is refused with a `400`. Parts are as even as the page limit allows (212 pages at 50: 43, 43, 42, 42, 42). A part over `maxBytes` is halved until it fits or is a single page. At most 200 parts.
+- **Asked again** for the same file with the same sizes, the same parts come back and nothing is stored. Other sizes make a split of their own, and `getDocumentParts` then gives the newest.
+- **What is refused** (`400`, in words to show a person): not a PDF; a PDF that needs a password to open (a *secured* one, with restrictions but no password to open it, is split); one that can't be read; over 100 MB; a part (split the original); a document in the trash. A document that isn't the person's is a `404`. One split at a time per person; another meanwhile is a `409`.
+- **Parts follow their original**: to the trash, back, and deleted for good with it. A part moved to the trash on its own makes its split incomplete.
+- **No upload event for a part**, so the cognitive pipeline doesn't ingest pages it already has; `documents.document.split` fires instead.
+- **Over HTTP**: `POST /api/v1/document-management/documents/:id/split` with `{ maxPages?, maxBytes? }` (never a `source`), and `GET /api/v1/document-management/documents/:id/parts`.
 
 ## Record history and the trash (v1.20.0+)
 
