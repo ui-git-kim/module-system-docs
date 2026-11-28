@@ -23,7 +23,9 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 
 **Shipped in v2.18.11:** phase A5, [recurring work](#recurring-work): `registerSweep` in the jobs feature, and the [keep-alive](#refreshing) that renews unused service connections before a service lets them lapse, with an admin setting to switch it off.
 
-**Everything else on this page is the agreed design and is not built yet:** resources inside a service connection, access keys, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
+**Shipped in v2.18.13:** phase B1, [access keys](#b1-access-keys). A user creates a key on the **Devices and keys** settings page so an outside tool can act for them, for only what they ticked; a route takes a key only when it asks with `requireAccessKey`. Four admin settings sit under **Access keys** on the admin Integrations page. See [B1 as built](#b1-as-built).
+
+**Everything else on this page is the agreed design and is not built yet:** resources inside a service connection, triggers and actions, Zapier, incoming webhooks and SMS. Names and types of the unbuilt parts may still change.
 </Aside>
 
 ## The decision this page designs to
@@ -872,6 +874,52 @@ model AccessKey {
 ```
 
 **Structure's own API keys move onto this** (decided on review). Structure keeps its public API and its per-type switches. It stops issuing and checking keys itself and mounts `requireAccessKey` with two scopes, `structure:read` and `structure:write`, created by admins as they are today. Carrying existing keys across is work in Structure's repo.
+
+#### B1 as built
+
+Shipped in v2.18.13, in a feature of its own, `features/access-keys` (backend and frontend).
+
+**A module declares what a key may do, then guards its route:**
+
+```ts
+import { accessKeyScopes, requireAccessKey } from '../access-keys/index.js';
+
+accessKeyScopes.register({
+  id: 'reviews:actions',          // '<module>:<what>', lower case
+  moduleId: 'reviews',
+  label: 'Reviews: send review requests',
+  description: 'Send a review request to a customer.',
+  writes: true,                   // it can change data, so such a key always ends
+  // adminOnly: true,             // only an admin may put it on a key
+});
+
+router.post('/request', requireAccessKey('reviews:actions'), handler);
+```
+
+Behind `requireAccessKey`, `req.user` is the key's user with `role: 'user'` and `authMethod: 'access-key'`, and `req.accessKey` is `{ id, name, scopes }`. The key may come as `Authorization: Bearer ak_…` or in `X-API-Key`. The refusals each have a code: `access_key_required` and `access_key_invalid` (401), `access_key_scope` (403, with the scope it lacks in `details.scope`), `access_key_rate_limited` (429). `requireWebSession`, `requireAdmin`, `requireRole` and `requireStepUp` all refuse a key.
+
+**The routes.**
+
+| Method | Path | What it does |
+|---|---|---|
+| `GET` | `/api/v1/access-keys` | The person's keys, what they may put on one, and the rules a new key follows. Web session only |
+| `POST` | `/api/v1/access-keys` | Create a key: `{ name, scopes, expiresInDays }` (`null` for never). Answers the key itself, once. Web session, and the emailed code at the hardened and strict levels |
+| `DELETE` | `/api/v1/access-keys/:id` | Revoke a key. Web session only |
+| `GET` / `PUT` | `/api/v1/admin/access-keys/settings` | The admin's settings, with their starting values and limits |
+| `GET` | `/api/v1/automation/me` | Whose key it is and what it may do (a tool's "test this key"). Any live key |
+
+**The rules a key follows.** It needs a name and at least one thing it may do. A key that can change data always ends, no later than the admin's longest. A read-only key may be set never to end when the admin allows it; otherwise it ends within a year. One account holds at most 50 live keys. The key is `ak_` and 32 random bytes; only its SHA-256 hash and its last four characters are kept. Its last use is written at most once an hour. Account deletion removes an account's keys, the privacy export lists them (names, permissions and dates, never a key), and `accessKey.created` / `accessKey.revoked` reach the audit trail.
+
+**The admin's settings** ([LLM rule 11](/getting-started/llm-rules/#11-a-judgement-call-is-the-admins-make-it-a-setting)), under **Access keys** on the admin Integrations page, kept in the reserved `_access_keys` record of `ServiceConnectionConfig` (no table of their own):
+
+| Setting | Starting value |
+|---|---|
+| Let users create access keys (off: only an admin can) | On |
+| Longest a key that can change data may last | 1 year |
+| Let a read-only key never end | On |
+| Calls a key may make, counted per key | 60 a minute |
+
+**Nothing in the starter takes a key yet.** Until a module declares something a key may do, the Devices and keys page says so and offers no form. Structure's move onto access keys is the first planned.
 
 ### B2. Actions
 
