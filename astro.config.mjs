@@ -152,7 +152,7 @@ export default defineConfig({
                   slug: "starter-template/email-feature",
                 },
                 {
-                  label: "Connections",
+                  label: "Service connections",
                   slug: "starter-template/connections",
                 },
                 {

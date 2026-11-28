@@ -30,7 +30,7 @@ The startup security posture, reused — not reimplemented — from the security
 
 - `evaluateStartupPosture()` findings (Neon Auth, edge, trust-proxy, hardening, …)
 - `getKeyProviderStatus()` field-encryption key readiness
-- Tier, environment, edge, and DB adapter
+- Security level, environment, edge, and DB adapter
 </TabItem>
 <TabItem label="Console">
 The live **Errors** and **Activity** feeds from the in-memory audit sink (newest first). Manual refresh only — there is no polling (except while a **Verify integrity** check runs), so a left-open admin tab never adds steady API load.
@@ -38,14 +38,14 @@ The live **Errors** and **Activity** feeds from the in-memory audit sink (newest
 </Tabs>
 
 <Aside type="tip" title="In-memory by default; durable + compliance are opt-in">
-The console is backed by an **in-memory** sink by default: buffers are bounded (about 200 errors / 500 activity), per-process, and reset on restart — intentional for a zero-config live console. Set `SECURITY_AUDIT_SINK=database` (or the strict / compliance tier) to persist events durably — see [Durable & compliance storage](#durable--compliance-storage-p2p3) below. Production observability still belongs in Sentry / a log aggregator.
+The console is backed by an **in-memory** sink by default: buffers are bounded (about 200 errors / 500 activity), per-process, and reset on restart — intentional for a zero-config live console. Set `SECURITY_AUDIT_SINK=database` (or the strict level, or compliance mode) to persist events durably — see [Durable & compliance storage](#durable--compliance-storage-p2p3) below. Production observability still belongs in Sentry / a log aggregator.
 </Aside>
 
 ## Deeper database diagnostics (Neon CLI)
 
 The Database tab above is deliberately shallow — connectivity, adapter, last migration, and row counts, all via the app's own scoped connection. Deeper diagnostics (index health and unused indexes, table / index sizes and bloat, slow queries, vacuum and dead-tuple stats, locks, Neon's local-file-cache hit rate) are **not** in the admin UI by design.
 
-Those live in Neon's CLI — [`neon inspect db`](https://neon.com/blog/neon-inspect-db), a set of read-only, agent-safe diagnostic subcommands. It is an **operator / terminal tool**: it runs with account-level Neon credentials and works only against Neon. Embedding it in the app would mean shelling out to the CLI with a broad new secret in the runtime and would break the `pg` / self-host adapter — against the [provider-delegation](/starter-template/security-feature/) floor. So its home is your terminal (or an agent wired to it via Neon's MCP), pointed at your project — not `/admin/system`.
+Those live in Neon's CLI — [`neon inspect db`](https://neon.com/blog/neon-inspect-db), a set of read-only, agent-safe diagnostic subcommands. It is a **terminal tool for the app owner**: it runs with account-level Neon credentials and works only against Neon. Embedding it in the app would mean shelling out to the CLI with a broad new secret in the runtime and would break the `pg` / self-host adapter — against the [provider-delegation](/starter-template/security-feature/) floor. So its home is your terminal (or an agent wired to it via Neon's MCP), pointed at your project — not `/admin/system`.
 
 <Aside type="note" title="A native subset ships in the app (v2.2.0)">
 The *ideas* inspect-db surfaces — real table / index sizes, unused-index and sequential-scan signals, dead-tuple / last-vacuum bloat — are standard `pg_catalog` + `pg_stat_user_*` reads the app runs natively via `prisma.$queryRaw` on its own connection (no new credential, works on `neon` or `pg`). As of **v2.2.0** these appear in a **Database internals** section on this page. Slow-query text (`pg_stat_statements`) stays out of the surface as a multi-tenant data-exposure consideration.
@@ -93,7 +93,7 @@ const recent = auditSink.queryErrors(50); // newest first
 Nothing in the emitting services changed — capture is wired by listeners:
 
 - **Errors** — the global error middleware fires an `error:unhandled` action; `features/admin/audit.registration.ts` records it. Stack traces are kept server-side outside development.
-- **Activity** — the same registration subscribes to the lifecycle hooks the starter already emits (`user.*` / `admin.*`), plus `security.dataAccessed` (v1.64.0) — audited reads of encrypted content via `auditedDecrypt`, recorded under the data **owner's** `tenantId` so cross-tenant reads are queryable per owner. Payloads are summarised and sensitive keys masked.
+- **Activity** — the same registration subscribes to the lifecycle hooks the starter already emits (`user.*` / `admin.*`), plus `security.dataAccessed` (v1.64.0) — audited reads of encrypted content via `auditedDecrypt`, recorded under the `tenantId` of the **user whose data it is**, so cross-tenant reads are queryable per user. Payloads are summarised and sensitive keys masked.
 
 To record your own activity from a module, add a listener to an existing hook or call the sink directly:
 
@@ -113,14 +113,14 @@ By default the console is **ephemeral** (in-memory). Two opt-in env knobs upgrad
 | Knob | Effect |
 |------|--------|
 | `SECURITY_AUDIT_SINK=database` | **Durable (P2).** Persists errors + activity to a self-provisioned `"AuditLog"` table while the live console still serves recent events from memory. Prunable. |
-| `SECURITY_AUDIT_MODE=compliance` (or the `strict` tier) | **Compliance (P3).** An immutable, **hash-chained**, append-only sink — never pruned. |
+| `SECURITY_AUDIT_MODE=compliance` (or the `strict` level) | **Compliance (P3).** An immutable, **hash-chained**, append-only sink — never pruned. |
 | `SECURITY_AUDIT_RETENTION_DAYS=30` | Activity-row TTL in days (default 30; `0` = keep forever). Compliance rows are never pruned. |
 
 <Aside type="note" title="No schema migration required">
 The `"AuditLog"` table is created at runtime via `CREATE TABLE IF NOT EXISTS` — it is **not** a Prisma model, so there is no schema change, migration, or `create-app` / `template:update` propagation to do. The sink uses raw SQL, so the code compiles in every app whether or not durable audit is enabled. Apps that prefer Prisma-managed schema + Row-Level Security can add an equivalent model themselves.
 </Aside>
 
-**Retention & erasure.** Activity rows age out after `SECURITY_AUDIT_RETENTION_DAYS`. They are also **owned data**: the [deletion cascade](/starter-template/security-feature/) erases a tenant's activity rows on account deletion (errors from authed requests carry the tenant; unauthenticated errors are operational telemetry that age out via retention). Compliance rows are **preserved** (legal hold) — the cascade never deletes them.
+**Retention & erasure.** Activity rows age out after `SECURITY_AUDIT_RETENTION_DAYS`. They also **belong to a user**: the [deletion cascade](/starter-template/security-feature/) erases a tenant's activity rows on account deletion (errors from authed requests carry the tenant; unauthenticated errors are operational telemetry that age out via retention). Compliance rows are **preserved** (legal hold) — the cascade never deletes them.
 
 **Tamper-evidence (compliance).** Each compliance row stores the exact canonical serialisation it was hashed over plus `hash = SHA-256(prevHash + payload)`, chained across rows and serialised with a Postgres advisory lock. `GET /api/v1/admin/system/audit/export` returns the rows for offline archival. The **History** tab on the Console page surfaces durable rows and a **Verify integrity** action.
 

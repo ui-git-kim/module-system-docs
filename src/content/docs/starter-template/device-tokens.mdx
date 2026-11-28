@@ -58,7 +58,7 @@ All live in the backend `auth` feature, mounted at `/api/v1/auth/devices`.
 | `POST` | `/auth/devices/enrol` | Public | Body `{ enrolmentToken, deviceName?, platform? }`. Verify + **consume** the enrolment token, create the device → `{ deviceToken, refreshToken, userId, apiBaseUrl, expiresAt }`. Rate-limited; generic errors. |
 | `POST` | `/auth/devices/refresh` | Public | Body `{ refreshToken }`. Rotate → `{ deviceToken, refreshToken, expiresAt }`; the presented refresh token is invalidated. Rate-limited. |
 | `GET` | `/auth/devices` | Web session | List the caller's devices: `{ id, name, platform, createdAt, lastSeenAt, status }` (never token material). |
-| `POST` | `/auth/devices/:id/revoke` | Web session | Revoke one device (owner-scoped). `DELETE /auth/devices/:id` is an alias. |
+| `POST` | `/auth/devices/:id/revoke` | Web session | Revoke one device (scoped to the user). `DELETE /auth/devices/:id` is an alias. |
 
 <Aside type="note">
   **"Web session" vs "Public".** The public endpoints (`enrol` / `refresh`) authenticate the caller by the token in the body — the companion has no session yet. The management endpoints require an interactive **web session** (a Neon Auth JWT), not a device token — see [Non-admin, web-session-only](#non-admin-web-session-only) below.
@@ -90,7 +90,7 @@ if (token.startsWith(DEVICE_TOKEN_PREFIX)) {          // 'dvc_'
 
 A device principal never carries `req.user.emailVerified` (v2.14.2): that field comes from a Neon JWT claim, so treat its absence as unverified.
 
-`verifyAccessToken` hashes the presented token, looks up the `AuthDevice` row by its unique `deviceTokenHash`, checks it is `active` (not revoked, not expired), resolves the owner's email, and throttles the `lastSeenAt` update to at most once per minute. There is **no verification cache**, so a revoke takes effect on the very next request.
+`verifyAccessToken` hashes the presented token, looks up the `AuthDevice` row by its unique `deviceTokenHash`, checks it is `active` (not revoked, not expired), resolves the user's email, and throttles the `lastSeenAt` update to at most once per minute. There is **no verification cache**, so a revoke takes effect on the very next request.
 
 **One lookup per request (v2.14.0).** Express tries each route mount whose path prefix matches until one answers, so a request can meet `requireAuth` more than once (at `/api/v1/admin`, then at `/api/v1/admin/security`, for example). Before v2.14.0 each of those mounts verified the token again, which cost a device token a second database lookup. Now `requireAuth` remembers the verified identity for the rest of that request, but only after a successful check, and keyed on the request object in a module-private map. A later mount with the same `Authorization` header gets a fresh copy of that identity without a new lookup, while a changed header is verified from scratch. Nothing carries over between requests, so the instant revoke above still holds.
 
@@ -98,8 +98,8 @@ A device principal never carries `req.user.emailVerified` (v2.14.2): that field 
 
 A device token is deliberately **lower-trust** than a web session, and two invariants enforce it:
 
-- **Never admin.** `requireAdmin`, `requireRole` and `attachRole` all refuse to elevate an `authMethod: 'device'` principal — even if the owner is an admin in the database. (They re-derive role from the DB, so this guard is explicit, not merely a default `role: 'user'`.)
-- **Management is web-session-only.** `pair`, list and revoke require `requireWebSession` (a JWT, any signed-in user — not necessarily an admin). This stops a leaked device token from enrolling *further* long-lived devices (which would survive revoking the original) or revoking the owner's other devices.
+- **Never admin.** `requireAdmin`, `requireRole` and `attachRole` all refuse to elevate an `authMethod: 'device'` principal — even if its user is an admin in the database. (They re-derive role from the DB, so this guard is explicit, not merely a default `role: 'user'`.)
+- **Management is web-session-only.** `pair`, list and revoke require `requireWebSession` (a JWT, any signed-in user — not necessarily an admin). This stops a leaked device token from enrolling *further* long-lived devices (which would survive revoking the original) or revoking the user's other devices.
 - **Account-wide actions are web-session-only too** (v2.13.0): deleting the account (`DELETE /api/v1/user`), the full personal-data export (`POST /api/v1/user/export`), and turning off security-alert emails (`emailSecurityAlerts` in `PATCH /api/v1/user/preferences`). A device principal gets **403** with `code: 'web_session_required'`. Modules should guard their own account-wide destructive or exporting actions the same way.
 - **Never a step-up.** Device tokens can't answer the emailed code of [step-up re-verification](/starter-template/security-feature/#step-up-re-verification-sensitive-actions), so every step-up-guarded route refuses them.
 
@@ -137,7 +137,7 @@ Three starter-owned tables, following the schema's isolation convention (`tenant
 - **`AuthDeviceEnrolment`** (v2.8.0) — `id`, `tenantId`, `userId`, `tokenHash` (@unique), `deviceName?`, `platform?`, `expiresAt`, `usedAt?`, `createdAt`.
 - **`AuthDeviceRetiredToken`** (v2.13.0) — `tokenHash` (@id), `deviceId`, `tenantId`, `rotatedAt`. One row per rotated-out refresh token, for [reuse detection](#token-model).
 
-All three are declared in the `auth` feature's `securityRegistry` manifest (owned models + hashed-secret fields), and a deletion handler clears an account's rows during the [account-deletion cascade](/starter-template/security-feature/). The personal-data export includes devices and enrolments, but never a hash, and leaves the retired-token table out.
+All three are declared in the `auth` feature's `securityRegistry` manifest (the models that belong to a user + hashed-secret fields), and a deletion handler clears an account's rows during the [account-deletion cascade](/starter-template/security-feature/). The personal-data export includes devices and enrolments, but never a hash, and leaves the retired-token table out.
 
 <Aside type="caution" title="Downstream apps: run a migration after updating">
   These are **new starter-owned tables**. `schema.prisma` is merge-protected, so `npm run template:update` brings them in via auto-add blocks (they also ship in `create-app` for new apps). `AuthDeviceRetiredToken` has its own block, so apps that already have the device tables get it too. Since v2.13.0, `template:update` generates **and commits** the migration; deploy it with the app. See [Database & Prisma](/starter-template/database/). Skipping the migration leaves `prisma.authDevice` code without a table.
@@ -192,7 +192,7 @@ It is composed entirely from the shared `settings-blocks` (`SectionHeader`, `Tab
 - Opaque ≥32-byte tokens, **hashed at rest** (SHA-256), never logged.
 - Enrolment single-use + short TTL, consumed atomically; `pair` rate-limited per user.
 - Public `enrol` / `refresh` rate-limited per IP, **generic errors** (never reveal whether a token exists), HTTPS only.
-- Device tokens are **non-admin**, owner-scoped, and individually **revocable** (instant). They can't delete or export the account, or step up.
+- Device tokens are **non-admin**, scoped to the user, and individually **revocable** (instant). They can't delete or export the account, or step up.
 - A replayed, rotated-out refresh token (any of them, not just the last) **revokes the device**, after a 30-second grace window for lost-response retries.
 - Credential lifecycle events reach the audit trail: `device.paired`, `device.enrolled`, `device.refreshReuse` and `device.revoked` (ids only, never token material). `device.refreshed` fires about hourly per device, so it stays a hook and a log line, not an audit row.
 - Stale enrolments and long-dead devices are pruned. Device rows are erased on account deletion and included in the personal-data export (without any hash).
